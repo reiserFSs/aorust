@@ -37,6 +37,7 @@
 //! `option=NativeVariable:value` dispatches Options control input and checks native store/runtime consumers.
 //! `optionpersist=name:name` saves/reopens native user files; `optioncheck=name:value` observes a subsequent login without writing.
 //! `perf=N` renders fixed-60Hz steps; `perfreport=label` snapshots timings, memory and caches even with zero samples.
+//! `grassreport=label` prints current native-cell/material/exposure/authored-cover rejection and duplicate-cell diagnostics.
 //! `AOMAC_ALLOC_COUNT=1` opts into process-wide test allocator counts (relative to test entry, native memory excluded).
 use super::*;
 use ao_render::{GameInput, KeyCode, Offscreen};
@@ -699,6 +700,7 @@ fn live_walk() {
             }
             "perfreset" => l.o.perf_reset(),
             "perfreport" => super::tests::counted_perf_report(&mut l.o, &l.p, v),
+            "grassreport" => eprintln!("live grass {v}\n{}", l.o.evidence_grass_diagnostics()),
             "perf" => {
                 assert!(std::env::var_os("AOMAC_PERF").is_some(), "perf requires AOMAC_PERF=1");
                 let frames: usize = v.parse().expect("perf=frame_count");

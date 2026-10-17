@@ -545,14 +545,29 @@ vegetation geometry. Only native ground material 15 (grass texture IDs 2/258) or
 liquid-overlapped cells, room floors and roads do not. Source-triangle liquid
 bounds conservatively omit some shoreline grass. GPU expansion uses a fixed
 world-cell/texture hash, 128 tuft sites per cell and at most 1024 cells. Each tuft
-spreads 3–7 thin, tapered two-segment strips with curved lean and ±40% height
-variation; density thins stable tuft sites with distance
+spreads 3–7 tapered two-segment strips with seeded narrow/full leaf profiles,
+curved lean, lateral curl and ±40% height variation. Procedural central folds and
+longitudinal veins remain terrain-tinted and subtractive, with derivative-based
+detail fading to avoid subpixel shimmer; no external texture assets are used.
+Density thins stable tuft sites with distance
 rather than reseeding them. The default distance is 50 m (bounded to 60 m), further
 limited by the original projection far plane, native fully-fine terrain radius
 and fixed cell budget. Each native triangle admits grass up to about 40°;
 one steep half does not discard its valid neighbor. The slope uses actual
 triangle gradients, not the direction-dependent corner height range.
 Collision and selection are unchanged.
+
+Authored ground vegetation also excludes Enhanced blades, including non-colliding
+foliage cards. At load time the native resource name table (`1000010/1`) identifies
+plant mesh families; ICC uses `1010001/206506`
+(`spikey_green_grass_largecluster.abiff`), while Borealis includes `1503`
+(`nature_groundplant.abiff`) and `21009` (`jungle_fern_2m_hipoly.abiff`).
+Transformed full-placement triangles intersecting a ±0.5 m terrain-height slab
+mark covered native cells. Reduced LOD twins and repeated global-zone references
+do not add coverage; high canopy alone does not suppress ground grass.
+This is an intentional conservative Enhanced exclusion policy, not a recovered
+retail vegetation rule: projected triangle bounds can omit extra blades at cell
+corners. Native geometry, collision and faithful rendering remain untouched.
 
 Native substrate alone is not proof that terrain is exposed: statel floors may
 overlay a grass cell. An opt-in callback reuses the loaded native `Collision`

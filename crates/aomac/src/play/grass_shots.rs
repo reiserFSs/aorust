@@ -159,7 +159,7 @@ fn grass_ground_camera(
     let mut cells = std::collections::BTreeMap::new();
     for patch in &scene.ground_detail {
         for (index, cell) in patch.fine_cells.iter().enumerate() {
-            if !matches!(cell.ground_material, 6 | 15) { continue; }
+            if cell.authored_vegetation || !matches!(cell.ground_material, 6 | 15) { continue; }
             let (x, z) = (index % patch.cells, index / patch.cells);
             let grid = [patch.origin[0] + x as i32, patch.origin[1] + z as i32];
             let (wx, wz) = (grid[0] as f32 * patch.cell_size, -(grid[1] as f32) * patch.cell_size);

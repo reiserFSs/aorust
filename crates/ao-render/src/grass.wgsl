@@ -63,10 +63,14 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     let corner = vec2<f32>(side, along);
     let angle = grass_unit(grass_hash(seed ^ 0x42u)) * 6.283185307 + f32(blade) * 2.39996323;
     let direction = vec2<f32>(cos(angle), sin(angle));
-    let width = direction * (corner.x * (0.012 + grass_unit(grass_hash(blade_seed ^ 0x31u)) * 0.016) * (1.0 - along) * fade);
+    // Mix narrow tapered blades with fuller leaves, keeping every native root.
+    let blade_shape = grass_unit(grass_hash(blade_seed ^ 0x128u));
+    let profile = (1.0 - along) * (0.65 + along * (0.7 + blade_shape * 1.2));
+    let width = direction * (corner.x * (0.012 + grass_unit(grass_hash(blade_seed ^ 0x31u)) * 0.016) * profile * fade);
     let height = 0.38 * (0.6 + grass_unit(grass_hash(blade_seed ^ 0x85u)) * 0.8) * fade;
     let wind = clamp(grass_params.wind_time.xy, vec2<f32>(-3.0), vec2<f32>(3.0)) * (sin(grass_params.wind_time.z * 1.7 + root.x * 0.37 + root.z * 0.29) * 0.06 * fade);
     var bend = wind + direction * ((0.03 + grass_unit(grass_hash(blade_seed ^ 0x29u)) * 0.11) * fade);
+    bend += vec2<f32>(-direction.y, direction.x) * ((blade_shape - 0.5) * 0.12 * fade);
     // Current frame only: no recovery/trail state can retain a vanished actor.
     for (var index = 0u; index < min(u32(grass_params.limits.z), 16u); index += 1u) {
         let actor = grass_params.benders[index];
@@ -90,7 +94,9 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     o.uv = grass_uv(c.identity.y, uv);
     // Ground-root fog: raised tips cannot reduce native extinction.
     o.fog = max(vertex_fog(-(g.view * vec4<f32>(root, 1.0)).z), vertex_fog(-(g.view * vec4<f32>(p, 1.0)).z));
-    o.color = vec4<f32>(c.origin.w, grass_unit(grass_hash(blade_seed ^ 0x128u)), grass_unit(grass_hash(blade_seed ^ 0x619u)), along);
+    o.color = vec4<f32>(c.origin.w, blade_shape, grass_unit(grass_hash(blade_seed ^ 0x619u)), along);
+    // Blade-local coordinates are independent of terrain UV/palette sampling.
+    o.tint = vec3<f32>(side, along, blade_shape);
     o.fade = 1.0 - smoothstep(radius * 0.65, max(radius, 0.001), distance_to_eye);
     // Evaluate the same four native terrain-corner Gouraud values, then
     // interpolate on the native diagonal. Blade tips never gain extra light.
@@ -130,7 +136,12 @@ fn fs_grass(i: VOut) -> GrassOutput {
     // sides keep the terrain's lighting budget, and tips never exceed it.
     let jitter = vec3<f32>(0.88 + i.color.g * 0.12, 0.91 + i.color.b * 0.09, 0.82 + i.color.g * 0.18);
     let gradient = mix(0.5, 1.0, smoothstep(0.0, 1.0, i.color.w));
-    let tile = ground_tile(i) * jitter * gradient;
+    // A soft central fold and fine longitudinal veins describe the leaf surface
+    // without adding light. Fade subpixel veins rather than letting them shimmer.
+    let ridge = 1.0 - 0.14 * abs(i.tint.x);
+    let vein_visibility = 1.0 - smoothstep(0.15, 0.6, fwidth(i.tint.x));
+    let veins = 1.0 - 0.04 * (0.5 + 0.5 * cos(i.tint.x * 25.0 + i.tint.z * 6.283185307)) * vein_visibility;
+    let tile = ground_tile(i) * jitter * gradient * ridge * veins;
     let bayer = array<f32, 16>(0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
     let pixel = vec2<u32>(i.clip.xy) & vec2<u32>(3u);
     if i.fade <= (bayer[pixel.x + pixel.y * 4u] + 0.5) / 16.0 { discard; }

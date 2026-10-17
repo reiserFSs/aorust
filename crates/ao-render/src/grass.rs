@@ -152,7 +152,7 @@ impl Grass {
                 }
                 // One pass over cells, not one full scan per material.
                 for (index, cell) in patch.fine_cells.iter().enumerate() {
-                    if self.fine_mask[index] != 15 || !eligible(cell.native_tile, cell.ground_material) || self.candidates.len() == MAX_CELLS { continue; }
+                    if self.fine_mask[index] != 15 || cell.authored_vegetation || !eligible(cell.native_tile, cell.ground_material) || self.candidates.len() == MAX_CELLS { continue; }
                     let (x, z) = (index % patch.cells, index / patch.cells);
                     let world_x = x0 + x as f32 * patch.cell_size;
                     let world_z = z0 - z as f32 * patch.cell_size;
@@ -455,8 +455,10 @@ impl super::Renderer {
         let vp = super::Mat4::perspective_rh(self.lens.vertical_fov(aspect), aspect, self.lens.near, far)
             * super::Mat4::look_to_rh(camera.pos, camera.forward(), camera.up());
         let radius = f32::from_bits(grass.last_radius);
-        let mut counts = std::collections::BTreeMap::<(u16, u8), [usize; 9]>::new();
+        let mut counts = std::collections::BTreeMap::<(u16, u8), [usize; 10]>::new();
         let mut report = format!("grass_radius={radius} generated_cells={} candidates={} batches={}\n", grass.cells.len(), grass.candidates.len(), grass.batches.len());
+        let unique = grass.cells.iter().map(|cell| [cell.origin[0], cell.origin[1], cell.origin[2]].map(f32::to_bits)).collect::<std::collections::BTreeSet<_>>().len();
+        writeln!(report, "grass_duplicate_cells={}", grass.cells.len() - unique).unwrap();
         for batch in &grass.batches {
             let patch = &ground.detail.patches()[batch.patch];
             let draw = ground.draws[batch.patch][batch.submesh];
@@ -483,6 +485,7 @@ impl super::Renderer {
                 count[0] += 1;
                 if !eligible(cell.native_tile, cell.ground_material) { count[1] += 1; continue; }
                 if mask.get(index).copied().unwrap_or(0) != 15 { count[2] += 1; continue; }
+                if cell.authored_vegetation { count[9] += 1; continue; }
                 let offset = (index / patch.cells) * (patch.cells + 1) + index % patch.cells;
                 let heights = [offset, offset + 1, offset + patch.cells + 1, offset + patch.cells + 2]
                     .map(|i| patch.heights[i] as f32 * (patch.height_scale / 256.0));
@@ -522,7 +525,7 @@ impl super::Renderer {
             }
         }
         for ((tile, material), c) in counts {
-            writeln!(report, "grass_tile tile={tile} material={material} nearby={} rejected_material={} rejected_fine={} rejected_slope={} rejected_padding={} pending={} rejected_exposure={} generated={} root_frustum_tuft_sites={}", c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7],c[8]).unwrap();
+            writeln!(report, "grass_tile tile={tile} material={material} nearby={} rejected_material={} rejected_fine={} rejected_slope={} rejected_padding={} pending={} rejected_exposure={} generated={} root_frustum_tuft_sites={} rejected_authored_vegetation={}", c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7],c[8],c[9]).unwrap();
         }
         report
     }
@@ -609,5 +612,118 @@ mod tests {
         assert_eq!(cell_height(&cell, [0.5, 0.5]), 3.0);
         cell.identity[2] = 1;
         assert_eq!(cell_height(&cell, [0.5, 0.5]), 4.0);
+    }
+}
+
+#[cfg(test)]
+mod blade_appearance_tests {
+    #[test]
+    fn procedural_blades_preserve_terrain_receivers_and_validate_all_outputs() {
+        let grass = include_str!("grass.wgsl");
+        assert!(grass.contains("let profile = (1.0 - along)"));
+        assert!(grass.contains("o.tint = vec3<f32>(side, along, blade_shape);"));
+        assert!(grass.contains("fwidth(i.tint.x)"));
+        assert!(grass.contains("ground_tile(i) * jitter * gradient * ridge * veins"));
+        assert!(grass.contains("o.wpos = root;"));
+        assert!(grass.contains("o.n = p;"));
+        assert!(grass.contains("o.uv = grass_uv(c.identity.y, uv);"));
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let renderer = crate::Renderer::new(&instance, None).expect("grass WGSL requires offscreen GPU");
+        for flags in 0..8 {
+            let (ao, bloom, shadows) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
+            let source = super::shader_source((ao, bloom), shadows);
+            assert_eq!(source.contains("output.emissive = vec4<f32>(0.0);"), bloom);
+            assert_eq!(source.contains("let receiving = tile *"), ao);
+            assert_eq!(source.contains("let receiver_normal = cross(dpdx(i.n), dpdy(i.n));"), shadows);
+            let _shader = renderer.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("procedural grass appearance and receiver regression"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod authored_vegetation_admission_tests {
+    use ao_scene::ground_detail::{GroundCell, GroundPatch};
+    use ao_scene::{Instance, Mesh, Scene, Submesh, Vertex, IDENTITY};
+
+    #[test]
+    fn authored_vegetation_excludes_only_covered_native_grass_cells() {
+        // Native fine admission requires a nonterminal 2x2 patch, with separate
+        // fine vertices and a coarse lattice just like the receiver fixture.
+        let mut ground = Mesh { vertices: vec![], submeshes: vec![] };
+        let mut fine_cells = Vec::new();
+        let mut fine_indices = Vec::new();
+        for z in 0..2 {
+            for x in 0..2 {
+                let first = ground.vertices.len() as u32;
+                for [dx, dz] in [[0, 0], [1, 0], [0, 1], [1, 1]] {
+                    ground.vertices.push(Vertex {
+                        pos: [(x + dx) as f32 * 2.0, 0.0, -((z + dz) as f32) * 2.0],
+                        normal: [0.0, 1.0, 0.0], uv: [0.0; 2], color: [1.0; 4],
+                    });
+                }
+                fine_cells.push(GroundCell {
+                    submesh: 0, vertices: [first, first + 1, first + 2, first + 3],
+                    native_tile: 2, ground_material: 15,
+                    authored_vegetation: x == 0 && z == 0,
+                    ..Default::default()
+                });
+                fine_indices.extend([first, first + 1, first + 2, first + 1, first + 3, first + 2]);
+            }
+        }
+        let lattice_start = ground.vertices.len() as u32;
+        for z in 0..=2 {
+            for x in 0..=2 {
+                ground.vertices.push(Vertex {
+                    pos: [x as f32 * 2.0, 0.0, -(z as f32) * 2.0],
+                    normal: [0.0, 1.0, 0.0], uv: [0.0; 2], color: [1.0; 4],
+                });
+            }
+        }
+        ground.submeshes = vec![
+            Submesh::new(fine_indices, None),
+            Submesh::new(vec![lattice_start, lattice_start + 2, lattice_start + 6,
+                lattice_start + 2, lattice_start + 8, lattice_start + 6], None),
+        ];
+        let scene = Scene {
+            meshes: vec![ground],
+            instances: vec![Instance { mesh: 0, transform: IDENTITY }],
+            ground_detail: vec![GroundPatch {
+                mesh: 0, cells: 2, cell_size: 2.0, height_scale: 1.0, heights: vec![0; 9],
+                lattice_start, coarse_submesh: 1, fine_cells,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = crate::Renderer::new(&instance, None).expect("native grass admission GPU");
+        renderer.set_msaa_samples(1);
+        renderer.upload(&scene);
+        renderer.set_enhanced_settings(crate::EnhancedSettings {
+            ground_grass: true, grass_density: 1.0, grass_distance: 30.0, ..Default::default()
+        });
+        renderer.set_enhanced_grass_exposure(Some(super::GrassExposure {
+            generation: 1,
+            // All four flat cells are exposed; only authored coverage may reject one.
+            query: std::rc::Rc::new(|_| true),
+            line_of_sight: std::rc::Rc::new(|_, _| true),
+        }));
+        let camera = crate::Camera::look_at(
+            super::Vec3::new(2.0, 1.5, 3.0), super::Vec3::new(2.0, 0.2, -2.0),
+        );
+        renderer.warm_grass_tiles(&camera);
+        let grass = renderer.grass.as_ref().expect("enabled grass");
+        assert!(grass.candidates.iter().all(|candidate| candidate.grid != [0, 0]),
+            "authored vegetation must be excluded before candidate exposure");
+        let grids: std::collections::BTreeSet<_> = grass.cells.iter()
+            .map(|cell| [(cell.origin[0] / cell.origin[2]) as i32,
+                (-cell.origin[1] / cell.origin[2]) as i32])
+            .collect();
+        assert_eq!(grids, [[0, 1], [1, 0], [1, 1]].into_iter().collect(),
+            "covered cell must stay absent while every uncovered neighbor generates");
+        assert_eq!(grass.cells.len(), grids.len(), "native cells must not generate duplicate grass");
     }
 }

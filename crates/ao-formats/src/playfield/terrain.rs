@@ -182,7 +182,7 @@ pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene, shad
                 s.texture_clamp = true;
                 mesh.submeshes.push(s);
             }
-            let fine_cells = fine_cells.into_iter().map(|(t, raw, vertices)| ao_scene::ground_detail::GroundCell { submesh: material_indices[&t], vertices, native_tile: t, ground_material: super::ground::ground_material(t) as u8, orientation: (raw >> 14) as u8 }).collect();
+            let fine_cells = fine_cells.into_iter().map(|(t, raw, vertices)| ao_scene::ground_detail::GroundCell { submesh: material_indices[&t], vertices, native_tile: t, ground_material: super::ground::ground_material(t) as u8, orientation: (raw >> 14) as u8, authored_vegetation: false }).collect();
             let lattice_start = mesh.vertices.len() as u32;
             let mut heights = Vec::with_capacity((patch + 1) * (patch + 1));
             for z in pz..=ez { for x in px..=ex {

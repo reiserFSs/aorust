@@ -12,6 +12,9 @@ pub struct GroundCell {
     pub ground_material: u8,
     /// Raw tile bits 14..15 (DisplaySystem 100374c5).
     pub orientation: u8,
+    /// Authored near-ground plant geometry occupies this cell; Enhanced grass only.
+    /// Native ground selection and authored mesh rendering do not consume this flag.
+    pub authored_vegetation: bool,
 }
 
 #[derive(Clone, Debug, Default)]
