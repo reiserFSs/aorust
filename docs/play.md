@@ -902,3 +902,23 @@ For the all-effects 1920×1200 timing matrix, set `AOMAC_GFX_EFFECTS=1`
 Newland day captures use time 3240 (midday), while preserving the original
 4700-derived camera selection. `AOMAC_GFX_DAY_TIME` overrides Newland's daytime
 only; `AOMAC_GFX_DISTANCE` overrides the grass radius without changing density.
+
+Measured on Apple M4 Pro at code revision `afb37e44`: 1920×1200, actual 4× MSAA,
+all five effects enabled, density 1, distance 160 m, sun boost 0.5 and grade 0.8.
+Values below are grass-on minus grass-off whole-frame GPU p50, in milliseconds;
+both variant orders are retained rather than selecting the faster order.
+
+| View | Off/on order | On/off order | Pair mean |
+| --- | ---: | ---: | ---: |
+| Newland park, noon 3240 | 2.258 | 2.262 | 2.260 |
+| ICC mid / arch, native frozen time | 1.766 | 1.677 | 1.722 |
+| Borealis full-green hillside close | 1.827 | 2.279 | 2.053 |
+| Borealis hillside mid/far overview | 1.106 | 1.599 | 1.352 |
+
+This is approximately the 2 ms budget, not a strict ≤2 ms guarantee: the Newland
+pair is 0.26 ms above that nominal target. The older fixture's advertised 4× runs
+actually rendered at 1× because the persistent timing target overwrote the host's
+sample count each frame; `evidence_timing_honors_explicit_msaa_across_frames`
+regresses the corrected behavior. Before/after PNG sheets are retained under
+`~/aomac-handoff/gfx/v2/GrassV3/`. Newland's baseline is late afternoon 4700, not
+a same-time lighting comparison; the other comparison cameras/times are pinned.
