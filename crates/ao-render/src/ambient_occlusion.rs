@@ -38,7 +38,7 @@ impl AmbientOcclusion {
             label: Some("ambient AO inputs"), entries: &[
                 wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 texture(1, wgpu::TextureSampleType::Depth),
-                texture(2, wgpu::TextureSampleType::Float { filterable: false }),
+                texture(2, wgpu::TextureSampleType::Uint),
                 texture(3, wgpu::TextureSampleType::Float { filterable: false }),
             ],
         });
@@ -50,8 +50,8 @@ impl AmbientOcclusion {
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(entry), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask: wgpu::ColorWrites::RED | wgpu::ColorWrites::GREEN | if entry == "composite" { wgpu::ColorWrites::BLUE } else { wgpu::ColorWrites::empty() } })] }),
             primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
         });
-        let estimate = make_pipeline("estimate", wgpu::TextureFormat::Rg32Float, None);
-        let blur = make_pipeline("blur", wgpu::TextureFormat::Rg32Float, None);
+        let estimate = make_pipeline("estimate", wgpu::TextureFormat::Rg32Uint, None);
+        let blur = make_pipeline("blur", wgpu::TextureFormat::Rg32Uint, None);
         let composite = make_pipeline("composite", format, Some(wgpu::BlendState {
             color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::ReverseSubtract },
             alpha: wgpu::BlendComponent::REPLACE,
@@ -66,7 +66,7 @@ impl AmbientOcclusion {
         if self.targets.as_ref().is_none_or(|targets| targets.size != size || targets.depth != *depth || targets.ambient != *ambient) {
             let create = |label| device.create_texture_tracked(&wgpu::TextureDescriptor {
                 label: Some(label), size: wgpu::Extent3d { width: size.0.div_ceil(2), height: size.1.div_ceil(2), depth_or_array_layers: 1 },
-                mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rg32Float,
+                mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rg32Uint,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
             }).create_view(&Default::default());
             let raw = create("ambient AO raw");
@@ -108,8 +108,8 @@ impl AmbientOcclusion {
     }
 
     pub(super) fn incremental_bytes(size: (u32, u32)) -> u64 {
-        // Two full-precision (occlusion, depth) targets preserve edge rejection
-        // even at distant geometry where half-float depth would quantize.
+        // Two packed targets retain full32 depth and exact selected-pixel offsets
+        // for bilateral edges; AO itself is half precision for native UNORM.
         u64::from(size.0.div_ceil(2)) * u64::from(size.1.div_ceil(2)) * 16 + std::mem::size_of::<Params>() as u64
     }
 }

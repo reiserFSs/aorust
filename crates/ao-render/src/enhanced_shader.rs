@@ -11,7 +11,11 @@ pub(super) fn source(shadows: bool, ao: bool, bloom: bool) -> String {
     let liquid = source[liquid_start..liquid_end].replace("    o.ambient_share = select(l.ambient_share, vec3<f32>(0.0), prelit);\n    o.sun_share = select(l.sun_share, vec3<f32>(0.0), prelit);\n    o.sun_spec_share = select(l.sun_spec_share, vec3<f32>(0.0), prelit);\n", "");
     source.replace_range(liquid_start..liquid_end, &liquid);
     source = source.replace("struct Lit {", "struct Lit {\n    ambient_share: vec3<f32>,\n    sun_share: vec3<f32>,\n    sun_spec_share: vec3<f32>,");
-    source = source.replace("    return o;\n}\n\n// mode:", "    let base = to_g(emissive) + dl[0];\n    let direct = sun_diffuse * max(sn, 0.0);\n    o.ambient_share = max(o.light - min(base + direct, vec3<f32>(1.0)), vec3<f32>(0.0));\n    o.sun_share = max(o.light - min(base + g.ambient_g.rgb, vec3<f32>(1.0)), vec3<f32>(0.0));\n    o.sun_spec_share = max(o.spec - min(to_g(specular) * dl[1], vec3<f32>(1.0)), vec3<f32>(0.0));\n    return o;\n}\n\n// mode:");
+    // Reuse the complete native sum, never a regrouped partial sum: Metal's
+    // fast math otherwise reassociates the beauty calculation by an UNORM LSB.
+    source = source.replace("    o.light = min(to_g(emissive) + g.ambient_g.rgb + sun_diffuse * max(sn, 0.0) + dl[0], vec3<f32>(1.0));", "    let native_raw = to_g(emissive) + g.ambient_g.rgb + sun_diffuse * max(sn, 0.0) + dl[0];\n    o.light = min(native_raw, vec3<f32>(1.0));");
+    source = source.replace("    o.spec = min(to_g(specular) * (dl[1] + sun_spec), vec3<f32>(1.0));", "    let native_spec = to_g(specular) * (dl[1] + sun_spec);\n    o.spec = min(native_spec, vec3<f32>(1.0));");
+    source = source.replace("    return o;\n}\n\n// mode:", "    let excess = max(native_raw - vec3<f32>(1.0), vec3<f32>(0.0));\n    o.ambient_share = max(g.ambient_g.rgb - excess, vec3<f32>(0.0));\n    o.sun_share = max(sun_diffuse * max(sn, 0.0) - excess, vec3<f32>(0.0));\n    o.sun_spec_share = max(to_g(specular) * sun_spec - max(native_spec - vec3<f32>(1.0), vec3<f32>(0.0)), vec3<f32>(0.0));\n    return o;\n}\n\n// mode:");
     if shadows {
         source = source.replace("    var light = i.light;\n    var spec = i.spec;", "    var shadow = 0.0;\n    if any(i.sun_share > vec3<f32>(0.0)) || any(i.sun_spec_share > vec3<f32>(0.0)) { shadow = 1.0 - sun_visibility(i.wpos); }\n    var light = max(i.light - i.sun_share * shadow, vec3<f32>(0.0));\n    var spec = max(i.spec - i.sun_spec_share * shadow, vec3<f32>(0.0));");
     }
@@ -127,8 +131,15 @@ fn enhanced_ambient(i: VOut, beauty: vec4<f32>) -> vec4<f32> {
     if mat.emissive.w > 0.5 && mat.emissive.w < 1.5 && t.a > 0.0 {
         share = vec3<f32>(0.0);
     }
-    let lit = min(t.rgb * i.tint * i.light + i.spec, vec3<f32>(1.0));
-    let without = min(t.rgb * i.tint * max(i.light - share, vec3<f32>(0.0)) + i.spec, vec3<f32>(1.0));
+    var texture_native = min(t.rgb * i.tint * i.light, vec3<f32>(1.0));
+    var texture_without = min(t.rgb * i.tint * max(i.light - share, vec3<f32>(0.0)), vec3<f32>(1.0));
+    if mat.native.x > 0.5 {
+        let env = sample_clamped(env_tex, i.env_uv);
+        texture_native = min(texture_native + env.rgb, vec3<f32>(1.0));
+        texture_without = min(texture_without + env.rgb, vec3<f32>(1.0));
+    }
+    let lit = min(texture_native + i.spec, vec3<f32>(1.0));
+    let without = min(texture_without + i.spec, vec3<f32>(1.0));
     return vec4<f32>(min(beauty.rgb, max(lit - without, vec3<f32>(0.0)) * (1.0 - native_fog(i.fog))), beauty.a);
 }
 fn enhanced_emission(i: VOut, beauty: vec4<f32>) -> vec4<f32> {
@@ -156,7 +167,7 @@ mod tests {
         assert!(source.contains("@fragment fn fs_ground_shadow"));
         assert!(source.contains("@fragment fn fs_lava_crust"));
         assert!(!source.contains("@group(3)"));
-        assert!(source.contains("o.ambient_share = max(o.light - min(base + direct"));
+        assert!(source.contains("o.ambient_share = max(g.ambient_g.rgb - excess"));
         assert!(source.contains("mat.emissive.w > 1.5 || i.effect != 0u"));
         assert!(!include_str!("shader.wgsl").contains("EnhancedOutput"));
         let ao_only = super::source(false, true, false);

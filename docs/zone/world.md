@@ -501,7 +501,9 @@ compares every output byte with wall-hidden and fully fog-hidden actors
 absent/present, checks zero-ambient beauty is unchanged, and asserts AO never
 increases a component. The MRT regression covers both static and actor
 materials: ordinary, baked/prelit, unlit and self-lit, plus an occluded emitter.
-AO's two RG32F half-resolution targets cost
+AO's two RG32U half-resolution targets cache the exact selected pixel offset,
+half-precision AO and full32 depth, avoiding repeated four-depth reselection
+inside the filters. Targets plus the uniform cost
 `ceil(width/2) * ceil(height/2) * 16 + 144` bytes (excluding shared Enhanced
 depth/ambient targets and driver allocation overhead), and are dropped when
 the AO switch is disabled.
