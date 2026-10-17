@@ -654,6 +654,23 @@ The same captured bytes are written as top-down tightly packed `.rgba` and `.png
 alongside `manifest.txt` and `status.txt`. Set `AOMAC_GFX_PNG_ONLY=1` to retain
 only PNG images (including repeat-failure images); byte-exact independent-repeat
 checks still run in memory, and baseline comparison then decodes the baseline PNG.
+
+**Known open strict-repeat failure (2026-10-17, frozen source `6031e9c7`):**
+LookLand's faithful and neutral matrices pass all seventeen views exactly, with
+neutral versus faithful zero differing bytes. The `all` and `all-no-bloom` profiles
+both fail `icc-actor-authored` at pixel `(1599, 490)`: first RGB `(23, 40, 19)`,
+repeat `(22, 41, 19)` (two channel bytes, maximum one code; blue/alpha unchanged).
+The root is not isolated; disabling bloom does not remove it. The historical
+`9f78245e` all-before capture also failed this view, at a different pixel
+`(1041, 463)` (red `53 -> 54`, blue `34 -> 33`); that does not establish the
+same mechanism. The original failed manifests and repeat images are retained in
+`gfx/v3/LookLand/after` and `after-no-bloom`. Remaining views were captured once
+in `after-remaining/<view>` and `no-bloom-remaining/<view>` rather than retrying
+the failed view. The first images are also collected into the flat comparison
+directories for the final sheets. No tolerance, retry-to-pass, or passing status
+was added. Main approved recording this open item instead of extending the
+investigation beyond its ten-minute limit.
+
 For sky precision investigations, `AOMAC_SKY_PIXELS='743,208;779,212'` also
 writes `<view>-sky-first.txt` and `<view>-sky-repeat.txt` from each renderer's
 last uploaded SingleCloud layer17 draws. These opt-in reports include unblended
