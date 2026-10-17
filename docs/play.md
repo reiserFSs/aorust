@@ -523,6 +523,50 @@ disk cache. C/C++ cache hits worked. It is not the dependency-reuse mechanism fo
 this workflow. Do not use a shared live `CARGO_TARGET_DIR`: parallel revisions
 would serialize on Cargo's build lock and invalidate one another's artifacts.
 
+### Measured iteration costs (2026-10-17)
+
+Single-run `/usr/bin/time -p` wall seconds on this Mac, `-j 2`, private targets;
+before source `82bed1e`, after this iteration change. Shipping release settings
+were identical before/after. These are build/fixture latency measurements, not
+Enhanced frame-time or retail visual-quality claims.
+
+| Work | Before | After |
+| --- | ---: | ---: |
+| Clean `cargo build -p aomac` | release 259.79 s | fast 211.86 s |
+| Rebuild after `touch crates/ao-render/src/grade.wgsl` | release 259.68 s | fast 4.85 s |
+| First fixture test executable build after app build (`--no-run`) | release 286.21 s | fast 77.92 s |
+| Full faithful fixture, release, 14 views / 28 independent captures | 19.14 s | 13.71 s |
+| Selected faithful fixture, release, `borealis-foliage-sun-high` | 6.03 s | 5.22 s |
+| Scene loads for full matrix | 14 | 6 (839.717 ms total loader time) |
+| Shader-only edit using existing executable + runtime sources | release rebuild required | **zero Rust compilation**; Enhanced-all selected-view run 15.83 s |
+
+The exact-view filter already existed; no redundant filter was added. The full
+fixture now shares snapshots without sharing renderers or weakening repeats.
+The fast full faithful fixture also passed in 22.16 s; fast is not promised to
+render faster than release. Runtime fixture latency varies with machine load;
+the reliable shader-iteration win is removing compilation.
+
+Two agents built fresh private worktrees simultaneously. With sccache alone they
+took 174.43 / 173.73 s and had zero Rust hits. With provenance-safe APFS seeding,
+cloning took 1.81 / 1.32 s and builds took 127.81 / 149.21 s. Both seeded builds
+compiled **only the nine workspace crates**, with no registry dependencies rebuilt
+and no shared Cargo target lock. The script also refused an existing destination
+without deleting it and rejected a missing reference without creating a target.
+
+All 14 faithful views were byte-identical to the pre-change release baseline,
+including independent repeats, in both fast and release. All 14 runtime-loaded
+faithful views matched that baseline too; the Enhanced-all selected-view runtime
+override matched its embedded-source capture byte-for-byte. Evidence directories
+are `~/aomac-handoff/gfx/iterspeed-*` (plus `iterspeed-enhanced-*`).
+Headless release workspace gates passed: **2261 passed, 73 ignored** and strict
+`cargo clippy --release --workspace --all-targets -j 2 -- -D warnings`.
+
+### Runtime shader overrides
+
+All file-backed WGSL/Metal sources use the override, including the world/Enhanced,
+grade, grass, shadow, AO and bloom paths. Shader equations and feature switches
+are unchanged.
+
 For shader-only iteration, build the fixture test once, then set
 `AOMAC_SHADER_DIR` to the **absolute** `crates/ao-render/src` directory in your
 worktree. Each new renderer reads its shader sources from that directory instead
