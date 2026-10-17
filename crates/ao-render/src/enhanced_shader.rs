@@ -152,6 +152,17 @@ struct EnhancedOutput {
     @location(2) emission: vec4<f32>,
     @location(3) sun: vec4<f32>,
 }
+// AO removes (receiver share) x (occlusion x AO_SKY_BOOST, <= 1) of the diffuse
+// colour. Sky-fill is fully eligible; only AO_SUN_CAP of the direct-sun share is,
+// so contact creases ground the sun-lit surface without cutting its light:
+// darkening only, never below the ambient-only look by more than that cap, and
+// bounded by the diffuse colour (no effect on fog, specular, emission or sky).
+// AO_SKY_BOOST must match SKY_BOOST in ambient_occlusion.wgsl.
+const AO_SKY_BOOST = 2.0;
+const AO_SUN_CAP = 0.25;
+fn ao_share(sky_fraction: vec3<f32>) -> vec3<f32> {
+    return sky_fraction + (vec3<f32>(1.0) - sky_fraction) * (AO_SUN_CAP / AO_SKY_BOOST);
+}
 // The receiving colour is evaluated after the native body: no new texture
 // samples or derivatives can occur after its cutout discard.
 fn enhanced_ao_receiver(i: VOut, beauty: vec4<f32>) -> vec4<f32> {
@@ -165,7 +176,7 @@ fn enhanced_ao_receiver(i: VOut, beauty: vec4<f32>) -> vec4<f32> {
     let fog_colour = select(g.fog_g.rgb, to_g(mat.flags.yzw), mat.scroll.z > 1.5);
     let diffuse = max(beauty.rgb - fog_colour * fog - max(i.spec, vec3<f32>(0.0)) * (1.0 - fog), vec3<f32>(0.0));
     let indirect_fraction = clamp(g.ambient_g.rgb / max(i.light, vec3<f32>(0.001)), vec3<f32>(0.0), vec3<f32>(1.0));
-    let receiving_fraction = mix(vec3<f32>(0.8), vec3<f32>(1.0), indirect_fraction);
+    let receiving_fraction = ao_share(indirect_fraction);
     let baked = select(1.0, 0.2, mat.emissive.w > 1.5);
     return vec4<f32>(min(clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), diffuse * receiving_fraction * baked), beauty.a);
 }
@@ -174,7 +185,9 @@ fn enhanced_ground_receiver(i: VOut, beauty: vec4<f32>, multiplier: bool) -> vec
     // colour exactly as it multiplies the previous beauty colour.
     if multiplier { return vec4<f32>(clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), beauty.a); }
     let diffuse = max(beauty.rgb - g.fog_g.rgb * ground_fog(i), vec3<f32>(0.0));
-    return vec4<f32>(min(clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), diffuse * 0.8), beauty.a);
+    // The baked terrain light has no sun/sky split here; i.light's ambient share stands in (over-estimating the sky share only darkens more, still <= diffuse).
+    let sky_fraction = clamp(g.ambient_g.rgb / max(i.light, vec3<f32>(0.001)), vec3<f32>(0.0), vec3<f32>(1.0));
+    return vec4<f32>(min(clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), diffuse * ao_share(sky_fraction)), beauty.a);
 }
 fn enhanced_emission(i: VOut, beauty: vec4<f32>) -> vec4<f32> {
     // Liquid emission is native lighting authoring, not a bloom source.
@@ -215,6 +228,11 @@ mod tests {
         assert!(source.contains("o.ao_info = vec3<f32>(select(0.0, 1.0, all(emissive"));
         assert!(source.contains("let baked = select(1.0, 0.2"));
         assert!(!include_str!("shader.wgsl").contains("EnhancedOutput"));
+        // The receiver's sun cap assumes the composite's boost; the two constants must agree.
+        let boost = |text: &str, name: &str| text.split(name).nth(1).and_then(|rest| rest.split(['=', ';']).nth(1)).map(str::trim).map(str::to_owned);
+        assert_eq!(boost(super::OUTPUT, "const AO_SKY_BOOST"), boost(include_str!("ambient_occlusion.wgsl"), "const SKY_BOOST"));
+        assert_eq!(boost(super::OUTPUT, "const AO_SKY_BOOST").as_deref(), Some("2.0"));
+        assert!(super::OUTPUT.contains("const AO_SUN_CAP = 0.25;"), "sun share removal is capped at 25%");
         let ao_only = super::source(false, true, false, false);
         assert!(!ao_only.contains("sun_share:"));
         assert!(!ao_only.contains("sun_spec_share:"));

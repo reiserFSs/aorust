@@ -66,7 +66,7 @@ crates/ao-render/src/contact_shadows.{rs,wgsl} follow the algorithm of
 reimplementation of the algorithm, not copied source.
 
 Bloom pyramid
-=============
+======
 
 The 13-tap Karis-weighted first downsample and 3x3-tent upsample chain in
 crates/ao-render/src/bloom.wgsl follow the structure of rvk/shaders/bloom_down.frag
@@ -74,3 +74,12 @@ and rvk/shaders/bloom_up.frag in ao-vk (https://github.com/wannabuh/ao-vk), MIT
 licensed, including its soft-knee threshold above white. The WGSL is an independent
 reimplementation; the energy-preserving level mix, authored-emission seeds and
 HDR tonemap interaction are specific to this renderer.
+=======
+Enhanced ambient occlusion sampling
+===================================
+
+The per-pixel rotated direction set, step jitter (interleaved gradient noise) and
+sum/(directions*steps) normalisation in crates/ao-render/src/ambient_occlusion.wgsl
+follow rvk/shaders/ao.frag and ao_blur.frag from ao-vk
+(https://github.com/wannabuh/ao-vk, MIT License). The algorithm was re-expressed in
+WGSL for this project's depth-bilateral pipeline; no source text or assets are copied.

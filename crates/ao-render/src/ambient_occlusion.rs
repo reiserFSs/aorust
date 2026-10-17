@@ -82,7 +82,7 @@ impl AmbientOcclusion {
             self.targets = Some(Targets { size, depth: depth.clone(), ambient: ambient.clone(), raw_bind: bind(&filtered), blur_bind: bind(&raw), raw, filtered });
         }
         let targets = self.targets.as_ref().expect("AO targets allocated");
-        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&Params { inverse_vp: vp.inverse().to_cols_array_2d(), vp: vp.to_cols_array_2d(), control: [radius, strength.clamp(0.0, 1.0), fog_depth, size.1 as f32] }));
+        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&Params { inverse_vp: vp.inverse().to_cols_array_2d(), vp: vp.to_cols_array_2d(), control: [radius, strength.clamp(0.0, 2.0), fog_depth, size.1 as f32] }));
         for (index, (label, pipeline, input, output, load)) in [
             ("ambient AO estimate", &self.estimate, &targets.raw_bind, &targets.raw, wgpu::LoadOp::Clear(wgpu::Color::BLACK)),
             ("ambient AO bilateral blur", &self.blur, &targets.blur_bind, &targets.filtered, wgpu::LoadOp::Clear(wgpu::Color::BLACK)),

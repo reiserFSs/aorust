@@ -1,6 +1,15 @@
 // HBAO-lite: current primary-view depth only; no actor lists or history.
-const AXES = array<vec2<f32>, 6>(vec2(1.0,0.0), vec2(0.5,0.8660254), vec2(-0.5,0.8660254),
-    vec2(-1.0,0.0), vec2(-0.5,-0.8660254), vec2(0.5,-0.8660254));
+// Sampling pattern, interleaved-gradient noise and the sum/(directions*steps)
+// normalisation follow ao-vk rvk/shaders/ao.frag (MIT, wannabuh/ao-vk), see THIRD_PARTY.
+const TAU = 6.2831853;
+const DIRECTIONS = 6;
+const STEPS = 4;
+// Sky-fill share is darkened SKY_BOOST x harder than the raw occlusion; the
+// receiver weights the sun share by SUN_CAP / SKY_BOOST so at most SUN_CAP of it
+// is removed. Must match AO_SKY_BOOST / AO_SUN_CAP in enhanced_shader.rs.
+const SKY_BOOST = 2.0;
+// ao.frag uses 2; sparse jittered samples of a 1.75 m radius read weaker in the native dim lighting.
+const OCCLUSION_GAIN = 4.0;
 struct Params {
     inverse_vp: mat4x4<f32>,
     vp: mat4x4<f32>,
@@ -69,12 +78,15 @@ fn selected_pixel(half: vec2<i32>, sample: vec2<u32>) -> vec2<i32> {
     let clip = params.vp * vec4<f32>(p, 1.0);
     let projection_y = length(vec3<f32>(params.vp[0].y, params.vp[1].y, params.vp[2].y));
     let radius_pixels = clamp(params.control.x * projection_y * params.control.w / (2.0 * max(clip.w, 0.01)), 1.0, 64.0);
+    // Fixed screen-space pattern (no time term): static frames are bit-stable.
+    let noise = fract(52.9829189 * fract(dot(position.xy, vec2<f32>(0.06711056, 0.00583715))));
     var occlusion = 0.0;
-    for (var direction = 0; direction < 6; direction++) {
-        let axis = AXES[direction];
-        var horizon = 0.0;
-        for (var step = 1; step <= 4; step++) {
-            let sample_pixel = pixel + vec2<i32>(round(axis * radius_pixels * f32(step) / 4.0));
+    for (var direction = 0; direction < DIRECTIONS; direction++) {
+        let angle = (f32(direction) + noise) * (TAU / f32(DIRECTIONS));
+        let axis = vec2<f32>(cos(angle), sin(angle));
+        for (var step = 0; step < STEPS; step++) {
+            let t = (f32(step) + fract(noise * 7.0 + f32(step) * 0.618)) / f32(STEPS);
+            let sample_pixel = pixel + vec2<i32>(round(axis * (t * radius_pixels + 1.0)));
             if !inside(sample_pixel) { continue; }
             let sample_z = depth_at(sample_pixel);
             if sample_z >= 1.0 { continue; }
@@ -83,12 +95,12 @@ fn selected_pixel(half: vec2<i32>, sample: vec2<u32>) -> vec2<i32> {
             if normal_distance <= 0.0 { continue; }
             let distance = length(delta);
             if distance < 0.01 || distance >= params.control.x { continue; }
-            let elevation = max(normal_distance / distance - 0.15, 0.0);
-            horizon = max(horizon, elevation * (1.0 - distance / params.control.x));
+            occlusion += max(normal_distance / distance - 0.15, 0.0) * (1.0 - distance / params.control.x);
         }
-        occlusion += horizon;
     }
-    return encoded(clamp(occlusion / 6.0 * params.control.y, 0.0, 1.0), z, pixel);
+    // Strength is an exponent on the open fraction: 0 -> neutral, always within [0, 1].
+    let open = 1.0 - clamp(OCCLUSION_GAIN * occlusion / f32(DIRECTIONS * STEPS), 0.0, 1.0);
+    return encoded(1.0 - pow(open, params.control.y), z, pixel);
 }
 // Strict world-space depth rejection prevents background AO crossing silhouettes.
 fn bilateral(center: vec3<f32>, candidate: vec3<f32>) -> f32 {
@@ -104,14 +116,15 @@ fn bilateral(center: vec3<f32>, candidate: vec3<f32>) -> f32 {
     let p = world(selected_pixel(pixel, center), depth_of(center));
     var sum = value_of(center);
     var weight = 1.0;
-    for (var y = -1; y <= 1; y++) {
-        for (var x = -1; x <= 1; x++) {
+    // 5x5 removes the per-pixel rotation pattern; the strict depth test below keeps it inside silhouettes.
+    for (var y = -2; y <= 2; y++) {
+        for (var x = -2; x <= 2; x++) {
             if x == 0 && y == 0 { continue; }
             let neighbor = pixel + vec2<i32>(x, y);
             if any(neighbor < vec2<i32>(0)) || any(neighbor >= vec2<i32>(textureDimensions(ao_input))) { continue; }
             let sample = textureLoad(ao_input, neighbor, 0).rg;
             if depth_of(sample) >= 1.0 { continue; }
-            let w = bilateral(p, world(selected_pixel(neighbor, sample), depth_of(sample)));
+            let w = exp(-f32(x * x + y * y) / 4.5) * bilateral(p, world(selected_pixel(neighbor, sample), depth_of(sample)));
             sum += value_of(sample) * w;
             weight += w;
         }
@@ -141,5 +154,5 @@ fn bilateral(center: vec3<f32>, candidate: vec3<f32>) -> f32 {
         }
     }
     let occlusion = select(0.0, sum / max(weight, 0.00001), weight > 0.0);
-    return vec4<f32>(textureLoad(ambient, pixel, 0).rgb * occlusion, 0.0);
+    return vec4<f32>(textureLoad(ambient, pixel, 0).rgb * min(occlusion * SKY_BOOST, 1.0), 0.0);
 }

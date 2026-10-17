@@ -32,7 +32,7 @@ impl Default for EnhancedSettings {
     fn default() -> Self {
         Self {
             sun_shadows: false, ambient_occlusion: false, emissive_bloom: false, ground_grass: false, hdr: false, contact_shadows: false,
-            shadow_map_size: 2048, shadow_strength: 0.65, shadow_softness: 1.5, ao_radius: 1.0, ao_strength: 1.0, bloom_strength: 0.6,
+            shadow_map_size: 2048, shadow_strength: 0.65, shadow_softness: 1.5, ao_radius: 1.75, ao_strength: 1.5, bloom_strength: 0.6,
             grass_density: 1.0, grass_distance: 50.0, sun_boost: 0.35, grade_strength: 0.7, contact_strength: 0.4,
         }
     }
@@ -59,7 +59,7 @@ impl EnhancedSettings {
             shadow_strength: finite(self.shadow_strength, 1.0, defaults.shadow_strength),
             shadow_softness: finite(self.shadow_softness, 4.0, defaults.shadow_softness),
             ao_radius: finite(self.ao_radius, 5.0, defaults.ao_radius),
-            ao_strength: finite(self.ao_strength, 1.0, defaults.ao_strength),
+            ao_strength: finite(self.ao_strength, 2.0, defaults.ao_strength),
             bloom_strength: finite(self.bloom_strength, 1.0, defaults.bloom_strength),
             grass_density: finite(self.grass_density, 2.0, defaults.grass_density),
             grass_distance: finite(self.grass_distance, 60.0, defaults.grass_distance),
@@ -96,7 +96,7 @@ mod tests {
             shadow_map_size: 0, ao_radius: -1.0, ao_strength: 3.0, bloom_strength: 2.0,
             grass_density: 4.0, grass_distance: 100.0, ..defaults
         }.clamped();
-        assert_eq!((bounded.shadow_map_size, bounded.ao_radius, bounded.ao_strength), (256, 0.0, 1.0));
+        assert_eq!((bounded.shadow_map_size, bounded.ao_radius, bounded.ao_strength), (256, 0.0, 2.0));
         assert_eq!((bounded.bloom_strength, bounded.grass_density, bounded.grass_distance), (1.0, 2.0, 60.0));
         assert_eq!(defaults.shadow_map_size, 2048);
         let shadow = EnhancedSettings { shadow_strength: 2.0, shadow_softness: 9.0, ..defaults }.clamped();
