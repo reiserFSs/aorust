@@ -1387,7 +1387,9 @@ MSAA is independently selectable; there is no player-facing master/HDR switch.
 
 | Quality control / DV Main key | Default | Bounds |
 |---|---|---|
-| Shadow Map Size / `AomacShadowMapSize` | 1024 | 256–4096 (UI choices 256/512/1024/2048/4096) |
+| Shadow Map Size / `AomacShadowMapSize` | 2048 | 256–4096 (UI choices 256/512/1024/2048/4096) |
+| Sun Shadow Strength / `AomacShadowStrength` | 0.65 | 0–1 (share of the sun removed in full shadow) |
+| Sun Shadow Softness / `AomacShadowSoftness` | 1.5 | 0–4 (penumbra growth with blocker distance; 0 = hard 3x3 PCF) |
 | Ambient Occlusion Radius / `AomacAoRadius` | 1 m | 0–5 m |
 | Ambient Occlusion Strength / `AomacAoStrength` | 1 | 0–1 |
 | Emissive Bloom Strength / `AomacBloomStrength` | 0.6 | 0–1 |

@@ -285,3 +285,73 @@ fn write_evidence(images: &[(&str, &[u8])], size: (u32, u32)) {
         encoder.write_header().unwrap().write_image_data(pixels).unwrap();
     }
 }
+
+#[test]
+fn soft_shadow_penumbra_grows_with_caster_distance_and_is_stable() {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let mut renderer = Renderer::new(&instance, None).expect("headless shadow GPU");
+    let awning = |height: f32, z0: f32, z1: f32|
+        quad([[0.0, height, z0], [20.0, height, z0], [20.0, height, z1], [0.0, height, z1]], [0.0, 1.0, 0.0]);
+    // Two awnings with a common x = 0 edge, 1 m and 12 m above the ground.
+    let scene = Scene {
+        meshes: vec![
+            quad([[-30.0, 0.0, -30.0], [30.0, 0.0, -30.0], [30.0, 0.0, 30.0], [-30.0, 0.0, 30.0]], [0.0, 1.0, 0.0]),
+            awning(1.0, -8.0, -2.0), awning(12.0, 2.0, 8.0),
+        ],
+        ..Default::default()
+    };
+    renderer.upload(&Scene {
+        instances: (0..3).map(|mesh| ao_scene::Instance { mesh, transform: ao_scene::IDENTITY }).collect(), ..scene });
+    let sun = [0.6, 0.8, 0.0];
+    renderer.shadow_sun = Some(sun);
+    renderer.env.sun_dir = sun;
+    renderer.env.sun_color = [0.6; 3];
+    renderer.env.ambient = [0.2; 3];
+    renderer.env.fog_start = 100.0;
+    renderer.env.fog_end = 120.0;
+    let (width, height) = (512u32, 512u32);
+    let targets = Targets::new(&renderer, width, height);
+    let output = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("soft shadow image"), size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: renderer.format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+    });
+    let view = output.create_view(&Default::default());
+    let camera = Camera::look_to_up(Vec3::new(-6.0, 30.0, 0.0), -Vec3::Y, Vec3::Z);
+    let capture = |renderer: &mut Renderer, settings| {
+        renderer.set_enhanced_settings(settings);
+        renderer.render(&view, &targets, &camera);
+        texture_to_rgba(renderer, &output, width, height).unwrap()
+    };
+    let aspect = width as f32 / height as f32;
+    let view_projection = Mat4::perspective_rh(renderer.lens.vertical_fov(aspect), aspect, renderer.lens.near,
+        renderer.lens.far.unwrap_or(132.0)) * Mat4::look_to_rh(camera.pos, camera.forward(), camera.up());
+    let pixel_of = |x: f32, z: f32| {
+        let p = view_projection.project_point3(Vec3::new(x, 0.0, z));
+        (((p.x * 0.5 + 0.5) * width as f32) as usize, ((0.5 - p.y * 0.5) * height as f32) as usize)
+    };
+    let pixels_per_metre = (pixel_of(1.0, 0.0).0 as f32 - pixel_of(0.0, 0.0).0 as f32).abs();
+    // Metres of ground across which the row's green channel is neither lit nor shadowed.
+    let transition = |image: &[u8], z: f32, x0: f32, x1: f32| {
+        let row: Vec<f32> = (pixel_of(x0, z).0.min(pixel_of(x1, z).0)..pixel_of(x0, z).0.max(pixel_of(x1, z).0)).map(|x| f32::from(image[(pixel_of(0.0, z).1 * width as usize + x) * 4 + 1])).collect();
+        let (lo, hi) = row.iter().fold((255.0f32, 0.0f32), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        assert!(hi - lo > 20.0, "row {z} has no shadow edge: {lo}..{hi}");
+        row.iter().filter(|&&v| v > lo + 0.1 * (hi - lo) && v < lo + 0.9 * (hi - lo)).count() as f32 / pixels_per_metre
+    };
+    let shadows = EnhancedSettings { sun_shadows: true, shadow_strength: 1.0, ..Default::default() };
+    let soft = capture(&mut renderer, EnhancedSettings { shadow_softness: 4.0, ..shadows });
+    write_evidence(&[("soft-penumbra", &soft)], (width, height));
+    let (contact, far) = (transition(&soft, -5.0, -5.0, -0.2), transition(&soft, 5.0, -12.0, -5.0));
+    assert!(contact < 0.35, "edge under a 1 m awning must stay sharp: {contact} m");
+    assert!(far > 3.0 * contact && far > 0.6, "edge under a 12 m awning must be much wider: {contact} m vs {far} m");
+    assert_eq!(soft, capture(&mut renderer, EnhancedSettings { shadow_softness: 4.0, ..shadows }), "static soft shadows must repeat exactly");
+    let hard = capture(&mut renderer, EnhancedSettings { shadow_softness: 0.0, ..shadows });
+    assert!(transition(&hard, 5.0, -12.0, -5.0) < 0.35, "softness 0 keeps the hard 3x3 PCF");
+    let original = capture(&mut renderer, EnhancedSettings::default());
+    assert!(soft.iter().zip(&original).all(|(shadowed, lit)| shadowed <= lit), "soft shadows brightened the original image");
+    // Partial sun survives full shadow: strength 0.5 is brighter than 1.0 inside the shadow but never above the original.
+    let (x, y) = pixel_of(-9.0, 5.0);
+    let half = capture(&mut renderer, EnhancedSettings { shadow_softness: 4.0, shadow_strength: 0.5, ..shadows });
+    let at = (y * width as usize + x) * 4 + 1;
+    assert!(half[at] > soft[at] && half[at] <= original[at], "shadow strength must keep part of the sun: {} {} {}", soft[at], half[at], original[at]);
+}

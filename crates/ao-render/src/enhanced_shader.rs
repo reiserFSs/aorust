@@ -68,11 +68,11 @@ pub(super) fn source(shadows: bool, ao: bool, bloom: bool) -> String {
         let fragment_input = if receiving { "surface" } else { "i" };
         source.push_str(&format!("\n@fragment fn {name}(i: VOut) -> EnhancedOutput {{\n{geometric_normal}    let envelope = vec4<f32>(1.0);\n    let emission_sample = {emission_sample};\n    let beauty = enhanced_original_{name}({fragment_input});\n    let bounded_beauty = clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0));\n    return EnhancedOutput(beauty, {ambient}, {emission_result});\n}}\n"));
     }
-    source = source.replace("sun_visibility(i.wpos)", "sun_visibility(i.wpos, i.n)");
+    source = source.replace("sun_visibility(i.wpos)", "sun_visibility(i.wpos, i.n, i.clip.xy)");
     if shadows {
         append_shadow_receiver(&mut source, 0);
     } else {
-        source.push_str("\nfn sun_visibility(world: vec3<f32>, normal: vec3<f32>) -> f32 { return 1.0; }\n");
+        source.push_str("\nfn sun_visibility(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>) -> f32 { return 1.0; }\n");
     }
     // Remove disabled effects structurally, not merely by multiplying by zero.
     for (enabled, name) in [(ao, "enhanced_ao_receiver"), (ao, "enhanced_ground_receiver"), (bloom, "enhanced_emission")] {
@@ -129,7 +129,7 @@ pub(super) fn append_shadow_receiver(source: &mut String, binding_offset: u32) {
         source.push_str(&line);
         source.push('\n');
     }
-    source.push_str(&shader[shader.find("fn cascade_visibility(").expect("shadow receiver function")..]);
+    source.push_str(&shader[shader.find("// Vogel (golden-angle) disk").expect("shadow receiver function")..]);
 }
 
 const OUTPUT: &str = r#"

@@ -303,6 +303,8 @@ fn enhanced_page() -> Page {
         items: vec![
             Item::Opt(check("AomacSunShadows", "Sun Shadows")),
             Item::Opt(opt("AomacShadowMapSize", "Shadow Map Size", &[("256", 256), ("512", 512), ("1024", 1024), ("2048", 2048), ("4096", 4096)])),
+            Item::Opt(slider("AomacShadowStrength", "Sun Shadow Strength", "%.2f")),
+            Item::Opt(slider("AomacShadowSoftness", "Sun Shadow Softness", "%.2f")),
             Item::Opt(check("AomacAmbientOcclusion", "Ambient Occlusion")),
             Item::Opt(slider("AomacAoRadius", "Ambient Occlusion Radius", "%.2f m")),
             Item::Opt(slider("AomacAoStrength", "Ambient Occlusion Strength", "%.2f")),

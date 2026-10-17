@@ -591,6 +591,11 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
         "faithful" => {}
         "neutral" => { settings.ground_grass = true; settings.grass_density = 0.0; }
         "shadows" => settings.sun_shadows = true,
+        // Pre-soft-shadow look: 1024 maps, hard 3x3 PCF, full-strength shadow.
+        "shadows-hard" => {
+            settings.sun_shadows = true;
+            (settings.shadow_map_size, settings.shadow_softness, settings.shadow_strength) = (1024, 0.0, 1.0);
+        }
         "ao" => settings.ambient_occlusion = true,
         "bloom" => settings.emissive_bloom = true,
         "grass" => settings.ground_grass = true,
@@ -600,7 +605,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             settings.emissive_bloom = true;
             settings.ground_grass = true;
         }
-        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|ao|bloom|grass|all"),
+        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|ao|bloom|grass|all"),
     }
     Ok(settings)
 }
@@ -612,6 +617,7 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
     assert!(neutral.any_enabled() && neutral.grass_density == 0.0);
     for (name, expected) in [
         ("neutral", [false, false, false, true]), ("shadows", [true, false, false, false]),
+        ("shadows-hard", [true, false, false, false]),
         ("ao", [false, true, false, false]), ("bloom", [false, false, true, false]),
         ("grass", [false, false, false, true]), ("all", [true; 4]),
     ] {

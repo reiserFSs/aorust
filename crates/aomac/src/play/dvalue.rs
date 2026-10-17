@@ -195,8 +195,9 @@ impl DValues {
         for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass"] {
             s.add(name, Variant::Bool(false), true, CAT_MAIN, None, None, false);
         }
-        s.add("AomacShadowMapSize", Variant::Int(1024), true, CAT_MAIN, Some(Variant::Int(256)), Some(Variant::Int(4096)), false);
+        s.add("AomacShadowMapSize", Variant::Int(2048), true, CAT_MAIN, Some(Variant::Int(256)), Some(Variant::Int(4096)), false);
         for (name, default, max) in [
+            ("AomacShadowStrength", 0.65, 1.0), ("AomacShadowSoftness", 1.5, 4.0),
             ("AomacAoRadius", 1.0, 5.0), ("AomacAoStrength", 1.0, 1.0), ("AomacBloomStrength", 0.6, 1.0),
             ("AomacGrassDensity", 1.0, 2.0), ("AomacGrassDistance", 50.0, 60.0),
         ] {
@@ -237,6 +238,8 @@ impl DValues {
             emissive_bloom: self.flag("AomacEmissiveBloom"),
             ground_grass: self.flag("AomacGroundGrass"),
             shadow_map_size: self.get_i64("AomacShadowMapSize").unwrap_or(i64::from(defaults.shadow_map_size)).clamp(256, 4096) as u32,
+            shadow_strength: self.get_f32("AomacShadowStrength").unwrap_or(defaults.shadow_strength),
+            shadow_softness: self.get_f32("AomacShadowSoftness").unwrap_or(defaults.shadow_softness),
             ao_radius: self.get_f32("AomacAoRadius").unwrap_or(defaults.ao_radius),
             ao_strength: self.get_f32("AomacAoStrength").unwrap_or(defaults.ao_strength),
             bloom_strength: self.get_f32("AomacBloomStrength").unwrap_or(defaults.bloom_strength),

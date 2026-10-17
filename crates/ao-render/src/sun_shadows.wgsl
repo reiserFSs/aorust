@@ -66,7 +66,23 @@ fn primary_actor_id(i: ShadowVertex, cutout: bool) -> u32 {
 @fragment fn fs_shadow_test(i: ShadowVertex) { shadow_alpha(i, true); }
 @fragment fn fs_shadow_dynamic_opaque(i: ShadowVertex) { shadow_alpha(i, false); shadow_admission(i); }
 @fragment fn fs_shadow_dynamic_test(i: ShadowVertex) { shadow_alpha(i, true); shadow_admission(i); }
-fn cascade_visibility(world: vec3<f32>, normal: vec3<f32>, layer: u32) -> f32 {
+// Vogel (golden-angle) disk point, radius 1, rotated.
+fn shadow_vogel(index: u32, count: u32, rotation: f32) -> vec2<f32> {
+    let r = sqrt((f32(index) + 0.5) / f32(count));
+    let a = f32(index) * 2.39996323 + rotation;
+    return r * vec2<f32>(cos(a), sin(a));
+}
+// Depth texels hold the caster plane at their centres: compare the receiver
+// plane there too, or off-centre taps self-shadow.
+fn shadow_center(uv: vec2<f32>, dimensions: vec2<f32>) -> vec2<f32> {
+    return (floor(uv * dimensions) + vec2<f32>(0.5)) / dimensions;
+}
+// Soft sun shadow, after ao-vk rvk/shaders/ffp_main.glsl CascadeVisibility
+// (MIT, https://github.com/wannabuh/ao-vk): a blocker search finds the mean
+// caster depth, and the penumbra grows with caster-to-receiver distance
+// (sharp at contact, wide far out). Taps are rotated per pixel by a fixed
+// screen-space interleaved-gradient pattern: identical every frame.
+fn cascade_visibility(world: vec3<f32>, normal: vec3<f32>, layer: u32, pixel: vec2<f32>) -> f32 {
     let clip = shadow_frame.matrices[layer] * vec4<f32>(world, 1.0);
     let p = clip.xyz / clip.w;
     let uv = p.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
@@ -84,37 +100,83 @@ fn cascade_visibility(world: vec3<f32>, normal: vec3<f32>, layer: u32) -> f32 {
         dot(normal, row_y) / dot(row_y, row_y), dot(normal, row_z) / dot(row_z, row_z));
     var gradient = vec2<f32>(0.0);
     if abs(plane.z) > 0.000001 { gradient = vec2<f32>(-2.0 * plane.x, 2.0 * plane.y) / plane.z; }
-    let texel_position = uv * dimensions - vec2<f32>(0.5);
-    let center = floor(texel_position) + vec2<f32>(0.5);
-    let fraction = fract(texel_position);
-    var visibility = 0.0;
-    // Bilinearly slide the 3x3 box instead of jumping its centre by a texel.
-    // Compare the underlying texel centres separately: hardware bilinear PCF
-    // would use one depth for four different points on a sloped receiver plane.
-    for (var y = -1; y <= 2; y++) {
-        let wy = select(select(1.0, fraction.y, y == 2), 1.0 - fraction.y, y == -1);
-        for (var x = -1; x <= 2; x++) {
-            let wx = select(select(1.0, fraction.x, x == 2), 1.0 - fraction.x, x == -1);
-            let sample_uv = (center + vec2<f32>(f32(x), f32(y))) / dimensions;
-            let receiver_depth = p.z + dot(gradient, sample_uv - uv) - 0.00002;
-            visibility += wx * wy * textureSampleCompareLevel(shadow_maps, shadow_sampler,
-                sample_uv, i32(layer), receiver_depth);
+    let softness = bitcast<f32>(shadow_frame.control.y);
+    if softness <= 0.0 {
+        let texel_position = uv * dimensions - vec2<f32>(0.5);
+        let center = floor(texel_position) + vec2<f32>(0.5);
+        let fraction = fract(texel_position);
+        var visibility = 0.0;
+        // Bilinearly slide the 3x3 box instead of jumping its centre by a texel.
+        // Compare the underlying texel centres separately: hardware bilinear PCF
+        // would use one depth for four different points on a sloped receiver plane.
+        for (var y = -1; y <= 2; y++) {
+            let wy = select(select(1.0, fraction.y, y == 2), 1.0 - fraction.y, y == -1);
+            for (var x = -1; x <= 2; x++) {
+                let wx = select(select(1.0, fraction.x, x == 2), 1.0 - fraction.x, x == -1);
+                let sample_uv = (center + vec2<f32>(f32(x), f32(y))) / dimensions;
+                let receiver_depth = p.z + dot(gradient, sample_uv - uv) - 0.00002;
+                visibility += wx * wy * textureSampleCompareLevel(shadow_maps, shadow_sampler,
+                    sample_uv, i32(layer), receiver_depth);
+            }
         }
+        return visibility / 9.0;
     }
-    return visibility / 9.0;
+    // Wide taps must not slope-extrapolate past ~76 degrees of receiver tilt.
+    let slope = 8.0 * length(row_z) / length(row_x);
+    gradient = clamp(gradient, vec2<f32>(-slope), vec2<f32>(slope));
+    let rotation = 6.2831853 * fract(52.9829189 * fract(dot(pixel, vec2<f32>(0.06711056, 0.00583715))));
+    // Taps stay inside the rendered square, never reading clamped border texels.
+    let lo = guard;
+    let hi = vec2<f32>(1.0) - guard;
+    let texel_uv = 1.0 / dimensions;
+    if layer >= 2u {
+        // Distant texels are wider than any penumbra: a small fixed filter.
+        var visibility = 0.0;
+        for (var i = 0u; i < 4u; i++) {
+            let sample_uv = shadow_center(clamp(uv + shadow_vogel(i, 4u, rotation) * 1.5 * texel_uv, lo, hi), dimensions);
+            let receiver_depth = p.z + dot(gradient, sample_uv - uv) - 0.00002;
+            visibility += textureSampleCompareLevel(shadow_maps, shadow_sampler, sample_uv, i32(layer), receiver_depth);
+        }
+        return visibility * 0.25;
+    }
+    let texel_world = 2.0 / (length(row_x) * dimensions.x);
+    let range_world = 1.0 / length(row_z);
+    let k = 0.02 * softness;
+    let search = clamp(k * 30.0 / texel_world, 1.5, 24.0);
+    var blocker_sum = 0.0;
+    var blockers = 0.0;
+    // Centre plus four disk taps: a thin pole must not fall between the taps.
+    for (var i = 0u; i < 5u; i++) {
+        var offset = vec2<f32>(0.0);
+        if i < 4u { offset = shadow_vogel(i, 4u, rotation) * search * texel_uv; }
+        let sample_uv = shadow_center(clamp(uv + offset, lo, hi), dimensions);
+        let depth = textureLoad(shadow_maps, vec2<i32>(floor(sample_uv * dimensions)), i32(layer), 0);
+        if depth < p.z + dot(gradient, sample_uv - uv) - 0.00002 { blocker_sum += depth; blockers += 1.0; }
+    }
+    if blockers == 0.0 { return 1.0; }
+    if blockers == 5.0 { return 0.0; }
+    let distance = (p.z - blocker_sum / blockers) * range_world;
+    let radius = clamp(distance * k / texel_world, 1.5, 24.0);
+    var visibility = 0.0;
+    for (var i = 0u; i < 12u; i++) {
+        let sample_uv = shadow_center(clamp(uv + shadow_vogel(i, 12u, rotation) * radius * texel_uv, lo, hi), dimensions);
+        let receiver_depth = p.z + dot(gradient, sample_uv - uv) - 0.00002;
+        visibility += textureSampleCompareLevel(shadow_maps, shadow_sampler, sample_uv, i32(layer), receiver_depth);
+    }
+    return visibility / 12.0;
 }
-fn sun_visibility(world: vec3<f32>, normal: vec3<f32>) -> f32 {
+fn sun_visibility(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>) -> f32 {
     if shadow_frame.forward.w <= 0.0 { return 1.0; }
     let depth = dot(world - shadow_frame.eye.xyz, shadow_frame.forward.xyz);
     if depth < shadow_frame.splits.w || depth >= min(shadow_frame.splits.z, shadow_frame.eye.w) { return 1.0; }
     var layer = 0u;
     if depth > shadow_frame.splits.x { layer = 1u; }
     if depth > shadow_frame.splits.y { layer = 2u; }
-    var visible = cascade_visibility(world, normal, layer);
+    var visible = cascade_visibility(world, normal, layer, pixel);
     let start = select(shadow_frame.splits.w, shadow_frame.splits[layer - min(layer, 1u)], layer > 0u);
     let end = shadow_frame.splits[layer];
     let blend = smoothstep(end - (end - start) * 0.1, end, depth);
-    if layer < 2u { visible = mix(visible, cascade_visibility(world, normal, layer + 1u), blend); }
+    if layer < 2u { visible = mix(visible, cascade_visibility(world, normal, layer + 1u, pixel), blend); }
     else { visible = mix(visible, 1.0, blend); }
     // Camera-local fog may end before the stable cascade envelope. Retain a
     // smooth receiver fade there, including native materials that disable fog.

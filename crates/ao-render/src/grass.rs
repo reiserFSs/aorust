@@ -276,7 +276,7 @@ fn shader_source(channels: (bool, bool), shadows: bool) -> String {
         } else { "" })
         .replace("//__SHADOW_NORMAL__", if shadows { "let receiver_normal = cross(dpdx(i.n), dpdy(i.n));" } else { "" })
         .replace("//__SHADOW_RECEIVE__", if shadows {
-            "let sun_share = max(light - without_sun, vec3<f32>(0.0));\n    if any(sun_share > vec3<f32>(0.0)) {\n        light = max(light - sun_share * (1.0 - sun_visibility(i.n, receiver_normal)), vec3<f32>(0.0));\n    }"
+            "let sun_share = max(light - without_sun, vec3<f32>(0.0));\n    if any(sun_share > vec3<f32>(0.0)) {\n        light = max(light - sun_share * (1.0 - sun_visibility(i.n, receiver_normal, i.clip.xy)), vec3<f32>(0.0));\n    }"
         } else { "" })
         .replace("//__EMISSIVE_WRITE__", if channels.1 { "output.emissive = vec4<f32>(0.0);" } else { "" });
     let mut source = format!("{}\nconst GRASS_TUFTS: u32 = {TUFTS_PER_CELL}u;\nconst GRASS_BLADES: u32 = {BLADES_PER_TUFT}u;\n{grass}", include_str!("shader.wgsl"));

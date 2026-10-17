@@ -94,8 +94,9 @@ impl Renderer {
             self.sun_shadows = Some(shadows);
             return;
         };
-        frame.uniform.forward[3] = strength;
+        frame.uniform.forward[3] = strength * self.enhanced_settings.shadow_strength.clamp(0.0, 1.0);
         frame.uniform.eye[3] = receiver_far;
+        frame.uniform.control[1] = self.enhanced_settings.shadow_softness.clamp(0.0, 4.0).to_bits();
         shadows.update(&self.queue, &frame);
         // The primary pass uses only the native visible list. Cascades also
         // admit loaded static geometry in their bounded light volumes.

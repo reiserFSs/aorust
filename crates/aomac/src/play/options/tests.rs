@@ -898,7 +898,7 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
     }
     d.set("AomacShadowMapSize", Variant::Int(2048));
     for (name, value) in [
-        ("AomacAoRadius", 2.0), ("AomacAoStrength", 0.5), ("AomacBloomStrength", 0.25),
+        ("AomacShadowStrength", 0.4), ("AomacShadowSoftness", 2.0), ("AomacAoRadius", 2.0), ("AomacAoStrength", 0.5), ("AomacBloomStrength", 0.25),
         ("AomacGrassDensity", 1.5), ("AomacGrassDistance", 35.0),
     ] {
         assert!(d.persists(name));
@@ -938,7 +938,7 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
     r.click(&format!("{view}_2048"));
     assert_eq!(r.d.enhanced_settings().shadow_map_size, 2048);
     for (name, value) in [
-        ("AomacAoRadius", 2.5), ("AomacAoStrength", 0.5), ("AomacBloomStrength", 0.25),
+        ("AomacShadowStrength", 0.4), ("AomacShadowSoftness", 2.0), ("AomacAoRadius", 2.5), ("AomacAoStrength", 0.5), ("AomacBloomStrength", 0.25),
         ("AomacGrassDensity", 1.5), ("AomacGrassDistance", 35.0),
     ] {
         let view = r.show(name);

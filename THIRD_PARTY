@@ -10,3 +10,12 @@ in this atlas. It is distributed under the same terms as the project source.
 The atlas is used only by the optional Enhanced ground-grass renderer. Native
 terrain samples are evaluated at runtime solely to blend the new vegetation
 with the installed scene; they are not copied into the generated atlas.
+
+Soft sun-shadow filter
+======================
+
+The blocker-search and Vogel-disk penumbra filter in
+crates/ao-render/src/sun_shadows.wgsl follows the algorithm of
+`CascadeVisibility` in ao-vk (https://github.com/wannabuh/ao-vk,
+rvk/shaders/ffp_main.glsl), MIT licensed. The WGSL is an independent
+reimplementation of the algorithm, not copied source.
