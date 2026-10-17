@@ -42,7 +42,7 @@ pub struct Host {
     /// downward-clamped to what the adapter supports by [`Renderer::set_msaa_samples`].
     pub msaa_samples: Option<u32>,
     /// Independent opt-in graphics effects and quality knobs; drained by both viewer frontends.
-    /// Immediate fixture/evidence setting; an unseen combination compiles on the calling thread.
+    /// Immediate fixture/evidence setting; waits for background compilation of an unseen combination.
     pub enhanced_settings: Option<crate::EnhancedSettings>,
     /// Live option request: keep drawing the current variant until the worker finishes.
     pub enhanced_switch: Option<crate::EnhancedSettings>,
@@ -1248,6 +1248,14 @@ impl Offscreen {
     pub fn world_pipeline_compiles(&self) -> u64 { self.r.world_pipeline_compiles() }
     pub fn world_frame_thread_compiles(&self) -> u64 { self.r.world_frame_thread_compiles() }
     pub fn frame_thread_compiles(&self) -> u64 { self.r.frame_thread_compiles() }
+    pub fn frame_pipeline_waits(&self) -> u64 { self.r.frame_pipeline_waits() }
+    /// Readiness of both the world/effect pipelines and the GUI pipeline used by this frontend.
+    pub fn pipeline_warmup_complete(&self) -> bool { self.r.pipeline_warmup_complete() && self.gr.is_ready() }
+    /// Explicit loading boundary; ordinary frames wait only for the pipelines they actually use.
+    pub fn wait_for_pipeline_warmup(&self) {
+        self.r.wait_for_pipeline_warmup();
+        self.gr.wait();
+    }
     pub fn world_variant_cache_len(&self) -> usize { self.r.world_variant_cache_len() }
     pub fn emissive_seed_rgba(&self) -> Result<Option<Vec<u8>>> { self.r.emissive_seed_rgba() }
 
@@ -1454,6 +1462,8 @@ mod tests {
         let mut fe = Idle(ao_gui::Gui::new(&ao_gui::client_dir(), None).unwrap());
         let mut off = Offscreen::evidence_timing(&fe, (64, 64)).unwrap();
         off.host.msaa_samples = Some(4);
+        // Evidence requests are synchronous; samples-only requests exercise the live worker path.
+        off.host.enhanced_settings = Some(crate::EnhancedSettings::default());
         for _ in 0..2 {
             off.frame(&mut fe, 0.0);
             assert_eq!(off.r.msaa_samples(), 4, "the timing target must not overwrite explicit quality");

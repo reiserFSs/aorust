@@ -12,6 +12,13 @@ pub(super) struct PoseGpu {
 }
 
 impl Renderer {
+    pub(crate) fn skin_pipeline_is_ready(&self) -> bool {
+        self.act.skin_pipeline.as_ref().is_some_and(|(pipeline, _)| pipeline.is_ready())
+    }
+    pub(crate) fn wait_skin_pipeline(&self) {
+        self.act.skin_pipeline.as_ref().expect("CAT pipeline warmed at startup").0.get();
+    }
+
     pub(crate) fn warm_skin_pipeline(&mut self) {
         let native_metal = self.act.native_metal;
         self.act.skin_pipeline.get_or_insert_with(|| {
@@ -28,20 +35,23 @@ impl Renderer {
             let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("CAT compute layout"), bind_group_layouts: &[Some(&layout)], immediate_size: 0,
             });
-            let shader = if native_metal {
-                // SAFETY: fixed native layouts match the four bindings above. Model upload checks attribute
-                // count against mesh 0; set_actors checks every active bone index against nonempty palettes.
-                unsafe { self.device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
-                    label: Some("precise native CAT Metal"), msl: Some(crate::shader_source::load("skinning.metal", include_str!("skinning.metal"))),
-                    num_workgroups: (64, 1, 1), ..Default::default()
-                }) }
-            } else {
-                self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("native CAT scalar skin"), source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("skinning.wgsl", include_str!("skinning.wgsl"))),
+            let device = self.device.clone();
+            let pipeline = crate::pipeline_creation::ComputePipeline::new(move || {
+                let shader = if native_metal {
+                    // SAFETY: fixed native layouts match the four bindings above. Model upload checks attribute
+                    // count against mesh 0; set_actors checks every active bone index against nonempty palettes.
+                    unsafe { device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
+                        label: Some("precise native CAT Metal"), msl: Some(crate::shader_source::load("skinning.metal", include_str!("skinning.metal"))),
+                        num_workgroups: (64, 1, 1), ..Default::default()
+                    }) }
+                } else {
+                    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("native CAT scalar skin"), source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("skinning.wgsl", include_str!("skinning.wgsl"))),
+                    })
+                };
+                crate::pipeline_creation::compute(&device, &wgpu::ComputePipelineDescriptor {
+                    label: Some("native CAT skin"), layout: Some(&pipeline_layout), module: &shader, entry_point: Some("skin"), compilation_options: Default::default(), cache: None,
                 })
-            };
-            let pipeline = crate::pipeline_creation::compute(&self.device, &wgpu::ComputePipelineDescriptor {
-                label: Some("native CAT skin"), layout: Some(&pipeline_layout), module: &shader, entry_point: Some("skin"), compilation_options: Default::default(), cache: None,
             });
             (pipeline, layout)
         });

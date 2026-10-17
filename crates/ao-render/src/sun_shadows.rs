@@ -138,10 +138,10 @@ pub(crate) struct SunShadows {
 }
 /// Size-independent shadow programs, shared by every runtime target allocation.
 pub(crate) struct Compiled {
-    pub pipelines: std::collections::HashMap<(bool, usize, bool), Option<wgpu::RenderPipeline>>,
+    pub pipelines: std::collections::HashMap<(bool, usize, bool), Option<crate::pipeline_creation::RenderPipeline>>,
     caster_layout: wgpu::BindGroupLayout,
     visibility_layout: wgpu::BindGroupLayout,
-    visibility_pipeline: wgpu::ComputePipeline,
+    visibility_pipeline: crate::pipeline_creation::ComputePipeline,
 }
 impl Compiled {
     pub fn new(device: &wgpu::Device, globals: &wgpu::BindGroupLayout, material: &wgpu::BindGroupLayout) -> Self {
@@ -170,7 +170,7 @@ impl Compiled {
         let visibility_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("current-frame actor visibility reduction"), bind_group_layouts: &[Some(&visibility_layout)], immediate_size: 0,
         });
-        let visibility_pipeline = crate::pipeline_creation::compute(device, &wgpu::ComputePipelineDescriptor {
+        let visibility_pipeline = crate::pipeline_creation::compute_deferred(device, &wgpu::ComputePipelineDescriptor {
             label: Some("current-frame actor visibility reduction"), layout: Some(&visibility_pipeline_layout),
             module: &visibility_shader, entry_point: Some("visible_actors"), compilation_options: Default::default(), cache: None,
         });
@@ -196,15 +196,31 @@ impl Compiled {
                 let spec = slots.spec(slot);
                 for primary in [false, true] {
                     let pipeline = pipeline_key(spec, primary).map(|key| {
-                        unique.entry(key).or_insert_with(|| compile_pipeline(device, &shader,
-                            if primary { &primary_pipeline_layout } else { &caster_pipeline_layout },
-                            spec, primary).expect("eligible shadow pipeline")).clone()
+                        unique.entry(key).or_insert_with(|| {
+                            let device = device.clone();
+                            let shader = shader.clone();
+                            let layout = if primary { &primary_pipeline_layout } else { &caster_pipeline_layout }.clone();
+                            crate::pipeline_creation::Deferred::new(move || {
+                                compile_pipeline(&device, &shader, &layout, spec, primary)
+                                    .expect("eligible shadow pipeline")
+                            })
+                        }).clone()
                     });
                     pipelines.insert((actor, slot, primary), pipeline);
                 }
             }
         }
         Self { pipelines, caster_layout, visibility_layout, visibility_pipeline }
+    }
+    pub fn is_ready(&self) -> bool {
+        self.visibility_pipeline.is_ready()
+            && self.pipelines.values().flatten().all(crate::pipeline_creation::RenderPipeline::is_ready)
+    }
+    pub fn wait(&self) {
+        self.visibility_pipeline.get();
+        for pipeline in self.pipelines.values().flatten() {
+            pipeline.get();
+        }
     }
 }
 impl SunShadows {
@@ -433,6 +449,8 @@ mod tests {
                 }
             }
         }
+        compiled.wait();
+        assert!(compiled.is_ready(), "all caster and visibility pipelines must finish warming");
         assert!(renderer.sun_shadows.is_none(), "warming must not allocate cascade targets");
     }
     fn frame(eye: Vec3, sun: Vec3) -> CascadeFrame {

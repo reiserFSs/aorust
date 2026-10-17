@@ -1,5 +1,6 @@
 //! Current-frame bloom: authored emission always, plus (HDR only) highlights above white. No history.
 use crate::gpu_stats::{GpuStatsExt, TextureViewStatsExt};
+use crate::pipeline_creation::RenderPipeline;
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const LEVELS: usize = 7;
@@ -14,7 +15,7 @@ pub(super) struct Bloom {
     composite: Option<Pass>,
     params: wgpu::Buffer,
     strength: f32,
-    pipelines: [wgpu::RenderPipeline; 4],
+    pipelines: [RenderPipeline; 4],
     pub bytes: u64,
 }
 struct Pass {
@@ -72,9 +73,12 @@ impl Pass {
 }
 pub(super) struct BloomPipelines {
     layout: wgpu::BindGroupLayout,
-    pipelines: [wgpu::RenderPipeline; 4],
+    pipelines: [RenderPipeline; 4],
 }
 impl BloomPipelines {
+    pub fn is_ready(&self) -> bool { self.pipelines.iter().all(RenderPipeline::is_ready) }
+    pub fn wait(&self) { for pipeline in &self.pipelines { pipeline.get(); } }
+
     pub fn new(device: &wgpu::Device) -> Self {
         let source = [glare().as_ref(), crate::shader_source::load("bloom.wgsl", include_str!("bloom.wgsl")).as_ref()].concat();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Visible-source bounded bloom"), source: wgpu::ShaderSource::Wgsl(source.into()) });
@@ -89,7 +93,7 @@ impl BloomPipelines {
         });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("Bloom inputs"), entries: &entries });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Bloom kernels"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
-        let pipelines = ["seed_down", "down", "up", "composite"].map(|entry| crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
+        let pipelines = ["seed_down", "down", "up", "composite"].map(|entry| crate::pipeline_creation::render_deferred(device, &wgpu::RenderPipelineDescriptor {
             label: Some(entry), layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("fullscreen"), compilation_options: Default::default(), buffers: &[] },
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(entry), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
@@ -159,7 +163,7 @@ impl crate::Renderer {
         if self.bloom.as_ref().is_none_or(|bloom| bloom.size != frame.size || bloom.is_hdr() != grade.is_some()) {
             let emission = frame.emissive.as_ref().expect("enabled bloom owns its world emission mask");
             self.bloom = Some(Bloom::new(&self.device, frame.size, grade.map_or(&frame.colour, |grade| grade.hdr_view()), emission,
-                &frame.composite.get_bind_group_layout(0), grade.map(|grade| grade.halo_view()), &self.bloom_pipelines));
+                self.enhanced_pipelines.source_layout(), grade.map(|grade| grade.halo_view()), &self.bloom_pipelines));
         }
     }
     /// Explicit offline diagnostic; no resources or passes exist until requested.
@@ -173,7 +177,7 @@ impl crate::Renderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
         });
         let bind = self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
-            label: Some("Authored emission mask diagnostic"), layout: &frame.composite.get_bind_group_layout(0),
+            label: Some("Authored emission mask diagnostic"), layout: self.enhanced_pipelines.source_layout(),
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(emission) }],
         });
         let mut encoder = self.device.create_command_encoder(&Default::default());

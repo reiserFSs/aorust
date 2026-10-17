@@ -441,6 +441,100 @@ fn rig() -> Option<Rig> {
     Some(Rig { p, host, port, _l: l })
 }
 
+/// Real login frontend, Renderer + GUI creation, and completed offscreen frames; no server or window.
+/// Run alone: cargo test --profile fast -p aomac first_present_during_pipeline_warmup -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore = "client data + GPU; startup first-present and post-warmup first-use timing"]
+fn first_present_during_pipeline_warmup() {
+    let startup = Instant::now();
+    let mut r = rig().expect("startup regression requires real client GUI data");
+    let frontend_ms = startup.elapsed().as_secs_f64() * 1000.0;
+    let backdrop_load = Instant::now();
+    let store = ao_rdb::RecordStore::open(&r.p.dir).unwrap();
+    let backdrop = ao_formats::screens::login_world_scene(&store, 0).unwrap();
+    r.p.tx.send(Bg::Backdrop(Ok(Box::new(backdrop)))).unwrap();
+    r.p.pump(&mut r.host);
+    let backdrop_load_ms = backdrop_load.elapsed().as_secs_f64() * 1000.0;
+    let creation = Instant::now();
+    // Unlike the logic-only evidence path, this installs persistent rendering targets and
+    // Offscreen::frame waits for a submission following both the world and GUI submissions.
+    let mut o = ao_render::Offscreen::evidence_timing(&r.p, (1280, 800)).unwrap();
+    o.host = std::mem::replace(&mut r.host, Host::headless());
+    o.host.msaa_samples = Some(1);
+    let creation_ms = creation.elapsed().as_secs_f64() * 1000.0;
+    let frame_compiles = o.frame_thread_compiles();
+    let first_frame_waits = o.frame_pipeline_waits();
+    let first = Instant::now();
+    let login_list = o.frame(&mut r.p, 0.0);
+    let first_complete_ms = first.elapsed().as_secs_f64() * 1000.0;
+    let startup_to_first_present_ms = startup.elapsed().as_secs_f64() * 1000.0;
+    let warmup_complete_at_first_present = o.pipeline_warmup_complete();
+    eprintln!("STARTUP_PRESENT frontend_creation_ms={frontend_ms:.3} backdrop_fixture_load_ms={backdrop_load_ms:.3} renderer_gui_creation_ms={creation_ms:.3} first_frame_complete_ms={first_complete_ms:.3} renderer_gui_to_first_present_ms={:.3} startup_to_first_present_ms={startup_to_first_present_ms:.3} warmup_complete={warmup_complete_at_first_present} world_compiles={} frame_thread_compiles={} world_frame_thread_compiles={}",
+        creation_ms + first_complete_ms, o.world_pipeline_compiles(),
+        o.frame_thread_compiles() - frame_compiles, o.world_frame_thread_compiles());
+    eprintln!("STARTUP_PRESENT first_frame_pipeline_waits={}", o.frame_pipeline_waits() - first_frame_waits);
+    assert!(r.p.screen == Screen::Login && r.login_visible(), "must present the real login");
+    assert_eq!(o.frame_thread_compiles(), frame_compiles, "login frame must not compile pipelines");
+
+    // Capture only after the first-present clocks stop; readback is not part of startup timing.
+    // Reuse exactly the same draw list and renderer time before and after installing the tail.
+    let before_warmup = o.rgba(&r.p, &login_list).unwrap();
+    if let Some(path) = std::env::var_os("AOMAC_STARTUP_OUT") {
+        let path = std::path::PathBuf::from(path);
+        assert!(path.is_absolute(), "AOMAC_STARTUP_OUT must be an absolute RGBA output path");
+        std::fs::write(&path, &before_warmup).unwrap();
+        eprintln!("STARTUP_PRESENT login_rgba={} bytes={}", path.display(), before_warmup.len());
+    }
+    let warmup = Instant::now();
+    o.wait_for_pipeline_warmup();
+    eprintln!("STARTUP_PRESENT warmup_wait_ms={:.3} startup_ready_ms={:.3} world_compiles={}",
+        warmup.elapsed().as_secs_f64() * 1000.0, startup.elapsed().as_secs_f64() * 1000.0, o.world_pipeline_compiles());
+    assert!(o.pipeline_warmup_complete(), "explicit wait must settle both renderer and GUI warmup");
+    let ready_waits = o.frame_pipeline_waits();
+    let after_warmup = o.rgba(&r.p, &login_list).unwrap();
+    assert!(before_warmup == after_warmup, "warmup must not change the frozen login image");
+    assert_eq!(o.frame_thread_compiles(), frame_compiles, "login captures must also use prepared pipelines");
+    assert_eq!(o.frame_pipeline_waits(), ready_waits, "post-ready login capture must not wait for pipelines");
+
+    // Admit previously unseen actor and RSprite/TargetIndicatorMat material states only after readiness.
+    for (id, label, blend, sprite_alpha_test) in [
+        (1u32, "actor", ao_scene::Blend::Opaque, false),
+        (2, "tag_sprite", ao_scene::Blend::AlphaBlend, true),
+        (3, "additive_sprite", ao_scene::Blend::Additive, false),
+    ] {
+        let model = ao_scene::Scene {
+            meshes: vec![ao_scene::Mesh {
+                vertices: [[-0.5, 0.0, 0.0], [0.5, 0.0, 0.0], [0.5, 1.0, 0.0], [-0.5, 1.0, 0.0]]
+                    .into_iter().map(|pos| ao_scene::Vertex { pos, normal: [0.0, 0.0, 1.0], ..Default::default() }).collect(),
+                submeshes: vec![ao_scene::Submesh {
+                    blend, sprite_alpha_test, two_sided: true, emissive: [0.7, 0.3, 0.1],
+                    ..ao_scene::Submesh::new(vec![0, 1, 2, 0, 2, 3], None)
+                }],
+            }],
+            instances: vec![ao_scene::Instance { mesh: 0, transform: ao_scene::IDENTITY }],
+            ..Default::default()
+        };
+        let before = o.frame_thread_compiles();
+        let before_world = o.world_frame_thread_compiles();
+        let before_waits = o.frame_pipeline_waits();
+        let admission = Instant::now();
+        o.host.actor_models.push((u64::from(id), std::sync::Arc::new(model)));
+        o.host.actors.push(ao_scene::ActorFrame {
+            id, model: u64::from(id), always: true, ..Default::default()
+        });
+        o.fixed_camera(Some(ao_render::Camera::look_at(
+            glam::Vec3::new(0.0, 1.5, 6.0), glam::Vec3::new(0.0, 0.8, 0.0))));
+        o.frame(&mut r.p, 0.0);
+        eprintln!("STARTUP_PRESENT after_warmup_{label}_first_use_complete_ms={:.3} world_compiles={} frame_thread_compiles={} world_frame_thread_compiles={}",
+            admission.elapsed().as_secs_f64() * 1000.0, o.world_pipeline_compiles(),
+            o.frame_thread_compiles() - before, o.world_frame_thread_compiles() - before_world);
+        eprintln!("STARTUP_PRESENT after_warmup_{label}_frame_pipeline_waits={}", o.frame_pipeline_waits() - before_waits);
+        assert_eq!(o.frame_pipeline_waits(), before_waits, "{label} first use must not wait for pipeline compilation");
+        assert_eq!(o.frame_thread_compiles(), before, "{label} admission/first draw must not compile pipelines");
+        assert_eq!(o.world_frame_thread_compiles(), before_world, "{label} first draw must use prepared world pipelines");
+    }
+}
+
 /// Real offscreen replay, not the logic-only Rig or PNG encoder. Run explicitly with AOMAC_PERF=1.
 #[test]
 #[ignore = "client data + GPU; performance replay"]
@@ -2148,6 +2242,8 @@ fn enhanced_option_switch_reuses_compiled_variants() {
         o.fixed_camera(Some(Camera { pos: Vec3::new(927.02765, 28.060379, -730.7181), yaw: 0.0, pitch: -0.24497865, roll: 0.0 }));
         o.prepare_frozen_rendering();
         o.set_cpu_timing(true);
+        o.wait_for_pipeline_warmup();
+        assert!(o.pipeline_warmup_complete());
         let mut worst = 0.0f64;
         for index in 0..30 {
             worst = worst.max(frame(&mut o, &mut r.p, phase, index));
@@ -2162,11 +2258,13 @@ fn enhanced_option_switch_reuses_compiled_variants() {
         }
     };
     fn frame(o: &mut ao_render::Offscreen, p: &mut Play, phase: &str, index: usize) -> f64 {
+        let before_waits = o.frame_pipeline_waits();
         let start = Instant::now();
         // Hold simulation time fixed: newly spawned animated sprites are separate pipeline admissions,
         // not work caused by switching the already-visible world's Enhanced combination.
         o.frame(p, 0.0);
         let ms = start.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(o.frame_pipeline_waits(), before_waits, "{phase} frame {index} must not wait for pipeline compilation");
         if ms > 50.0 {
             let stages = o.frame_cpu_timings();
             let render_ms = stages.map_or(0.0, |s| s.prepare_ms + s.encode_ms + s.queue_submit_ms);

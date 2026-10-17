@@ -1,6 +1,7 @@
 //! Enhanced HDR scene: authored-day sun brightening into RGBA16F, then tonemap + dither to the 8-bit output.
 //! Owns no resources unless `EnhancedSettings::hdr` is on; the faithful path never reaches it.
 use crate::gpu_stats::GpuStatsExt;
+use crate::pipeline_creation::RenderPipeline;
 
 const HDR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
@@ -11,16 +12,19 @@ pub(super) struct Grade {
     halo: wgpu::TextureView,
     aux_bg: wgpu::BindGroup,
     params: wgpu::Buffer,
-    expose: wgpu::RenderPipeline,
-    present: wgpu::RenderPipeline,
+    expose: RenderPipeline,
+    present: RenderPipeline,
 }
 
 pub(super) struct GradePipelines {
     aux_layout: wgpu::BindGroupLayout,
-    expose: wgpu::RenderPipeline,
-    present: wgpu::RenderPipeline,
+    expose: RenderPipeline,
+    present: RenderPipeline,
 }
 impl GradePipelines {
+    pub fn is_ready(&self) -> bool { self.expose.is_ready() && self.present.is_ready() }
+    pub fn wait(&self) { self.expose.get(); self.present.get(); }
+
     pub fn new(device: &wgpu::Device, output: wgpu::TextureFormat, source_layout: &wgpu::BindGroupLayout) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Enhanced HDR grade"), source: wgpu::ShaderSource::Wgsl([crate::bloom::glare().as_ref(), crate::shader_source::load("grade.wgsl", include_str!("grade.wgsl")).as_ref()].concat().into()) });
         let aux_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("Enhanced grade inputs"), entries: &[
@@ -32,7 +36,7 @@ impl GradePipelines {
                 ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
         ] });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Enhanced grade"), bind_group_layouts: &[Some(source_layout), Some(&aux_layout)], immediate_size: 0 });
-        let make = |entry, format| crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
+        let make = |entry, format| crate::pipeline_creation::render_deferred(device, &wgpu::RenderPipelineDescriptor {
             label: Some(entry), layout: Some(&layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(entry), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
@@ -134,7 +138,7 @@ impl crate::Renderer {
         let Some(frame) = self.enhanced_frame.as_ref() else { self.grade = None; return; };
         if self.grade.as_ref().is_none_or(|grade| grade.size != frame.size) {
             let sun = frame.sun.as_ref().expect("HDR owns its world sun mask");
-            self.grade = Some(Grade::new(&self.device, frame.size, &frame.composite.get_bind_group_layout(0), sun, &self.grade_pipelines));
+            self.grade = Some(Grade::new(&self.device, frame.size, self.enhanced_pipelines.source_layout(), sun, &self.grade_pipelines));
         }
         if let Some(grade) = &self.grade {
             grade.set_grade(&self.queue, self.enhanced_settings.grade_strength, time_of_day(self.sky.pose.daylight, self.env.sun_dir));

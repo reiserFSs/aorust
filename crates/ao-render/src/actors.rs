@@ -178,7 +178,7 @@ pub(crate) struct ActorLayer {
     /// capacity, since the layer started: a regression counter, not drained. Converges once the actor's largest
     /// frame has been seen; a model whose geometry size never exceeds its first frame never grows at all.
     pub(crate) mesh_buffer_grows: u64,
-    skin_pipeline: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    skin_pipeline: Option<(crate::pipeline_creation::ComputePipeline, wgpu::BindGroupLayout)>,
     pub(super) native_metal: bool,
 }
 

@@ -1,6 +1,7 @@
 //! Optional UNORM boundary. Keep native per-draw saturation and quantization;
 //! auxiliary float masks never change the faithful colour target's blend semantics.
 use crate::{gpu_stats::{GpuStatsExt, TextureViewStatsExt}, DEPTH};
+use crate::pipeline_creation::RenderPipeline;
 pub(super) const AUX: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// Colour attachments the world pass declares: 1 native, 3 with AO/bloom masks, 4 when the HDR sun mask exists.
@@ -20,9 +21,9 @@ pub(super) struct EnhancedFrame {
     pub depth: wgpu::TextureView,
     pub resolved_depth: wgpu::TextureView,
     pub msaa: Option<[Option<wgpu::TextureView>; 4]>,
-    pub composite: wgpu::RenderPipeline,
+    pub composite: RenderPipeline,
     pub composite_bg: wgpu::BindGroup,
-    depth_resolve: Option<(wgpu::RenderPipeline, wgpu::BindGroup)>,
+    depth_resolve: Option<(RenderPipeline, wgpu::BindGroup)>,
 }
 impl EnhancedFrame {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32, u32), samples: u32, settings: crate::EnhancedSettings, compiled: &EnhancedPipelines) -> Self {
@@ -70,12 +71,15 @@ impl EnhancedFrame {
     }
 }
 pub(super) struct EnhancedPipelines {
-    colour: wgpu::RenderPipeline,
+    colour: RenderPipeline,
     colour_layout: wgpu::BindGroupLayout,
-    depth: wgpu::RenderPipeline,
+    depth: RenderPipeline,
     depth_layout: wgpu::BindGroupLayout,
 }
 impl EnhancedPipelines {
+    pub fn is_ready(&self) -> bool { self.colour.is_ready() && self.depth.is_ready() }
+    pub fn wait(&self) { self.colour.get(); self.depth.get(); }
+
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let (colour, colour_layout) = pipeline(device, format, false);
         let (depth, depth_layout) = pipeline(device, DEPTH, true);
@@ -86,7 +90,7 @@ impl EnhancedPipelines {
 fn bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, input: &wgpu::TextureView) -> wgpu::BindGroup {
     device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("Enhanced boundary"), layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(input) }] })
 }
-fn pipeline(device: &wgpu::Device, format: wgpu::TextureFormat, depth: bool) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+fn pipeline(device: &wgpu::Device, format: wgpu::TextureFormat, depth: bool) -> (RenderPipeline, wgpu::BindGroupLayout) {
     let source = if depth {
         "@group(0) @binding(0) var image: texture_depth_multisampled_2d;\n@fragment fn fs(@builtin(position) p: vec4<f32>) -> @builtin(frag_depth) f32 { var z=1.0; for(var s=0u;s<textureNumSamples(image);s+=1u){z=min(z,textureLoad(image,vec2<i32>(p.xy),i32(s)));} return z; }"
     } else {
@@ -99,7 +103,7 @@ fn pipeline(device: &wgpu::Device, format: wgpu::TextureFormat, depth: bool) -> 
     }] });
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Enhanced boundary"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
     let targets = [Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })];
-    let pipe = crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
+    let pipe = crate::pipeline_creation::render_deferred(device, &wgpu::RenderPipelineDescriptor {
         label: Some("Enhanced boundary"), layout: Some(&pl),
         vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
         fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), compilation_options: Default::default(), targets: if depth { &[] } else { &targets } }),

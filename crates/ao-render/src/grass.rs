@@ -96,14 +96,14 @@ struct Candidate {
 /// Day/night programs and their layout; no ground buffers or textures.
 #[derive(Clone)]
 pub(super) struct Compiled {
-    pipeline: [wgpu::RenderPipeline; 2],
+    pipeline: [crate::pipeline_creation::RenderPipeline; 2],
     layout: wgpu::BindGroupLayout,
     samples: u32,
     channels: (bool, bool, bool),
     shadows: bool,
 }
 pub(super) struct Grass {
-    pipeline: [wgpu::RenderPipeline; 2],
+    pipeline: [crate::pipeline_creation::RenderPipeline; 2],
     bind: Option<wgpu::BindGroup>,
     layout: wgpu::BindGroupLayout,
     shadows: bool,
@@ -182,7 +182,7 @@ impl Compiled {
                     alpha: wgpu::BlendComponent::REPLACE,
                 });
             }
-            crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
+            crate::pipeline_creation::render_deferred(device, &wgpu::RenderPipelineDescriptor {
                 label: Some(if night { "night ground grass" } else { "ground grass" }), layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_grass"), compilation_options: wgpu::PipelineCompilationOptions {
                     constants: &[("GRASS_NIGHT_PASS", f64::from(u8::from(night)))], ..Default::default()
@@ -196,6 +196,19 @@ impl Compiled {
             })
         });
         Self { pipeline, layout, samples, channels, shadows }
+    }
+    pub fn is_ready(&self) -> bool {
+        self.pipeline.iter().all(crate::pipeline_creation::RenderPipeline::is_ready)
+    }
+    pub fn wait(&self) {
+        for pipeline in &self.pipeline {
+            pipeline.get();
+        }
+    }
+    pub fn warm(&self) {
+        for pipeline in &self.pipeline {
+            pipeline.warm();
+        }
     }
 }
 impl Grass {
@@ -1196,7 +1209,9 @@ mod blade_appearance_tests {
             assert_eq!(source.contains("grass_direct_visibility = visible;"), shadows,
                 "the HDR sun mask excludes beauty's retained shadow floor");
             // Creating the pipeline validates the shader against the real bind-group layouts.
-            let _grass = super::Compiled::new(&renderer.device, &renderer.g_layout, &renderer.tex_layout, &renderer.holo_layout, 1, (ao, bloom, hdr), shadows, renderer.format);
+            let grass = super::Compiled::new(&renderer.device, &renderer.g_layout, &renderer.tex_layout, &renderer.holo_layout, 1, (ao, bloom, hdr), shadows, renderer.format);
+            grass.wait();
+            assert!(grass.is_ready());
         }
     }
 }

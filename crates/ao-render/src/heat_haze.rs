@@ -2,6 +2,7 @@
 //! DS10056a6a queues perturbations; 100590fe integrates a persistent60x30 UV grid.
 use glam::{Mat4, Vec2, Vec3};
 use crate::{frustum_culls_sphere, frustum_planes, gpu_stats::GpuStatsExt};
+use crate::pipeline_creation::RenderPipeline;
 
 const WIDTH: usize = 60;
 const HEIGHT: usize = 30;
@@ -22,7 +23,7 @@ pub(super) struct HeatHaze {
 struct Gpu {
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    pipeline: wgpu::RenderPipeline,
+    pipeline: RenderPipeline,
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     target: Option<Target>,
@@ -59,6 +60,11 @@ fn indices() -> Vec<u16> {
     indices
 }
 impl HeatHaze {
+    pub fn is_ready(&self) -> bool { self.gpu.as_ref().is_some_and(|gpu| gpu.pipeline.is_ready()) }
+    pub fn wait(&self) {
+        self.gpu.as_ref().expect("heat haze pipeline warmed at startup").pipeline.get();
+    }
+
     pub fn reset(&mut self) {
         // GC100b1f20 activates offscreen compositor FX3e at environment setup.
         // ActivateFX10063cc1 invokes its init hook10058baf on each activation:
@@ -142,7 +148,7 @@ impl Gpu {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("native heat haze"), source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("heat_haze.wgsl", include_str!("heat_haze.wgsl"))) });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
         let attributes = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
-        let pipeline = crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
+        let pipeline = crate::pipeline_creation::render_deferred(device, &wgpu::RenderPipelineDescriptor {
             label: Some("native heat haze"), layout: Some(&pipeline_layout), vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: 16, step_mode: wgpu::VertexStepMode::Vertex, attributes: &attributes }] },
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() }, depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,

@@ -1431,29 +1431,45 @@ exact byte equality against the clean pre-change `d56be26` baseline:
 ##### Pipeline readiness before the first world frame
 
 World, actor (including nameplates/tags and every rendering-effect/material state),
-ground, liquid/lava and both sky attachment paths are compiled as a complete variant:
-the initial faithful variant at renderer construction, subsequent live Enhanced
-and MSAA variants on the existing background switch worker. Exact-equivalent
-descriptors share pipeline handles; explicit synchronous fixture setters remain available.
-The render path only selects prepared handles, including when actors or clouds first
-appear after a variant has been installed; it never invalidates/recompiles a sky slot.
+ground, liquid/lava and both sky attachment paths share descriptor-deduplicated,
+per-pipeline readiness cells. Renderer construction queues the initial faithful set
+on the background compiler and returns without joining the warmup tail. Login and
+loading draw normally: if an early draw needs an unready slot, it dispatches that
+slot independently of unrelated queued work and waits only for its own compilation.
+The compile still runs on a worker, never on the frame thread. Live Enhanced/MSAA
+variants retain the existing fully-prepared-before-install worker behavior; explicit
+fixture setters synchronously wait for that worker rather than compiling on their caller.
 
 The lazy-pipeline sweep also found grass day/night, shadow caster/admission and
 visibility compute, AO, contact shadows, bloom, HDR grading, Enhanced boundary,
-viewport blend, heat haze, and native CAT skin compute pipelines. Those now retain
-startup/per-variant compiled handles independently of lazy size-dependent targets.
-Resize, zone changes and effect toggles may allocate targets but do not compile.
-GUI's single pipeline already belongs to `GuiRenderer::new`; `ao-gui` itself creates
-no GPU pipelines. Explicit pixel-probe/test pipelines are not gameplay initializers.
+viewport blend, heat haze, and native CAT skin compute pipelines. Their independent
+readiness cells retain compiled handles separately from lazy size-dependent targets.
+Grass day/night and unique shadow descriptors are independent cells, not bundle-wide
+barriers. GUI's pipeline is queued at `GuiRenderer::new`; `ao-gui` creates no GPU
+pipelines. Dropped renderers cancel unused queued cells through weak ownership.
+Resize and toggles reuse handles; explicit pixel probes remain diagnostics, not gameplay initializers.
 
 `Renderer::frame_thread_compiles` counts actual render **and compute** pipeline
 creation in nested frame scopes, in addition to the world-variant counters.
+`frame_pipeline_waits` separately counts unready cells encountered during a frame,
+so a background compile waited on by a frame cannot hide behind a zero compile count.
 `ao-render`'s ignored `first_use_after_zone_ready` regression starts without actors,
 then introduces tag/sprite actors, six native rendering effects, all five liquid
 styles, and an unseen actor material after a background variant install; every
-first-use and warm frame must compile exactly zero pipelines. Retaining compiled
+first-use and warm frame after readiness must compile and wait for exactly zero pipelines. Retaining compiled
 handles does not eagerly allocate optional full-size attachments, and disabling
 AO/contact shadows still releases their targets.
+
+`wait_for_pipeline_warmup` is an explicit active-renderer/GUI readiness barrier for
+zone preparation and evidence only; presenting a login/loading frame never calls it.
+Deferred factories use stdlib `OnceLock::wait`, are single-flight, and propagate
+failure to every waiter without killing the queue. Deterministic blocked-queue
+tests prove that early demand neither joins an unrelated queue head nor compiles
+on its caller. Native Metal skin shader-module creation also runs in its deferred
+factory: unlike WGSL parsing, MSL passthrough creation invokes Metal's compiler.
+
+The following measurements document the earlier eager-startup revision; the
+first-present follow-up below measures removal of that constructor stall.
 
 Baseline offscreen first-use measurement at `3f82a934` (128×128, Metal, fast profile):
 startup **28.768 ms**; first actor/nameplate/tag frame **225.936 ms** submit /
@@ -1497,6 +1513,65 @@ cold-switch frame, zero frame-thread compilations; warm roundtrip zero total com
 The faithful fixture passed **17 views / 34 captures**, exactly byte-equal to
 `SpriteWarm-before`; workspace release all-target Clippy passed with `-D warnings`.
 Combined output: `~/aomac-handoff/gfx/v3/SpriteWarm-warmup-gates.txt`.
+
+First-present follow-up (headless Metal, fast profile, 1280×800): warm-cache
+ABBA measurements separate renderer+GUI construction, first-frame GPU completion,
+and total startup (including frontend/backdrop preparation):
+
+| Run | Construction (ms) | First frame (ms) | Construction + first present (ms) | Total startup to first present (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Before A1 | 225.572 | 43.779 | 269.351 | 309.647 |
+| After B1 | 24.350 | 43.612 | 67.962 | 109.826 |
+| After B2 | 23.667 | 44.215 | 67.882 | 109.043 |
+| Before A2 | 228.975 | 43.371 | 272.346 | 313.822 |
+
+Both after frames presented with warmup **not ready** (153/151 world pipelines
+created), encountered **1** pipeline wait each, and compiled **zero** pipelines
+on the frame thread. After readiness, actor/tag/additive first-use frames took
+**1.618/1.458/1.457 ms** and **1.578/1.611/1.552 ms**, respectively, with
+**zero** pipeline waits or frame-thread compiles. Both before/after login byte
+pairs matched exactly, as recorded in `SpriteWarm-startup-ABBA.json`; raw RGBA
+captures were removed.
+
+A separate source-equivalent cold-key diagnostic renamed `vertex_fog` and its
+calls consistently to unique helper names in temporary shader overrides. This
+changes the shader cache key, not shader behavior; **no shader edits ship**, and
+this does not flush every driver cache or establish a universally cold bound.
+Before: construction **1039.813 ms**, first frame **42.030 ms**, total startup to
+first present **1122.746 ms**. After: construction **25.029 ms**, first frame
+**74.370 ms**, construction-to-first-present **99.398 ms**, total startup
+**140.498 ms**. First present was still **not ready**, with **12** world pipelines
+created and **6** frame pipeline waits, but **zero actual render/compute or world
+frame-thread compilations**. The explicit post-present warmup-tail wait took
+**889.009 ms**; startup reached readiness at **1032.415 ms**, with all **548**
+world pipelines created. Post-ready actor/tag/additive frames took
+**1.786/1.548/1.541 ms**, each with **zero** waits and frame-thread compiles.
+
+The separately sampled cold-key run presented at **165.270 ms** while not ready,
+then completed its **929.914 ms** warmup-tail wait at **1097.677 ms** startup
+readiness. Its first frame had **6** waits and zero frame-thread compiles;
+post-ready actor/tag/additive frames again had zero waits/compiles. The sample
+records Metal compilation on `startup pipeline warmup` workers and the explicit
+readiness barrier on the test thread. Retained evidence under
+`~/aomac-handoff/gfx/v3/`: `SpriteWarm-startup-ABBA.json`,
+`SpriteWarm-startup-before-A1.txt`, `SpriteWarm-startup-cold-before.txt`,
+`SpriteWarm-startup-cold-after.txt`, `SpriteWarm-startup-cold-profile.txt`, and
+`SpriteWarm-startup-cold-profile-sample.txt`.
+
+Final release gates for the first-present follow-up: **184 render tests passed / 15
+ignored**, **45 flow tests passed / 4 ignored**, and the ignored first-use,
+first-present and Enhanced-switch regressions all passed. The first-present
+regression completed renderer+GUI construction plus its login frame in **66.081 ms**
+(**104.321 ms** total startup), with warmup still incomplete and zero frame-thread
+compiles. Post-ready tag introduction took **1.462 ms**, with zero waits/compiles.
+The 128×128 first-use scene took **0.113 / 1.404 ms** submit / GPU-complete for its
+first tags; effects, all five liquids, resize and the new Enhanced material also
+recorded zero frame-thread compiles and pipeline waits. All **18 faithful views /
+36 independent captures** passed, and native `cmp` verified **18/18** views
+byte-identical to a freshly rebuilt `d907cf8b` baseline. Workspace/all-target release
+Clippy passed with `-D warnings`. Metrics and byte-proof logs are
+`SpriteWarm-startup-{final-gates,build-gates,byte-comparison}.txt`; full matrices and
+RGBA dumps were measured in private scratch storage and deleted, not retained as handoff evidence.
 
 
 MSAA is independently selectable. HDR is a scene-path switch, not a master switch: with it on the world pass writes

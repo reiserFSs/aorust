@@ -28,11 +28,43 @@ pub(super) struct Pipes {
     pub pipes: Pipelines,
     pub actor_pipes: Pipelines,
     pub ground_pipes: Pipelines,
-    pub depth_clear_pipe: wgpu::RenderPipeline,
+    pub depth_clear_pipe: super::pipeline_creation::RenderPipeline,
     pub grass: super::grass::Compiled,
 }
 
-/// A variant is completely compiled at startup or on the existing switch worker.
+impl Pipes {
+    pub(super) fn is_ready(&self) -> bool {
+        self.pipes.is_ready() && self.actor_pipes.is_ready() && self.ground_pipes.is_ready()
+            && self.native_sky_pipes.as_ref().is_none_or(Pipelines::is_ready)
+            && self.depth_clear_pipe.is_ready() && self.grass.is_ready()
+    }
+    pub(super) fn wait(&self) {
+        self.pipes.wait();
+        self.actor_pipes.wait();
+        self.ground_pipes.wait();
+        if let Some(sky) = &self.native_sky_pipes { sky.wait(); }
+        self.depth_clear_pipe.get();
+        self.grass.wait();
+    }
+    fn warm(&self) {
+        self.pipes.warm();
+        self.actor_pipes.warm();
+        self.ground_pipes.warm();
+        if let Some(sky) = &self.native_sky_pipes { sky.warm(); }
+        self.depth_clear_pipe.warm();
+        self.grass.warm();
+    }
+}
+
+/// Shared owned-handle thread mechanism for queued, demanded, and variant work.
+pub(super) fn spawn_compile_worker<T: Send + 'static>(
+    name: &str, compile: impl FnOnce() -> T + Send + 'static,
+) -> std::thread::JoinHandle<T> {
+    std::thread::Builder::new().name(name.into()).spawn(compile)
+        .expect("spawn pipeline compiler thread")
+}
+
+/// Owned context shared by descriptor-unique factories.
 struct Compile {
     device: wgpu::Device,
     shader: wgpu::ShaderModule,
@@ -43,15 +75,22 @@ struct Compile {
     settings: EnhancedSettings,
     msaa: u32,
     compiles: Arc<AtomicU64>,
-    frame: Option<Arc<AtomicU64>>,
+    frame_compiles: Arc<AtomicU64>,
+    frame_thread: std::thread::ThreadId,
 }
 
 impl Compile {
-    pub(super) fn pipeline(&self, spec: PipelineSpec, faithful_sky: bool) -> wgpu::RenderPipeline {
-        self.compiles.fetch_add(1, Ordering::Relaxed);
-        if let Some(frame) = &self.frame { frame.fetch_add(1, Ordering::Relaxed); }
-        let (shader, settings) = if faithful_sky { (&self.native, EnhancedSettings::default()) } else { (&self.shader, self.settings) };
-        compile_pipeline(&self.device, shader, self.format, (&self.pipeline_layout, &self.holo_pipeline_layout), settings, self.msaa, spec)
+    pub(super) fn pipeline(self: &Arc<Self>, spec: PipelineSpec, faithful_sky: bool) -> super::pipeline_creation::RenderPipeline {
+        let compile = self.clone();
+        super::pipeline_creation::Deferred::new(move || {
+            compile.compiles.fetch_add(1, Ordering::Relaxed);
+            if std::thread::current().id() == compile.frame_thread {
+                compile.frame_compiles.fetch_add(1, Ordering::Relaxed);
+            }
+            let (shader, settings) = if faithful_sky { (&compile.native, EnhancedSettings::default()) } else { (&compile.shader, compile.settings) };
+            compile_pipeline(&compile.device, shader, compile.format,
+                (&compile.pipeline_layout, &compile.holo_pipeline_layout), settings, compile.msaa, spec)
+        })
     }
 }
 
@@ -66,6 +105,7 @@ pub(super) struct Request {
     settings: EnhancedSettings,
     compiles: Arc<AtomicU64>,
     frame_compiles: Arc<AtomicU64>,
+    frame_thread: std::thread::ThreadId,
 }
 
 impl Request {
@@ -80,11 +120,18 @@ impl Request {
             device: device.clone(), native: native.clone(), format,
             g_layout: layouts.0.clone(), tex_layout: layouts.1.clone(), holo_layout: layouts.2.clone(),
             key, settings,
-            compiles: compiles.clone(), frame_compiles: frame_compiles.clone(),
+            compiles: compiles.clone(),
+            frame_compiles: frame_compiles.clone(), frame_thread: std::thread::current().id(),
         }
     }
 
-    pub(super) fn build(&self, frame_thread: bool) -> Pipes {
+    pub(super) fn build(&self) -> Pipes {
+        let pipes = self.prepare();
+        pipes.warm();
+        pipes
+    }
+
+    pub(super) fn prepare(&self) -> Pipes {
         let shader = self.key.enhanced().then(|| {
             let source = super::enhanced_shader::source(
                 self.settings.sun_shadows, self.settings.ambient_occlusion,
@@ -106,13 +153,12 @@ impl Request {
         let holo_pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("holo optional shadow receiver"), bind_group_layouts: &holo, immediate_size: 0,
         });
-        let compile = Compile {
+        let compile = Arc::new(Compile {
             device: self.device.clone(), shader: shader.clone().unwrap_or_else(|| self.native.clone()),
-            native: self.native.clone(), pipeline_layout: pipeline_layout.clone(),
-            holo_pipeline_layout: holo_pipeline_layout.clone(), format: self.format,
+            native: self.native.clone(), pipeline_layout, holo_pipeline_layout, format: self.format,
             settings: self.settings, msaa: self.key.msaa, compiles: self.compiles.clone(),
-            frame: frame_thread.then(|| self.frame_compiles.clone()),
-        };
+            frame_compiles: self.frame_compiles.clone(), frame_thread: self.frame_thread,
+        });
         let (mut pipes, mut actor_pipes, mut ground_pipes) = build_pipelines();
         pipes.prepare_all(&|spec| compile.pipeline(spec, false));
         actor_pipes.prepare_all(&|spec| compile.pipeline(spec, false));
@@ -124,9 +170,17 @@ impl Request {
             }
             sky
         });
-        self.compiles.fetch_add(1, Ordering::Relaxed);
-        if frame_thread { self.frame_compiles.fetch_add(1, Ordering::Relaxed); }
-        let depth_clear_pipe = super::screen::depth_clear_pipeline(&self.device, self.format, self.key.msaa, self.settings);
+        let device = self.device.clone();
+        let format = self.format;
+        let msaa = self.key.msaa;
+        let settings = self.settings;
+        let depth_clear_pipe = super::pipeline_creation::Deferred::new(move || {
+            compile.compiles.fetch_add(1, Ordering::Relaxed);
+            if std::thread::current().id() == compile.frame_thread {
+                compile.frame_compiles.fetch_add(1, Ordering::Relaxed);
+            }
+            super::screen::depth_clear_pipeline(&device, format, msaa, settings)
+        });
         let grass = super::grass::Compiled::new(
             &self.device, &self.g_layout, &self.tex_layout, &self.holo_layout, self.key.msaa,
             (self.settings.ambient_occlusion, self.settings.emissive_bloom, self.settings.needs_sun_mask()),
@@ -136,9 +190,7 @@ impl Request {
     }
 
     pub(super) fn spawn(self, key: Key, settings: EnhancedSettings) -> Pending {
-        let worker = std::thread::Builder::new().name("enhanced world variant".into())
-            .spawn(move || self.build(false))
-            .expect("spawn the enhanced world variant thread");
+        let worker = spawn_compile_worker("enhanced world variant", move || self.build());
         Pending { key, settings, worker: Some(worker) }
     }
 }
@@ -171,6 +223,7 @@ mod tests {
     fn standalone_live_msaa_request_compiles_off_frame_thread_and_reuses_cache() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let mut r = Renderer::new(&instance, None).expect("MSAA state-machine regression requires GPU");
+        r.wait_for_pipeline_warmup();
         let samples = r.msaa_supported.iter().copied().find(|&samples| samples > 1)
             .expect("MSAA state-machine regression requires a multisample-capable GPU");
         let original = r.msaa_samples();
@@ -227,6 +280,7 @@ mod tests {
     fn live_variant_requests_preserve_workers_and_supersede_stale_results() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let mut r = Renderer::new(&instance, None).expect("variant state-machine regression requires GPU");
+        r.wait_for_pipeline_warmup();
         let faithful = EnhancedSettings::default();
         let ao = EnhancedSettings { ambient_occlusion: true, ..faithful };
         let bloom = EnhancedSettings { emissive_bloom: true, ..faithful };

@@ -4,6 +4,7 @@
 //! A finite 3x3 march-phase tile is averaged over a full period using symmetric tangent-plane rejection,
 //! including at upsampling; sloping surfaces stay smooth without mixing foreground/background silhouettes.
 use crate::gpu_stats::GpuStatsExt;
+use crate::pipeline_creation::RenderPipeline;
 use glam::{Mat4, Vec3};
 
 /// World-space length of the march towards the sun (metres).
@@ -24,9 +25,9 @@ struct Params {
 pub(super) struct ContactShadows {
     layout: wgpu::BindGroupLayout,
     params: wgpu::Buffer,
-    estimate: wgpu::RenderPipeline,
-    blur: wgpu::RenderPipeline,
-    composite: wgpu::RenderPipeline,
+    estimate: RenderPipeline,
+    blur: RenderPipeline,
+    composite: RenderPipeline,
     targets: Option<Targets>,
 }
 struct Targets {
@@ -40,6 +41,15 @@ struct Targets {
 }
 
 impl ContactShadows {
+    pub(super) fn is_ready(&self) -> bool {
+        self.estimate.is_ready() && self.blur.is_ready() && self.composite.is_ready()
+    }
+    pub(super) fn wait(&self) {
+        self.estimate.get();
+        self.blur.get();
+        self.composite.get();
+    }
+
     pub(super) fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let texture = |binding, sample_type| wgpu::BindGroupLayoutEntry {
             binding, visibility: wgpu::ShaderStages::FRAGMENT,
@@ -55,7 +65,7 @@ impl ContactShadows {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("contact shadows"), source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("contact_shadows.wgsl", include_str!("contact_shadows.wgsl"))) });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("contact shadows"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
-        let make_pipeline = |entry, format, blend, write_mask| crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
+        let make_pipeline = |entry, format, blend, write_mask| crate::pipeline_creation::render_deferred(device, &wgpu::RenderPipelineDescriptor {
             label: Some(entry), layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(entry), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask })] }),

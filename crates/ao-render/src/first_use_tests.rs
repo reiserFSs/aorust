@@ -55,6 +55,11 @@ fn first_use_after_zone_ready() {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let mut renderer = Renderer::new(&instance, None).expect("first-use regression requires an offscreen GPU");
     eprintln!("pipeline_first_use startup_new_ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);
+    let warmup = Instant::now();
+    renderer.wait_for_pipeline_warmup();
+    assert!(renderer.pipeline_warmup_complete());
+    eprintln!("pipeline_first_use startup_warmup_wait_ms={:.3} startup_ready_ms={:.3}",
+        warmup.elapsed().as_secs_f64() * 1000.0, started.elapsed().as_secs_f64() * 1000.0);
     let upload_started = Instant::now();
     renderer.set_msaa_samples(1);
     // Zone-ready deliberately contains no actors, tags, sprites, or effects.
@@ -75,6 +80,7 @@ fn first_use_after_zone_ready() {
         let targets = Targets::new(renderer, width, height);
         let before_total = renderer.frame_thread_compiles();
         let before = renderer.world_frame_thread_compiles();
+        let before_waits = renderer.frame_pipeline_waits();
         let start = Instant::now();
         renderer.render(&view, &targets, &camera);
         let submit_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -84,6 +90,9 @@ fn first_use_after_zone_ready() {
         eprintln!("pipeline_first_use {label} submit_ms={submit_ms:.3} complete_ms={elapsed_ms:.3} frame_thread_compiles={created} world_compiles={}", renderer.world_pipeline_compiles());
         let total_created = renderer.frame_thread_compiles() - before_total;
         eprintln!("pipeline_first_use {label} total_frame_thread_compiles={total_created}");
+        let waits = renderer.frame_pipeline_waits() - before_waits;
+        eprintln!("pipeline_first_use {label} frame_pipeline_waits={waits}");
+        if waits != 0 { failures.push((format!("{label}:waits"), waits)); }
         if total_created != 0 { failures.push((format!("{label}:total"), total_created)); }
         if created != 0 { failures.push((label.to_owned(), created)); }
     };

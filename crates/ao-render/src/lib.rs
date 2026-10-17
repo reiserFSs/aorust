@@ -1000,7 +1000,7 @@ pub fn frustum_planes(vp: &Mat4) -> [Vec4; 6] {
 }
 
 impl Renderer {
-    /// Picks the Metal adapter (compatible with `surface` when windowed) and builds pipelines.
+    /// Picks a compatible Metal adapter and queues pipeline warmup without waiting for unused states.
     pub fn new(instance: &wgpu::Instance, surface: Option<&wgpu::Surface>) -> Result<Self> {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -1113,7 +1113,7 @@ impl Renderer {
         let world = variant::Request::new(
             &device, &shader, format, (&g_layout, &tex_layout, &holo_layout),
             world_key, EnhancedSettings::default(),
-            &compiles, &frame_compiles).build(false);
+            &compiles, &frame_compiles).prepare();
         let enhanced_pipelines = enhanced::EnhancedPipelines::new(&device, format);
         let bloom_pipelines = bloom::BloomPipelines::new(&device);
         let grade_pipelines = grade::GradePipelines::new(&device, format, enhanced_pipelines.source_layout());
@@ -1216,6 +1216,34 @@ impl Renderer {
         Ok(r)
     }
 
+    /// Whether the active startup pipeline set has finished compiling in the background.
+    pub fn pipeline_warmup_complete(&self) -> bool {
+        self.world.is_ready()
+            && self.enhanced_pipelines.is_ready()
+            && self.bloom_pipelines.is_ready()
+            && self.grade_pipelines.is_ready()
+            && self.shadow_pipelines.is_ready()
+            && self.ambient_occlusion.as_ref().is_some_and(|ao| ao.is_ready())
+            && self.contact_shadows.as_ref().is_some_and(|contact| contact.is_ready())
+            && self.screen.is_ready()
+            && self.heat_haze.is_ready()
+            && self.skin_pipeline_is_ready()
+    }
+
+    /// Explicit readiness barrier for zone preparation and deterministic evidence, never a frame prerequisite.
+    pub fn wait_for_pipeline_warmup(&self) {
+        self.world.wait();
+        self.enhanced_pipelines.wait();
+        self.bloom_pipelines.wait();
+        self.grade_pipelines.wait();
+        self.shadow_pipelines.wait();
+        self.ambient_occlusion.as_ref().expect("startup AO pipelines").wait();
+        self.contact_shadows.as_ref().expect("startup contact pipelines").wait();
+        self.screen.wait();
+        self.heat_haze.wait();
+        self.wait_skin_pipeline();
+    }
+
     /// Native quality is latched at startup; compression callbacks affect future loads. `better` is the aomac
     /// Enhanced "Better Mip Filtering" option (not retail, default off, audit item 12).
     pub fn set_texture_policy(&mut self, quality: i32, compressed: bool, better: bool) {
@@ -1305,7 +1333,7 @@ impl Renderer {
         }
     }
 
-    /// Immediate setting for fixtures: compiles an unseen world combination before returning.
+    /// Immediate fixture setting: waits for an unseen world combination to compile on a worker.
     pub fn set_enhanced_settings(&mut self, settings: EnhancedSettings) {
         let settings = settings.clamped();
         let key = variant::Key::of(settings, self.clamp_msaa(self.requested_msaa, settings));
@@ -1342,7 +1370,7 @@ impl Renderer {
         if defer {
             self.pending_world = Some(request.spawn(key, settings));
         } else {
-            let world = request.build(true);
+            let world = request.spawn(key, settings).wait();
             self.install_world(key, world, settings);
         }
     }
@@ -1407,6 +1435,8 @@ impl Renderer {
     pub fn world_variant_cache_len(&self) -> usize { self.world_variants.len() }
     /// All instrumented pipeline creations inside this thread's render scopes.
     pub fn frame_thread_compiles(&self) -> u64 { pipeline_creation::frame_thread_compiles() }
+    /// Unready pipeline cells encountered inside this thread's render scopes.
+    pub fn frame_pipeline_waits(&self) -> u64 { pipeline_creation::frame_pipeline_waits() }
 
     pub fn enhanced_settings(&self) -> EnhancedSettings { self.enhanced_settings }
     /// Logical optional attachment bytes, not driver allocation/alignment or total GPU residency.

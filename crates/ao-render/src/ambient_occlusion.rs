@@ -1,5 +1,6 @@
 //! Half-resolution diffuse-contact AO from current visible depth and grass porosity tags.
 use crate::gpu_stats::GpuStatsExt;
+use crate::pipeline_creation::RenderPipeline;
 use glam::Mat4;
 
 #[repr(C)]
@@ -13,9 +14,9 @@ struct Params {
 pub(super) struct AmbientOcclusion {
     layout: wgpu::BindGroupLayout,
     params: wgpu::Buffer,
-    estimate: wgpu::RenderPipeline,
-    blur: wgpu::RenderPipeline,
-    composite: wgpu::RenderPipeline,
+    estimate: RenderPipeline,
+    blur: RenderPipeline,
+    composite: RenderPipeline,
     targets: Option<Targets>,
 }
 struct Targets {
@@ -29,6 +30,15 @@ struct Targets {
 }
 
 impl AmbientOcclusion {
+    pub(super) fn is_ready(&self) -> bool {
+        self.estimate.is_ready() && self.blur.is_ready() && self.composite.is_ready()
+    }
+    pub(super) fn wait(&self) {
+        self.estimate.get();
+        self.blur.get();
+        self.composite.get();
+    }
+
     pub(super) fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let texture = |binding, sample_type| wgpu::BindGroupLayoutEntry {
             binding, visibility: wgpu::ShaderStages::FRAGMENT,
@@ -44,7 +54,7 @@ impl AmbientOcclusion {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("diffuse-contact HBAO-lite"), source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("ambient_occlusion.wgsl", include_str!("ambient_occlusion.wgsl"))) });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("ambient AO"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
-        let make_pipeline = |entry, format, blend| crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
+        let make_pipeline = |entry, format, blend| crate::pipeline_creation::render_deferred(device, &wgpu::RenderPipelineDescriptor {
             label: Some(entry), layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(entry), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask: if entry == "composite" { wgpu::ColorWrites::RED | wgpu::ColorWrites::GREEN | wgpu::ColorWrites::BLUE } else { wgpu::ColorWrites::ALL } })] }),

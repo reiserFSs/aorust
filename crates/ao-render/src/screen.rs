@@ -1,5 +1,6 @@
 //! DS10023929/1002eec0: repeated native gamma-space viewport sprites.
 use super::*;
+use crate::pipeline_creation::RenderPipeline;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScreenLayer {
     pub color: [f32;4],
@@ -28,7 +29,7 @@ struct ScreenGpu {
     shader:wgpu::ShaderModule,
     sampler:wgpu::Sampler,
     textures:HashMap<Option<TextureKey>,wgpu::TextureView>,
-    pipes:HashMap<(u32,u32),wgpu::RenderPipeline>,
+    pipes:HashMap<(u32,u32),RenderPipeline>,
     frames:Vec<(wgpu::Buffer,wgpu::BindGroup,Option<TextureKey>)>,
 }
 fn factor(value:u32)->wgpu::BlendFactor {
@@ -41,6 +42,14 @@ fn blend_key(source: u32, destination: u32) -> (u32, u32) {
     (canonical(source), canonical(destination))
 }
 impl ScreenPass {
+    pub fn is_ready(&self) -> bool {
+        self.gpu.as_ref().is_some_and(|gpu| gpu.pipes.len() == 121 && gpu.pipes.values().all(RenderPipeline::is_ready))
+    }
+    pub fn wait(&self) {
+        let gpu = self.gpu.as_ref().expect("screen pipelines warmed at startup");
+        for pipeline in gpu.pipes.values() { pipeline.get(); }
+    }
+
     pub fn upload(&mut self,device:&wgpu::Device,queue:&wgpu::Queue,key:TextureKey,texture:&ao_scene::Texture,policy:crate::native_texture::Policy) {
         self.init(device,queue);
         let gpu=self.gpu.as_mut().unwrap();
@@ -67,7 +76,7 @@ impl ScreenPass {
             for destination in 1..=11 {
                 gpu.pipes.entry((source, destination)).or_insert_with(|| {
                     let component = wgpu::BlendComponent { src_factor: factor(source), dst_factor: factor(destination), operation: wgpu::BlendOperation::Add };
-                    crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
+                    crate::pipeline_creation::render_deferred(device, &wgpu::RenderPipelineDescriptor {
                         label: Some("native viewport blend"), layout: Some(&pl),
                         vertex: wgpu::VertexState { module: &gpu.shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
                         fragment: Some(wgpu::FragmentState { module: &gpu.shader, entry_point: Some("fs"), compilation_options: Default::default(),

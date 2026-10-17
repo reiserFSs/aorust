@@ -12,6 +12,7 @@ use crate::Renderer;
 use ao_gui::{DrawCmd, DrawList, Gui};
 use bytemuck::{Pod, Zeroable};
 use crate::gpu_stats::{GpuStatsExt, TextureViewStatsExt};
+use crate::pipeline_creation::RenderPipeline;
 use std::collections::HashMap;
 
 #[repr(C)]
@@ -31,7 +32,7 @@ struct Globals {
 }
 
 pub struct GuiRenderer {
-    pipeline: wgpu::RenderPipeline,
+    pipeline: RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     linear: wgpu::Sampler,
@@ -70,12 +71,15 @@ pub struct GuiRenderer {
 type Batch = (Option<[i32; 4]>, Option<usize>, std::ops::Range<u32>);
 
 impl GuiRenderer {
+    pub fn is_ready(&self) -> bool { self.pipeline.is_ready() }
+    pub fn wait(&self) { self.pipeline.get(); }
+
     /// View of the shared UNORM gamma-space framebuffer.
     pub fn view(tex: &wgpu::Texture) -> wgpu::TextureView {
         tex.create_view_tracked(&Default::default())
     }
 
-    /// Uploads the skin atlas of `gui` and builds the pipeline for `r.format`.
+    /// Uploads the skin atlas of `gui` and queues the pipeline for `r.format`.
     pub fn new(r: &Renderer, gui: &Gui) -> Self {
         let device = &r.device;
         let atlas = gui.atlas();
@@ -146,7 +150,7 @@ impl GuiRenderer {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("gui"), source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("gui.wgsl", include_str!("gui.wgsl"))) });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("gui"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
         let attrs = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Uint32];
-        let pipeline = crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
+        let pipeline = crate::pipeline_creation::render_deferred(device, &wgpu::RenderPipelineDescriptor {
             label: Some("gui"),
             layout: Some(&pl),
             vertex: wgpu::VertexState {

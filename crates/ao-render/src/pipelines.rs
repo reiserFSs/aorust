@@ -1,5 +1,5 @@
 //! Stable native pipeline slots, prepared before rendering begins.
-use super::Blend;
+use super::{Blend, pipeline_creation::RenderPipeline};
 use std::{collections::HashMap, ops::Index};
 
 #[derive(Clone, Copy)]
@@ -102,7 +102,7 @@ impl Spec {
 }
 #[derive(Clone, Copy)]
 enum Source { Compile(Spec), Alias(usize) }
-pub(super) struct Slot { source: Source, pipeline: Option<wgpu::RenderPipeline> }
+pub(super) struct Slot { source: Source, pipeline: Option<RenderPipeline> }
 impl Slot {
     pub fn new(spec: Spec) -> Self { Self { source: Source::Compile(spec), pipeline: None } }
     pub fn alias(index: usize) -> Self { Self { source: Source::Alias(index), pipeline: None } }
@@ -113,7 +113,7 @@ impl From<Vec<Slot>> for Pipelines {
 }
 impl Pipelines {
     pub fn len(&self) -> usize { self.0.len() }
-    pub fn prepare_all<F: Fn(Spec) -> wgpu::RenderPipeline>(&mut self, compile: &F) {
+    pub fn prepare_all<F: Fn(Spec) -> RenderPipeline>(&mut self, compile: &F) {
         let mut prepared: HashMap<Descriptor, usize> = HashMap::new();
         for index in 0..self.len() {
             if let Source::Compile(spec) = self.0[index].source {
@@ -135,7 +135,7 @@ impl Pipelines {
             Source::Alias(source) => self.spec(source),
         }
     }
-    pub fn ensure<F: Fn(Spec) -> wgpu::RenderPipeline>(&mut self, index: usize, compile: &F) {
+    pub fn ensure<F: Fn(Spec) -> RenderPipeline>(&mut self, index: usize, compile: &F) {
         if self.0[index].pipeline.is_some() { return }
         let pipeline = match self.0[index].source {
             Source::Compile(spec) => compile(spec),
@@ -143,11 +143,20 @@ impl Pipelines {
         };
         self.0[index].pipeline = Some(pipeline);
     }
+    pub fn is_ready(&self) -> bool {
+        self.0.iter().filter_map(|slot| slot.pipeline.as_ref()).all(RenderPipeline::is_ready)
+    }
+    pub fn wait(&self) {
+        for pipeline in self.0.iter().filter_map(|slot| slot.pipeline.as_ref()) { pipeline.get(); }
+    }
+    pub fn warm(&self) {
+        for pipeline in self.0.iter().filter_map(|slot| slot.pipeline.as_ref()) { pipeline.warm(); }
+    }
 }
 impl Index<usize> for Pipelines {
     type Output = wgpu::RenderPipeline;
     fn index(&self, index: usize) -> &Self::Output {
-        self.0[index].pipeline.as_ref().expect("native pipeline must be prepared before opening the render pass")
+        self.0[index].pipeline.as_ref().expect("native pipeline must be prepared before opening the render pass").get()
     }
 }
 
