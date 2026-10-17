@@ -503,6 +503,13 @@ impl Collision {
         self.closest(p, -1).map(|c| c.pos[1])
     }
 
+    /// Highest loaded static collision vertex, for optional vertical exposure probes.
+    /// Call once when creating a probe capability, not for every terrain sample.
+    pub fn surface_ceiling(&self) -> Option<f32> {
+        self.tris.iter().map(|triangle| triangle.a[1].max(triangle.b[1]).max(triangle.c[1]))
+            .reduce(f32::max)
+    }
+
     /// Footstep/landing/swim ground material at `p` (`FUN_10045069` [GC 0x10045069] `local_8`, fed to `PlayGameSound`'s
     /// material argument): submerged in liquid (`p` below the surface [`Collision::liquid_at`]) selects material 10 for
     /// calm lava (`kind & 0x1f == 2`), 11 for calm acid (`== 6`), else 8 (water/slime/mud) or 9 within 0.35 m of the

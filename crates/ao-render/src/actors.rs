@@ -173,6 +173,9 @@ pub(crate) struct ActorLayer {
 }
 
 impl ActorLayer {
+    pub(super) fn enhanced_grass_actor_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.items.iter().filter(|item| item.mesh == 0 && !item.faded).map(|item| item.actor)
+    }
     fn remove_model(&mut self, key: u64) {
         self.models.remove(&key);
         self.textures.retain(|_, texture| texture.strong_count() != 0);
@@ -582,6 +585,7 @@ impl Renderer {
         out.clear();
         out.extend(self.act.items.iter().filter(|item| item.mesh == 0).map(|item| item.actor));
     }
+
 
     pub(super) fn prepare_actor_pipelines(&mut self) {
         let shader = self.enhanced_shader.as_ref().unwrap_or(&self.shader);

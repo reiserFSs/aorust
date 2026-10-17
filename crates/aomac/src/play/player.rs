@@ -754,6 +754,17 @@ impl Player {
             host.actor_models.push((avatar::MODEL_KEY, self.avatar.model_arc()));
             self.model_sent = true;
         }
+        if host.enhanced_settings.is_some_and(|s| s.ground_grass && s.grass_density > 0.0 && s.grass_distance > 0.0) {
+            host.grass_benders.clear();
+            host.grass_benders.push(ao_render::GrassBender { actor: None, position: scene_pos(pos) });
+            host.grass_exposure = self.collision.as_ref().map(|surface| {
+                let generation = Rc::as_ptr(surface) as usize as u64;
+                host.grass_exposure.take().filter(|old| old.generation == generation)
+                    .unwrap_or_else(|| grass_exposure_surface(Rc::clone(surface)))
+            });
+        } else {
+            host.grass_exposure = None;
+        }
         // `VisualCATMesh_t::RunFunction` -> `RefreshAlpha`: opacity from the camera <-> head attractor distance (own character only)
         let head_position = glam::Vec3::from(scene_pos(pos)) + glam::Quat::from_rotation_y(scene_yaw(yaw)) * head_local.unwrap_or(glam::Vec3::ZERO);
         let head_to_camera = head_position - host.camera.pos;
@@ -954,8 +965,31 @@ impl Player {
 
 /// `n3Playfield_t::LineOfSight` (N3 0x1000d34c) tests both directions against
 /// front-face surface lines, including sloping rock faces, floors and ceilings.
-fn segment_clear(c: &Collision, a: [f32; 3], b: [f32; 3]) -> bool {
+pub(super) fn segment_clear(c: &Collision, a: [f32; 3], b: [f32; 3]) -> bool {
     c.inside(a) && c.inside(b) && !door_closed(c, a, b) && c.line(a, b).is_none() && c.line(b, a).is_none()
+}
+
+/// Enhancement-only exposure: higher native ground or any overhead collision
+/// rejects a sample. No actor geometry participates in this static surface query.
+pub(super) fn grass_exposure_surface(surface: Rc<RefCell<Collision>>) -> ao_render::GrassExposure {
+    // Collision triangles are immutable after load. Door state changes affect
+    // character LOS, not this static ground/vertical-ray exposure capability.
+    let generation = Rc::as_ptr(&surface) as usize as u64;
+    let ceiling = surface.borrow().surface_ceiling().unwrap_or(f32::NEG_INFINITY);
+    let ground = Rc::clone(&surface);
+    ao_render::GrassExposure {
+        generation,
+        query: Rc::new(move |point| grass_point_exposed(&ground.borrow(), point, ceiling)),
+        line_of_sight: Rc::new(move |from, to| segment_clear(&surface.borrow(), from, to)),
+    }
+}
+
+fn grass_point_exposed(surface: &Collision, point: [f32; 3], ceiling: f32) -> bool {
+    let raised = [point[0], point[1] + 0.5, point[2]];
+    if surface.ground(raised).is_none_or(|ground| ground > point[1]) { return false; }
+    let low = [point[0], point[1] + 0.005, point[2]];
+    let high = [point[0], (point[1] + 1.0).max(ceiling + 1.0), point[2]];
+    surface.line(low, high).is_none() && surface.line(high, low).is_none()
 }
 
 /// Gamecode `FUN_100ad4bd`: ask the playfield surface for its closest point and
@@ -1548,6 +1582,33 @@ mod tests {
         assert_eq!(corrected, point, "the native helper raises y only");
         assert!((normal - ao_render::Vec3::new(-0.5, 1.0, 0.0).normalize()).length() < 1e-5);
         assert!(effect_collision(&collision, ao_render::Vec3::new(10.0, 5.0, -2.0)).is_none());
+    }
+
+    #[test]
+    fn grass_exposure_rejects_raised_floors_and_roof_shelter() {
+        use ao_scene::{Instance, Mesh, Scene, Submesh, Vertex, IDENTITY};
+        let surface = |extra: Option<f32>| {
+            let mut scene = Scene::default();
+            for height in std::iter::once(0.0).chain(extra) {
+                let mesh = scene.meshes.len();
+                scene.meshes.push(Mesh {
+                    vertices: [[-2.0, height, -2.0], [-2.0, height, 2.0], [2.0, height, 2.0], [2.0, height, -2.0]]
+                        .map(|pos| Vertex { pos, ..Default::default() }).to_vec(),
+                    submeshes: vec![Submesh::new(vec![0, 1, 2, 0, 2, 3], None)],
+                });
+                scene.instances.push(Instance { mesh, transform: IDENTITY });
+            }
+            Collision::from_scene(&scene)
+        };
+        let exposed = |surface| {
+            let capability = grass_exposure_surface(Rc::new(RefCell::new(surface)));
+            (capability.query)([0.0; 3])
+        };
+        assert!(exposed(surface(None)));
+        assert!(!exposed(surface(Some(0.001))), "even a millimetre-high non-terrain floor rejects grass");
+        assert!(!exposed(surface(Some(0.2))), "a low statel floor cannot grow blades through it");
+        assert!(!exposed(surface(Some(3.0))), "a roof excludes sheltered terrain");
+        assert!(!exposed(surface(Some(256.0))), "shelter probing uses loaded geometry bounds, not an arbitrary ray length");
     }
 
     #[test]

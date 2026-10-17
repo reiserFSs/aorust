@@ -1406,6 +1406,10 @@ impl Frontend for Play {
     }
 
     fn frame(&mut self, dt: f32, size: (u32, u32), host: &mut Host) -> DrawList {
+        if self.player.is_none() {
+            host.grass_exposure = None;
+            host.grass_benders.clear();
+        }
         if let Some(hud) = self.hud.as_ref() {
             self.texture_quality = hud.dvalues.get_i64("DisplayOtherTextureQuality").unwrap_or(3) as i32;
             self.texture_compressed = hud.dvalues.flag("DisplayCompressedTextures");
@@ -1758,6 +1762,12 @@ impl Frontend for Play {
             self.zone.world.update_with_collision(dt, host.camera.pos.to_array(), host.camera.forward().to_array(), host, query, |id| {
                 player?.effect_anchor(id).map(|matrix| glam::Mat4::from_cols_array_2d(&matrix))
             });
+            if host.enhanced_settings.is_some_and(|s| s.ground_grass && s.grass_density > 0.0 && s.grass_distance > 0.0) {
+                host.grass_wind = self.world_weather.as_ref().map_or([0.0; 3], |weather| weather.state().wind);
+                host.grass_benders.retain(|bender| bender.actor.is_none());
+                host.grass_benders.extend(self.zone.world.grass_characters()
+                    .map(|(id, position)| ao_render::GrassBender { actor: Some(id), position }));
+            }
             if let (Some(control), Some(surface), Some((life, models))) = (
                 self.zone.own().map(|own| glam::Vec3::from_array(own.pos)),
                 self.player.as_ref().and_then(|player| player.effect_surface()),
@@ -2026,6 +2036,7 @@ impl Frontend for Play {
         list
     }
 }
+
 
 /// `ERRORURL` of `cd_image/data/launcher/AnarchyLauncher.url` (`KEY=value` lines, `#` comments, keys case-insensitive).
 fn errorurl(dir: &std::path::Path) -> Option<String> {

@@ -105,6 +105,12 @@ pub struct Host {
     pub pointer_warp: Option<(f32, f32)>,
     /// Current weather wind in AO world coordinates (`GCComputeWind`, Gamecode 0x100cd993).
     pub effect_wind: [f32; 3],
+    /// Current-frame character candidates; final body/visibility admission occurs in the renderer.
+    pub grass_benders: Vec<crate::GrassBender>,
+    /// Optional native surface capability, retained only while grass is enabled.
+    pub grass_exposure: Option<crate::GrassExposure>,
+    /// Current native weather wind for grass (zero when the current zone has no weather).
+    pub grass_wind: [f32; 3],
     /// Current server-synchronized GameDayTime (0..6480 seconds); absent outside a game zone.
     pub effect_day_time: Option<f32>,
     /// Server-synchronized integer game seconds in the current day; absent until GameTime arrives.
@@ -174,6 +180,8 @@ impl Host {
             r.update_actor_model(key, &scene);
         }
         r.set_actors(std::mem::take(&mut self.actors));
+        r.set_enhanced_grass_inputs(&mut self.grass_benders, [self.grass_wind[0], self.grass_wind[1], -self.grass_wind[2]]);
+        r.set_enhanced_grass_exposure(self.grass_exposure.clone());
         r.set_dynamic_lights(&std::mem::take(&mut self.dynamic_lights));
         for (key,texture) in self.screen_textures.drain(..) {r.upload_screen_texture(key,&texture);}
         let fog=self.native_fog.as_ref().map(|state|state.get());
@@ -184,7 +192,7 @@ impl Host {
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { enhanced_settings: None, actor_visual_resets: vec![], actor_visual_retirements: vec![], pointer_warp: None, smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
+        Host { enhanced_settings: None, grass_wind: [0.0; 3], grass_exposure: None, grass_benders: vec![], actor_visual_resets: vec![], actor_visual_retirements: vec![], pointer_warp: None, smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -1183,6 +1191,14 @@ fn native_gpu_allocated_bytes(r: &Renderer) -> Option<usize> {
 }
 
 impl Offscreen {
+    /// Effect-owned buffer bytes, latest cell preparation time, and GPU-expanded cells.
+    pub fn evidence_grass_metrics(&self) -> (usize, u64, usize) {
+        (self.r.enhanced_grass_resource_bytes(), self.r.enhanced_grass_prepare_cpu_ns(), self.r.enhanced_grass_cell_count())
+    }
+    /// Warms only procedural tiles, preserving native render-count animation clocks.
+    pub fn warm_grass_tiles(&mut self) { self.r.warm_grass_tiles(&self.host.camera); }
+    /// Offline-only per-tile material, exposure and projected-root diagnostics.
+    pub fn evidence_grass_diagnostics(&self) -> String { self.r.grass_diagnostics(&self.host.camera, self.size) }
     pub fn new(fe: &dyn Frontend, size: (u32, u32)) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let r = Renderer::new(&instance, None)?;

@@ -75,6 +75,20 @@ impl Surface {
         Some(std::array::from_fn(|i|((f64::from(triangle[0][i])+f64::from(triangle[1][i])+f64::from(triangle[2][i]))/3.0) as f32))
     }
 
+    /// Conservative source-triangle bounds exclude vegetation beside or below liquid.
+    /// False positives at shoreline triangle corners only remove optional grass.
+    pub fn overlaps_ground_cell(&self, x: f32, z: f32, size: f32, ground_y: f32) -> bool {
+        self.triangles.iter().any(|triangle| {
+            let points = triangle.indices.map(|i| self.vertices[i as usize].vertex.pos);
+            let min_x = points.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min);
+            let max_x = points.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max);
+            let min_z = points.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
+            let max_z = points.iter().map(|p| p[2]).fold(f32::NEG_INFINITY, f32::max);
+            let max_y = points.iter().map(|p| p[1]).fold(f32::NEG_INFINITY, f32::max);
+            max_y >= ground_y && max_x >= x && min_x <= x + size && max_z >= z - size && min_z <= z
+        })
+    }
+
     /// DS1003f50f..1003f533: _ftol(z/-100), _ftol(x/100), 60 cells/row.
     pub fn cell(camera: [f32;3]) -> [i32;2] {[(f64::from(camera[0])/100.0).trunc() as i32,(-f64::from(camera[2])/100.0).trunc() as i32]}
 
@@ -213,6 +227,14 @@ mod tests {
     use super::*;
     fn triangle(size:f32)->SourceTriangle {
         SourceTriangle {kind:0,vertices:[[0.0,0.0,0.0],[size,0.0,0.0],[0.0,0.0,-size]].map(|pos|Vertex {pos,..Default::default()})}
+    }
+    #[test]
+    fn optional_ground_grass_excludes_liquid_and_shoreline_bounds() {
+        let surface = Surface::new(0, 0, vec![triangle(8.0)]).unwrap();
+        assert!(surface.overlaps_ground_cell(1.0, -1.0, 1.0, -0.1));
+        assert!(surface.overlaps_ground_cell(7.5, -7.5, 1.0, 0.0));
+        assert!(!surface.overlaps_ground_cell(9.0, -1.0, 1.0, -0.1));
+        assert!(!surface.overlaps_ground_cell(1.0, -1.0, 1.0, 0.1));
     }
     #[test]
     fn lava_fx41_sources_follow_native_near_cell_lifecycle() {

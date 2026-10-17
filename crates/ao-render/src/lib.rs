@@ -2,6 +2,8 @@
 
 mod actors;
 mod bloom;
+mod grass;
+pub use grass::{GrassBender, GrassExposure};
 mod gui;
 mod viewer;
 mod screen;
@@ -606,6 +608,7 @@ impl Targets {
 }
 
 pub struct Renderer {
+    grass: Option<grass::Grass>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub format: wgpu::TextureFormat,
@@ -1114,6 +1117,7 @@ impl Renderer {
             enhanced_shader: None,
             ambient_occlusion: None,
             gpu_timer: None,
+            grass: None,
             stats: FrameStats::default(),
             time: 0.0,
             movers: vec![],
@@ -1276,6 +1280,7 @@ impl Renderer {
             || self.enhanced_settings.ambient_occlusion != settings.ambient_occlusion
             || self.enhanced_settings.emissive_bloom != settings.emissive_bloom;
         self.enhanced_settings = settings;
+        if !settings.ground_grass || settings.grass_density <= 0.0 { self.grass = None; }
         if !settings.ambient_occlusion { self.ambient_occlusion = None; }
         if !settings.sun_shadows { self.sun_shadows = None; }
         if changed_frame { self.enhanced_frame = None; self.bloom = None; }
@@ -2083,6 +2088,7 @@ impl Renderer {
         self.frame = (self.frame + 1) % INST_RING;
         self.prepare_actors(cam.pos, &planes);
         self.prepare_actor_pipelines();
+        self.prepare_enhanced_grass(cam, vp);
         {
             let shader = self.enhanced_shader.as_ref().unwrap_or(&self.shader);
             let format = self.world_format();
@@ -2309,6 +2315,7 @@ impl Renderer {
                     }
                 }
             }
+            calls.set(calls.get() + self.draw_enhanced_grass(&mut pass));
             // Existing native list order; list 4 remains the liquid list.
             for priority in [1, 2, 3, 4, 5, 6, 10, 7] {
                 world_phase(&mut pass, priority);

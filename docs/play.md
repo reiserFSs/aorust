@@ -523,3 +523,64 @@ without frontend updates, capture allocation or pixel readback. Explicit
 `set_gpu_timing(true)` / `read_frame_gpu_ms` provide GPU timestamps; unsupported
 hardware returns an error rather than substituting CPU wall time. Ordinary capture
 mode does not allocate that target or timing queries.
+## Optional material-ground grass
+
+`AomacGroundGrass` is an off-by-default enhancement, not a reproduction of native
+vegetation geometry. Only native ground material 15 (grass texture IDs 2/258) or
+6 (drygrass 291/685) admits blades; unknown materials, coarse terrain LOD cells,
+liquid-overlapped cells, room floors and roads do not. Source-triangle liquid
+bounds conservatively omit some shoreline grass. GPU expansion uses a fixed
+world-cell/texture hash, sixteen candidates per cell and at most 1024 cells
+(16,384 blades). Density rejects stable candidates rather than reseeding them.
+Distance fade ends at the smaller of the selected radius, 35 m and the original
+projection far plane, native fully-fine terrain radius and the fixed cell-budget
+radius. Collision and selection are unchanged.
+
+Native substrate alone is not proof that terrain is exposed: statel floors may
+overlay a grass cell. An opt-in callback reuses the loaded native `Collision`
+ground query plus vertical collision rays; a higher floor, roof or shelter at any
+of five cell samples rejects the whole cell. No collision capability means no
+grass. Exposure is computed only on generation, at most four new cells per frame,
+and retained in a 4096-entry FIFO cache tied to the immutable loaded collision
+source. Door flags affect actor LOS immediately but do not flush static exposure.
+Nearest unknown cells are generated first; unclassified cells remain absent until
+checked. Candidate selection is one pass over native cells and is reused until
+the native terrain selection/radius changes. Stationary warmed frames upload only
+wind/bender uniforms. Blades themselves are expanded entirely by the GPU.
+
+Colour samples the original oriented terrain texture and native ground palette.
+Normals use the native central height differences, cached at tile generation;
+the shader evaluates the original four terrain-corner sun/local Gouraud values
+and interpolates them on the native diagonal, including per-corner saturation
+and ambient for the simple-ground path. Fused and two-pass fog composition retain
+their native equations. Blade tips never acquire a new light budget, and fog is
+at least the root's interpolated native fog.
+Wind uses the current native weather wind; time is the renderer's existing clock.
+
+Interaction follows the approved conservative rule: own-character feet always
+bend grass, including first person. Other sources must be currently drawn opaque
+primary character bodies within 15 m whose feet + 5 cm are inside the final render
+frustum and clear the final camera's existing bidirectional collision/closed-door
+line-of-sight query. Admission uses the current prepared draw list, including body
+fade/priority, before selecting the fifteen nearest remote sources. Camera shake
+or a renderer-rejected body therefore cannot evict a visible source at the cap.
+CPU candidate allocations are exchanged with the host and reused; their size is
+bounded by the currently submitted character frames, while the GPU stays fixed
+at sixteen sources. Missing collision admits only own-character interaction.
+No recovery grid or actor history exists; concealment, disappearance or a blocked
+ray removes the bend immediately. Optional source channels are cleared under grass so blades
+neither seed bloom nor expose the underlying terrain's AO/emissive contribution.
+
+Effect buffers are fixed-size and released on disable; all-off execution does
+not prepare cells, upload grass data or create a grass pipeline. Regression tests
+cover material allowlisting, stable density, submerged placement and an actor
+behind a synthetic wall producing exactly the same bender list as its absence.
+
+The ignored `grass_offline_capture_and_timing` fixture compares density-zero
+neutral frames with grass using `FrameGpuTimer`, in both orderings. Alongside the
+canonical ICC/Borealis/Subway views it derives close ground views from exposed
+native grass cells, recording their texture, grid and camera rather than assuming
+that canopy-looking cameras show terrain. Its manifest includes per-tile material,
+fine-LOD, exposure and projected-root rejection counts, drawable batch availability,
+effect buffer bytes and native Metal allocation deltas. The timed GPU result is
+the paired whole-frame contribution, not an isolated draw timestamp.

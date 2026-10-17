@@ -62,6 +62,15 @@ pub struct GroundDetail {
 }
 
 impl GroundDetail {
+    /// Existing native selection state; optional vegetation reuses it without extra traversal.
+    pub fn selection_key(&self) -> Option<([i32; 2], i32, i32)> { self.last }
+
+    /// Conservative fully-fine radius, allowing for camera quantization and cell corners.
+    pub fn fine_radius(&self) -> f32 {
+        self.last.zip(self.patches.first()).map_or(0.0, |((_, _, radius), patch)| {
+            (radius as f32 / 3.0 - 3.0).max(0.0) * patch.cell_size
+        })
+    }
     pub fn new(patches: Vec<GroundPatch>) -> Self {
         let mut out = Self { patches, ..Self::default() };
         for p in 0..out.patches.len() {

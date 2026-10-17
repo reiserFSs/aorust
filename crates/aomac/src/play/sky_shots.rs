@@ -416,6 +416,10 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         for (name, pf, time, fixed) in views {
             ao_scene::crt_srand(1);
             let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
+            let grass_exposure = if settings.ground_grass && settings.grass_density > 0.0 {
+                Some(super::player::grass_exposure_surface(std::rc::Rc::new(std::cell::RefCell::new(
+                    ao_formats::playfield::collision::Collision::load(&store, pf)?))))
+            } else { None };
             let capture = |measure: bool| -> anyhow::Result<(Vec<u8>, Lens, usize, usize)> {
                 // Both renderers consume the exact same immutable snapshot, as effect comparisons do.
                 ao_scene::crt_srand(1);
@@ -429,6 +433,8 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 off.host.anisotropy = Some(1);
                 off.host.fog_density_scale = Some(1.0);
                 off.host.enhanced_settings = Some(settings);
+                off.host.grass_exposure = grass_exposure.clone();
+                off.host.grass_wind = weather.wind;
                 let mut list = off.frame(&mut shot, 0.0);
                 if matches!(name.as_str(), "icc-actor-authored" | "borealis-lightbar-night") {
                     let lightbar = name == "borealis-lightbar-night";
@@ -442,9 +448,15 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     if lightbar { avatar.set_transform([679.6, 72.8, -482.7], 0.0); }
                     off.host.dynamic_lights.extend(avatar.lights());
                     off.host.actor_models.push((super::avatar::MODEL_KEY, std::sync::Arc::new(avatar.model().clone())));
-                    off.host.actors.push(avatar.frame());
+                    let frame = avatar.frame();
+                    if grass_exposure.is_some() {
+                        let [x, y, z, _] = frame.transform[3];
+                        off.host.grass_benders.push(ao_render::GrassBender { actor: None, position: [x, y, z] });
+                    }
+                    off.host.actors.push(frame);
                     list = off.frame(&mut shot, 0.0);
                 }
+                if grass_exposure.is_some() { off.warm_grass_tiles(); }
                 let raw = off.rgba(&shot, &list)?;
                 if measure && profile == "bloom" && name == "borealis-lightbar-night" {
                     let mask = off.emissive_seed_rgba()?.context("Bloom emission mask")?;
@@ -704,3 +716,5 @@ fn graphics_bloom_gpu_timing() -> anyhow::Result<()> {
         delta[0], delta[1], delta[2], bytes[1].checked_sub(bytes[0]).context("Bloom allocation delta")?);
     Ok(())
 }
+#[path = "grass_shots.rs"]
+mod grass_shots;

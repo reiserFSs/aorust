@@ -3791,6 +3791,11 @@ impl Dynels {
             .collect()
     }
 
+    pub(super) fn grass_characters(&self) -> impl Iterator<Item = (u32, [f32; 3])> + '_ {
+        self.chars.iter().filter(|(id, c)| **id != self.own && c.visible && c.submitted)
+            .map(|(id, c)| (*id as u32, scene_pos(c.pose.pos)))
+    }
+
     /// False BoundingBoxTargeting uses the same composed body pose as the actor renderer.
     pub fn pick_character_hit(&self, body: &super::hud_pick::PickBody, ray: &super::hud_target::Ray, bounding_box: bool) -> Option<f32> {
         body.hit(ray.origin, ray.dir, ray.len)?;
