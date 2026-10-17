@@ -671,6 +671,31 @@ directories for the final sheets. No tolerance, retry-to-pass, or passing status
 was added. Main approved recording this open item instead of extending the
 investigation beyond its ten-minute limit.
 
+**Night fairness policy open item (`6031e9c7`, LookLand final sheets):**
+All five native night snapshots report `daylight=Some(0.0)` and exposure/meadow
+GPU gates add zero daylight energy. This is **not** whole-image zero brightening.
+With bloom disabled, the mean image is darker than faithful in every night view,
+but foliage and Newland retain positive pixel energy beyond one display code:
+
+| Night view | Mean Y change vs faithful | Mean positive Y change | Mean positive excess above 1 code | Maximum positive Y |
+|---|---:|---:|---:|---:|
+| Borealis foliage | -2.080203 | 0.080475 | 0.057036 | 19.1480 |
+| Newland | -3.509915 | 0.191571 | 0.153212 | 62.5596 |
+| Borealis street | -0.608888 | 0.057680 | 0 | 0.7192 |
+| Borealis light bar | -0.684295 | 0.041018 | 0 | 0.7192 |
+| Borealis light bar close | -0.838928 | 0.041626 | 0 | 0.7874 |
+
+Y is Rec.709 luminance of sRGB byte codes. **[INFERENCE]** changed grass geometry
+may lift night foliage/Newland above the native ground it replaces; the mechanism
+is not isolated and this remains a policy open item, not a blanket grass exemption.
+The three sub-code maxima are reported separately from those larger residuals.
+Bloom's approved uniform authored lens halo is also separate: with bloom enabled,
+street/light-bar/close mean changes become +0.691265/+0.699451/+1.169199 codes;
+Newland remains -2.103241 and foliage -2.080203. The maximum positive pixel change
+is 64.8456 codes including quantization/chroma. No new night HDR highlight seeds
+are admitted. Exact per-view measurements and first/repeat evidence remain in
+`gfx/v3/LookLand/metrics.txt`, `acceptance-summary.txt` and the final sheets.
+
 For sky precision investigations, `AOMAC_SKY_PIXELS='743,208;779,212'` also
 writes `<view>-sky-first.txt` and `<view>-sky-repeat.txt` from each renderer's
 last uploaded SingleCloud layer17 draws. These opt-in reports include unblended
