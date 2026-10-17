@@ -1181,6 +1181,14 @@ impl Offscreen {
         Ok(Self { r, targets, gr, host: Host::headless(), size, live: None, perf, fixed_camera: None })
     }
 
+    /// Headless capture without ambient performance environment configuration.
+    pub fn evidence(fe: &dyn Frontend, size: (u32, u32)) -> Result<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let r = Renderer::new(&instance, None)?;
+        let (targets, gr) = (Targets::new(&r, size.0, size.1), crate::GuiRenderer::new(&r, fe.gui()));
+        Ok(Self { r, targets, gr, host: Host::headless(), size, live: None, perf: None, fixed_camera: None })
+    }
+
     /// Changes the render surface size without replacing the live frontend or its GUI state.
     pub fn resize(&mut self, size: (u32, u32)) {
         self.size = (size.0.max(1), size.1.max(1));
@@ -1324,8 +1332,8 @@ impl Offscreen {
     }
 
 
-    /// Renders the current scene with the host camera, draws `list` over it and writes the PNG.
-    pub fn png(&mut self, fe: &dyn Frontend, list: &ao_gui::DrawList, path: &std::path::Path) -> Result<()> {
+    /// Captures a single frame as tightly packed, row-major RGBA8.
+    pub fn rgba(&mut self, fe: &dyn Frontend, list: &ao_gui::DrawList) -> Result<Vec<u8>> {
         let tex = self.r.device.create_texture_tracked(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d { width: self.size.0, height: self.size.1, depth_or_array_layers: 1 },
@@ -1339,7 +1347,17 @@ impl Offscreen {
         let view = tex.create_view_tracked(&Default::default());
         self.r.render(&view, &self.targets, &self.host.camera);
         self.gr.draw(&self.r, &crate::GuiRenderer::view(&tex), self.size, 1, fe.gui(), list);
-        crate::texture_to_png(&self.r, &tex, self.size.0, self.size.1, path)
+        crate::texture_to_rgba(&self.r, &tex, self.size.0, self.size.1)
+    }
+
+    /// Writes the same single-frame capture as PNG.
+    pub fn png(&mut self, fe: &dyn Frontend, list: &ao_gui::DrawList, path: &std::path::Path) -> Result<()> {
+        let pixels = self.rgba(fe, list)?;
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(path)?), self.size.0, self.size.1);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header()?.write_image_data(&pixels)?;
+        Ok(())
     }
 }
 

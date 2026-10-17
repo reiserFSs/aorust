@@ -473,3 +473,35 @@ This sweep is headless only: no application windows, desktop input or screenshot
 Same-account concurrent-character support was checked against the public PRK issue tracker, but not established: [issue 1848](https://git.project-rk.com/prk/issues/issues/1848) concerns a stale chat connection after a disconnected game session, not two concurrent characters. The documented LoginError mapping in `docs/protocol.md` is client/CellAO evidence, not proof of PRK policy. No second live process was started to infer a policy result; player trade uses the requested native-RE/synthetic fallback.
 
 Executed headless verification: `RUST_TEST_THREADS=2 cargo test --release --workspace -j 2` passed **1978**, with **62 ignored**, and workspace/all-targets strict clippy passed. These full gates ran **before** the subsequent additive upstream rebase (Reload and organisation decoder branches, plus appended documentation sections). After resolving that rebase, focused `ao-net` tests passed **229** and `aomac` tests passed **1181**, with **53 ignored**. This includes social/economy synthetic and recorded-capture regressions; it is not new PRK acceptance or a retail-window visual comparison.
+
+## Deterministic offline graphics fixture
+
+Run the ignored `graphics_offline_fixture` test with installed client assets, no
+server or window:
+
+```sh
+AOMAC_GFX_OUT="$HOME/aomac-handoff/gfx/my-new-run" \
+AOMAC_GFX_SETTINGS=faithful \
+cargo test --release -p aomac graphics_offline_fixture -j 2 -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The destination must not exist. The fixed matrix covers ICC 4582 landmark and
+platform views at its authored frozen time 2648.69; Borealis 800 street and foliage
+with high/low sun and at night; a captured ICC actor at idle time zero; and a
+Condemned Subway 127 corridor (indoor lighting needs no day/night duplicate).
+ICC's authored frozen GAME clock is never overridden. The actor uses
+`zone_ithaca.rec` own-character 25988 appearance/position and the existing Avatar
+builder synchronously, without replay worker timing or a synthetic character.
+Every view uses a fixed 1920×1200 camera/lens, day zero, clear weather,
+CRT/cloud seed one, zero renderer/effect time, MSAA one and anisotropy one.
+Each immutable scene snapshot is rendered by two independently initialized
+renderers; raw RGBA8 must match exactly before the run reports success.
+The same captured bytes are written as
+top-down tightly packed `.rgba` and `.png`, alongside `manifest.txt` and
+`status.txt`. A failed/interrupted run is never a pass.
+
+Set `AOMAC_GFX_BASELINE` to an earlier run directory to additionally require exact
+raw byte equality against that run. Keep evidence under `~/aomac-handoff/gfx/`,
+not in the repository. These are deterministic comparison inputs, not an aesthetic
+oracle or a claim of retail screenshot matching.

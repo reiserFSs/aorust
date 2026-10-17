@@ -142,6 +142,20 @@ pub fn load_playfield_on_day(store: &RecordStore, client_dir: &Path, id: u32, da
 }
 
 pub fn load_playfield_report_on_day(store: &RecordStore, client_dir: &Path, id: u32, day_time: f32, game_day: u32) -> Result<(Scene, Report)> {
+    load_playfield_report_with_weather(store, client_dir, id, day_time, game_day, None)
+}
+
+/// Offline captures may freeze both native wind vectors; ordinary loading keeps its day-seeded weather.
+pub fn load_playfield_report_with_weather(
+    store: &RecordStore, client_dir: &Path, id: u32, day_time: f32, game_day: u32,
+    weather: Option<crate::weather::State>,
+) -> Result<(Scene, Report)> {
+    if let Some(w) = weather {
+        anyhow::ensure!(day_time.is_finite() && (0.0..sky::DAY_LENGTH).contains(&day_time), "explicit fixture time must be in 0..6480");
+        anyhow::ensure!(w.fields.iter().chain(&w.wind).chain(&w.quake_offset)
+            .chain(&w.high_altitude_wind).chain(&w.high_altitude_wind_rate).all(|v| v.is_finite()),
+            "explicit fixture weather must be finite");
+    }
     // the day repeats: wrap so colour tracks, ground shadows, sun and moons agree; NaN/inf fall back to the default
     let day_time = if day_time.is_finite() { day_time.rem_euclid(sky::DAY_LENGTH) } else { DEFAULT_DAY_TIME };
     let raw = store.get(RECORD, id)?.ok_or_else(|| anyhow!("no playfield {id}"))?;
@@ -153,7 +167,7 @@ pub fn load_playfield_report_on_day(store: &RecordStore, client_dir: &Path, id: 
     let env = environment::parse(&mut tail).with_context(|| format!("environment of playfield {id}"))?;
     let tweaks = sky::Tweaks::load(client_dir, id, rec.is_outdoor());
     let sky = tweaks.as_ref().and_then(|t| sky::Sky::new(t, day_time)).map(|mut s| {
-        s.set_weather(sky::weather_at(&env, game_day, day_time));
+        s.set_weather(weather.unwrap_or_else(|| sky::weather_at(&env, game_day, day_time)));
         s
     });
     let mut environment = environment::to_scene(&env, rec.is_outdoor(), sky.as_ref());

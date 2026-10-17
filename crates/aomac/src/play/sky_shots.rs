@@ -367,3 +367,144 @@ fn icc_retail_sky_screenshots() -> anyhow::Result<()> {
     eprintln!("{report}");
     Ok(())
 }
+
+/// Frozen world evidence: no network, window, wall-clock simulation or desktop capture.
+/// Run with `AOMAC_GFX_OUT=$HOME/aomac-handoff/gfx/<new-run>`; see docs/play.md.
+#[test]
+#[ignore = "offline graphics matrix; requires installed client and writes handoff evidence"]
+fn graphics_offline_fixture() -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    use std::fmt::Write;
+    let out = PathBuf::from(std::env::var_os("AOMAC_GFX_OUT").context("set AOMAC_GFX_OUT to a new handoff directory")?);
+    let profile = std::env::var("AOMAC_GFX_SETTINGS").unwrap_or_else(|_| "faithful".into());
+    ensure!(profile == "faithful", "this revision supports only faithful captures");
+    ensure!(!out.exists(), "refusing to overwrite evidence {}", out.display());
+    std::fs::create_dir_all(&out)?;
+    let status = out.join("status.txt");
+    std::fs::write(&status, "status=running\nvisual_acceptance=unexercised\n")?;
+    let result = (|| -> anyhow::Result<()> {
+        let dir = ao_gui::client_dir();
+        let store = ao_rdb::RecordStore::open(&dir)?;
+        let command = |program: &str, args: &[&std::ffi::OsStr]| -> anyhow::Result<String> {
+            let output = std::process::Command::new(program).args(args)
+                .current_dir(env!("CARGO_MANIFEST_DIR")).output()?;
+            ensure!(output.status.success(), "{program} failed");
+            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        };
+        let revision = command("git", &["rev-parse".as_ref(), "HEAD".as_ref()])?;
+        let source_diff = command("git", &["diff".as_ref(), "--no-ext-diff".as_ref(), "HEAD".as_ref()])?;
+        let resource = command("shasum", &["-a".as_ref(), "256".as_ref(), dir.join("cd_image/rdb.db").as_os_str()])?;
+        let weather = ao_formats::weather::State::clear();
+        let size = (1920, 1200);
+        let mut manifest = format!("fixture_version=1\nrevision={}\nprofile={profile}\nsize={}x{}\npixel_format=RGBA8\nrow_order=top_to_bottom\nrenderer_time=0\neffect_time=0\ngame_day=0\ncrt_seed=1\ncloud_seed=1\nweather={weather:?}\nmsaa=1\nanisotropy=1\nwide=0\nscenery=1\nvisual_acceptance=unexercised\n",
+            revision, size.0, size.1);
+        writeln!(manifest, "source_diff={source_diff:?}\nresource_sha256={resource}")?;
+        writeln!(manifest, "icc_clock=authored_frozen2648.69\nsun_low_high_night_source=Borealis800")?;
+        let baseline = std::env::var_os("AOMAC_GFX_BASELINE").map(PathBuf::from);
+        let actor = graphics_fixture_actor()?;
+        let views = graphics_fixture_views(&actor);
+        writeln!(manifest, "actor_source=docs/captures/zone_ithaca.rec actor_id=25988 actor_name={:?} actor_pos={:?} actor_yaw={:?} actor_pose=idle actor_time=0", actor.name, actor.pos, actor.yaw())?;
+        std::fs::write(out.join("manifest.txt"), &manifest)?;
+        for (name, pf, time, fixed) in views {
+            ao_scene::crt_srand(1);
+            let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
+            let capture = || -> anyhow::Result<(Vec<u8>, Lens, usize, usize)> {
+                // Both renderers consume the exact same immutable snapshot, as effect comparisons do.
+                ao_scene::crt_srand(1);
+                let mut lens = camera::lens(scene.lens.unwrap_or_default(), false);
+                lens.far = Some(camera::far_plane(camera::VIEW_DISTANCE));
+                let counts = (scene.meshes.len(), scene.instances.len());
+                let mut shot = Shot { gui: Gui::new(&dir, None)?, scene: Some(scene.clone()), camera: fixed, lens };
+                let mut off = Offscreen::evidence(&shot, size)?;
+                off.fixed_camera(Some(fixed));
+                off.host.msaa_samples = Some(1);
+                off.host.anisotropy = Some(1);
+                off.host.fog_density_scale = Some(1.0);
+                let mut list = off.frame(&mut shot, 0.0);
+                if name == "icc-actor-authored" {
+                    let avatar = super::avatar::Avatar::new(&store, &dir, 25988, &actor,
+                        ao_formats::character::actor::ActorAssets::new(&store)?)?;
+                    off.host.actor_models.push((super::avatar::MODEL_KEY, std::sync::Arc::new(avatar.model().clone())));
+                    off.host.actors.push(avatar.frame());
+                    list = off.frame(&mut shot, 0.0);
+                }
+                Ok((off.rgba(&shot, &list)?, lens, counts.0, counts.1))
+            };
+            let (raw, lens, meshes, instances) = capture().with_context(|| format!("capture {name}"))?;
+            std::fs::write(out.join(format!("{name}.rgba")), &raw)?;
+            image::save_buffer(out.join(format!("{name}.png")), &raw, size.0, size.1, image::ColorType::Rgba8)?;
+            let (repeated, _, _, _) = capture().with_context(|| format!("repeat {name}"))?;
+            let differing = |other: &[u8]| raw.iter().zip(other).filter(|(a, b)| a != b).count() + raw.len().abs_diff(other.len());
+            let repeat_differences = differing(&repeated);
+            if repeat_differences != 0 {
+                std::fs::write(out.join(format!("{name}-repeat.rgba")), &repeated)?;
+                for (index, (a, b)) in raw.iter().zip(&repeated).enumerate().filter(|(_, (a, b))| a != b).take(16) {
+                    writeln!(manifest, "{name} difference x={} y={} channel={} first={a} repeat={b}", index / 4 % size.0 as usize, index / 4 / size.0 as usize, index % 4)?;
+                }
+            }
+            writeln!(manifest, "view={name} pf={pf} time={time} camera={fixed:?} lens={lens:?} meshes={meshes} instances={instances} raw_bytes={} repeat_differing_bytes={repeat_differences}", raw.len())?;
+            std::fs::write(out.join("manifest.txt"), &manifest)?;
+            ensure!(repeat_differences == 0, "{name}: independent captures differ in {repeat_differences} bytes");
+            if let Some(base) = &baseline {
+                let previous = std::fs::read(base.join(format!("{name}.rgba")))?;
+                let count = differing(&previous);
+                writeln!(manifest, "{name} baseline_differing_bytes={count}")?;
+                std::fs::write(out.join("manifest.txt"), &manifest)?;
+                ensure!(count == 0, "{name}: baseline differs in {count} bytes");
+            }
+            eprintln!("{name}: {} bytes, independent repeat identical", raw.len());
+        }
+        writeln!(manifest, "status=pass")?;
+        std::fs::write(out.join("manifest.txt"), manifest)?;
+        Ok(())
+    })();
+    match &result {
+        Ok(()) => std::fs::write(status, "status=pass\nvisual_acceptance=unexercised\n")?,
+        Err(error) => std::fs::write(status, format!("status=failed\nerror={error:#}\nvisual_acceptance=unexercised\n"))?,
+    }
+    result
+}
+
+fn graphics_fixture_actor() -> anyhow::Result<ao_net::n3::dynel::SimpleCharFullUpdate> {
+    use ao_net::{frame::{Frame, PT_N3}, n3::{self, N3, dynel::Dynel}};
+    for line in include_str!("../../../../docs/captures/zone_ithaca.rec").lines() {
+        let mut words = line.split_whitespace();
+        let (Some(_), Some("<"), Some(hex)) = (words.next(), words.next(), words.next()) else { continue };
+        let bytes = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16))
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some((frame, _)) = Frame::decode_with(&bytes, false)? else { continue };
+        if frame.ptype != PT_N3 { continue; }
+        let message = n3::decode(&frame)?;
+        if message.header.target.instance != 25988 { continue; }
+        if let N3::Dynel(Dynel::SimpleCharFullUpdate(update)) = message.body {
+            return Ok(*update);
+        }
+    }
+    anyhow::bail!("zone_ithaca.rec has no captured own actor 25988")
+}
+
+fn graphics_fixture_views(actor: &ao_net::n3::dynel::SimpleCharFullUpdate) -> Vec<(String, u32, f32, Camera)> {
+    // Recorded positions retained from the graphics baseline; headings are explicit fixture
+    // choices, not claims of matching a retail reference screenshot.
+    let mut views = Vec::new();
+    for (name, eye, yaw, pitch) in [
+        ("icc-landmark", Vec3::new(933.5, 26.0, -748.0), 3.765, 0.046),
+        ("icc-platform", Vec3::new(940.0, 48.72, -874.78), 3.765, -0.2),
+    ] {
+        views.push((format!("{name}-authored"), 4582, 2648.69, Camera { pos: eye, yaw, pitch, roll: 0.0 }));
+    }
+    for (name, eye, at) in [
+        ("borealis-street", [679.6, 74.5, -476.7], [679.6, 74.5, -477.7]),
+        ("borealis-foliage", [652.0, 65.3, -420.0], [651.8296, 73.42179, -428.4731]),
+    ] {
+        for (light, time) in [("sun-high", 3240.0), ("sun-low", 4860.0), ("night", 0.0)] {
+            views.push((format!("{name}-{light}"), 800, time, Camera::look_at(eye.into(), at.into())));
+        }
+    }
+    views.push(("subway-corridor".into(), 127, 3240.0,
+        Camera::look_at([96.0, 109.305, -242.0].into(), [108.0, 108.9, -242.0].into())));
+    let actor_at = Vec3::new(actor.pos[0], actor.pos[1] + 1.2, -actor.pos[2]);
+    views.push(("icc-actor-authored".into(), 4582, 2648.69,
+        Camera::look_at(actor_at + Vec3::new(0.0, 1.0, 5.0), actor_at)));
+    views
+}
