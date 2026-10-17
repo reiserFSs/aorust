@@ -298,6 +298,7 @@ struct Params { vp: mat4x4<f32> }
         let colour_view = colour.create_view(&Default::default());
         let mut ao = super::AmbientOcclusion::new(device, renderer.format);
         let mut timer = measure.then(|| crate::gpu_stats::FrameGpuTimer::new(device, queue).expect("AO timing requires timestamp support"));
+        let mut timings = Vec::with_capacity(if measure { 85 } else { 0 });
         if measure {
             let owned = super::AmbientOcclusion::incremental_bytes((width, height));
             let pixels = u64::from(width) * u64::from(height);
@@ -331,7 +332,7 @@ struct Params { vp: mat4x4<f32> }
             encoder.copy_texture_to_buffer(wgpu::TexelCopyTextureInfo { texture: &colour, mip_level: 0, origin: Default::default(), aspect: wgpu::TextureAspect::All }, wgpu::TexelCopyBufferInfo { buffer: &readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) } }, wgpu::Extent3d { width, height, depth_or_array_layers: 1 });
             queue.submit([encoder.finish()]);
             if let Some(timer) = timer.as_mut() {
-                eprintln!("AO GPU actor={actor} ambient={ambient_value} ms={:.6}", timer.read_ms(device, queue).expect("AO GPU timestamp readback"));
+                timings.push(timer.read_ms(device, queue).expect("AO GPU timestamp readback"));
             }
             let (send, receive) = std::sync::mpsc::channel();
             readback.slice(..).map_async(wgpu::MapMode::Read, move |result| { send.send(result).unwrap(); });
@@ -362,5 +363,13 @@ struct Params { vp: mat4x4<f32> }
         let fog_absent = render(false, 0.25, 3.25, false);
         let fog_present = render(false, 0.25, 3.25, true);
         assert_eq!(fog_absent, fog_present, "fully original-fogged actors cannot affect visible AO");
+        if measure {
+            for _ in 0..80 { render(true, 0.25, 100.0, false); }
+            let steady = &mut timings[25..];
+            steady.sort_by(f64::total_cmp);
+            eprintln!("AO steady-state 1920x1200 full-coverage samples={} mean_ms={:.6} p50_ms={:.6} p95_ms={:.6} min_ms={:.6} max_ms={:.6}",
+                steady.len(), steady.iter().sum::<f64>() / steady.len() as f64, steady[steady.len() / 2],
+                steady[steady.len() * 95 / 100], steady[0], steady[steady.len() - 1]);
+        }
     }
 }

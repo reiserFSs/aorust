@@ -1,4 +1,6 @@
 // HBAO-lite: current primary-view depth only; no actor lists or history.
+const AXES = array<vec2<f32>, 6>(vec2(1.0,0.0), vec2(0.5,0.8660254), vec2(-0.5,0.8660254),
+    vec2(-1.0,0.0), vec2(-0.5,-0.8660254), vec2(0.5,-0.8660254));
 struct Params {
     inverse_vp: mat4x4<f32>,
     vp: mat4x4<f32>,
@@ -68,10 +70,8 @@ fn selected_pixel(half: vec2<i32>, sample: vec2<u32>) -> vec2<i32> {
     let projection_y = length(vec3<f32>(params.vp[0].y, params.vp[1].y, params.vp[2].y));
     let radius_pixels = clamp(params.control.x * projection_y * params.control.w / (2.0 * max(clip.w, 0.01)), 1.0, 64.0);
     var occlusion = 0.0;
-    let axes = array<vec2<f32>, 6>(vec2(1.0,0.0), vec2(0.5,0.8660254), vec2(-0.5,0.8660254),
-        vec2(-1.0,0.0), vec2(-0.5,-0.8660254), vec2(0.5,-0.8660254));
     for (var direction = 0; direction < 6; direction++) {
-        let axis = axes[direction];
+        let axis = AXES[direction];
         var horizon = 0.0;
         for (var step = 1; step <= 4; step++) {
             let sample_pixel = pixel + vec2<i32>(round(axis * radius_pixels * f32(step) / 4.0));
