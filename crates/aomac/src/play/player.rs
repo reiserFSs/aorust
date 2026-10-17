@@ -991,6 +991,63 @@ fn grass_point_exposed(surface: &Collision, point: [f32; 3]) -> bool {
     surface.ground(raised).is_some_and(|ground| ground <= height)
 }
 
+// Sky fill must reject all roofs, independently of grass's floor-clearance policy.
+fn sky_point_exposed(surface: &Collision, point: [f32; 3], ceiling: f32) -> bool {
+    let height = surface.terrain_height(point).unwrap_or(point[1]);
+    let raised = [point[0], height + 0.5, point[2]];
+    if surface.ground(raised).is_none_or(|ground| ground > height) { return false; }
+    let low = [point[0], height + 0.005, point[2]];
+    let high = [point[0], (height + 1.0).max(ceiling + 1.0), point[2]];
+    surface.line(low, high).is_none() && surface.line(high, low).is_none()
+}
+
+/// Terrain-only enhancement data: sky openness is `1 - i.color.a`.
+/// Missing collision/ground stays closed; faithful shaders ignore this alpha.
+pub(super) fn bake_sky_open(surface: &Collision, scene: &mut ao_scene::Scene) {
+    let ceiling = surface.surface_ceiling().unwrap_or(f32::NEG_INFINITY);
+    let mut open_cells = std::collections::HashSet::new();
+    let mut corners = Vec::new();
+    for patch in &scene.ground_detail {
+        let mesh = &mut scene.meshes[patch.mesh];
+        let stride = patch.cells + 1;
+        corners.clear();
+        for index in 0..stride * stride {
+            let vertex = &mut mesh.vertices[patch.lattice_start as usize + index];
+            vertex.color[3] = 1.0;
+            corners.push(sky_point_exposed(surface, vertex.pos, ceiling));
+        }
+        for (index, cell) in patch.fine_cells.iter().enumerate() {
+            let (x, z) = (index % patch.cells, index / patch.cells);
+            let corner = z * stride + x;
+            let a = mesh.vertices[cell.vertices[0] as usize].pos;
+            let b = mesh.vertices[cell.vertices[3] as usize].pos;
+            let centre = std::array::from_fn(|axis| (a[axis] + b[axis]) * 0.5);
+            let open = [corner, corner + 1, corner + stride, corner + stride + 1]
+                .into_iter().all(|i| corners[i]) && sky_point_exposed(surface, centre, ceiling);
+            for vertex in cell.vertices {
+                mesh.vertices[vertex as usize].color[3] = if open { 0.0 } else { 1.0 };
+            }
+            if open {
+                open_cells.insert([patch.origin[0] + x as i32, patch.origin[1] + z as i32]);
+            }
+        }
+    }
+    // Shared lattice vertices require all four adjacent fine cells, including
+    // neighboring patches. Missing edge cells stay closed rather than leak.
+    for patch in &scene.ground_detail {
+        let mesh = &mut scene.meshes[patch.mesh];
+        for z in 0..=patch.cells {
+            for x in 0..=patch.cells {
+                let (gx, gz) = (patch.origin[0] + x as i32, patch.origin[1] + z as i32);
+                let open = [[gx - 1, gz - 1], [gx, gz - 1], [gx - 1, gz], [gx, gz]]
+                    .into_iter().all(|cell| open_cells.contains(&cell));
+                mesh.vertices[patch.lattice_start as usize + z * (patch.cells + 1) + x].color[3] =
+                    if open { 0.0 } else { 1.0 };
+            }
+        }
+    }
+}
+
 /// Gamecode `FUN_100ad4bd`: ask the playfield surface for its closest point and
 /// normal, then raise only the supplied point's y. The native surface query
 /// includes terrain / room tiles, their KD collision volumes and liquid depth.
@@ -1612,6 +1669,87 @@ mod tests {
         for height in [0.501, 3.0, 256.0] {
             assert_eq!(exposed(surface(Some(height))), [true; 5], "an arch or building floor {height} m above ground cannot intersect capped blades");
         }
+    }
+
+    fn exposure_test_surface(extra: Option<(f32, [f32; 4])>) -> Collision {
+        use ao_scene::{Instance, Mesh, Scene, Submesh, Vertex, IDENTITY};
+        let mut scene = Scene::default();
+        for (height, [x0, z0, x1, z1]) in std::iter::once((0.0, [-2.0, -2.0, 2.0, 2.0])).chain(extra) {
+            let mesh = scene.meshes.len();
+            scene.meshes.push(Mesh {
+                vertices: [[x0, height, z0], [x0, height, z1], [x1, height, z1], [x1, height, z0]]
+                    .map(|pos| Vertex { pos, ..Default::default() }).to_vec(),
+                submeshes: vec![Submesh::new(vec![0, 1, 2, 0, 2, 3], None)],
+            });
+            scene.instances.push(Instance { mesh, transform: IDENTITY });
+        }
+        Collision::from_scene(&scene)
+    }
+
+    #[test]
+    fn sky_exposure_rejects_raised_floors_and_roof_shelter() {
+        let surface = |extra: Option<f32>| exposure_test_surface(extra.map(|height| (height, [-2.0, -2.0, 2.0, 2.0])));
+        let exposed = |surface: Collision| {
+            sky_point_exposed(&surface, [0.0; 3], surface.surface_ceiling().unwrap_or(f32::NEG_INFINITY))
+        };
+        assert!(exposed(surface(None)));
+        assert!(!exposed(surface(Some(0.001))), "even a millimetre-high non-terrain floor rejects sky fill");
+        assert!(!exposed(surface(Some(0.2))), "a low statel floor excludes sky fill");
+        assert!(!exposed(surface(Some(3.0))), "a roof excludes sheltered terrain");
+        assert!(!exposed(surface(Some(256.0))), "shelter probing uses loaded geometry bounds, not an arbitrary ray length");
+        assert!(grass_point_exposed(&surface(Some(3.0)), [0.0; 3]), "floor-only grass occupancy admits arches without proving sky");
+        assert!(!grass_point_exposed(&surface(Some(0.2)), [0.0; 3]), "raised floors still exclude blades");
+    }
+
+    #[test]
+    fn sky_open_bake_requires_corners_centre_and_adjacent_cells() {
+        use ao_scene::{ground_detail::{GroundCell, GroundPatch}, Mesh, Scene, Vertex};
+        let vertex = |x: usize, z: usize| Vertex {
+            pos: [x as f32 - 1.0, 0.0, 1.0 - z as f32],
+            color: [0.2, 0.4, 0.6, 1.0],
+            ..Default::default()
+        };
+        let mut mesh = Mesh::default();
+        let mut fine_cells = Vec::new();
+        for z in 0..2 {
+            for x in 0..2 {
+                let start = mesh.vertices.len() as u32;
+                mesh.vertices.extend([vertex(x, z), vertex(x + 1, z), vertex(x, z + 1), vertex(x + 1, z + 1)]);
+                fine_cells.push(GroundCell { vertices: [start, start + 1, start + 2, start + 3], ..Default::default() });
+            }
+        }
+        let lattice_start = mesh.vertices.len() as u32;
+        for z in 0..=2 { for x in 0..=2 { mesh.vertices.push(vertex(x, z)); } }
+        let untouched = mesh.vertices.len();
+        mesh.vertices.push(Vertex { color: [0.3; 4], ..Default::default() });
+        let original = Scene {
+            meshes: vec![mesh],
+            ground_detail: vec![GroundPatch { mesh: 0, cells: 2, lattice_start, fine_cells, ..Default::default() }],
+            ..Default::default()
+        };
+        assert!(original.meshes[0].vertices[..untouched].iter().all(|v| v.color[3] == 1.0), "unbaked data fails closed");
+        let check = |surface: Collision, expected: [f32; 4], lattice: f32| {
+            let mut scene = original.clone();
+            bake_sky_open(&surface, &mut scene);
+            for (cell, alpha) in scene.ground_detail[0].fine_cells.iter().zip(expected) {
+                for index in cell.vertices {
+                    assert_eq!(scene.meshes[0].vertices[index as usize].color, [0.2, 0.4, 0.6, alpha]);
+                }
+            }
+            for i in 0..9 {
+                assert_eq!(scene.meshes[0].vertices[lattice_start as usize + i].color,
+                    [0.2, 0.4, 0.6, if i == 4 { lattice } else { 1.0 }]);
+            }
+            assert_eq!(scene.meshes[0].vertices[untouched].color, [0.3; 4], "non-terrain colours are untouched");
+        };
+        check(exposure_test_surface(None), [0.0; 4], 0.0);
+        check(Collision::from_scene(&Scene::default()), [1.0; 4], 1.0);
+        check(exposure_test_surface(Some((256.0, [-2.0, -2.0, 2.0, 2.0]))), [1.0; 4], 1.0);
+        // A tiny roof over just the first centre closes that cell and the shared
+        // coarse vertex, even though all lattice sample rays remain clear.
+        check(exposure_test_surface(Some((3.0, [-0.75, 0.25, -0.25, 0.75]))), [1.0, 0.0, 0.0, 0.0], 1.0);
+        // Conversely, the common corner is sheltered while all centres are open.
+        check(exposure_test_surface(Some((3.0, [-0.1, -0.1, 0.1, 0.1]))), [1.0; 4], 1.0);
     }
 
     #[test]

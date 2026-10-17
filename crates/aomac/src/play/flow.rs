@@ -805,8 +805,14 @@ impl Play {
                 store.set_ground_texture_quality(ground_texture_quality);
                 let is_grid = area_playfield.map(|id| ao_formats::playfield::area::load(&store, id))
                     .transpose()?.flatten().is_some_and(|areas| areas.is_grid());
-                let (scene, report) = ao_formats::playfield::load_playfield_report_on_day(&store, &dir, id, day_time, day)?;
+                let (mut scene, report) = ao_formats::playfield::load_playfield_report_on_day(&store, &dir, id, day_time, day)?;
                 zt("pf_terrain_statics_loaded");
+                if !scene.ground_detail.is_empty() {
+                    if let Ok(collision) = ao_formats::playfield::collision::Collision::load(&store, id) {
+                        super::player::bake_sky_open(&collision, &mut scene);
+                    }
+                    zt("pf_sky_open_baked");
+                }
                 let weather = ao_formats::playfield::open_weather(&store, id)?;
                 let lightning = super::lightning::LightningFx::load(&store)?;
                 let _ = tx.send(Bg::Weather(id, Box::new((weather, lightning))));

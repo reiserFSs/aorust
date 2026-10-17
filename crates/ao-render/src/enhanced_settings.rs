@@ -6,9 +6,9 @@ pub struct EnhancedSettings {
     pub ambient_occlusion: bool,
     pub emissive_bloom: bool,
     pub ground_grass: bool,
-    /// HDR scene + tonemap/grade/dither present; brightens only daylight-sun-lit surfaces.
+    /// HDR scene + tonemap/grade/dither present; daylight sun and mild outdoor sky fill.
     pub hdr: bool,
-    /// Half-resolution screen-space march towards the sun; darkens only the sun's direct share.
+    /// Half-resolution screen-space march towards the directional light; darkening only.
     pub contact_shadows: bool,
     pub shadow_map_size: u32,
     /// Share of the sun that full shadow removes (the rest stays as sky-lit shade).
@@ -20,11 +20,11 @@ pub struct EnhancedSettings {
     pub bloom_strength: f32,
     pub grass_density: f32,
     pub grass_distance: f32,
-    /// Peak extra brightness of a fully sunlit, unshadowed, unfogged daylight surface (0 = faithful).
+    /// Daylight exposure control; peak extra gamma-space brightness is 60% of this (0 = faithful).
     pub sun_boost: f32,
     /// Chroma-only grade strength inside the HDR present (luminance-preserving; 0 = off).
     pub grade_strength: f32,
-    /// Peak share of the direct sun a fully contact-shadowed daylight pixel loses.
+    /// Peak share of directional light a fully contact-shadowed pixel loses.
     pub contact_strength: f32,
 }
 
@@ -32,8 +32,8 @@ impl Default for EnhancedSettings {
     fn default() -> Self {
         Self {
             sun_shadows: false, ambient_occlusion: false, emissive_bloom: false, ground_grass: false, hdr: false, contact_shadows: false,
-            shadow_map_size: 2048, shadow_strength: 0.65, shadow_softness: 1.5, ao_radius: 1.75, ao_strength: 1.5, bloom_strength: 0.6,
-            grass_density: 1.0, grass_distance: 160.0, sun_boost: 0.5, grade_strength: 0.8, contact_strength: 0.4,
+            shadow_map_size: 2048, shadow_strength: 0.45, shadow_softness: 1.5, ao_radius: 1.75, ao_strength: 1.5, bloom_strength: 0.6,
+            grass_density: 1.0, grass_distance: 160.0, sun_boost: 0.6, grade_strength: 0.8, contact_strength: 0.8,
         }
     }
 }

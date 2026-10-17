@@ -483,6 +483,9 @@ pub struct Scene {
     pub ground_light: Option<([f32; 3], [f32; 3])>,
     /// True only when the authored ground-light expressions were evaluated.
     pub sun_authored: bool,
+    /// Native GAME.CurrentDayIntensity (DayIntensity at the authored interface clock).
+    /// None means unavailable; Enhanced daylight exposure stays closed.
+    pub daylight: Option<f32>,
     /// Moon1/2/3 authored poses; no world moon energy is inferred from disc lighting.
     pub moons: [Option<MoonSource>; 3],
     /// Native WaterLightCurrent and direction towards WaterLightDirection (DS1003f3db uses DAT10150264).

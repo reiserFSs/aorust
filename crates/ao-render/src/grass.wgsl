@@ -132,9 +132,12 @@ struct GOut {
     @location(8) mixes: vec4<f32>,    // x: root goes to ground; y: whole blade goes to ground; z: light through it; w: brightness scale
     @location(9) fog: f32,
     @location(10) @interpolate(flat) path: u32,
-    @location(11) @interpolate(flat) normal: vec3<f32>,
+    @location(11) @interpolate(flat) normal: vec4<f32>, // xyz: normal; w: same baked sky openness as terrain
     @location(12) @interpolate(flat) coverage: f32,
 }
+
+// Raw light visibility, before the artistic shadow-strength floor used by beauty.
+var<private> grass_direct_visibility: f32 = 1.0;
 
 @vertex
 fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance: u32) -> GOut {
@@ -346,7 +349,7 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     // the point/spot lights once at the root.
     o.root = root;
     o.uv = tile_uv;
-    o.normal = ground_n;
+    o.normal = vec4<f32>(ground_n, c.normals[0].w);
     o.path = u32(c.origin.w + 0.5);
     let local = vertex_lights(root, ground_n, 0.0)[0];
     let without_sun = clamp(local, vec3<f32>(0.0), vec3<f32>(1.0));
@@ -396,7 +399,7 @@ fn fs_grass(i: GOut) -> GrassOutput {
     let ground_luma = dot(ground, LUMA);
     // Only surviving direct daylight can lift the dull substrate towards meadow luminance.
     // Ambient/local lights alone must not brighten night or covered ground.
-    let daylight = clamp(dot(sun_share, LUMA) * 2.5, 0.0, 1.0) * visibility * smoothstep(0.0, 0.1, g.sun_dir.y);
+    let daylight = g.ambient_g.w * clamp(dot(sun_share, LUMA) * 2.5, 0.0, 1.0) * grass_direct_visibility * smoothstep(0.0, 0.1, g.sun_dir.y);
     let lit = smoothstep(0.2, 0.5, dot(light, LUMA)) * daylight * (1.0 - i.fog);
     let target_luma = mix(ground_luma, max(ground_luma, MEADOW_LUMA), lit);
     let body = hue * (target_luma / max(dot(hue, LUMA), 1e-3)) * i.mixes.w;

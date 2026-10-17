@@ -42,7 +42,7 @@ pub(super) fn source(shadows: bool, ao: bool, bloom: bool, hdr: bool) -> String 
     let names: Vec<String> = source.lines().filter_map(|line| line.strip_prefix("fn fs_").and_then(|rest| rest.split_once('(')).map(|(name, _)| format!("fs_{name}"))).collect();
     source = source.replace("@fragment\nfn fs_", "fn enhanced_original_fs_");
     source = source.replace(" -> @location(0) vec4<f32>", " -> vec4<f32>");
-    source.push_str(OUTPUT);
+    source.push_str(&crate::shader_source::load("enhanced_output.wgsl", OUTPUT));
     for name in names {
         let ambient = match name.as_str() {
             "fs_opaque" | "fs_fade_opaque" | "fs_fade_test" | "fs_test" | "fs_blend" => "enhanced_ao_receiver(i, beauty)",
@@ -72,6 +72,10 @@ pub(super) fn source(shadows: bool, ao: bool, bloom: bool, hdr: bool) -> String 
             _ if !hdr => "vec4<f32>(0.0)",
             "fs_opaque" | "fs_fade_opaque" | "fs_fade_test" | "fs_test" | "fs_blend" => "enhanced_sun(i, beauty, false)",
             "fs_ground_fused" | "fs_ground_base" | "fs_ground_simple" => "enhanced_sun(i, beauty, true)",
+            // ZERO/SRCCOLOR must extinguish only direct exposure under a roof;
+            // sky eligibility, native fog and coverage belong to the base pass.
+            "fs_ground_shadow" if shadows => "vec4<f32>(enhanced_sun_visibility, 1.0, 1.0, 1.0)",
+            "fs_ground_shadow" => "vec4<f32>(1.0)",
             _ => "vec4<f32>(0.0, 0.0, 0.0, beauty.a)",
         };
         source.push_str(&format!("\n@fragment fn {name}(i: VOut) -> EnhancedOutput {{\n{geometric_normal}    let envelope = vec4<f32>(1.0);\n    let emission_sample = {emission_sample};\n    let beauty = enhanced_original_{name}({fragment_input});\n    let bounded_beauty = clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0));\n    return EnhancedOutput(beauty, {ambient}, {emission_result}, {sun});\n}}\n"));
@@ -80,9 +84,12 @@ pub(super) fn source(shadows: bool, ao: bool, bloom: bool, hdr: bool) -> String 
     if shadows {
         append_shadow_receiver(&mut source, 0);
         if hdr {
-            // Remember the final cascade-blended visibility for the sun-mask output.
-            source = source.replace("fn sun_visibility(", "fn sun_visibility_raw(");
-            source.push_str("\nfn sun_visibility(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>) -> f32 { let v = sun_visibility_raw(world, normal, pixel); enhanced_sun_visibility = v; return v; }\n");
+            // HDR eligibility uses actual light visibility, not the artistic shade floor.
+            // Capture before the final mix: beauty retains its native Enhanced shadow strength.
+            source = source.replace(
+                "    return mix(1.0, visible, clamp(shadow_frame.forward.w, 0.0, 1.0));",
+                "    enhanced_sun_visibility = visible;\n    return mix(1.0, visible, clamp(shadow_frame.forward.w, 0.0, 1.0));",
+            );
         }
     } else {
         source.push_str("\nfn sun_visibility(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>) -> f32 { return 1.0; }\n");
@@ -145,80 +152,34 @@ pub(super) fn append_shadow_receiver(source: &mut String, binding_offset: u32) {
     source.push_str(&shader[shader.find("// Vogel (golden-angle) disk").expect("shadow receiver function")..]);
 }
 
-const OUTPUT: &str = r#"
-struct EnhancedOutput {
-    @location(0) beauty: vec4<f32>,
-    @location(1) ambient: vec4<f32>,
-    @location(2) emission: vec4<f32>,
-    @location(3) sun: vec4<f32>,
+/// Keep grass and world receivers on the same runtime-loaded AO budget.
+pub(super) fn append_ao_share(source: &mut String) {
+    let shader = crate::shader_source::load("enhanced_output.wgsl", OUTPUT);
+    let start = shader.find("const AO_SKY_BOOST").expect("AO sky budget");
+    let function = shader[start..].find("fn ao_share(").expect("AO share helper") + start;
+    let end = shader[function..].find("\n}").expect("AO share helper end") + function + 2;
+    source.push('\n');
+    source.push_str(&shader[start..end]);
+    source.push('\n');
 }
-// AO removes (receiver share) x (occlusion x AO_SKY_BOOST, <= 1) of the diffuse
-// colour. Sky-fill is fully eligible; only AO_SUN_CAP of the direct-sun share is,
-// so contact creases ground the sun-lit surface without cutting its light:
-// darkening only, never below the ambient-only look by more than that cap, and
-// bounded by the diffuse colour (no effect on fog, specular, emission or sky).
-// AO_SKY_BOOST must match SKY_BOOST in ambient_occlusion.wgsl.
-const AO_SKY_BOOST = 2.0;
-const AO_SUN_CAP = 0.25;
-fn ao_share(sky_fraction: vec3<f32>) -> vec3<f32> {
-    return sky_fraction + (vec3<f32>(1.0) - sky_fraction) * (AO_SUN_CAP / AO_SKY_BOOST);
-}
-// The receiving colour is evaluated after the native body: no new texture
-// samples or derivatives can occur after its cutout discard.
-fn enhanced_ao_receiver(i: VOut, beauty: vec4<f32>) -> vec4<f32> {
-    if native_unlit() || i.ao_info.x < 0.5 || i.effect != 0u || (u32(mat.native.z) & 16u) != 0u {
-        return vec4<f32>(0.0, 0.0, 0.0, beauty.a);
-    }
-    if mat.emissive.w > 0.5 && mat.emissive.w < 1.5 {
-        return vec4<f32>(0.0, 0.0, 0.0, beauty.a);
-    }
-    let fog = native_fog(i.fog);
-    let fog_colour = select(g.fog_g.rgb, to_g(mat.flags.yzw), mat.scroll.z > 1.5);
-    let diffuse = max(beauty.rgb - fog_colour * fog - max(i.spec, vec3<f32>(0.0)) * (1.0 - fog), vec3<f32>(0.0));
-    let indirect_fraction = clamp(g.ambient_g.rgb / max(i.light, vec3<f32>(0.001)), vec3<f32>(0.0), vec3<f32>(1.0));
-    let receiving_fraction = ao_share(indirect_fraction);
-    let baked = select(1.0, 0.2, mat.emissive.w > 1.5);
-    return vec4<f32>(min(clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), diffuse * receiving_fraction * baked), beauty.a);
-}
-fn enhanced_ground_receiver(i: VOut, beauty: vec4<f32>, multiplier: bool) -> vec4<f32> {
-    // The native two-pass ground shadow multiplies the previous receiving
-    // colour exactly as it multiplies the previous beauty colour.
-    if multiplier { return vec4<f32>(clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), beauty.a); }
-    let diffuse = max(beauty.rgb - g.fog_g.rgb * ground_fog(i), vec3<f32>(0.0));
-    // The baked terrain light has no sun/sky split here; i.light's ambient share stands in (over-estimating the sky share only darkens more, still <= diffuse).
-    let sky_fraction = clamp(g.ambient_g.rgb / max(i.light, vec3<f32>(0.001)), vec3<f32>(0.0), vec3<f32>(1.0));
-    return vec4<f32>(min(clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), diffuse * ao_share(sky_fraction)), beauty.a);
-}
-fn enhanced_emission(i: VOut, beauty: vec4<f32>) -> vec4<f32> {
-    // Liquid emission is native lighting authoring, not a bloom source.
-    // SourceColorOne and authored unlit materials use actual post-body beauty.
-    if (u32(mat.native.z) & 24u) != 0u || native_unlit() { return vec4<f32>(0.0); }
-    let t = sample_clamped(tex, i.uv + mat.scroll.xy * g.fog.z);
-    var emission = vec3<f32>(0.0);
-    if mat.emissive.w < 1.5 {
-        emission = t.rgb * i.tint * min(i.light, to_g(vec3<f32>(i.ao_info.w, i.sun_share.w, i.sun_spec_share.w)));
-    }
-    if mat.emissive.w > 0.5 && mat.emissive.w < 1.5 && (i.effect == 0u || i.effect == 3u || i.effect == 7u) {
-        emission = max(emission, t.rgb * i.tint * max(min(i.light + t.a, vec3<f32>(1.0)) - i.light, vec3<f32>(0.0)));
-    }
-    emission = min(beauty.rgb, emission * (1.0 - native_fog(i.fog)));
-    return vec4<f32>(emission, beauty.a);
-}
-var<private> enhanced_sun_visibility: f32 = 1.0;
-// Daylight sun weight for the HDR stage: the surface's own direct-sun share, after the shadow map and
-// the native fog ramp. Zero for unlit/glow/effect surfaces, so only receivers lit by the sun can brighten.
-fn enhanced_sun(i: VOut, beauty: vec4<f32>, ground: bool) -> vec4<f32> {
-    if !ground && (native_unlit() || i.effect != 0u || (u32(mat.native.z) & 16u) != 0u || (mat.emissive.w > 0.5 && mat.emissive.w < 1.5)) {
-        return vec4<f32>(0.0, 0.0, 0.0, beauty.a);
-    }
-    let fog = select(native_fog(i.fog), ground_fog(i), ground);
-    let share = dot(i.sun_share.xyz, vec3<f32>(0.2126, 0.7152, 0.0722));
-    return vec4<f32>(share * enhanced_sun_visibility * (1.0 - fog), share, enhanced_sun_visibility, beauty.a);
-}
-"#;
+
+const OUTPUT: &str = include_str!("enhanced_output.wgsl");
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn grass_ao_share_reuses_runtime_world_budget() {
+        let shader = crate::shader_source::load("enhanced_output.wgsl", super::OUTPUT);
+        let mut helper = String::new();
+        super::append_ao_share(&mut helper);
+        assert!(shader.contains(helper.trim()), "grass must use the runtime-loaded world AO definition verbatim");
+        assert!(helper.trim_start().starts_with("const AO_SKY_BOOST"));
+        assert!(helper.contains("const AO_SUN_CAP"));
+        assert!(helper.contains("fn ao_share("));
+        assert_eq!(helper.matches("fn ").count(), 1, "do not copy world-only receiver dependencies");
+        assert!(helper.trim_end().ends_with('}'));
+    }
+
     #[test]
     fn enhanced_preserves_native_entrypoints_and_separates_baked_light() {
         let source = super::source(false, true, true, false);
@@ -231,8 +192,15 @@ mod tests {
         // The receiver's sun cap assumes the composite's boost; the two constants must agree.
         let boost = |text: &str, name: &str| text.split(name).nth(1).and_then(|rest| rest.split(['=', ';']).nth(1)).map(str::trim).map(str::to_owned);
         assert_eq!(boost(super::OUTPUT, "const AO_SKY_BOOST"), boost(include_str!("ambient_occlusion.wgsl"), "const SKY_BOOST"));
-        assert_eq!(boost(super::OUTPUT, "const AO_SKY_BOOST").as_deref(), Some("2.0"));
-        assert!(super::OUTPUT.contains("const AO_SUN_CAP = 0.25;"), "sun share removal is capped at 25%");
+        assert_eq!(boost(super::OUTPUT, "const AO_SKY_BOOST").as_deref(), Some("1.25"));
+        assert!(super::OUTPUT.contains("const AO_SUN_CAP = 0.6;"), "sunlit creases retain a bounded 60% direct-diffuse budget");
+        let hdr = super::source(false, false, false, true);
+        let multiplier = hdr.split("@fragment fn fs_ground_shadow(").nth(1).unwrap().split("\n}").next().unwrap();
+        assert!(multiplier.contains(", vec4<f32>(1.0));"),
+            "without shadows, terrain multiplication preserves the base-pass daylight mask");
+        assert!(super::source(true, false, false, true).contains(
+            "enhanced_sun_visibility = visible;\n    return mix(1.0, visible, clamp(shadow_frame.forward.w, 0.0, 1.0));"),
+            "HDR uses raw visibility before beauty's artistic shadow floor");
         let ao_only = super::source(false, true, false, false);
         assert!(!ao_only.contains("sun_share:"));
         assert!(!ao_only.contains("sun_spec_share:"));
@@ -240,6 +208,156 @@ mod tests {
         let shadows_only = super::source(true, false, false, false);
         assert!(!shadows_only.contains("ao_info:"));
         assert!(!shadows_only.contains("fn enhanced_ao_receiver"));
+    }
+
+    #[test]
+    fn daylight_mask_preserves_fog_and_closes_custom_fog_and_roof_umbra_on_gpu() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let r = crate::Renderer::new(&instance, None).expect("daylight mask regression requires offscreen GPU");
+        let helper = &super::OUTPUT[super::OUTPUT.find("var<private> enhanced_sun_visibility").unwrap()..];
+        let meadow = include_str!("grass.wgsl").lines().find(|line| line.trim_start().starts_with("let daylight =")).unwrap();
+        let source = format!(r#"
+struct VOut {{ effect: u32, fog: f32, sun_share: vec4<f32>, color: vec4<f32> }}
+struct Material {{ scroll: vec4<f32>, native: vec4<f32>, emissive: vec4<f32> }}
+var<private> mat: Material;
+struct Globals {{ ambient_g: vec4<f32>, sun_dir: vec4<f32> }}
+var<private> g: Globals;
+var<private> grass_direct_visibility: f32;
+const LUMA: vec3<f32> = vec3<f32>(0.299, 0.587, 0.114);
+fn native_unlit() -> bool {{ return false; }}
+fn native_fog(f: f32) -> f32 {{ return f; }}
+fn ground_fog(i: VOut) -> f32 {{ return i.fog; }}
+{helper}
+@vertex fn vs(@builtin(vertex_index) n: u32) -> @builtin(position) vec4<f32> {{
+    return vec4<f32>(vec2<f32>(f32((n << 1u) & 2u), f32(n & 2u)) * 2.0 - 1.0, 0.0, 1.0);
+}}
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {{
+    if p.x >= 4.0 {{
+        g.ambient_g.w = select(0.0, 1.0, p.x >= 5.0);
+        g.sun_dir.y = 1.0;
+        grass_direct_visibility = select(1.0, 0.0, p.x >= 5.0 && p.x < 6.0);
+        let sun_share = vec3<f32>(1.0);
+        {meadow}
+        return vec4<f32>(vec3<f32>(daylight), 1.0);
+    }}
+    mat.scroll.z = select(0.0, 2.0, p.x >= 1.0 && p.x < 2.0);
+    enhanced_sun_visibility = select(1.0, 0.0, p.x >= 2.0);
+    let fog = select(0.5, 0.0, p.x >= 2.0);
+    let alpha = select(1.0, 0.0, p.x >= 3.0);
+    return enhanced_sun(VOut(0u, fog, vec4<f32>(1.0), vec4<f32>(1.0, 1.0, 1.0, alpha)), vec4<f32>(1.0), p.x >= 2.0);
+}}
+"#);
+        let shader = r.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("daylight fog mask regression"), source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let pipeline = r.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None, layout: None,
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState { format: r.format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                compilation_options: Default::default() }),
+            primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
+        });
+        let texture = r.device.create_texture(&wgpu::TextureDescriptor {
+            label: None, size: wgpu::Extent3d { width: 7, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: r.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let mut encoder = r.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view, resolve_target: None, depth_slice: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })], ..Default::default()
+            });
+            pass.set_pipeline(&pipeline);
+            pass.draw(0..3, 0..1);
+        }
+        r.queue.submit([encoder.finish()]);
+        let pixels = crate::texture_to_rgba(&r, &texture, 7, 1).unwrap();
+        assert_eq!(&pixels[..4], &[128, 0, 128, 255], "default-fog meshes retain native fog amount");
+        assert_eq!(&pixels[4..8], &[0, 0, 0, 255], "custom-fog receivers cannot gain daylight energy");
+        assert_eq!(&pixels[8..12], &[0, 0, 0, 255], "roof umbra has neither direct exposure nor sky fill");
+        assert_eq!(&pixels[12..16], &[0, 255, 0, 255], "open shade receives only independently proven sky fill");
+        assert_eq!(&pixels[16..20], &[0, 0, 0, 255], "bright moonlight cannot lift meadow albedo at authored night");
+        assert_eq!(&pixels[20..24], &[0, 0, 0, 255], "the retained shadow floor cannot lift roofed meadow albedo");
+        assert_eq!(&pixels[24..], &[255; 4], "actual direct daylight retains the meadow lift");
+    }
+
+    #[test]
+    fn ground_two_pass_roof_mask_multiplies_only_direct_exposure_on_gpu() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let r = crate::Renderer::new(&instance, None).expect("ground two-pass regression requires offscreen GPU");
+        for shadows in [true, false] {
+            let generated = super::source(shadows, false, false, true);
+            let wrapper = generated[generated.find("@fragment fn fs_ground_shadow(").unwrap()..]
+                .split("\n}").next().unwrap().replacen("@fragment ", "", 1);
+            // Exercise the generated wrapper with a fake roof receiver: beauty
+            // retains its artistic floor while raw direct visibility is zero.
+            let source = format!(r#"
+struct VOut {{ clip: vec4<f32>, n: vec3<f32>, wpos: vec3<f32> }}
+struct EnhancedOutput {{ beauty: vec4<f32>, ambient: vec4<f32>, emission: vec4<f32>, sun: vec4<f32> }}
+var<private> enhanced_sun_visibility: f32 = 1.0;
+fn enhanced_original_fs_ground_shadow(i: VOut) -> vec4<f32> {{
+    enhanced_sun_visibility = select(0.0, 1.0, i.clip.x >= 1.0);
+    return vec4<f32>(0.4, 0.4, 0.4, 1.0);
+}}
+{wrapper}
+}}
+@vertex fn vs(@builtin(vertex_index) n: u32) -> @builtin(position) vec4<f32> {{
+    return vec4<f32>(vec2<f32>(f32((n << 1u) & 2u), f32(n & 2u)) * 2.0 - 1.0, 0.0, 1.0);
+}}
+@fragment fn base() -> @location(0) vec4<f32> {{
+    return vec4<f32>(0.8, 0.6, 0.4, 1.0);
+}}
+@fragment fn multiply(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {{
+    return fs_ground_shadow(VOut(p, vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(p.xy, 0.0))).sun;
+}}
+"#);
+            let shader = r.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("ground two-pass roof mask regression"), source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            let pipeline = |entry, blend| r.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: None, layout: None,
+                vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+                fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(entry),
+                    targets: &[Some(wgpu::ColorTargetState { format: r.format, blend, write_mask: wgpu::ColorWrites::ALL })],
+                    compilation_options: Default::default() }),
+                primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
+            });
+            let base = pipeline("base", None);
+            // The native ground shadow pass uses ZERO/SRCCOLOR on every MRT.
+            let multiply = pipeline("multiply", Some(wgpu::BlendState {
+                color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::Src, operation: wgpu::BlendOperation::Add },
+                alpha: wgpu::BlendComponent::REPLACE,
+            }));
+            let texture = r.device.create_texture(&wgpu::TextureDescriptor {
+                label: None, size: wgpu::Extent3d { width: 2, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: r.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            let mut encoder = r.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view, resolve_target: None, depth_slice: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    })], ..Default::default()
+                });
+                pass.set_pipeline(&base);
+                pass.draw(0..3, 0..1);
+                pass.set_pipeline(&multiply);
+                pass.draw(0..3, 0..1);
+            }
+            r.queue.submit([encoder.finish()]);
+            let pixels = crate::texture_to_rgba(&r, &texture, 2, 1).unwrap();
+            assert_eq!(&pixels[..4], &[if shadows { 0 } else { 204 }, 153, 102, 255],
+                "roof shadow removes base direct exposure only; sky/fog/coverage survive, and HDR without shadows stays neutral");
+            assert_eq!(&pixels[4..], &[204, 153, 102, 255], "sunlit terrain preserves every base-mask channel");
+        }
     }
 
     #[test]

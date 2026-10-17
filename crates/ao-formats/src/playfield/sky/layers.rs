@@ -53,6 +53,7 @@ pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Sce
     scene.water_light=water_light(objs,&ctx);
     scene.ground_light = ground_light(objs, &ctx);
     scene.sun_authored = scene.ground_light.is_some();
+    scene.daylight = daylight(objs, &ctx);
     scene.moons = [None; 3];
     scene.directional_lights = horizon_lights(objs, &ctx);
     let mut b = Builder { store, names, ctx, objs, sky, scene, sorts };
@@ -166,6 +167,7 @@ pub(super) fn pose_source(objs: Vec<Obj>, hq_offset: [f32; 2]) -> impl FnMut(f32
         }
         snapshot.ground_light = ground_light(&objs, &current);
         snapshot.sun_authored = snapshot.ground_light.is_some();
+        snapshot.daylight = daylight(&objs, &current);
         for moon in snapshot.moons.iter_mut().flatten() {
             if let Some(instance) = snapshot.sky.get(moon.sky_instance) {
                 let center = std::array::from_fn(|k| instance.transform[3][k]
@@ -177,6 +179,12 @@ pub(super) fn pose_source(objs: Vec<Obj>, hq_offset: [f32; 2]) -> impl FnMut(f32
             env.sun_dir = scene(current.sun1.rotate(super::SUN_LOCAL));
         }
     }
+}
+
+fn daylight(objs: &[Obj], ctx: &Ctx) -> Option<f32> {
+    let game = objs.iter().find(|object| object.name == "GAME")?;
+    let value = script::eval_field(game, ctx, game.field("CurrentDayIntensity")?, 0)?;
+    value.is_finite().then(|| value.clamp(0.0, 1.0))
 }
 
 /// DS1005a3a9: quartic horizon fade, converted to a byte before the rim modulation.
@@ -798,6 +806,7 @@ mod tests {
             source(time, &mut snapshot);
             assert_eq!(snapshot.ground_light, Some((color, direction)));
             assert!(snapshot.sun_authored);
+            assert_eq!(snapshot.daylight, Some(color[0]), "native GAME.DayIntensity, not the environment's bright sun colour, gates daylight");
             assert_eq!(snapshot.environment.as_ref().unwrap().sun_color, [0.2, 0.3, 0.4]);
             let actual_sun = scene(ctx.sun1.rotate(super::super::SUN_LOCAL));
             assert_eq!(snapshot.environment.as_ref().unwrap().sun_dir, actual_sun);
@@ -805,6 +814,7 @@ mod tests {
         let unsupported = script::parse_objects("Object SunLight\n{\n Vector GroundLightCurrent: v(GAME.Unsupported,0,0)\n Quaternion GroundLightDirection: q(0,0,0,1)\n}\n");
         assert!(ground_light(&unsupported, &Ctx::at(0.0)).is_none());
         assert!(ground_light(&[], &Ctx::at(0.0)).is_none());
+        assert!(daylight(&[], &Ctx::at(0.0)).is_none(), "missing GAME authoring stays closed");
     }
 
     #[test]

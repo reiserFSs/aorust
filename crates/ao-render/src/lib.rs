@@ -491,6 +491,8 @@ struct GroundRun {
     composites: Vec<native_ground::Composite>,
     /// Which texels of each ground tile picture are green (Enhanced grass placement).
     green: grass::GreenMasks,
+    /// Collision-baked terrain sky openness per fine cell; never grass floor occupancy.
+    sky_open: Vec<Vec<f32>>,
 }
 
 type SkyMaterialKey = (Option<TextureKey>, Option<TextureKey>, bool, [u32; 32]);
@@ -1656,7 +1658,7 @@ impl Renderer {
                     entries: &[0, 1].map(|binding| wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(view) }),
                 }));
             }
-            GroundRun { detail: ao_scene::ground_detail::GroundDetail::new(scene.ground_detail.clone()), indices, draws, scratch: Vec::with_capacity(capacity), materials, has_shadow, texture_materials: ground_texture_materials.into_iter().map(|(mat,(key,u))| (mat,key,u)).collect(), composites, green: grass::green_masks(scene) }
+            GroundRun { detail: ao_scene::ground_detail::GroundDetail::new(scene.ground_detail.clone()), indices, draws, scratch: Vec::with_capacity(capacity), materials, has_shadow, texture_materials: ground_texture_materials.into_iter().map(|(mat,(key,u))| (mat,key,u)).collect(), composites, green: grass::green_masks(scene), sky_open: grass::baked_sky_open(scene) }
         });
     }
 
@@ -1799,6 +1801,7 @@ impl Renderer {
             environment: scene.environment,
             ground_light: scene.ground_light,
             sun_authored: scene.sun_authored,
+            daylight: scene.daylight,
             directional_lights: scene.directional_lights.clone(),
             meshes: scene.meshes.iter().map(|mesh| ao_scene::Mesh {
                 vertices: if mesh.submeshes.iter().any(|sub| sub.sun_flicker) { mesh.vertices.clone() } else { vec![] },
@@ -2125,7 +2128,7 @@ impl Renderer {
             dims: self.gpu.grid.1,
             wave: std::array::from_fn(|i| std::array::from_fn(|j| w[i * 4 + j])),
             sun_g: g4(env.sun_color, env.sun_specular),
-            ambient_g: g4(env.ambient, 0.0),
+            ambient_g: g4(env.ambient, grade::daylight_weight(self.sky.pose.daylight)),
             fog_g: g4(env.fog_color, 1.0),
             view: Mat4::look_to_rh(cam.pos, cam.forward(), cam.up()).to_cols_array_2d(),
             water_dir: v4(Vec3::from_array(water_dir).normalize_or_zero().to_array(), 0.0),
@@ -2205,7 +2208,7 @@ impl Renderer {
             self.grade = None;
             self.enhanced_frame = Some(enhanced::EnhancedFrame::new(&self.device, self.format, t.size, self.msaa_samples, self.enhanced_settings));
         }
-        self.prepare_enhanced_grade();
+        self.prepare_enhanced_grade(env.fog_color);
         self.prepare_enhanced_bloom();
         let encode_start = timed.then(std::time::Instant::now);
         let mut enc = self.device.create_command_encoder(&Default::default());

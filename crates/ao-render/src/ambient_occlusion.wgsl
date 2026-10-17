@@ -6,8 +6,8 @@ const DIRECTIONS = 6;
 const STEPS = 4;
 // Sky-fill share is darkened SKY_BOOST x harder than the raw occlusion; the
 // receiver weights the sun share by SUN_CAP / SKY_BOOST so at most SUN_CAP of it
-// is removed. Must match AO_SKY_BOOST / AO_SUN_CAP in enhanced_shader.rs.
-const SKY_BOOST = 2.0;
+// is removed. Must match AO_SKY_BOOST / AO_SUN_CAP in enhanced_output.wgsl.
+const SKY_BOOST = 1.25;
 // ao.frag uses 2; sparse jittered samples of a 1.75 m radius read weaker in the native dim lighting.
 const OCCLUSION_GAIN = 4.0;
 struct Params {
