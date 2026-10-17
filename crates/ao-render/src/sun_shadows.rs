@@ -5,7 +5,13 @@ use super::{GpuStatsExt, TextureViewStatsExt};
 pub(crate) const CASCADES: usize = 3;
 #[cfg(test)]
 pub(crate) const RESOLUTION: u32 = 1024;
-pub(crate) const SHADER: &str = concat!(include_str!("shader.wgsl"), "\n", include_str!("sun_shadows.wgsl"));
+fn shader_source() -> std::borrow::Cow<'static, str> {
+    if std::env::var_os("AOMAC_SHADER_DIR").is_none() {
+        return concat!(include_str!("shader.wgsl"), "\n", include_str!("sun_shadows.wgsl")).into();
+    }
+    format!("{}\n{}", crate::shader_source::load("shader.wgsl", include_str!("shader.wgsl")),
+        crate::shader_source::load("sun_shadows.wgsl", include_str!("sun_shadows.wgsl"))).into()
+}
 
 pub(crate) fn receiver_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -192,7 +198,7 @@ impl SunShadows {
         });
         let visibility_group = visibility_group(device, &visibility_layout, &primary_ids, &actor_visibility);
         let visibility_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("current-frame actor visibility reduction"), source: wgpu::ShaderSource::Wgsl(include_str!("shadow_visibility.wgsl").into()),
+            label: Some("current-frame actor visibility reduction"), source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("shadow_visibility.wgsl", include_str!("shadow_visibility.wgsl"))),
         });
         let visibility_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("current-frame actor visibility reduction"), bind_group_layouts: &[Some(&visibility_layout)], immediate_size: 0,
@@ -203,7 +209,7 @@ impl SunShadows {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("native current-frame shadow casters"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(shader_source()),
         });
         let caster_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sun caster layout"),

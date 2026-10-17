@@ -3,7 +3,7 @@
 pub(super) fn source(shadows: bool, ao: bool, bloom: bool, hdr: bool) -> String {
     // The HDR sun mask needs the per-vertex sun shares even when shadows are off.
     let sun_shares = shadows || hdr;
-    let mut source = include_str!("shader.wgsl").to_owned();
+    let mut source = crate::shader_source::load("shader.wgsl", include_str!("shader.wgsl")).into_owned();
     source = source.replace("    @location(12) env_uv: vec2<f32>,", "    @location(12) env_uv: vec2<f32>,\n    @location(13) ao_info: vec3<f32>,\n    @location(14) sun_share: vec3<f32>,\n    @location(15) sun_spec_share: vec3<f32>,");
     source = source.replace("    var o: VOut;", "    var o: VOut;\n    o.ao_info = vec3<f32>(0.0);\n    o.sun_share = vec3<f32>(0.0);\n    o.sun_spec_share = vec3<f32>(0.0);");
     source = source.replace("    o.dlight = l.dlight;", "    o.dlight = l.dlight;\n    o.ao_info = l.ao_info;\n    o.sun_share = select(l.sun_share, vec3<f32>(0.0), prelit);\n    o.sun_spec_share = select(l.sun_spec_share, vec3<f32>(0.0), prelit);");
@@ -128,7 +128,7 @@ pub(super) fn source(shadows: bool, ao: bool, bloom: bool, hdr: bool) -> String 
 
 /// Reuse the world receiver verbatim; grass packs it beside its cell buffers.
 pub(super) fn append_shadow_receiver(source: &mut String, binding_offset: u32) {
-    let shader = include_str!("sun_shadows.wgsl");
+    let shader = crate::shader_source::load("sun_shadows.wgsl", include_str!("sun_shadows.wgsl"));
     let declarations = shader.split("@group(3) @binding(3)").next().expect("shadow receiver declarations");
     for line in declarations.lines() {
         let mut line = line.to_owned();

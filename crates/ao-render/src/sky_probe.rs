@@ -54,7 +54,7 @@ impl Renderer {
         let instances = self.sky.bufs.get(self.frame).context("render a sky frame before probing")?;
         let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("actual sky pixel probe"),
-            source: wgpu::ShaderSource::Wgsl(format!("{}\n{FRAGMENT}", include_str!("shader.wgsl")).into()),
+            source: wgpu::ShaderSource::Wgsl(format!("{}\n{FRAGMENT}", crate::shader_source::load("shader.wgsl", include_str!("shader.wgsl"))).into()),
         });
         let vertex_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
         let instance_attrs = wgpu::vertex_attr_array![4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4];

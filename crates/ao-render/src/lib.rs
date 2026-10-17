@@ -26,6 +26,7 @@ mod enhanced_settings;
 pub use enhanced_settings::EnhancedSettings;
 mod enhanced;
 mod enhanced_shader;
+mod shader_source;
 mod ambient_occlusion;
 mod sky_probe;
 mod sun_shadows;
@@ -1052,7 +1053,7 @@ impl Renderer {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("shader.wgsl", include_str!("shader.wgsl"))),
         });
         let globals = device.create_buffer_tracked(&wgpu::BufferDescriptor {
             label: Some("globals"),

@@ -415,15 +415,30 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         writeln!(manifest, "actor_source=docs/captures/zone_ithaca.rec actor_id=25988 actor_name={:?} actor_pos={:?} actor_yaw={:?} actor_pose=idle actor_time=0", actor.name, actor.pos, actor.yaw())?;
         writeln!(manifest, "borealis_lightbar_fixture_override=Testy mount5 mesh26163 field0 byte0 pos[679.6,72.8,-482.7] yaw0 pose_idle_time0 native_mounted_lights=enabled")?;
         std::fs::write(out.join("manifest.txt"), &manifest)?;
+        // Weather and game day are fixed for this entire cache; preserve exact time bits.
+        let mut snapshots = std::collections::HashMap::new();
+        let mut scene_load_count = 0;
+        let mut scene_load_time = std::time::Duration::ZERO;
         for (name, pf, time, fixed) in views {
-            ao_scene::crt_srand(1);
-            let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
-            let grass_exposure = if settings.ground_grass && settings.grass_density > 0.0 {
-                Some(super::player::grass_exposure_surface(std::rc::Rc::new(std::cell::RefCell::new(
-                    ao_formats::playfield::collision::Collision::load(&store, pf)?))))
-            } else { None };
+            let (scene, grass_exposure) = match snapshots.entry((pf, time.to_bits())) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    // Every unique snapshot starts with the original loader's CRT seed.
+                    ao_scene::crt_srand(1);
+                    let started = std::time::Instant::now();
+                    let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
+                    scene_load_time += started.elapsed();
+                    scene_load_count += 1;
+                    let grass_exposure = if settings.ground_grass && settings.grass_density > 0.0 {
+                        Some(super::player::grass_exposure_surface(std::rc::Rc::new(std::cell::RefCell::new(
+                            ao_formats::playfield::collision::Collision::load(&store, pf)?))))
+                    } else { None };
+                    entry.insert((scene, grass_exposure))
+                }
+            };
             let capture = |measure: bool| -> anyhow::Result<(Vec<u8>, Lens, usize, usize)> {
-                // Both renderers consume the exact same immutable snapshot, as effect comparisons do.
+                // Fresh renderers and the original per-capture CRT reset remain independent.
+                // Both consume clones of the same immutable snapshot, including across views.
                 ao_scene::crt_srand(1);
                 let mut lens = camera::lens(scene.lens.unwrap_or_default(), false);
                 lens.far = Some(camera::far_plane(camera::VIEW_DISTANCE));
@@ -510,6 +525,9 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
             }
             eprintln!("{name}: {} bytes, independent repeat identical", raw.len());
         }
+        let scene_load_ms = scene_load_time.as_secs_f64() * 1000.0;
+        writeln!(manifest, "scene_load_count={scene_load_count}\nscene_load_ms={scene_load_ms:.3}")?;
+        eprintln!("scene_load_count={scene_load_count} scene_load_ms={scene_load_ms:.3}");
         writeln!(manifest, "status=pass")?;
         std::fs::write(out.join("manifest.txt"), manifest)?;
         Ok(())
@@ -583,6 +601,22 @@ fn graphics_fixture_views(actor: &ao_net::n3::dynel::SimpleCharFullUpdate) -> Ve
     views.push(("borealis-lightbar-night-close".into(), 800, 0.0,
         Camera::look_at([679.6, 74.0, -480.2].into(), [679.6, 74.0, -482.7].into())));
     views
+}
+
+#[test]
+fn graphics_fixture_snapshot_keys_share_only_matching_playfield_and_time() -> anyhow::Result<()> {
+    let views = graphics_fixture_views(&graphics_fixture_actor()?);
+    let mut keys = std::collections::HashMap::<_, usize>::new();
+    for (_, pf, time, _) in &views {
+        *keys.entry((*pf, time.to_bits())).or_default() += 1;
+    }
+    assert_eq!(views.len(), 14);
+    assert_eq!(keys.len(), 6);
+    assert_eq!(keys[&(4582, 2648.69_f32.to_bits())], 3);
+    assert_eq!(keys[&(800, 0.0_f32.to_bits())], 4);
+    assert_eq!(keys[&(800, 3240.0_f32.to_bits())], 2);
+    assert_eq!(keys[&(127, 3240.0_f32.to_bits())], 1);
+    Ok(())
 }
 
 fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::EnhancedSettings> {

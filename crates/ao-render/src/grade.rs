@@ -18,7 +18,7 @@ pub(super) struct Grade {
 impl Grade {
     /// `source_layout` is the Enhanced single-texture boundary layout; `sun` is the world pass's sun mask.
     pub fn new(device: &wgpu::Device, output: wgpu::TextureFormat, size: (u32, u32), source_layout: &wgpu::BindGroupLayout, sun: &wgpu::TextureView) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Enhanced HDR grade"), source: wgpu::ShaderSource::Wgsl([crate::bloom::GLARE, include_str!("grade.wgsl")].concat().into()) });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Enhanced HDR grade"), source: wgpu::ShaderSource::Wgsl([crate::bloom::glare().as_ref(), crate::shader_source::load("grade.wgsl", include_str!("grade.wgsl")).as_ref()].concat().into()) });
         let aux_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("Enhanced grade inputs"), entries: &[
             wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },

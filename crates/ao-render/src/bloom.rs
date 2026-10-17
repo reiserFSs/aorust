@@ -43,8 +43,10 @@ fn sizes(mut size: (u32, u32)) -> Vec<(u32, u32)> {
 }
 /// Size of the final (half-resolution) halo level; the HDR grade owns a texture of this size.
 pub(super) fn halo_size(size: (u32, u32)) -> (u32, u32) { sizes(size)[0] }
-/// The bloom WGSL with its shared glare helpers.
-pub(super) const GLARE: &str = include_str!("bloom_glare.wgsl");
+/// Shared glare helpers used by bloom and HDR presentation.
+pub(super) fn glare() -> std::borrow::Cow<'static, str> {
+    crate::shader_source::load("bloom_glare.wgsl", include_str!("bloom_glare.wgsl"))
+}
 impl Pass {
     fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout,
         inputs: [&wgpu::TextureView; 3], params: &wgpu::Buffer, target: wgpu::TextureView) -> Self {
@@ -74,7 +76,7 @@ impl Bloom {
     /// UNORM-range composite is built and exposed through `present`.
     pub fn new(device: &wgpu::Device, size: (u32, u32), beauty: &wgpu::TextureView,
         emission: &wgpu::TextureView, presentation: &wgpu::BindGroupLayout, halo: Option<&wgpu::TextureView>) -> Self {
-        let source = [GLARE, include_str!("bloom.wgsl")].concat();
+        let source = [glare().as_ref(), crate::shader_source::load("bloom.wgsl", include_str!("bloom.wgsl")).as_ref()].concat();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Visible-source bounded bloom"), source: wgpu::ShaderSource::Wgsl(source.into()) });
         let entries = std::array::from_fn::<_, 4, _>(|i| wgpu::BindGroupLayoutEntry {
             binding: i as u32, visibility: wgpu::ShaderStages::FRAGMENT,

@@ -48,7 +48,7 @@ impl ScreenPass {
             wgpu::BindGroupLayoutEntry {binding:0,visibility:wgpu::ShaderStages::VERTEX_FRAGMENT,ty:wgpu::BindingType::Buffer {ty:wgpu::BufferBindingType::Uniform,has_dynamic_offset:false,min_binding_size:None},count:None},
             wgpu::BindGroupLayoutEntry {binding:1,visibility:wgpu::ShaderStages::FRAGMENT,ty:wgpu::BindingType::Texture {sample_type:wgpu::TextureSampleType::Float {filterable:true},view_dimension:wgpu::TextureViewDimension::D2,multisampled:false},count:None},
             wgpu::BindGroupLayoutEntry {binding:2,visibility:wgpu::ShaderStages::FRAGMENT,ty:wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),count:None}]});
-        let shader=device.create_shader_module(wgpu::ShaderModuleDescriptor {label:None,source:wgpu::ShaderSource::Wgsl(include_str!("screen.wgsl").into())});
+        let shader=device.create_shader_module(wgpu::ShaderModuleDescriptor {label:None,source:wgpu::ShaderSource::Wgsl(crate::shader_source::load("screen.wgsl", include_str!("screen.wgsl")))});
         let sampler=device.create_sampler_tracked(&wgpu::SamplerDescriptor {address_mode_u:wgpu::AddressMode::Repeat,address_mode_v:wgpu::AddressMode::Repeat,mag_filter:wgpu::FilterMode::Linear,min_filter:wgpu::FilterMode::Linear,mipmap_filter:wgpu::MipmapFilterMode::Linear,..Default::default()});
         let white=ao_scene::Texture { source: Default::default(), width:1,height:1,rgba:vec![255;4] };
         let mut textures=HashMap::new();textures.insert(None,upload(device,queue,&white,Default::default()));
@@ -107,7 +107,7 @@ fn upload(device:&wgpu::Device,queue:&wgpu::Queue,image:&ao_scene::Texture,polic
 pub(super) fn depth_clear_pipeline(device:&wgpu::Device,format:wgpu::TextureFormat,samples:u32,settings:crate::EnhancedSettings)->wgpu::RenderPipeline {
     let shader=device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label:Some("native viewport depth clear"),
-        source:wgpu::ShaderSource::Wgsl(include_str!("depth_clear.wgsl").into()),
+        source:wgpu::ShaderSource::Wgsl(crate::shader_source::load("depth_clear.wgsl", include_str!("depth_clear.wgsl"))),
     });
     let layout=device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label:Some("native viewport depth clear"),bind_group_layouts:&[],immediate_size:0,

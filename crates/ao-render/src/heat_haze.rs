@@ -136,7 +136,7 @@ impl Gpu {
             wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
         ] });
         let sampler = device.create_sampler_tracked(&wgpu::SamplerDescriptor { label: Some("native heat haze linear clamp"), address_mode_u: wgpu::AddressMode::ClampToEdge, address_mode_v: wgpu::AddressMode::ClampToEdge, min_filter: wgpu::FilterMode::Linear, mag_filter: wgpu::FilterMode::Linear, ..Default::default() });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("native heat haze"), source: wgpu::ShaderSource::Wgsl(include_str!("heat_haze.wgsl").into()) });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("native heat haze"), source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("heat_haze.wgsl", include_str!("heat_haze.wgsl"))) });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
         let attributes = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {

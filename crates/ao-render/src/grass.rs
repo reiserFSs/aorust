@@ -359,7 +359,7 @@ fn hash(mut value: u32) -> u32 { value ^= value >> 16; value = value.wrapping_mu
 fn cell_seed(x: u32, z: u32, tile: u16) -> u32 { hash(hash(x) ^ hash(z.rotate_left(16)) ^ u32::from(tile)) }
 
 fn shader_source(channels: (bool, bool, bool), shadows: bool) -> String {
-    let grass = include_str!("grass.wgsl")
+    let grass = crate::shader_source::load("grass.wgsl", include_str!("grass.wgsl"))
         .replace("//__AMBIENT_FIELD__", if channels.0 { "@location(1) ambient: vec4<f32>," } else { "" })
         .replace("//__EMISSIVE_FIELD__", if channels.1 { "@location(2) emissive: vec4<f32>," } else { "" })
         .replace("//__SUN_FIELD__", if channels.2 { "@location(3) sun: vec4<f32>," } else { "" })
@@ -371,10 +371,10 @@ fn shader_source(channels: (bool, bool, bool), shadows: bool) -> String {
         .replace("//__EMISSIVE_WRITE__", if channels.1 { "output.emissive = vec4<f32>(0.0);" } else { "" })
         // The HDR present's sun mask, as the ground writes it: the sun's surviving share, its visibility, and fog.
         .replace("//__SUN_WRITE__", if channels.2 { "let sun_luma = dot(sun_share, LUMA);\n    output.sun = vec4<f32>(sun_luma * visibility * (1.0 - fog), sun_luma, visibility, 1.0);" } else { "" });
-    let mut source = format!("{}\nconst GRASS_MAX_CELLS: u32 = {MAX_CELLS}u;\n{grass}", include_str!("shader.wgsl"));
+    let mut source = format!("{}\nconst GRASS_MAX_CELLS: u32 = {MAX_CELLS}u;\n{grass}", crate::shader_source::load("shader.wgsl", include_str!("shader.wgsl")));
     if shadows {
         crate::enhanced_shader::append_shadow_receiver(&mut source, 2);
-        source.push_str(include_str!("grass_shadow.wgsl"));
+        source.push_str(&crate::shader_source::load("grass_shadow.wgsl", include_str!("grass_shadow.wgsl")));
     }
     source
 }

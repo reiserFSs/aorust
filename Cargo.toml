@@ -29,3 +29,11 @@ debug = "line-tables-only"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Local graphics iteration and harnesses; shipping release stays unchanged.
+[profile.fast]
+inherits = "release"
+lto = false
+incremental = true
+codegen-units = 256
+opt-level = 2

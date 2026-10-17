@@ -92,7 +92,7 @@ shown again, not recreated), and the `SlotLoginReply` routing: `LoginError` → 
 `AOMAC_PREFS_DIR` redirects the prefs directory and must be absolute. Empty overrides are treated as unset and use an absolute `HOME` plus `Library/Application Support/aomac`; missing/empty or relative bases emit an error and disable persistence rather than writing into cwd. The live harness uses its thread-private scratch directory when the override is unset or empty, and rejects invalid explicit overrides. Both skip without the client.
 Tests use `play::prefs::test_dir()` for a stable, thread-private scratch directory, unique across test processes and removed when the test thread exits; `set_test_dir` keeps the preference override thread-local. Social/LFT save-and-reopen tests must never share or clear another test's directory.
 
-`AOMAC_SHOT_DIR=<dir> cargo test --release -p aomac shots -- --nocapture` renders login, character select, the delete dialog and every
+`AOMAC_SHOT_DIR=<dir> cargo test --profile fast -p aomac shots -j 2 -- --nocapture` renders login, character select, the delete dialog and every
 creation scene (real mouse/keyboard input at window coordinates: breed pick, head/height/build, profession, name, close → exit dialog)
 offscreen through `ao_render::Offscreen` (same frame sequence as the windowed app) into PNGs. No window or unlocked session needed.
 
@@ -474,6 +474,53 @@ Same-account concurrent-character support was checked against the public PRK iss
 
 Executed headless verification: `RUST_TEST_THREADS=2 cargo test --release --workspace -j 2` passed **1978**, with **62 ignored**, and workspace/all-targets strict clippy passed. These full gates ran **before** the subsequent additive upstream rebase (Reload and organisation decoder branches, plus appended documentation sections). After resolving that rebase, focused `ao-net` tests passed **229** and `aomac` tests passed **1181**, with **53 ignored**. This includes social/economy synthetic and recorded-capture regressions; it is not new PRK acceptance or a retail-window visual comparison.
 
+## Fast development builds and shader iteration
+
+Use `--profile fast` for local tests, fixtures and the live harness. It inherits
+release with optimization level 2, no LTO, 256 codegen units and incremental Rust
+compilation. `--release` remains the unchanged shipping/gating profile (thin LTO,
+one codegen unit); do not compare performance measurements across profiles.
+
+```sh
+# Install once. Every agent uses the same on-disk sccache but its own Cargo target.
+brew install sccache
+export RUSTC_WRAPPER=sccache
+export CARGO_TARGET_DIR=/tmp/MyAgent/target
+cargo test --profile fast --workspace -j 2
+cargo test --profile fast -p aomac live_walk -j 2 -- --ignored --nocapture
+# Optional windowed development, subject to the live/window lock:
+cargo run --profile fast -p aomac -j 2 -- play
+sccache --show-stats
+```
+
+The default sccache location is `~/Library/Caches/Mozilla.sccache`, shared across
+worktrees and parallel agents. Do not share Cargo target directories: their build
+lock serializes agents, and each agent's incremental workspace state is private.
+sccache reuses eligible dependency compilations; incremental Rust compilations,
+linking and native build-script work are not guaranteed cache hits. Keep the same
+toolchain, profile and compiler flags to reuse entries.
+
+For shader-only iteration, build the fixture test once, then set
+`AOMAC_SHADER_DIR` to the **absolute** `crates/ao-render/src` directory in your
+worktree. Each new renderer reads its shader sources from that directory instead
+of the embedded strings. Edit WGSL, then rerun the already-built test executable
+directly: running Cargo would still notice the embedded source changed and rebuild.
+The override directory must contain every source used by that run; missing or
+unreadable files fail loudly rather than silently falling back. Unset the variable
+for shipping/default embedded behavior. This is reload-on-renderer-creation, not
+live pipeline replacement in an existing window.
+
+```sh
+cargo test --profile fast -p aomac graphics_offline_fixture -j 2 --no-run
+# Cargo prints the test executable path; use that exact path, not a wildcard.
+AOMAC_SHADER_DIR="$PWD/crates/ao-render/src" \
+AOMAC_GFX_OUT="$HOME/aomac-handoff/gfx/shader-iteration-unique" \
+AOMAC_GFX_VIEW=borealis-foliage-sun-high AOMAC_GFX_SETTINGS=all \
+AOMAC_GFX_PNG_ONLY=1 \
+  /absolute/path/printed/by/cargo/aomac-<hash> \
+  graphics_offline_fixture --ignored --nocapture --test-threads=1
+```
+
 ## Deterministic offline graphics fixture
 
 Run the ignored `graphics_offline_fixture` test with installed client assets, no
@@ -482,7 +529,7 @@ server or window:
 ```sh
 AOMAC_GFX_OUT="$HOME/aomac-handoff/gfx/my-new-run" \
 AOMAC_GFX_SETTINGS=faithful \
-cargo test --release -p aomac graphics_offline_fixture -j 2 -- \
+cargo test --profile fast -p aomac graphics_offline_fixture -j 2 -- \
   --ignored --nocapture --test-threads=1
 ```
 `AOMAC_GFX_SETTINGS` accepts `faithful` (default, all switches off), `neutral`
@@ -491,7 +538,13 @@ or `all`. Each effect profile uses its explicit default knobs; the manifest reco
 the full settings value. Selecting a profile does not change the captured world,
 camera, clock, actor equipment or lights.
 
-
+`AOMAC_GFX_VIEW=<exact-name>` filters before scene loading and rendering; this
+existing filter renders only that view (including its two independent repeats).
+Within one process, views share immutable scene/collision snapshots keyed by exact
+playfield and time bits, with the fixture's fixed clear weather/day. The current
+14-view matrix loads six snapshots instead of fourteen; renderers, uploads and
+independent-repeat checks remain separate. `scene_load_count` and `scene_load_ms`
+in the manifest report loader work (collision loading is not included in the time).
 The destination must not exist. The fixed matrix covers ICC 4582 landmark and
 platform views at its authored frozen time 2648.69; Borealis 800 street and foliage
 with high/low sun and at night; a captured ICC actor at idle time zero; and a
@@ -521,7 +574,7 @@ RGBA files, select the view explicitly:
 AOMAC_GFX_OUT="$HOME/aomac-handoff/gfx/lightbar-night-close-bloom" \
 AOMAC_GFX_SETTINGS=bloom AOMAC_GFX_VIEW=borealis-lightbar-night-close \
 AOMAC_GFX_PNG_ONLY=1 \
-cargo test --release -p aomac graphics_offline_fixture -j 2 -- \
+cargo test --profile fast -p aomac graphics_offline_fixture -j 2 -- \
   --ignored --nocapture --test-threads=1
 ```
 
@@ -546,7 +599,7 @@ or window):
 
 ```sh
 AOMAC_GFX_OUT="$HOME/aomac-handoff/gfx/enhanced-cpu-before" \
-cargo test --release -p aomac graphics_enhanced_cpu_timing -j 2 -- \
+cargo test --profile fast -p aomac graphics_enhanced_cpu_timing -j 2 -- \
   --ignored --nocapture --test-threads=1
 ```
 

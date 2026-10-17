@@ -42,7 +42,7 @@ impl AmbientOcclusion {
                 texture(3, wgpu::TextureSampleType::Float { filterable: false }),
             ],
         });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("diffuse-contact HBAO-lite"), source: wgpu::ShaderSource::Wgsl(include_str!("ambient_occlusion.wgsl").into()) });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("diffuse-contact HBAO-lite"), source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("ambient_occlusion.wgsl", include_str!("ambient_occlusion.wgsl"))) });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("ambient AO"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
         let make_pipeline = |entry, format, blend| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(entry), layout: Some(&pipeline_layout),

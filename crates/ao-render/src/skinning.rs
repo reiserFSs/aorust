@@ -33,12 +33,12 @@ impl Renderer {
                 // SAFETY: fixed native layouts match the four bindings above. Model upload checks attribute
                 // count against mesh 0; set_actors checks every active bone index against nonempty palettes.
                 unsafe { self.device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
-                    label: Some("precise native CAT Metal"), msl: Some(include_str!("skinning.metal").into()),
+                    label: Some("precise native CAT Metal"), msl: Some(crate::shader_source::load("skinning.metal", include_str!("skinning.metal"))),
                     num_workgroups: (64, 1, 1), ..Default::default()
                 }) }
             } else {
                 self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("native CAT scalar skin"), source: wgpu::ShaderSource::Wgsl(include_str!("skinning.wgsl").into()),
+                    label: Some("native CAT scalar skin"), source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("skinning.wgsl", include_str!("skinning.wgsl"))),
                 })
             };
             let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
