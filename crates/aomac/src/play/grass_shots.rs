@@ -125,12 +125,12 @@ fn run_temporal(out: &std::path::Path) -> anyhow::Result<()> {
             }
             let captures: [Vec<u8>; 2] = captures.try_into().map_err(|_| anyhow::anyhow!("missing temporal pair"))?;
             let column = match frame { 0 => Some(0), 60 => Some(1), 119 => Some(2), _ => None };
-            for pixel in 0..roi.len() {
+            for (pixel, eligible) in roi.iter_mut().enumerate() {
                 let i = pixel * 4;
                 let off = &captures[0][i..i + 3];
                 let green = off[1] as f32 > 1.1 * off[0] as f32 && off[1] as f32 > 1.1 * off[2] as f32;
                 let blade = (0..3).any(|c| captures[1][i + c].abs_diff(off[c]) > 8);
-                roi[pixel] |= pixel / size.0 as usize >= size.1 as usize / 3 && green && blade;
+                *eligible |= pixel / size.0 as usize >= size.1 as usize / 3 && green && blade;
             }
             if let Some(column) = column {
                 for (variant, raw) in captures.iter().enumerate() {
@@ -189,10 +189,8 @@ fn run_temporal(out: &std::path::Path) -> anyhow::Result<()> {
         if !baseline && eligible < 1000 { failures.push(format!("{name}: only {eligible} blade-bearing ROI pixels")); }
         let oscillation_fraction = oscillation_total[2] as f64 / oscillation_total[3].max(1) as f64;
         let (reversal_fraction, reversal_rms) = temporal_opportunity_metrics(oscillation_total, opportunities_total);
-        if !baseline && matches!(name, "static-wind-on" | "micro-camera") {
-            if reversal_fraction > 0.01 || reversal_rms > 1.0 {
-                failures.push(format!("{name}: reversal opportunity fraction={reversal_fraction} (bound0.01), RMS={reversal_rms} codes (bound1.0)"));
-            }
+        if !baseline && matches!(name, "static-wind-on" | "micro-camera") && (reversal_fraction > 0.01 || reversal_rms > 1.0) {
+            failures.push(format!("{name}: reversal opportunity fraction={reversal_fraction} (bound0.01), RMS={reversal_rms} codes (bound1.0)"));
         }
         let mut csv = String::from("frame,renderer_dt,wind_x,wind_y,wind_z,camera_x,camera_y,camera_z,roi_pixels,off_rgb_abs_sum,on_rgb_abs_sum,grass_residual_rgb_abs_sum,off_rgb_abs_mean,on_rgb_abs_mean,grass_residual_rgb_abs_mean,off_pixels_gt40,on_pixels_gt40,grass_residual_pixels_gt40,off_gpu_ms,on_gpu_ms,active_channel_pairs,channel_reversals,weighted_reversal_energy,total_delta_pair_energy,weighted_reversal_energy_fraction,channel_opportunities,reversal_opportunity_fraction,reversal_rms_codes\n");
         let mut timings = [Vec::with_capacity(FRAMES), Vec::with_capacity(FRAMES)];
