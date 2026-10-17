@@ -482,23 +482,41 @@ compilation. `--release` remains the unchanged shipping/gating profile (thin LTO
 one codegen unit); do not compare performance measurements across profiles.
 
 ```sh
-# Install once. Every agent uses the same on-disk sccache but its own Cargo target.
-brew install sccache
-export RUSTC_WRAPPER=sccache
+# Seed a new private target (macOS/APFS; destination must not exist).
+scripts/seed-fast-target.sh /tmp/MyAgent/target
 export CARGO_TARGET_DIR=/tmp/MyAgent/target
 cargo test --profile fast --workspace -j 2
 cargo test --profile fast -p aomac live_walk -j 2 -- --ignored --nocapture
 # Optional windowed development, subject to the live/window lock:
 cargo run --profile fast -p aomac -j 2 -- play
-sccache --show-stats
+# Final shipping gates still use --release, not --profile fast.
 ```
 
-The default sccache location is `~/Library/Caches/Mozilla.sccache`, shared across
-worktrees and parallel agents. Do not share Cargo target directories: their build
-lock serializes agents, and each agent's incremental workspace state is private.
-sccache reuses eligible dependency compilations; incremental Rust compilations,
-linking and native build-script work are not guaranteed cache hits. Keep the same
-toolchain, profile and compiler flags to reuse entries.
+The warm reference lives at `~/aomac-cache/target-fast` (override with
+`AOMAC_FAST_TARGET_CACHE`). Refresh it from a clean worktree of current main,
+using the same Rust toolchain and flags as the agents:
+
+```sh
+# Only the reference maintainer runs this; never build agents' changes here.
+CARGO_TARGET_DIR="$HOME/aomac-cache/target-fast" \
+  cargo build --profile fast -p aomac -j 2
+```
+
+Do not refresh the reference while another process is seeding it. The seed script
+uses `cp -c -p -R` to APFS-clone the complete target, preserving Cargo fingerprints
+and timestamps. Each agent then builds only in its private copy; writes are
+copy-on-write, with no common Cargo lock or shared mutation. Dependencies are reused
+when fingerprints match; changed workspace paths/revisions and native build-script
+outputs can still need rebuilding. Existing targets are never overwritten.
+Refresh is optional when main changes; Cargo rebuilds invalidated artifacts normally.
+Use `cargo test --profile fast -p aomac --no-run -j 2` in the reference maintenance
+step as well if sharing warm test artifacts is useful.
+
+sccache 0.18.0 was also measured: its Rust key includes the working directory,
+so two fresh worktrees had **zero Rust cache hits**, despite sharing the default
+disk cache. C/C++ cache hits worked. It is not the dependency-reuse mechanism for
+this workflow. Do not use a shared live `CARGO_TARGET_DIR`: parallel revisions
+would serialize on Cargo's build lock and invalidate one another's artifacts.
 
 For shader-only iteration, build the fixture test once, then set
 `AOMAC_SHADER_DIR` to the **absolute** `crates/ao-render/src` directory in your
