@@ -181,6 +181,7 @@ mod tests {
             }).collect();
             // Capture the identical first frame before any timing work or counter advancement.
             for (index, r) in renderers.iter_mut().enumerate() {
+                ao_scene::crt_srand(1);
                 r.render(&outputs[index].1, &outputs[index].2, &camera);
             }
             let mut pixels = Vec::with_capacity(2);
@@ -220,6 +221,7 @@ mod tests {
                 for index in if pair % 2 == 0 { [0, 1] } else { [1, 0] } {
                     let r = &mut renderers[index];
                     let (_, view, targets) = &outputs[index];
+                    ao_scene::crt_srand(1);
                     let start = Instant::now();
                     r.render(view, targets, &camera);
                     let cpu_ms = start.elapsed().as_secs_f64() * 1000.0;
