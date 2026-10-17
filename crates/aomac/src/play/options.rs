@@ -167,6 +167,7 @@ pub(super) struct HudOptions {
     texts: TextDb,
     template: Option<Config>,
     screen: (u32, u32),
+    screen_changed: bool,
     win: Option<Win>,
     closed: bool,
     actions: Vec<Action>,
@@ -184,18 +185,17 @@ fn borders(b: &str) -> String {
 /// The view XML of a page (`ScrollView` of `Root.xml`); `n` numbers the controls over all pages. Controls follow the structure of `OptionCheckBox_c`
 /// (`FUN_100c1be9`), `OptionSlider_c` (`FUN_100c0aa9`: `[label, spacer, value text]` above the slider) and `OptionRadioButtonGroup_c` (`FUN_100c2fd5`: label above the
 /// group, group borders (10, 3, 0, 0)).
-fn page_xml(page: &Page, idx: usize, n: &mut usize, text_width: Option<i32>) -> String {
-    fn item(it: &Item, n: &mut usize, out: &mut String, text_width: Option<i32>) {
+fn page_xml(page: &Page, idx: usize, n: &mut usize) -> String {
+    fn item(it: &Item, n: &mut usize, out: &mut String) {
         match it {
             Item::Text { value, borders: b } => {
-                let wrap = text_width.map_or(String::new(), |w| format!(" feature_flags=\"TVF_MULTILINE|TVF_WORD_WRAP\" min_size=\"Point({w},-1)\" max_size=\"Point({w},-1)\""));
-                *out += &format!("<TextView value=\"{}\"{}{wrap}/>", esc(value), borders(b));
+                *out += &format!("<TextView value=\"{}\"{}/>", esc(value), borders(b));
             }
             Item::Spacer { min, max } => *out += &format!("<VLayoutSpacer min_size=\"{min}\" max_size=\"{max}\"/>"),
             Item::Group { borders: b, items } => {
                 *out += &format!("<View{}>", borders(b));
                 for i in items {
-                    item(i, n, out, text_width);
+                    item(i, n, out);
                 }
                 *out += "</View>";
             }
@@ -225,14 +225,19 @@ fn page_xml(page: &Page, idx: usize, n: &mut usize, text_width: Option<i32>) -> 
             }
         }
     }
-    let mut s = format!("<ScrollView name=\"pg{idx}\" label=\"{}\" v_scrollbar_mode=\"auto\" max_size=\"Point(16000,-1)\"><ScrollViewChild><View h_alignment=\"left\" view_layout=\"vertical\" max_size=\"Point(16000,-1)\" layout_borders=\"Rect(0,0,10,0)\">", esc(&page.label));
+    let enhanced = page.label == "Enhanced";
+    let mut s = if enhanced { "<View view_layout=\"vertical\">".to_string() } else { String::new() };
+    // Reserve the scrollbar width in the Enhanced minimum, not just after the viewport shrinks.
+    let (mode, height) = if enhanced { ("auto_reserve", 16000) } else { ("auto", -1) };
+    s += &format!("<ScrollView name=\"pg{idx}\" label=\"{}\" v_scrollbar_mode=\"{mode}\" max_size=\"Point(16000,{height})\"><ScrollViewChild><View h_alignment=\"left\" view_layout=\"vertical\" max_size=\"Point(16000,-1)\" layout_borders=\"Rect(0,0,10,0)\">", esc(&page.label));
     for it in &page.items {
-        item(it, n, &mut s, text_width);
+        item(it, n, &mut s);
     }
-    if page.label == "Enhanced" {
-        s += "<Button name=\"restore_original_graphics\" label=\"Restore Original\" tooltip=\"Disable sun shadows, ambient occlusion, emissive bloom and ground grass; other preferences are unchanged.\"/>";
+    s += "</View></ScrollViewChild></ScrollView>";
+    if enhanced {
+        s += "<View view_layout=\"horizontal\" layout_borders=\"Rect(0,5,10,0)\"><Button name=\"restore_original_graphics\" label=\"Restore Original\" tooltip=\"Disable sun shadows, ambient occlusion, emissive bloom and ground grass; other preferences are unchanged.\"/><HLayoutSpacer/></View></View>";
     }
-    s + "</View></ScrollViewChild></ScrollView>"
+    s
 }
 
 /// aomac-only controls, separate from the retail inventory. All effects default off;
@@ -296,7 +301,6 @@ fn enhanced_page() -> Page {
     Page {
         label: "Enhanced".to_string(),
         items: vec![
-            Item::Text { value: "aomac-only additions: none of these exist in the original client. Every default matches retail exactly.".to_string(), borders: String::new() },
             Item::Opt(check("AomacSunShadows", "Sun Shadows")),
             Item::Opt(opt("AomacShadowMapSize", "Shadow Map Size", &[("256", 256), ("512", 512), ("1024", 1024), ("2048", 2048), ("4096", 4096)])),
             Item::Opt(check("AomacAmbientOcclusion", "Ambient Occlusion")),
@@ -336,10 +340,11 @@ impl HudOptions {
         let texts = TextDb::load(dir)?;
         let keypages = keypage::KeyPages::new(dir, &texts, screen);
         let pages = { let mut p = model::parse(&root); p.push(enhanced_page()); p };
-        Ok(Self { pages, texts, template, screen, win: None, closed: false, actions: vec![], live: live::Live::default(), dir: dir.to_path_buf(), esc: vec![], keypages })
+        Ok(Self { pages, texts, template, screen, screen_changed: false, win: None, closed: false, actions: vec![], live: live::Live::default(), dir: dir.to_path_buf(), esc: vec![], keypages })
     }
 
     pub(super) fn set_screen(&mut self, screen: (u32, u32)) {
+        self.screen_changed |= self.screen != screen;
         self.screen = screen;
         self.keypages.set_screen(screen);
     }
@@ -426,9 +431,7 @@ impl HudOptions {
         let mut n = 0;
         let mut pages_xml = String::new();
         for (i, p) in self.pages.iter().enumerate() {
-            // Hidden pages also contribute to the selector's preferred width.
-            let text_width = (p.label == "Enhanced").then(|| p.opts().iter().map(|o| gui.text_width(ao_gui::font::FontId::Normal, &o.label) - 1).max().unwrap_or(0));
-            pages_xml += &page_xml(p, i, &mut n, text_width);
+            pages_xml += &page_xml(p, i, &mut n);
         }
         let (quit_win, quit_login) = ["Quit2Windows", "Quit2Login"].map(|k| self.texts.by_key(CAT_GUI, k).unwrap_or_else(|| k.to_string())).into();
         let has_fixed = self.keypages.has_fixed();
@@ -525,10 +528,11 @@ impl HudOptions {
         gui.relayout_window(id);
         gui.set_window_preferred_size_limits(id, true);
         // Load the requested frame only after final content limits, then MoveInsideScreen.
-        gui.set_window_outer_frame(id, (x, y, outer.0, outer.1));
-        let (ow, oh) = gui.outer_size(id);
-        let (px, py) = ((x.min(self.screen.0 as i32 - ow as i32)).max(0), (y.min(self.screen.1 as i32 - oh as i32)).max(0));
-        gui.set_window_pos(id, (px, py));
+        gui.set_window_outer_frame(id, (x, y, outer.0.min(self.screen.0), outer.1.min(self.screen.1)));
+        if let Some(frame) = gui.window_outer_frame(id) {
+            let (px, py) = super::hud_wincfg::inside_screen(frame, self.screen);
+            gui.set_window_outer_frame(id, (px.max(0), py.max(0), frame.2, frame.3));
+        }
     }
 
     /// `OptionWindow_c` dtor: the frame, open folders and selection go into `OptionWindowConfig` (the flow saves the DValue files).
@@ -551,6 +555,19 @@ impl HudOptions {
     pub(super) fn update(&mut self, gui: &mut Gui, d: &DValues, res: &dyn Fn(&str, &str) -> Option<i64>) {
         let Some(w) = self.win.as_mut() else { return };
         let id = w.id;
+        // Options is not tracked by HudWinCfg: re-fit once after a viewport change.
+        // Ordinary updates must preserve user drags, especially when the minimum
+        // window is wider than a scaled logical viewport.
+        if self.screen_changed {
+            self.screen_changed = false;
+            if let Some((x, y, width, height)) = gui.window_outer_frame(id) {
+                gui.set_window_outer_frame(id, (x, y, width.min(self.screen.0), height.min(self.screen.1)));
+                if let Some(frame) = gui.window_outer_frame(id) {
+                    let (px, py) = super::hud_wincfg::inside_screen(frame, self.screen);
+                    gui.set_window_outer_frame(id, (px.max(0), py.max(0), frame.2, frame.3));
+                }
+            }
+        }
         self.keypages.sync(gui, d, &self.texts);
         self.keypages.refresh_fixed(gui, &keys::FixedKeys::from_prefs(&d.prefs));
         for c in &mut w.controls {

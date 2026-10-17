@@ -1401,12 +1401,24 @@ quality values, anisotropy, MSAA, camera and text preferences; the next frame re
 execution and the ordinary preference save persists it. Zero strength/density does not clear
 an enabled flag (offline fixtures can explicitly request neutral Enhanced execution).
 
-Enhanced explanations use native `TextView` multiline/word-wrap
-(`TextRenderer_c::CalculatePreferredSize`, GUI `0x101623ea`), bounded by the widest Enhanced
-control label in the normal font. Hidden explanatory prose therefore does not enlarge every
-retail page. Source regressions cover all 16 flag combinations, account-independent persistence,
-quality dispatch/reset preservation, and root width limits with and without the prose.
-These tests are source coverage, not a claim of enabled-effect image or performance validation.
+The Enhanced page has no introductory header. In `play/options.rs::page_xml`, its vertical
+wrapper gives the `pg{idx}` scroll view the remaining height above a fixed **Restore Original**
+row, separated by a five-pixel gap. The footer never scrolls over the last option. Enhanced
+uses `auto_reserve` so the native scrollbar's 11-pixel width contributes to the minimum
+preferred width instead of narrowing an already minimum-width list below its widest label
+(`ao-gui/layout.rs::calc` / `layout_scroll`). Retail page XML and click dispatch are unchanged.
+Options is not tracked by `HudWinCfg`'s screen-resize path, so its own update fits the
+requested size once on viewport changes, then applies `hud_wincfg::inside_screen` to the
+actual minimum-clamped outer frame. This repositions a 799-pixel minimum frame at x=1 on
+an 800-pixel screen. Ordinary updates preserve intentional user drags, including negative
+positions needed to reach controls when a scaled logical viewport is below that minimum.
+Opening uses outer-frame coordinates throughout, avoiding mixing client and frame origins.
+Source regressions cover all 16 flag combinations, account-independent persistence,
+quality dispatch/reset preservation, and Enhanced bounds, wheel scrolling and footer clicks
+at large, minimum and 800×600 viewport sizes. `options_shots` also emits
+`options_enhanced_large.png` and `options_enhanced_small.png` (the latter scrolled to the last
+row). These are source coverage and optional offscreen captures, not a claim of executed
+tests, real-window verification or enabled-effect image/performance validation.
 
 The renderer's optional boundary (`ao-render/enhanced.rs`, `enhanced_shader.rs`) keeps the
 same native ordered world draws. Any enabled effect selects a colour attachment with the

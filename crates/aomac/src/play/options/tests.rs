@@ -462,14 +462,14 @@ fn options_border_drag_survives_hud_updates() {
     assert_eq!(gui.window_outer_frame(id), Some(frame));
 }
 
-/// `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac -- options_shots`: the Preferences window on its first page, the control-centre page, and two others.
+/// `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac -- options_shots`: retail pages plus Enhanced at large and small viewports.
 #[test]
 fn options_shots() {
     let Some(mut r) = Rig::new() else { return };
     let size = (900, 740);
     let mut off = Offscreen::new(&r, size).unwrap();
     r.opt.set_screen(size);
-    let mut snap = |r: &mut Rig, name: &str| {
+    let snap = |off: &mut Offscreen, r: &mut Rig, name: &str| {
         let mut list = DrawList::default();
         for _ in 0..3 {
             list = off.frame(r, 0.016);
@@ -479,11 +479,21 @@ fn options_shots() {
             off.png(r, &list, &std::path::Path::new(&dir).join(format!("{name}.png"))).unwrap();
         }
     };
-    snap(&mut r, "options_first");
+    snap(&mut off, &mut r, "options_first");
     for (var, name) in [("cc_compass", "options_cc"), ("Wildlife", "options_effects"), ("BattlemusicMode", "options_audio"), ("ChatTextShadowOffset", "options_chat"), ("MouseWheel", "options_mouse")] {
         r.show(var);
-        snap(&mut r, name);
+        snap(&mut off, &mut r, name);
     }
+    let id = r.win();
+    r.gui.set_window_outer_frame(id, (10, 10, 880, 720));
+    r.show("AomacSunShadows");
+    snap(&mut off, &mut r, "options_enhanced_large");
+    let small = (800, 600);
+    off.resize(small);
+    r.opt.set_screen(small);
+    r.gui.set_window_outer_frame(id, (10, 10, 780, 580));
+    r.show("AomacSmoothText");
+    snap(&mut off, &mut r, "options_enhanced_small");
 }
 
 #[test]
@@ -951,24 +961,86 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
 }
 
 #[test]
-fn enhanced_explanations_do_not_widen_native_pages() {
+fn enhanced_page_bounds_and_scrolling_at_large_minimum_and_small_sizes() {
+    let source = page_xml(&enhanced_page(), 7, &mut 0);
+    assert!(!source.contains("aomac-only additions"));
+    assert!(!source.contains("<TextView value=\"aomac-only"));
+    assert!(source.contains("name=\"pg7\""));
+    assert!(source.contains("</ScrollView><View view_layout=\"horizontal\" layout_borders=\"Rect(0,5,10,0)\"><Button name=\"restore_original_graphics\""));
     let Some(mut r) = Rig::new() else { return };
-    let with_text = r.gui.window_preferred_size_limits(r.win()).unwrap();
-    r.show("AomacSunShadows");
-    let enhanced = r.opt.pages.iter().find(|p| p.label == "Enhanced").unwrap();
-    let width = enhanced.opts().iter().map(|o| r.gui.text_width(ao_gui::font::FontId::Normal, &o.label) - 1).max().unwrap();
-    let source = page_xml(enhanced, 0, &mut 0, Some(width));
-    assert!(source.contains("TVF_MULTILINE|TVF_WORD_WRAP"));
-    for item in &enhanced.items {
-        if let Item::Text { value, .. } = item {
-            assert!(source.contains(&esc(value)));
+    let id = r.win();
+    let first = r.show("AomacSunShadows");
+    let page = r.opt.win.as_ref().unwrap().selected;
+    let pg = format!("pg{page}");
+    let last = r.opt.win.as_ref().unwrap().controls.iter().find(|c| c.opt.var == "AomacSmoothText").unwrap().name.clone();
+    let (minimum, _) = r.gui.window_preferred_size_limits(id).unwrap();
+    for (screen, outer) in [
+        ((1280, 800), (1100, 740)),
+        ((1280, 800), (minimum.0 + CHROME.0, minimum.1 + CHROME.1)),
+        ((800, 600), (780, 580)),
+    ] {
+        r.opt.set_screen(screen);
+        r.gui.set_window_outer_frame(id, (10, 10, outer.0, outer.1));
+        r.tick();
+        r.gui.set_scroll_offset(id, &pg, 0.0);
+        let frame = r.gui.window_outer_frame(id).unwrap();
+        assert!(frame.0 >= 0 && frame.1 >= 0);
+        assert!(frame.0 + frame.2 as i32 <= screen.0 as i32 && frame.1 + frame.3 as i32 <= screen.1 as i32, "{screen:?}: {frame:?}");
+        let bounds = r.gui.view_rect(id, PAGES).unwrap();
+        let viewport = r.gui.view_rect(id, &pg).unwrap();
+        let button = r.gui.view_rect(id, "restore_original_graphics").unwrap();
+        for rect in [bounds, viewport, button, r.gui.view_rect(id, TREE).unwrap()] {
+            assert!(rect.l >= frame.0 as f32 && rect.t >= frame.1 as f32 && rect.r < (frame.0 + frame.2 as i32) as f32 && rect.b < (frame.1 + frame.3 as i32) as f32, "{screen:?}: {rect:?} outside {frame:?}");
         }
+        for rect in [viewport, button] {
+            assert!(rect.l >= bounds.l && rect.t >= bounds.t && rect.r <= bounds.r && rect.b <= bounds.b, "{rect:?} outside page {bounds:?}");
+        }
+        assert!(viewport.height() > 0.0);
+        for control in r.opt.win.as_ref().unwrap().controls.iter().filter(|c| c.page == page) {
+            let rect = r.gui.view_rect(id, &control.name).unwrap();
+            assert!(rect.l >= viewport.l && rect.r < viewport.r - ao_gui::layout::SCROLLBAR_W, "{} spills horizontally: {rect:?} in {viewport:?}", control.opt.var);
+        }
+        assert!(button.t >= viewport.b + 5.0, "{viewport:?} overlaps footer {button:?}");
+        let top = r.gui.view_rect(id, &first).unwrap();
+        assert!(top.t >= viewport.t);
+        let needs_scroll = r.gui.view_rect(id, &last).unwrap().b > viewport.b;
+        if outer.1 == minimum.1 + CHROME.1 {
+            assert!(needs_scroll, "minimum-sized Enhanced page must exercise scrolling");
+        }
+        r.send(InputEvent::Wheel { x: viewport.l + 2.0, y: viewport.t + 2.0, dy: -1.0 });
+        if needs_scroll {
+            assert!(r.gui.scroll_offset(id, &pg) > 0.0, "Enhanced list must scroll at {screen:?}");
+            assert!(r.gui.view_rect(id, &first).unwrap().t < top.t);
+        } else {
+            assert_eq!(r.gui.scroll_offset(id, &pg), 0.0);
+        }
+        r.gui.set_scroll_offset(id, &pg, 100000.0);
+        let bottom = r.gui.view_rect(id, &last).unwrap();
+        assert!(bottom.t >= viewport.t && bottom.b <= viewport.b, "last row {bottom:?} outside {viewport:?}");
+        assert!(bottom.b < button.t);
+        assert_eq!(r.gui.view_rect(id, "restore_original_graphics"), Some(button));
+        // A real footer click still reaches the normal restore dispatch after scrolling.
+        r.d.set("AomacSunShadows", Variant::Bool(true));
+        r.tick();
+        r.click("restore_original_graphics");
+        assert!(!r.d.flag("AomacSunShadows"));
     }
-    r.opt.close(&mut r.gui, &mut r.d);
-    r.opt.pages.iter_mut().find(|p| p.label == "Enhanced").unwrap().items.retain(|item| !matches!(item, Item::Text { .. }));
-    r.opt.open(&mut r.gui, &r.d);
+    // Shrinking the application viewport must re-fit an already open Options window,
+    // without a caller supplying a replacement Preferences frame.
+    r.opt.set_screen((1280, 800));
+    r.gui.set_window_outer_frame(id, (100, 50, 1100, 740));
     r.tick();
-    let without_text = r.gui.window_preferred_size_limits(r.win()).unwrap();
-    assert_eq!(with_text.0.0, without_text.0.0);
-    assert_eq!(with_text.1.0, without_text.1.0);
+    r.opt.set_screen((800, 600));
+    r.tick();
+    let (x, y, width, height) = r.gui.window_outer_frame(id).unwrap();
+    assert!(x >= 0 && y >= 0 && x + width as i32 <= 800 && y + height as i32 <= 600);
+    // At scaled logical widths below the content minimum, users must still be
+    // able to drag the oversized frame left/up to reach its other controls.
+    r.opt.set_screen((640, 480));
+    r.tick();
+    let (_, _, width, height) = r.gui.window_outer_frame(id).unwrap();
+    r.gui.set_window_outer_frame(id, (-120, -30, width, height));
+    let dragged = r.gui.window_outer_frame(id).unwrap();
+    r.tick();
+    assert_eq!(r.gui.window_outer_frame(id), Some(dragged));
 }
