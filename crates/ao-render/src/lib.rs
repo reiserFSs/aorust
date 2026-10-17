@@ -577,7 +577,7 @@ fn mat_uniform(s: &ao_scene::Submesh) -> [f32; 32] {
         | (u32::from(!s.fog_enabled) << 1) | (u32::from(!s.lighting_enabled) << 2)
         // Authored SRCCOLOR/ONE effects use fs_blend, not the additive entry.
         | (u32::from(s.blend == Blend::SourceColorOne && !s.liquid && !s.sky_points && !s.sky_fog) << 3)
-        | (u32::from(s.liquid) << 4);
+        | (u32::from(s.liquid) << 4) | (u32::from(s.overlay) << 5);
     [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], fog_mode, s.sun_flicker as u32 as f32, wu, au, wv, av, s.specular[0], s.specular[1], s.specular[2], s.shininess, s.texture_clamp as u32 as f32, fr, fg, fb, s.uv_camera[0], s.uv_camera[1], s.uv_camera[2], s.uv_camera[3],
         s.stage1_env_texture.is_some() as u32 as f32, f32::from(s.alpha_test.unwrap_or(30)) / 255.0, native_flags as f32, f32::from(s.alpha_func)]
 }

@@ -147,6 +147,9 @@ fn quad_model(width_px: u32, rgba: Vec<u8>) -> Scene {
     let vertices = [(0, [0.0, 0.0]), (1, [1.0, 0.0]), (2, [0.0, 1.0]), (3, [1.0, 1.0])].map(|(i, uv)| Vertex { pos: corners[i], normal: [0.0, 0.0, 1.0], uv, ..Default::default() });
     let mut sub = Submesh::new(vec![0, 2, 3, 0, 3, 1], Some(key));
     sub.blend = Blend::AlphaBlend;
+    // Names, organisation text, health bars and target plates are presentation,
+    // not authored light sources; retain the native full-bright material below.
+    sub.overlay = true;
     sub.sprite_alpha_test = true;
     sub.two_sided = true;
     sub.emissive = [1.0; 3];
@@ -327,7 +330,9 @@ mod tests {
     fn quad_model_is_an_alpha_tested_unlit_billboard() {
         let m = quad_model(256, vec![0; 256 * SPRITE_H * 4]);
         let s = &m.meshes[0].submeshes[0];
-        assert!(s.blend == Blend::AlphaBlend && s.sprite_alpha_test && s.emissive == [1.0; 3] && s.two_sided);
+        assert!(s.blend == Blend::AlphaBlend && s.emissive == [1.0; 3] && s.two_sided);
+        assert!(s.sprite_alpha_test, "retain native RSprite coverage/depth state");
+        assert!(s.overlay, "all tag/health/indicator billboards must exclude bloom emission");
         assert_eq!(s.base_color[3], 1.0, "filtered sprite alpha must remain unscaled for blending");
         let v = &m.meshes[0].vertices;
         assert_eq!((v[1].pos[0] - v[0].pos[0], v[0].pos[1] - v[2].pos[1]), (2.0, 0.3));

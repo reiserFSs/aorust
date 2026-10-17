@@ -4167,6 +4167,11 @@ mod tests {
         let mut host = Host::headless();
         world.effects.as_mut().unwrap().frame(0.1, &mut host, None);
         let text = host.actors.first().expect("floating text render actor");
+        let model = &host.actor_models.iter().find(|(key, _)| *key == text.model)
+            .expect("floating text private glyph model").1;
+        assert!(model.meshes.iter().flat_map(|mesh| &mesh.submeshes).all(|sub|
+            sub.overlay && sub.blend == ao_scene::Blend::AlphaBlend && !sub.sprite_alpha_test),
+            "Font billboards exclude bloom without adopting RSprite alpha/depth states");
         let skin = text.skin.as_ref().expect("world-space glyph vertices");
         assert!(!skin.is_empty());
         assert!(skin.iter().all(|v| (glam::Vec3::from_array(v.pos) - root.w_axis.truncate()).length() < 3.0));

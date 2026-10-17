@@ -810,6 +810,7 @@ pub(crate) fn same_material(a: &ao_scene::Submesh, b: &ao_scene::Submesh) -> boo
         base_color,
         two_sided,
         emissive,
+        overlay,
         glow_mask,
         prelit,
         uv_scroll,
@@ -837,6 +838,7 @@ pub(crate) fn same_material(a: &ao_scene::Submesh, b: &ao_scene::Submesh) -> boo
         && *base_color == b.base_color
         && *two_sided == b.two_sided
         && *emissive == b.emissive
+        && *overlay == b.overlay
         && *glow_mask == b.glow_mask
         && *prelit == b.prelit
         && *uv_scroll == b.uv_scroll
@@ -878,6 +880,7 @@ fn submesh_shape(submeshes: &[ao_scene::Submesh]) -> Vec<ao_scene::Submesh> {
             base_color: s.base_color,
             two_sided: s.two_sided,
             emissive: s.emissive,
+            overlay: s.overlay,
             glow_mask: s.glow_mask,
             prelit: s.prelit,
             uv_scroll: s.uv_scroll,
@@ -1195,6 +1198,7 @@ mod tests {
             |s| s.base_color = [0.0, 0.0, 0.0, 1.0],
             |s| s.two_sided = true,
             |s| s.emissive = [1.0, 0.0, 0.0],
+            |s| s.overlay = true,
             |s| s.glow_mask = true,
             |s| s.prelit = true,
             |s| s.uv_scroll = [1.0, 0.0],

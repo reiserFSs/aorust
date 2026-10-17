@@ -65,6 +65,13 @@ pub(super) fn source(shadows: bool, ao: bool, bloom: bool, hdr: bool) -> String 
         } else {
             "vec4<f32>(min(bounded_beauty, max(emission_sample.rgb, vec3<f32>(0.0))), beauty.a)"
         };
+        // Presentation text shares native full-bright materials with authored effects.
+        // Gate its final seed once, preserving coverage and every native beauty calculation.
+        let emission_result = if bloom {
+            format!("select({emission_result}, vec4<f32>(0.0, 0.0, 0.0, beauty.a), (u32(mat.native.z) & 32u) != 0u)")
+        } else {
+            emission_result.to_owned()
+        };
         let receiving = shadows && matches!(name.as_str(), "fs_opaque" | "fs_fade_opaque" | "fs_fade_test" | "fs_test" | "fs_blend" | "fs_sprite" | "fs_add" | "fs_mesh_add" | "fs_add_one" | "fs_ground_fused" | "fs_ground_shadow" | "fs_ground_simple");
         let geometric_normal = if receiving { "    var surface = i;\n    surface.n = cross(dpdx(i.wpos), dpdy(i.wpos));\n" } else { "" };
         let fragment_input = if receiving { "surface" } else { "i" };

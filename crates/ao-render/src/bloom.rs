@@ -450,6 +450,97 @@ pub(crate) mod tests {
         assert_eq!(total(&rig.run(&pixels, &sources, 0.6)), 0.0, "an emission mark under a fully dark visible pixel leaks nothing");
     }
     #[test]
+    fn tagged_actor_has_no_emissive_seed_or_bloom_halo_but_authored_sprite_does() {
+        use crate::{Camera, EnhancedSettings, Renderer, Targets, Vec3, texture_to_rgba};
+        use ao_scene::{ActorFrame, Blend, Mesh, Scene, Submesh, Texture, TextureKey, Vertex};
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut r = Renderer::new(&instance, None).expect("tag bloom regression GPU");
+        r.set_msaa_samples(1);
+        r.upload(&Scene { environment: Some(ao_scene::Environment {
+            sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 100.0, fog_end: 200.0,
+            ambient: [0.2; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0], sun_specular: 0.0,
+        }), ..Default::default() });
+        let key = TextureKey { rdb_type: 0, id: 0x7a67 };
+        let quad = |y0, y1, material| Mesh {
+            vertices: [(-0.5,y0),(0.5,y0),(0.5,y1),(-0.5,y1)].into_iter().map(|(x,y)|
+                Vertex { pos: [x,y,0.0], normal: [0.0,0.0,1.0], ..Default::default() }).collect(),
+            submeshes: vec![material],
+        };
+        // Same material contract as Play's tags::quad_model: the sprite pipeline
+        // carries names/orgs, health bars and selection/attack indicators together.
+        let tag = Submesh { blend: Blend::AlphaBlend, sprite_alpha_test: true,
+            emissive: [1.0; 3], two_sided: true, overlay: true,
+            ..Submesh::new(vec![0,1,2,0,2,3], Some(key)) };
+        let mut model = Scene { meshes: vec![
+            quad(-0.7, 0.1, Submesh { two_sided: true,
+                ..Submesh::new(vec![0,1,2,0,2,3], None) }),
+            quad(0.35, 0.65, tag),
+        ], ..Default::default() };
+        model.textures.insert(key, Texture { source: Default::default(), width: 1,
+            height: 1, rgba: vec![255; 4] });
+        r.add_actor_model(1, &model);
+        let mut actor = ActorFrame { id: 1, model: 1, ..Default::default() };
+        actor.transform[3][2] = -3.0;
+        r.set_actors(vec![actor.clone()]);
+        let capture = |r: &mut Renderer, strength| {
+            r.set_enhanced_settings(EnhancedSettings { emissive_bloom: true,
+                bloom_strength: strength, ..Default::default() });
+            let output = r.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Tagged actor bloom regression"),
+                size: wgpu::Extent3d { width: 96, height: 96, depth_or_array_layers: 1 },
+                mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+                format: r.format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            r.render(&output.create_view(&Default::default()), &Targets::new(r,96,96),
+                &Camera::look_at(Vec3::ZERO, Vec3::NEG_Z));
+            texture_to_rgba(r, &output, 96, 96).unwrap()
+        };
+        let native = capture(&mut r, 0.0);
+        assert!(native.as_chunks::<4>().0.iter().any(|p| p[..3] == [255; 3]),
+            "the tagged actor must actually draw its white tag");
+        let bloom = capture(&mut r, 1.0);
+        assert!(r.emissive_seed_rgba().unwrap().unwrap().as_chunks::<4>().0.iter()
+            .all(|p| p[..3] == [0; 3]), "visible tags must never seed emission");
+        assert_eq!(native, bloom, "bloom contributes zero both on and around the tag");
+        // Font2014 uses ordinary AlphaBlend, not RSprite coverage/depth states.
+        model.meshes[1].submeshes[0].sprite_alpha_test = false;
+        r.add_actor_model(2, &model);
+        actor.model = 2;
+        r.set_actors(vec![actor.clone()]);
+        let native_font = capture(&mut r, 0.0);
+        assert!(native_font.as_chunks::<4>().0.iter().any(|p| p[..3] == [255; 3]));
+        assert_eq!(native_font, capture(&mut r, 1.0), "Font overlay has no on/around-text bloom");
+        assert!(r.emissive_seed_rgba().unwrap().unwrap().as_chunks::<4>().0.iter()
+            .all(|p| p[..3] == [0; 3]), "Font overlay must never seed emission");
+        // Changing overlay alone must invalidate the actor material cache.
+        model.meshes[1].submeshes[0].overlay = false;
+        r.update_actor_model(2, &model);
+        capture(&mut r, 1.0);
+        assert!(r.emissive_seed_rgba().unwrap().unwrap().as_chunks::<4>().0.iter()
+            .any(|p| p[..3].iter().any(|&v| v > 0)), "same full-bright material without overlay must emit");
+        model.meshes[1].submeshes[0].overlay = true;
+        r.update_actor_model(2, &model);
+        assert_eq!(native_font, capture(&mut r, 1.0), "overlay-only update retires the emitting material");
+        assert!(r.emissive_seed_rgba().unwrap().unwrap().as_chunks::<4>().0.iter()
+            .all(|p| p[..3] == [0; 3]), "overlay-only update must clear the cached emission seed");
+        // Authored unlit sprites use the ordinary blend pipeline, not fs_sprite.
+        let authored = &mut model.meshes[1].submeshes[0];
+        authored.sprite_alpha_test = false;
+        authored.overlay = false;
+        authored.lighting_enabled = false;
+        r.add_actor_model(2, &model);
+        actor.model = 2;
+        r.set_actors(vec![actor]);
+        let native = capture(&mut r, 0.0);
+        let bloom = capture(&mut r, 1.0);
+        assert!(r.emissive_seed_rgba().unwrap().unwrap().as_chunks::<4>().0.iter()
+            .any(|p| p[..3].iter().any(|&v| v > 0)), "authored sprite positive emission control");
+        assert!(native.as_chunks::<4>().0.iter().zip(bloom.as_chunks::<4>().0).any(|(a,b)|
+            a[..3] == [0; 3] && b[..3].iter().any(|&v| v > 0)),
+            "authored sprite positive halo control outside visible geometry");
+    }
+    #[test]
     fn bloom_switch_resize_and_msaa_retire_cached_views() {
         use crate::{Camera, EnhancedSettings, Renderer, Targets, Vec3, texture_to_rgba};
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());

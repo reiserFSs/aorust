@@ -147,6 +147,9 @@ pub struct Submesh {
     /// `_D3DMATERIAL7.emissive` = the material's `emis` (linear RGB; `EMISSIVEMATERIALSOURCE` = MATERIAL). D3D adds it to the vertex
     /// lighting sum, which is then saturated: `tex * saturate(emissive + ambient + diffuse lights)`, then fog.
     pub emissive: [f32; 3],
+    /// Presentation-only billboard text or indicator (Play tags and GC Font 2014).
+    /// Never seeds Enhanced bloom; native material colour and coverage are unchanged.
+    pub overlay: bool,
     /// Texture alpha is a self-illumination mask (opaque materials only): the texel is
     /// lit by `max(lighting, min(lighting + a, 1))` (engine: `saturate(a + lighting)`).
     pub glow_mask: bool,
@@ -214,6 +217,7 @@ impl Submesh {
             base_color: WHITE,
             two_sided: false,
             emissive: [0.0; 3],
+            overlay: false,
             glow_mask: false,
             prelit: false,
             uv_scroll: [0.0; 2],

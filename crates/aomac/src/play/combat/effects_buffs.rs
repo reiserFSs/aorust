@@ -201,6 +201,7 @@ impl Buff {
     pub(super) fn take_sounds(&mut self)->Vec<super::AuxSound> {match &mut self.native {Native::LavaBall(n)=>n.take_sounds(),Native::Notum(n)=>n.take_sounds().into_iter().map(|(name,p)|super::AuxSound {id:ao_audio::sbf::sound_id(name),pos:p.to_array(),velocity:[0.0;3],parameters:[1.0,0.0,0.0,0.0],probability:100}).collect(),_=>Vec::new()}}
     pub(super) fn render_bucket(&self)->Option<i32> {match &self.native {Native::LavaBall(n)=>n.render_bucket(),_=>None}}
     pub(super) fn dynamic_models(&self)->bool {matches!(self.native,Native::WaterRipples(_)|Native::Shadow {..})}
+    pub(super) fn text(&self)->bool {matches!(self.native,Native::Font(_))}
     pub(super) fn forwarded_child(&self)->Option<u32> {match &self.native {Native::Delay(n) if n.child()!=0=>Some(n.child()),_=>None}}
     pub(super) fn initialize(&mut self,renderer:&Renderer)->Result<()> {if let Native::Delay(n)=&mut self.native {n.initialize(renderer,self.config)?;}Ok(())}
     pub(super) fn set_text(&mut self,text:&[u8])->Result<()> {if let Native::Font(n)=&mut self.native {n.set_text(text)?;}Ok(())}

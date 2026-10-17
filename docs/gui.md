@@ -1545,6 +1545,25 @@ blocks). Seeds are the world pass's depth-tested authored emission mask (clipped
 HDR on, above-white peak-RGB highlights with gain 3 and a one-sided 1/32 knee. Hue is preserved and the pyramid
 alpha tracks actual highlight luminance. Only exposed colours above native white seed highlight glow; native-range
 night and interior colours cannot seed it. No history is used.
+World name/org text, health bars and target-indicator plates (`play/tags.rs::quad_model`) and
+Font2014/12122 floating billboard text (`build_buff_geometry`, GC Font control) use full-bright
+native materials for readability, not authored light emission. `Submesh::overlay` marks only these
+producers; flag value 32 (bit 5) of the material uniform zeros final Enhanced emission RGB while preserving coverage
+alpha, native alpha/depth states and faithful colour. Authored lamps, Light Bar and other effect sprites
+remain emitters. Regression: `tagged_actor_has_no_emissive_seed_or_bloom_halo_but_authored_sprite_does`
+draws an actor with both tag and Font-contract overlays, checks zero seed and zero on/around-text bloom
+delta, exercises overlay-only material updates, and requires authored-sprite seed and halo controls.
+`quad_model_is_an_alpha_tested_unlit_billboard` and `floating_text_builds_its_visual_on_the_loading_subject_dynel`
+guard both real Play producers.
+Release acceptance: **9 bloom tests passed / 2 ignored**, material-cache equality and both
+real Play producer regressions passed, and the first-use regression still recorded zero
+world/render/compute frame-thread compilations. Workspace release all-target Clippy passed.
+The complete expanded fixture passed **18 views / 36 independent captures**; native `cmp`
+confirmed exact byte equality for **all 17 historical RGBA views** against `SpriteWarm-before`.
+The newly added upstream `icc-shadow-edges-authored` view has no historical baseline, but its
+independent repeat is identical. An initial full-baseline invocation reported ENOENT for that
+new filename; no comparison was skipped or tolerance changed in the complete matrix run.
+Evidence: `~/aomac-handoff/gfx/v3/SpriteWarm-overlay-{complete,faithful.txt,byte-comparison.txt}`.
 The halo is an optical exception: source-gated, uniform lens veiling rather than
 surface radiance or a change to native fog extinction. Only depth-visible, already
 fog-attenuated sources seed it. Receivers are never classified or masked, which

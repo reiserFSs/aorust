@@ -980,6 +980,7 @@ impl Renderer {
             let offset=vertices.len() as u32;
             let mut sub=Submesh::new(indices.into_iter().map(|i|i+offset).collect(),key);
             sub.blend=blend;sub.two_sided=true;sub.emissive=[1.0;3];
+            sub.overlay=buff.text();
             sub.texture_clamp=buff.texture_clamp();
             submeshes.push(sub);vertices.resize(vertices.len()+count,Vertex::default());
         }
