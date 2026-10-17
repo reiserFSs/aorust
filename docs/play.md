@@ -483,6 +483,7 @@ one codegen unit); do not compare performance measurements across profiles.
 
 ```sh
 # Seed a new private target (macOS/APFS; destination must not exist).
+mkdir -p /tmp/MyAgent
 scripts/seed-fast-target.sh /tmp/MyAgent/target
 export CARGO_TARGET_DIR=/tmp/MyAgent/target
 cargo test --profile fast --workspace -j 2
@@ -503,11 +504,15 @@ CARGO_TARGET_DIR="$HOME/aomac-cache/target-fast" \
 ```
 
 Do not refresh the reference while another process is seeding it. The seed script
-uses `cp -c -p -R` to APFS-clone the complete target, preserving Cargo fingerprints
-and timestamps. Each agent then builds only in its private copy; writes are
-copy-on-write, with no common Cargo lock or shared mutation. Dependencies are reused
-when fingerprints match; changed workspace paths/revisions and native build-script
-outputs can still need rebuilding. Existing targets are never overwritten.
+uses `cp -c -p -R` to APFS-clone the complete target, preserving dependency
+fingerprints and timestamps. It invalidates only this workspace's `ao-*` and
+`aomac` fingerprints: workspace code must rebuild so `env!("CARGO_MANIFEST_DIR")`
+and fixture provenance name the new worktree, not the reference checkout. Each
+agent then builds only in its private copy; writes are copy-on-write, with no
+common Cargo lock or shared mutation. Registry dependencies are reused when
+fingerprints match; workspace/native build-script outputs may need rebuilding.
+Existing targets are never overwritten. Always run Cargo after seeding before
+executing a copied binary.
 Refresh is optional when main changes; Cargo rebuilds invalidated artifacts normally.
 Use `cargo test --profile fast -p aomac --no-run -j 2` in the reference maintenance
 step as well if sharing warm test artifacts is useful.

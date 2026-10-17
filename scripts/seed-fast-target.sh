@@ -2,6 +2,7 @@
 # Clone a warm fast-profile target into a private Cargo target directory.
 # Keep the reference read-only: no builds may modify it during this clone.
 # Refresh it separately from main with --profile fast when needed.
+# The reference must come from this aomac workspace namespace (ao-* and aomac).
 
 fail() {
 	printf '%s\n' "$*" >&2
@@ -42,4 +43,9 @@ trap 'exit 1' HUP INT TERM
 if ! cp -c -p -R "$reference/." "$destination/"; then
 	fail "APFS clone failed: $reference -> $destination"
 fi
+# Workspace binaries can embed the reference worktree's CARGO_MANIFEST_DIR.
+# Rebuild them for this worktree while retaining registry dependency caches.
+rm -rf "$destination"/fast/.fingerprint/ao-* \
+	"$destination"/fast/.fingerprint/aomac-* \
+	|| fail "cannot invalidate workspace fingerprints: $destination"
 trap - 0 HUP INT TERM
