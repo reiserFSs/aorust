@@ -377,7 +377,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
     use std::fmt::Write;
     let out = PathBuf::from(std::env::var_os("AOMAC_GFX_OUT").context("set AOMAC_GFX_OUT to a new handoff directory")?);
     let profile = std::env::var("AOMAC_GFX_SETTINGS").unwrap_or_else(|_| "faithful".into());
-    ensure!(profile == "faithful", "this revision supports only faithful captures");
+    let settings = graphics_fixture_settings(&profile)?;
     ensure!(!out.exists(), "refusing to overwrite evidence {}", out.display());
     std::fs::create_dir_all(&out)?;
     let status = out.join("status.txt");
@@ -400,6 +400,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
             revision, size.0, size.1);
         writeln!(manifest, "source_diff={source_diff:?}\nresource_sha256={resource}")?;
         writeln!(manifest, "icc_clock=authored_frozen2648.69\nsun_low_high_night_source=Borealis800")?;
+        writeln!(manifest, "enhanced_settings={settings:?}")?;
         let baseline = std::env::var_os("AOMAC_GFX_BASELINE").map(PathBuf::from);
         let actor = graphics_fixture_actor()?;
         let views = graphics_fixture_views(&actor);
@@ -421,6 +422,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 off.host.msaa_samples = Some(1);
                 off.host.anisotropy = Some(1);
                 off.host.fog_density_scale = Some(1.0);
+                off.host.enhanced_settings = Some(settings);
                 let mut list = off.frame(&mut shot, 0.0);
                 if matches!(name.as_str(), "icc-actor-authored" | "borealis-lightbar-night") {
                     let lightbar = name == "borealis-lightbar-night";
@@ -518,4 +520,41 @@ fn graphics_fixture_views(actor: &ao_net::n3::dynel::SimpleCharFullUpdate) -> Ve
     views.push(("borealis-lightbar-night".into(), 800, 0.0,
         Camera::look_at([679.6, 74.5, -476.7].into(), [679.6, 74.0, -482.7].into())));
     views
+}
+
+fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::EnhancedSettings> {
+    let mut settings = ao_render::EnhancedSettings::default();
+    match profile {
+        "faithful" => {}
+        "neutral" => { settings.ground_grass = true; settings.grass_density = 0.0; }
+        "shadows" => settings.sun_shadows = true,
+        "ao" => settings.ambient_occlusion = true,
+        "bloom" => settings.emissive_bloom = true,
+        "grass" => settings.ground_grass = true,
+        "all" => {
+            settings.sun_shadows = true;
+            settings.ambient_occlusion = true;
+            settings.emissive_bloom = true;
+            settings.ground_grass = true;
+        }
+        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|ao|bloom|grass|all"),
+    }
+    Ok(settings)
+}
+
+#[test]
+fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
+    assert!(!graphics_fixture_settings("faithful").unwrap().any_enabled());
+    let neutral = graphics_fixture_settings("neutral").unwrap();
+    assert!(neutral.any_enabled() && neutral.grass_density == 0.0);
+    for (name, expected) in [
+        ("neutral", [false, false, false, true]), ("shadows", [true, false, false, false]),
+        ("ao", [false, true, false, false]), ("bloom", [false, false, true, false]),
+        ("grass", [false, false, false, true]), ("all", [true; 4]),
+    ] {
+        let s = graphics_fixture_settings(name).unwrap();
+        assert_eq!([s.sun_shadows, s.ambient_occlusion, s.emissive_bloom, s.ground_grass], expected);
+    }
+    assert!(graphics_fixture_settings("unknown").is_err());
+    assert_eq!(graphics_fixture_actor().unwrap().name, "Testy");
 }

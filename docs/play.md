@@ -485,6 +485,12 @@ AOMAC_GFX_SETTINGS=faithful \
 cargo test --release -p aomac graphics_offline_fixture -j 2 -- \
   --ignored --nocapture --test-threads=1
 ```
+`AOMAC_GFX_SETTINGS` accepts `faithful` (default, all switches off), `neutral`
+(Enhanced boundary with zero-density grass), `shadows`, `ao`, `bloom`, `grass`,
+or `all`. Each effect profile uses its explicit default knobs; the manifest records
+the full settings value. Selecting a profile does not change the captured world,
+camera, clock, actor equipment or lights.
+
 
 The destination must not exist. The fixed matrix covers ICC 4582 landmark and
 platform views at its authored frozen time 2648.69; Borealis 800 street and foliage
@@ -509,3 +515,11 @@ Set `AOMAC_GFX_BASELINE` to an earlier run directory to additionally require exa
 raw byte equality against that run. Keep evidence under `~/aomac-handoff/gfx/`,
 not in the repository. These are deterministic comparison inputs, not an aesthetic
 oracle or a claim of retail screenshot matching.
+
+Effect benchmarks may reuse `graphics_fixture_views` / `graphics_fixture_actor`
+and `Offscreen::evidence_timing`. After uploading a snapshot with `frame`, use
+`render_frozen` to render its retained camera/actors into the persistent target
+without frontend updates, capture allocation or pixel readback. Explicit
+`set_gpu_timing(true)` / `read_frame_gpu_ms` provide GPU timestamps; unsupported
+hardware returns an error rather than substituting CPU wall time. Ordinary capture
+mode does not allocate that target or timing queries.
