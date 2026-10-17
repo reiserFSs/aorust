@@ -341,9 +341,15 @@ impl super::Renderer {
             self.grass = Some(Grass::new(&self.device, &self.g_layout, &self.tex_layout, &self.holo_layout, self.msaa_samples(), (settings.ambient_occlusion, settings.emissive_bloom), self.format));
         }
     }
+    pub(super) fn clear_enhanced_grass_inputs(&mut self) {
+        if let Some(grass) = &mut self.grass { grass.inputs.clear(); }
+    }
     /// Current-frame opaque character candidates. Admission, LOS and nearest-source
     /// capping use the renderer's final camera, after body preparation.
     /// Reuse the caller's allocation; no candidate copies or persistent trail state.
+    /// Set after `set_actors`, which invalidates the previous batch's snapshot.
+    /// The snapshot remains valid for repeated draws/screenshots until the next
+    /// actor batch replaces it; visibility is still checked again on every render.
     pub fn set_enhanced_grass_inputs(&mut self, benders: &mut Vec<GrassBender>, wind: [f32; 3]) {
         self.ensure_grass();
         if let Some(grass) = &mut self.grass {
@@ -379,7 +385,6 @@ impl super::Renderer {
             );
             grass.benders = selected.map(|bender| bender.position);
             grass.bender_count = count;
-            grass.inputs.clear();
             grass.prepare(&self.queue, ground, &self.liquids, cam.pos, settings, self.time, self.ground_state.path());
             grass.prepare_cpu_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         }
@@ -501,7 +506,9 @@ mod tests {
         let run = |mut inputs: Vec<GrassBender>, admitted: Vec<u32>| {
             select_benders(&mut inputs, eye, vp, admitted.into_iter(), Some(&clear))
         };
-        let first = run(vec![own, visible, hidden], vec![1, 2]);
+        let mut snapshot = vec![own, visible, hidden];
+        let first = select_benders(&mut snapshot, eye, vp, [1, 2].into_iter(), Some(&clear));
+        assert_eq!(first, select_benders(&mut snapshot, eye, vp, [1, 2].into_iter(), Some(&clear)), "re-rendering one actor snapshot preserves exactly the same bending");
         assert_eq!(first.1, 2);
         assert_eq!(first, run(vec![own, visible], vec![1]), "low-wall-hidden actor is identical to absence");
         assert_eq!(run(vec![own, visible], vec![]), run(vec![own], vec![]), "loss of current body admission removes bending immediately");

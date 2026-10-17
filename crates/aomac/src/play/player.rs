@@ -985,10 +985,13 @@ pub(super) fn grass_exposure_surface(surface: Rc<RefCell<Collision>>) -> ao_rend
 }
 
 fn grass_point_exposed(surface: &Collision, point: [f32; 3], ceiling: f32) -> bool {
-    let raised = [point[0], point[1] + 0.5, point[2]];
-    if surface.ground(raised).is_none_or(|ground| ground > point[1]) { return false; }
-    let low = [point[0], point[1] + 0.005, point[2]];
-    let high = [point[0], (point[1] + 1.0).max(ceiling + 1.0), point[2]];
+    // Use the same native plane solve as `ground`, not the renderer's corner
+    // interpolation, so ulp differences cannot masquerade as a raised floor.
+    let height = surface.terrain_height(point).unwrap_or(point[1]);
+    let raised = [point[0], height + 0.5, point[2]];
+    if surface.ground(raised).is_none_or(|ground| ground > height) { return false; }
+    let low = [point[0], height + 0.005, point[2]];
+    let high = [point[0], (height + 1.0).max(ceiling + 1.0), point[2]];
     surface.line(low, high).is_none() && surface.line(high, low).is_none()
 }
 

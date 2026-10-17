@@ -517,6 +517,7 @@ impl Renderer {
                     "native skin palette is too short for the model's active bone indices");
             }
         }
+        self.clear_enhanced_grass_inputs();
         self.act.tick += 1;
         let tick = self.act.tick;
         for f in &mut frames {

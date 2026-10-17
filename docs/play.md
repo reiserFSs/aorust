@@ -556,6 +556,7 @@ and ambient for the simple-ground path. Fused and two-pass fog composition retai
 their native equations. Blade tips never acquire a new light budget, and fog is
 at least the root's interpolated native fog.
 Wind uses the current native weather wind; time is the renderer's existing clock.
+Calm or unavailable weather stays still; no synthetic fallback breeze is invented.
 
 Interaction follows the approved conservative rule: own-character feet always
 bend grass, including first person. Other sources must be currently drawn opaque
@@ -567,6 +568,8 @@ or a renderer-rejected body therefore cannot evict a visible source at the cap.
 CPU candidate allocations are exchanged with the host and reused; their size is
 bounded by the currently submitted character frames, while the GPU stays fixed
 at sixteen sources. Missing collision admits only own-character interaction.
+Repeated renders of the same actor snapshot preserve bends for screenshots;
+the next actor batch replaces all candidates, including an empty batch.
 No recovery grid or actor history exists; concealment, disappearance or a blocked
 ray removes the bend immediately. Optional source channels are cleared under grass so blades
 neither seed bloom nor expose the underlying terrain's AO/emissive contribution.

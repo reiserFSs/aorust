@@ -503,6 +503,11 @@ impl Collision {
         self.closest(p, -1).map(|c| c.pos[1])
     }
 
+    /// Native heightfield plane only, ignoring statels and liquids (scene coordinates).
+    pub fn terrain_height(&self, p: [f32; 3]) -> Option<f32> {
+        self.terrain.as_ref()?.at(p[0], -p[2]).map(|(height, _)| height)
+    }
+
     /// Highest loaded static collision vertex, for optional vertical exposure probes.
     /// Call once when creating a probe capability, not for every terrain sample.
     pub fn surface_ceiling(&self) -> Option<f32> {
@@ -1073,6 +1078,7 @@ mod tests {
         kd.extend(quad(-0.5, 8.0, 12.0, -8.0, -4.0)); // a slab 0.5 m under it
         kd.extend(quad(0.2, 0.0, 3.0, -3.0, 0.0)); // a step 0.2 m high
         let c = Collision::build(kd, Some(Terrain { tm }), None, Vec::new());
+        assert_eq!(c.terrain_height([6.0, 10.0, -6.0]), Some(0.0), "heightfield provenance ignores the raised platform");
         let g = |x: f32, y: f32, z: f32| c.ground([x, y, z]).unwrap();
         assert!((g(6.0, 3.2, -6.0) - 3.0).abs() < 1e-5, "standing on the platform");
         assert!((g(6.0, 10.0, -6.0) - 3.0).abs() < 1e-5, "the ray reaches down from a fall");
