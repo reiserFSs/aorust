@@ -607,6 +607,20 @@ impl Targets {
     }
 }
 
+/// Opt-in CPU wall time for the last render, in milliseconds (not GPU execution time).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameCpuTimings {
+    pub prepare_ms: f64,
+    pub encode_ms: f64,
+    pub finish_ms: f64,
+    pub queue_submit_ms: f64,
+    pub shadow_prepare_encode_ms: f64,
+    pub grass_prepare_ms: f64,
+    pub grass_encode_ms: f64,
+    pub ao_ms: f64,
+    pub bloom_ms: f64,
+}
+
 pub struct Renderer {
     grass: Option<grass::Grass>,
     pub device: wgpu::Device,
@@ -618,6 +632,7 @@ pub struct Renderer {
     enhanced_shader: Option<wgpu::ShaderModule>,
     ambient_occlusion: Option<ambient_occlusion::AmbientOcclusion>,
     gpu_timer: Option<FrameGpuTimer>,
+    cpu_timings: Option<FrameCpuTimings>,
     pub stats: FrameStats,
     sun_shadows: Option<sun_shadows::SunShadows>,
     shadow_sun: Option<[f32; 3]>,
@@ -1117,6 +1132,7 @@ impl Renderer {
             enhanced_shader: None,
             ambient_occlusion: None,
             gpu_timer: None,
+            cpu_timings: None,
             grass: None,
             stats: FrameStats::default(),
             time: 0.0,
@@ -1334,6 +1350,12 @@ impl Renderer {
     pub fn read_frame_gpu_ms(&mut self) -> Result<Option<f64>> {
         self.gpu_timer.as_mut().map(|timer| timer.read_ms(&self.device, &self.queue)).transpose()
     }
+
+    /// No clock reads or timing allocations while disabled (the default).
+    pub fn set_cpu_timing(&mut self, enabled: bool) {
+        self.cpu_timings = enabled.then(FrameCpuTimings::default);
+    }
+    pub fn frame_cpu_timings(&self) -> Option<FrameCpuTimings> { self.cpu_timings }
 
     // The native P8 shadow palette is filtered in framebuffer space. It is
     // neither an sRGB tile nor subject to RGB565/BC resource preferences.
@@ -2018,6 +2040,9 @@ impl Renderer {
 
     /// Draws one frame into `resolve` (a view of the output texture).
     pub fn render(&mut self, resolve: &wgpu::TextureView, t: &Targets, cam: &Camera) -> wgpu::SubmissionIndex {
+        let timed = self.cpu_timings.is_some();
+        let prepare_start = timed.then(std::time::Instant::now);
+        let mut cpu = FrameCpuTimings::default();
         self.update_liquids(cam.pos);
         self.update_ground_detail(cam.pos);
         self.update_lod(cam.pos.x, cam.pos.z);
@@ -2088,7 +2113,9 @@ impl Renderer {
         self.frame = (self.frame + 1) % INST_RING;
         self.prepare_actors(cam.pos, cam.forward(), &planes);
         self.prepare_actor_pipelines();
+        let grass_start = timed.then(std::time::Instant::now);
         self.prepare_enhanced_grass(cam, vp, env.fog_end.max(env.fog_start + 1e-3));
+        if let Some(start) = grass_start { cpu.grass_prepare_ms = start.elapsed().as_secs_f64() * 1000.0; }
         {
             let shader = self.enhanced_shader.as_ref().unwrap_or(&self.shader);
             let format = self.world_format();
@@ -2116,6 +2143,7 @@ impl Renderer {
             self.enhanced_frame = Some(enhanced::EnhancedFrame::new(&self.device, self.format, t.size, self.msaa_samples, self.enhanced_settings));
         }
         self.prepare_enhanced_bloom();
+        let encode_start = timed.then(std::time::Instant::now);
         let mut enc = self.device.create_command_encoder(&Default::default());
         self.encode_actor_skins(&mut enc);
         if let Some(buf) = self.gpu.inst_bufs.get(self.frame) {
@@ -2207,7 +2235,9 @@ impl Renderer {
         }
         self.sorted.sort_by(|a, b| actors::bucket_order(a.0, a.1, b.0, b.1)
             .then_with(|| b.4.cmp(&a.4)).then_with(|| a.3.cmp(&b.3)));
+        let shadow_start = timed.then(std::time::Instant::now);
         self.encode_enhanced_shadows(&mut enc, cam, t.size, env, far);
+        if let Some(start) = shadow_start { cpu.shadow_prepare_encode_ms = start.elapsed().as_secs_f64() * 1000.0; }
         self.prepare_grass_shadow_receiver();
         let inst_buf = self.gpu.inst_bufs.get(self.frame);
         let sky_buf = self.sky.bufs.get(self.frame);
@@ -2244,13 +2274,14 @@ impl Renderer {
                 multiview_mask: None,
             });
             pass.set_bind_group(0, &self.globals_bg, &[]);
+            // Sky, ground and actors retain this receiver across pipeline changes.
+            if self.enhanced_settings.sun_shadows {
+                pass.set_bind_group(3, &self.sun_shadows.as_ref().expect("shadow maps prepared before world").receiver, &[]);
+            }
             let (pipe, mesh, mat) = (std::cell::Cell::new(usize::MAX), std::cell::Cell::new((false, usize::MAX)), std::cell::Cell::new((false, usize::MAX)));
             let draw = |pass: &mut wgpu::RenderPass, d: &Draw, insts: std::ops::Range<u32>, sky: bool| {
                 if pipe.get() != d.pipe {
                     pass.set_pipeline(if d.pipe >= 1000 { &self.ground_pipes[d.pipe - 1000] } else { &self.pipes[d.pipe] });
-                    if self.enhanced_settings.sun_shadows {
-                        pass.set_bind_group(3, &self.sun_shadows.as_ref().expect("shadow maps prepared before world").receiver, &[]);
-                    }
                     pipe.set(d.pipe);
                 }
                 if mesh.get() != (sky, d.mesh) {
@@ -2275,6 +2306,10 @@ impl Renderer {
             };
             let world_phase = |pass: &mut wgpu::RenderPass, priority: i32| {
                 pass.set_bind_group(0, &self.globals_bg, &[]);
+                // Grass replaces group 3; restore the shared receiver at phase entry.
+                if self.enhanced_settings.sun_shadows {
+                    pass.set_bind_group(3, &self.sun_shadows.as_ref().expect("shadow maps prepared before world").receiver, &[]);
+                }
                 pipe.set(usize::MAX); mesh.set((false, usize::MAX)); mat.set((false, usize::MAX));
                 if let Some(inst) = inst_buf {
                     pass.set_vertex_buffer(1, inst.slice(..));
@@ -2316,7 +2351,9 @@ impl Renderer {
                     }
                 }
             }
+            let grass_start = timed.then(std::time::Instant::now);
             calls.set(calls.get() + self.draw_enhanced_grass(&mut pass));
+            if let Some(start) = grass_start { cpu.grass_encode_ms = start.elapsed().as_secs_f64() * 1000.0; }
             // Existing native list order; list 4 remains the liquid list.
             for priority in [1, 2, 3, 4, 5, 6, 10, 7] {
                 world_phase(&mut pass, priority);
@@ -2326,9 +2363,15 @@ impl Renderer {
             frame.resolve_depth(&mut enc);
         }
         if self.enhanced_settings.ambient_occlusion {
+            let ao_start = timed.then(std::time::Instant::now);
             self.encode_enhanced_ao(&mut enc, vp, ambient_occlusion::fog_depth_limit(self.lens.near, far, env.fog_end));
+            if let Some(start) = ao_start { cpu.ao_ms = start.elapsed().as_secs_f64() * 1000.0; }
         }
-        if let Some(bloom) = &mut self.bloom { bloom.encode(&self.queue, &mut enc, self.enhanced_settings.bloom_strength); }
+        if let Some(bloom) = &mut self.bloom {
+            let bloom_start = timed.then(std::time::Instant::now);
+            bloom.encode(&self.queue, &mut enc, self.enhanced_settings.bloom_strength);
+            if let Some(start) = bloom_start { cpu.bloom_ms = start.elapsed().as_secs_f64() * 1000.0; }
+        }
         if let Some(frame) = self.enhanced_frame.as_ref() {
             let timestamps = if self.heat_haze.source().is_none() && self.screen.layers.is_empty() { self.gpu_timer.as_mut().map(FrameGpuTimer::end_pass) } else { None };
             frame.composite(&mut enc, self.heat_haze.source().unwrap_or(resolve), self.bloom.as_ref().map(|bloom| &bloom.present), timestamps);
@@ -2339,7 +2382,18 @@ impl Renderer {
         self.screen.draw(&mut enc, resolve, timestamps);
         self.drawn_visuals.extend(self.pending_visuals.get_mut().drain());
         self.stats = FrameStats { instances: self.vis.len(), draw_calls: calls.get() };
-        self.queue.submit([enc.finish()])
+        let finish_start = timed.then(std::time::Instant::now);
+        let commands = enc.finish();
+        if let Some(start) = finish_start { cpu.finish_ms = start.elapsed().as_secs_f64() * 1000.0; }
+        let submit_start = timed.then(std::time::Instant::now);
+        let submission = self.queue.submit([commands]);
+        if let (Some(prepare), Some(encode), Some(submit)) = (prepare_start, encode_start, submit_start) {
+            cpu.prepare_ms = (encode - prepare).as_secs_f64() * 1000.0;
+            cpu.encode_ms = (submit - encode).as_secs_f64() * 1000.0;
+            cpu.queue_submit_ms = submit.elapsed().as_secs_f64() * 1000.0;
+            self.cpu_timings = Some(cpu);
+        }
+        submission
     }
 }
 

@@ -717,6 +717,7 @@ impl Renderer {
     }
 
     /// Draws a native render list without changing its material pipelines.
+    /// With sun shadows enabled, the caller binds the shared receiver at group 3.
     pub(crate) fn draw_actors(&self,pass:&mut wgpu::RenderPass,priority:i32)->usize {
         let layer=&self.act;
         let buf=layer.bufs.get(self.frame);
@@ -757,9 +758,6 @@ impl Renderer {
                     let pipe = mesh_effect_pipe(pipe, effect, d.projection_pass);
                     if pipe_c.get() != pipe {
                         pass.set_pipeline(&self.actor_pipes[pipe]);
-                        if self.enhanced_settings.sun_shadows {
-                            pass.set_bind_group(3, &self.sun_shadows.as_ref().expect("shadow maps prepared before actors").receiver, &[]);
-                        }
                         pipe_c.set(pipe);
                     }
                     if mat_c.get() != (it.model, d.mat) {

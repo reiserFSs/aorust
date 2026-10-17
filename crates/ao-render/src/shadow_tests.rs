@@ -1,6 +1,18 @@
 //! Actual headless image regression: a wall-concealed actor cannot seed a cascade.
 use super::*;
 
+#[test]
+fn static_shadow_ranges_preserve_draw_order_and_instance_holes() {
+    let commands = [(0, 0), (0, 1), (0, 3), (1, 4), (0, 5), (0, 5), (0, 4)];
+    let mut batches = Vec::new();
+    for (draw, instance) in commands {
+        shadow_pass::push_static_shadow_command(&mut batches, draw, instance);
+    }
+    assert_eq!(batches, [(0, 0..2), (0, 3..4), (1, 4..5), (0, 5..6), (0, 5..6), (0, 4..5)]);
+    let expanded: Vec<_> = batches.iter().flat_map(|(draw, range)| range.clone().map(|instance| (*draw, instance))).collect();
+    assert_eq!(expanded, commands);
+}
+
 fn quad(points: [[f32; 3]; 4], normal: [f32; 3]) -> ao_scene::Mesh {
     ao_scene::Mesh {
         vertices: points.into_iter().map(|pos| ao_scene::Vertex { pos, normal, uv: [0.0; 2], color: [1.0; 4] }).collect(),

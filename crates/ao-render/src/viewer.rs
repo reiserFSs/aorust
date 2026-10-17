@@ -1236,6 +1236,8 @@ impl Offscreen {
     }
 
     pub fn set_gpu_timing(&mut self, enabled: bool) -> Result<()> { self.r.set_gpu_timing(enabled) }
+    pub fn set_cpu_timing(&mut self, enabled: bool) { self.r.set_cpu_timing(enabled); }
+    pub fn frame_cpu_timings(&self) -> Option<crate::FrameCpuTimings> { self.r.frame_cpu_timings() }
     pub fn read_frame_gpu_ms(&mut self) -> Result<Option<f64>> { self.r.read_frame_gpu_ms() }
     pub fn enhanced_target_bytes(&self) -> u64 { self.r.enhanced_target_bytes() }
     pub fn emissive_seed_rgba(&self) -> Result<Option<Vec<u8>>> { self.r.emissive_seed_rgba() }
@@ -1261,6 +1263,7 @@ impl Offscreen {
     pub fn set_shadow_gpu_timing(&mut self, enabled: bool) -> Result<()> { self.r.set_shadow_gpu_timing(enabled) }
     pub fn read_shadow_gpu_ms(&mut self) -> Result<Option<f64>> { self.r.read_shadow_gpu_ms() }
     pub fn shadow_resident_bytes(&self) -> u64 { self.r.shadow_resident_bytes() }
+    pub fn shadow_static_command_counts(&self) -> (usize, usize) { self.r.shadow_static_command_counts() }
     pub fn gpu_allocated_bytes(&self) -> Option<usize> { native_gpu_allocated_bytes(&self.r) }
 
     /// Starts a fresh measured interval without rebuilding the renderer or its resources.

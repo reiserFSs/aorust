@@ -537,6 +537,71 @@ without frontend updates, capture allocation or pixel readback. Explicit
 `set_gpu_timing(true)` / `read_frame_gpu_ms` provide GPU timestamps; unsupported
 hardware returns an error rather than substituting CPU wall time. Ordinary capture
 mode does not allocate that target or timing queries.
+
+### Enhanced CPU encode/submission benchmark
+
+Run before and after a production optimization with the **same harness** and
+different, nonexistent output directories (installed assets required; no server
+or window):
+
+```sh
+AOMAC_GFX_OUT="$HOME/aomac-handoff/gfx/enhanced-cpu-before" \
+cargo test --release -p aomac graphics_enhanced_cpu_timing -j 2 -- \
+  --ignored --nocapture --test-threads=1
+```
+
+Repeat with `enhanced-cpu-after` after the production change. The default view is
+`borealis-foliage-sun-high`; optionally set `AOMAC_GFX_VIEW` to another existing
+`borealis-foliage-*` view, identically for both runs. This reuses the
+`graphics_offline_fixture` view, lens, clear weather, seed, snapshot loading,
+collision exposure and procedural grass warmup. One immutable scene is loaded
+once and cloned into fresh renderers in **all, faithful, faithful, all** order.
+Each phase has 120 warmup frames and 600 measured frames at 1920×1200,
+single-sample/anisotropy 1, renderer time and dt zero. There is no GUI draw,
+pixel readback or PNG encoding. Frozen rendering retains renderer-owned
+render-count animations, as the existing evidence harness does; it never
+advances the frontend or scene clock.
+
+`frames.csv` contains paired GPU frame timestamps and CPU wall spans per measured
+frame; `summary.csv` reports per-phase mean and nearest-rank p50/p95/p99.
+Compare both paired occurrences of each profile, not just the first all/faithful
+pair. `manifest.txt` records revision, source diff, resource hash, camera, lens,
+settings and resource counts; `status.txt` distinguishes complete/failed runs.
+GPU timestamp resolution/readback serializes frames **after** the CPU sample:
+these are isolated submission measurements, not pipelined live FPS.
+
+Explicit `set_cpu_timing(true)` on `Renderer` or `Offscreen` enables
+`frame_cpu_timings()`; the default performs no clock reads or timing allocation.
+Instrumentation boundaries (milliseconds, CPU **wall**, not thread CPU):
+
+- `prepare_ms`: entry to `Renderer::render` through preparation immediately
+  before command-encoder creation, including grass preparation.
+- `encode_ms`: command-encoder creation through `finish()`, including existing
+  interleaved CPU work/uploads, world draws and Enhanced stages.
+- `finish_ms`: only `enc.finish()` wall time, nested within `encode_ms`.
+- `queue_submit_ms`: only `queue.submit` wall time, excluding GPU completion
+  waits, timestamp resolve/readback, frontend updates and GUI submission.
+- `cpu_render_ms`: sum of those three spans.
+- `shadow_prepare_encode_ms`: the existing `encode_enhanced_shadows` call,
+  **combined preparation and encoding**, kept in its original ordering.
+- `grass_prepare_ms`: `prepare_enhanced_grass`; `grass_encode_ms`: the grass
+  draw-call encoding inside the world pass.
+- `ao_ms` and `bloom_ms`: their individual encode calls (zero when absent).
+
+Stage spans are nested diagnostics, not additional time to add to the total.
+Depth resolution, compositing and grass shadow-receiver preparation remain in
+the parent encode span rather than being mislabeled as isolated AO/grass work.
+
+Static sun-caster instance ranges preserve draw and instance order while
+coalescing adjacent slots for the same draw; cascade binding state changes only
+when its pipeline, mesh or material changes. The union of the original cascade
+admission tests is retained: existing instance spheres are not guaranteed
+conservative after arbitrary shear or repose, so narrowing each cascade's list
+from those bounds would not establish pixel identity. Primary actor-admission
+draws retain their original order and draw granularity. World/actor sun receiver
+bindings are shared across pipeline changes and restored at world-phase entry
+after grass uses its own receiver layout.
+
 ## Optional material-ground grass
 
 `AomacGroundGrass` is an off-by-default enhancement, not a reproduction of native

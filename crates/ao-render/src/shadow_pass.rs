@@ -10,7 +10,26 @@ pub(super) fn authored_sun(scene: &Scene) -> Option<[f32; 3]> {
         .map(|(_, direction)| direction)
 }
 
+/// Coalesce only consecutive commands; holes and draw order remain unchanged.
+pub(super) fn push_static_shadow_command(commands: &mut Vec<(usize, std::ops::Range<u32>)>, draw: usize, instance: u32) {
+    if let Some((last_draw, range)) = commands.last_mut() {
+        if *last_draw == draw && range.end == instance {
+            range.end += 1;
+            return;
+        }
+    }
+    commands.push((draw, instance..instance + 1));
+}
+
 impl Renderer {
+    /// Developer/offscreen counts of admitted static instance commands and batched ranges per cascade.
+    pub fn shadow_static_command_counts(&self) -> (usize, usize) {
+        self.sun_shadows.as_ref().map_or((0, 0), |shadows| (
+            shadows.static_commands.iter().map(|(_, range)| range.len()).sum(),
+            shadows.static_commands.len(),
+        ))
+    }
+
     pub(super) fn update_shadow_sun(&mut self, scene: &Scene) {
         self.shadow_sun = authored_sun(scene);
     }
@@ -139,6 +158,7 @@ impl Renderer {
         }
         for (index, draw) in self.gpu.opaque.iter().enumerate() {
             if draw.count == 0 || self.ground.as_ref().is_some_and(|ground| ground.materials[draw.mesh].is_some()) { continue; }
+            let first_command = shadows.static_commands.len();
             for slot in self.gpu.mesh_range[draw.mesh].clone() {
                 let instance = &self.gpu.insts[slot];
                 if instance.hidden || (!self.spaceships_shown && self.spaceship_slots[slot])
@@ -151,9 +171,11 @@ impl Renderer {
                         shadows.static_transforms[slot] = instance.m;
                         changed = true;
                     }
-                    shadows.static_commands.push((index, slot as u32));
-                    shadows.ensure_pipeline(self, false, draw.pipe, false, self.pipes.spec(draw.pipe));
+                    push_static_shadow_command(&mut shadows.static_commands, index, slot as u32);
                 }
+            }
+            if shadows.static_commands.len() != first_command {
+                shadows.ensure_pipeline(self, false, draw.pipe, false, self.pipes.spec(draw.pipe));
             }
         }
         if shadows.static_transforms.len() > shadows.static_capacity {
@@ -176,13 +198,23 @@ impl Renderer {
     fn draw_static_shadows(&self, pass: &mut wgpu::RenderPass, shadows: &SunShadows, primary: bool) {
         let Some(instances) = (if primary { self.gpu.inst_bufs.get(self.frame) } else { shadows.static_instances.as_ref() }) else { return; };
         pass.set_vertex_buffer(1, instances.slice(..));
-        let draw_one = |pass: &mut wgpu::RenderPass, draw: &Draw, range: std::ops::Range<u32>| {
-            let Some(Some(pipeline)) = shadows.pipelines.get(&(false, draw.pipe, primary)) else { return; };
+        let (mut pipe, mut mesh, mut mat) = (None, None, None);
+        let mut draw_one = |pass: &mut wgpu::RenderPass, draw: &Draw, range: std::ops::Range<u32>| {
             let Some((vertices, indices)) = &self.gpu.meshes[draw.mesh] else { return; };
-            pass.set_pipeline(pipeline);
-            pass.set_vertex_buffer(0, vertices.slice(..));
-            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.set_bind_group(1, &self.gpu.mats[draw.mat], &[]);
+            if primary || pipe != Some(draw.pipe) {
+                let Some(Some(pipeline)) = shadows.pipelines.get(&(false, draw.pipe, primary)) else { return; };
+                pass.set_pipeline(pipeline);
+                pipe = Some(draw.pipe);
+            }
+            if primary || mesh != Some(draw.mesh) {
+                pass.set_vertex_buffer(0, vertices.slice(..));
+                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                mesh = Some(draw.mesh);
+            }
+            if primary || mat != Some(draw.mat) {
+                pass.set_bind_group(1, &self.gpu.mats[draw.mat], &[]);
+                mat = Some(draw.mat);
+            }
             pass.draw_indexed(draw.first_index..draw.first_index + draw.count, 0, range);
         };
         if primary {
@@ -191,8 +223,8 @@ impl Renderer {
                 draw_one(pass, draw, instance..instance + 1);
             }
         } else {
-            for &(index, instance) in &shadows.static_commands {
-                draw_one(pass, &self.gpu.opaque[index], instance..instance + 1);
+            for (index, range) in &shadows.static_commands {
+                draw_one(pass, &self.gpu.opaque[*index], range.clone());
             }
         }
         if primary {

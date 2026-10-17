@@ -672,6 +672,105 @@ fn graphics_shadow_timing(off: &mut Offscreen, directory: &std::path::Path, name
     Ok(())
 }
 
+/// Frozen Enhanced CPU/GPU ABBA benchmark; no capture or PNG work.
+#[test]
+#[ignore = "installed-client headless Enhanced CPU/GPU benchmark; 120 warmup + 600 samples per phase"]
+fn graphics_enhanced_cpu_timing() -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    use std::fmt::Write;
+    let out = PathBuf::from(std::env::var_os("AOMAC_GFX_OUT").context("set AOMAC_GFX_OUT to a new directory")?);
+    ensure!(!out.exists(), "refusing to overwrite evidence {}", out.display());
+    std::fs::create_dir_all(&out)?;
+    std::fs::write(out.join("status.txt"), "status=running\n")?;
+    let result = (|| -> anyhow::Result<()> {
+        let dir = ao_gui::client_dir();
+        let store = ao_rdb::RecordStore::open(&dir)?;
+        let actor = graphics_fixture_actor()?;
+        let selected = std::env::var("AOMAC_GFX_VIEW").unwrap_or_else(|_| "borealis-foliage-sun-high".into());
+        ensure!(selected.starts_with("borealis-foliage-"), "CPU timing requires a Borealis foliage fixture");
+        let (name, pf, time, fixed) = graphics_fixture_views(&actor).into_iter()
+            .find(|(name, _, _, _)| *name == selected).context("unknown AOMAC_GFX_VIEW")?;
+        let weather = ao_formats::weather::State::clear();
+        ao_scene::crt_srand(1);
+        // One immutable scene, shared by every ABBA phase, exactly as in graphics_offline_fixture.
+        let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(
+            &store, &dir, pf, time, 0, Some(weather))?;
+        let exposure = super::player::grass_exposure_surface(std::rc::Rc::new(std::cell::RefCell::new(
+            ao_formats::playfield::collision::Collision::load(&store, pf)?)));
+        let mut lens = camera::lens(scene.lens.unwrap_or_default(), false);
+        lens.far = Some(camera::far_plane(camera::VIEW_DISTANCE));
+        let mut manifest = format!("fixture=graphics_offline_fixture\nbenchmark=graphics_enhanced_cpu_timing\nview={name}\npf={pf}\ngame_time={time}\ncamera={fixed:?}\nlens={lens:?}\nsize=1920x1200\nrenderer_time=0\ndt=0\ncrt_seed=1\nweather={weather:?}\nmsaa=1\nanisotropy=1\nwarmup=120\nsamples_per_phase=600\norder=all,faithful,faithful,all\npercentile=nearest_rank_ceil_np\nunits=milliseconds\ncpu=wall_not_thread_cpu\npixel_readback=false\npng=false\ngpu_readback=after_cpu_sample_serialized_each_frame\n");
+        for (label, program, args) in [
+            ("revision", "git", vec!["rev-parse".into(), "HEAD".into()]),
+            ("source_diff", "git", vec!["diff".into(), "--no-ext-diff".into(), "HEAD".into()]),
+            ("resource_sha256", "shasum", vec!["-a".into(), "256".into(), dir.join("cd_image/rdb.db").into_os_string()]),
+        ] {
+            let output = std::process::Command::new(program).args(args)
+                .current_dir(env!("CARGO_MANIFEST_DIR")).output()?;
+            ensure!(output.status.success(), "{program} failed");
+            writeln!(manifest, "{label}={:?}", String::from_utf8(output.stdout)?.trim())?;
+        }
+        std::fs::write(out.join("manifest.txt"), &manifest)?;
+        let columns = ["gpu_frame_ms", "prepare_ms", "encode_ms", "queue_submit_ms",
+            "cpu_render_ms", "shadow_prepare_encode_ms", "grass_prepare_ms", "grass_encode_ms", "ao_ms", "bloom_ms", "finish_ms"];
+        let mut csv = format!("phase,profile,sample,{}\n", columns.join(","));
+        let mut summary = String::from("phase,profile,metric,samples,mean_ms,p50_ms,p95_ms,p99_ms\n");
+        for (phase, profile) in ["all", "faithful", "faithful", "all"].into_iter().enumerate() {
+            ao_scene::crt_srand(1);
+            let settings = graphics_fixture_settings(profile)?;
+            let mut shot = Shot { gui: Gui::new(&dir, None)?, scene: Some(scene.clone()), camera: fixed, lens };
+            let mut off = Offscreen::evidence_timing(&shot, (1920, 1200))?;
+            off.fixed_camera(Some(fixed));
+            off.host.msaa_samples = Some(1);
+            off.host.anisotropy = Some(1);
+            off.host.fog_density_scale = Some(1.0);
+            off.host.enhanced_settings = Some(settings);
+            if settings.ground_grass { off.host.grass_exposure = Some(exposure.clone()); }
+            off.host.grass_wind = weather.wind;
+            off.frame(&mut shot, 0.0);
+            if settings.ground_grass { off.warm_grass_tiles(); }
+            off.set_cpu_timing(true);
+            off.set_gpu_timing(true)?;
+            let mut samples = Vec::with_capacity(600);
+            for frame in 0..720 {
+                off.render_frozen()?;
+                // CPU spans have ended before the blocking timestamp resolve/readback.
+                let cpu = off.frame_cpu_timings().context("CPU timing disabled")?;
+                let gpu = off.read_frame_gpu_ms()?.context("GPU timestamp sample")?;
+                if frame < 120 { continue; }
+                let row = [gpu, cpu.prepare_ms, cpu.encode_ms, cpu.queue_submit_ms,
+                    cpu.prepare_ms + cpu.encode_ms + cpu.queue_submit_ms, cpu.shadow_prepare_encode_ms,
+                    cpu.grass_prepare_ms, cpu.grass_encode_ms, cpu.ao_ms, cpu.bloom_ms, cpu.finish_ms];
+                write!(csv, "{phase},{profile},{}", frame - 120)?;
+                for value in row { write!(csv, ",{value:.9}")?; }
+                writeln!(csv)?;
+                samples.push(row);
+            }
+            ensure!(samples.len() == 600, "incomplete measured phase");
+            for (column, metric) in columns.iter().enumerate() {
+                let mut values: Vec<f64> = samples.iter().map(|row| row[column]).collect();
+                ensure!(values.iter().all(|value| value.is_finite() && *value >= 0.0), "invalid {metric}");
+                let mean = values.iter().sum::<f64>() / values.len() as f64;
+                values.sort_by(f64::total_cmp);
+                writeln!(summary, "{phase},{profile},{metric},600,{mean:.9},{:.9},{:.9},{:.9}",
+                    values[299], values[569], values[593])?;
+            }
+            writeln!(manifest, "phase={phase} profile={profile} settings={settings:?} meshes={} instances={} enhanced_target_bytes={} shadow_bytes={} grass_metrics={:?}",
+                scene.meshes.len(), scene.instances.len(), off.enhanced_target_bytes(),
+                off.shadow_resident_bytes(), off.evidence_grass_metrics())?;
+            let (static_instances, ranges_per_cascade) = off.shadow_static_command_counts();
+            writeln!(manifest, "phase={phase} shadow_static_admitted_instances={static_instances} shadow_static_batched_ranges_per_cascade={ranges_per_cascade}")?;
+            std::fs::write(out.join("frames.csv"), &csv)?;
+            std::fs::write(out.join("summary.csv"), &summary)?;
+            std::fs::write(out.join("manifest.txt"), &manifest)?;
+        }
+        eprintln!("ENHANCED_CPU_TIMING {}\n{summary}", out.display());
+        Ok(())
+    })();
+    std::fs::write(out.join("status.txt"), if result.is_ok() { "status=complete\n" } else { "status=failed\n" })?;
+    result
+}
+
 #[test]
 #[ignore = "explicit headless Bloom ABBA benchmark: 120 warmup, 600 GPU samples per phase"]
 fn graphics_bloom_gpu_timing() -> anyhow::Result<()> {

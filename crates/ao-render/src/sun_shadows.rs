@@ -108,7 +108,8 @@ pub(crate) struct SunShadows {
     pub caster_pipeline_layout: wgpu::PipelineLayout,
     pub primary_pipeline_layout: wgpu::PipelineLayout,
     pub pipelines: std::collections::HashMap<(bool, usize, bool), Option<wgpu::RenderPipeline>>,
-    pub static_commands: Vec<(usize, u32)>,
+    /// Current-frame union-of-cascades casters, in original draw/instance order.
+    pub static_commands: Vec<(usize, std::ops::Range<u32>)>,
     pub static_transforms: Vec<[[f32; 4]; 4]>,
     pub static_instances: Option<wgpu::Buffer>,
     pub static_capacity: usize,
