@@ -1116,3 +1116,44 @@ threshold of about 29.3 m. The far-hill speck regression still passes:
 These are paired whole-frame GPU medians, not an isolated grass draw timestamp
 or a guarantee about tail latency.
 
+### ICC beach shadow edges
+
+Use `AOMAC_GFX_VIEW=icc-shadow-edges-authored` with
+`graphics_offline_fixture --ignored --nocapture --test-threads=1` and a fresh
+`AOMAC_GFX_OUT` directory for each `AOMAC_GFX_SETTINGS` profile:
+`shadow-edges` (sun shadows only), `shadow-edges-hdr` (sun shadows + HDR),
+and `shadow-edges-hdr-only` (HDR only). AO, bloom, grass and contact shadows
+are disabled in all three. Each profile explicitly pins shadow map size 4096,
+shadow strength 0.45, softness 1.5, sun boost 0.5 and grade strength 0.8.
+
+The authored ICC 4582 view uses frozen time 2648.69, scene-space eye
+`[922, 26, -750]` and look-at `[905, 23, -770]`, looking northwest across the
+beach near player coordinates `[919, 22.8, 754]` (scene Z negates player Z).
+This is an artifact-isolation camera, not a retail screenshot match.
+
+The HDR-plus-shadow sand wedges were terrain sky-fill eligibility, not cascade
+boundaries: `grade.wgsl::boost_at` falls back to `sun.g` when the filtered
+directional mask is shadowed. That channel formerly interpolated vertex alpha
+across the selected ROAM triangle, skipping all interior collision-baked lattice
+samples and differing from fine-cell vertices. Ground now binds that complete
+conservative lattice as an R8 texture in its otherwise-unused `holo1` slot and
+samples it bilinearly at fragment world position. Closed cells retain four closed
+corners, so roof rejection is preserved; fine/coarse selection cannot change
+eligibility. Direct exposure still uses the beauty receiver's filtered cascade
+visibility, including cascade blends and receiver-limit fade.
+
+`cargo test --release -p ao-render -j 2
+coarse_terrain_hdr_sky_fill_preserves_closed_island_without_triangle_wedges --
+--nocapture --test-threads=1` renders both fused and native two-pass terrain,
+checks closed/exposed controls, and bounds exposure residual and adjacent
+gradients against the bilinear lattice rather than a tuned image threshold.
+The runtime now honors the existing 4096 setting instead of silently capping
+it to 2048; default map size remains 2048.
+
+Set `AOMAC_GFX_FRAME_TIMING=1` on `graphics_offline_fixture` to retain the
+selected profile and measure frozen whole-frame GPU time after capture, excluding
+screenshot readback. It warms 120 frames, records 600 samples, and writes
+`<view>-frame-gpu.txt` with the profile and nearest-rank p50/p95/p99 in
+milliseconds. Acquire the shared GPU timing lock before timing; do not run
+concurrent captures or GPU tests.
+

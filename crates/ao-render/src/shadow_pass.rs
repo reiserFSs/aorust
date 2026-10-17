@@ -71,7 +71,7 @@ impl Renderer {
             self.sun_shadows = None;
             return;
         }
-        let resolution = self.enhanced_settings.shadow_map_size.clamp(256, 2048);
+        let resolution = self.enhanced_settings.shadow_map_size.clamp(256, 4096);
         let mut shadows = self.sun_shadows.take().filter(|s| s.size == size && s.resolution == resolution)
             .unwrap_or_else(|| SunShadows::new(self, size, resolution));
         let sun = self.shadow_sun.map(Vec3::from);

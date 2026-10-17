@@ -290,6 +290,156 @@ fn grass_pixels_receive_sun_shadows_and_ao_without_emission() {
     ], (width, height));
 }
 
+#[test]
+fn coarse_terrain_hdr_sky_fill_preserves_closed_island_without_triangle_wedges() {
+    use ao_scene::ground_detail::{GroundCell, GroundPatch};
+    let mut ground = ao_scene::Mesh { vertices: vec![], submeshes: vec![] };
+    let mut fine_cells = Vec::new();
+    let mut fine_indices = Vec::new();
+    // Conservatively close every corner of the central roofed cells. The
+    // surrounding one-cell ramps must be bilinear, not ROAM-triangle linear.
+    let openness = |x: usize, z: usize| if (2..=6).contains(&x) && (2..=6).contains(&z) { 0.0 } else { 1.0 };
+    let vertex = |x: usize, z: usize| ao_scene::Vertex {
+        pos: [x as f32, 0.0, -(z as f32)], normal: [0.0, 1.0, 0.0],
+        uv: [0.5; 2], color: [1.0, 1.0, 1.0, 1.0 - openness(x, z)],
+    };
+    for z in 0..8 {
+        for x in 0..8 {
+            let first = ground.vertices.len() as u32;
+            ground.vertices.extend([[0, 0], [1, 0], [0, 1], [1, 1]].map(|[dx, dz]| vertex(x + dx, z + dz)));
+            fine_cells.push(GroundCell { submesh: 0, vertices: [first, first + 1, first + 2, first + 3], ..Default::default() });
+            fine_indices.extend([first, first + 1, first + 2, first + 1, first + 3, first + 2]);
+        }
+    }
+    let lattice_start = ground.vertices.len() as u32;
+    for z in 0..=8 { for x in 0..=8 { ground.vertices.push(vertex(x, z)); } }
+    let sand = ao_scene::TextureKey { rdb_type: 1_010_006, id: 41 };
+    let palette = ao_scene::TextureKey { rdb_type: 1_000_007, id: 42 };
+    // Native fine tiles and coarse composite have separate material draws.
+    let composite = ao_scene::TextureKey { rdb_type: 1_010_006, id: 43 };
+    ground.submeshes = vec![
+        ao_scene::Submesh::new(fine_indices, Some(sand)),
+        ao_scene::Submesh::new(vec![lattice_start, lattice_start + 8, lattice_start + 72,
+            lattice_start + 8, lattice_start + 80, lattice_start + 72], Some(composite)),
+    ];
+    let sun = [0.0, 0.8, -0.6];
+    let scene = Scene {
+        textures: [
+            (sand, ao_scene::Texture { width: 8, height: 8, rgba: [180, 156, 112, 255].repeat(64), source: ao_scene::TextureSource::GroundRgb }),
+            (composite, ao_scene::Texture { width: 8, height: 8, rgba: [180, 156, 112, 255].repeat(64), source: ao_scene::TextureSource::GroundRgb }),
+            (palette, ao_scene::Texture { width: 1, height: 1, rgba: vec![128, 128, 128, 255], source: Default::default() }),
+        ].into(),
+        meshes: vec![ground],
+        instances: vec![ao_scene::Instance { mesh: 0, transform: ao_scene::IDENTITY }],
+        ground_detail: vec![GroundPatch {
+            mesh: 0, cells: 8, cell_size: 1.0, height_scale: 1.0, heights: vec![0; 81],
+            lattice_start, coarse_submesh: 1, fine_cells, shadow_texture: Some(palette),
+            shadow_uv_scale: [0.125; 2], ..Default::default()
+        }],
+        sun_authored: true, ground_light: Some(([0.5; 3], sun)), daylight: Some(1.0),
+        ..Default::default()
+    };
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let mut renderer = Renderer::new(&instance, None).expect("headless terrain sky-fill GPU");
+    renderer.set_msaa_samples(1);
+    renderer.upload(&scene);
+    renderer.set_ground_detail(100, 7);
+    renderer.shadow_sun = Some(sun);
+    renderer.env.sun_dir = sun;
+    // The authored palette supplies native brightness. A positive but tiny
+    // direct light keeps cascades active, below HDR's directional-share ramp.
+    renderer.env.sun_color = [0.000001; 3];
+    renderer.env.ambient = [0.15; 3];
+    renderer.env.fog_start = 100.0;
+    renderer.env.fog_end = 120.0;
+    renderer.time = 0.0;
+    // ROAM selection uses horizontal camera distance, not camera height.
+    let camera = Camera::look_at(Vec3::new(4.0, 16.0, 12.0), Vec3::new(4.0, 0.0, -4.0));
+    let (width, height) = (512, 512);
+    let targets = Targets::new(&renderer, width, height);
+    let output = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("terrain sky-fill image"), size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: renderer.format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+    });
+    let view = output.create_view(&Default::default());
+    let settings = EnhancedSettings {
+        sun_shadows: true, shadow_map_size: 4096, shadow_strength: 0.45, shadow_softness: 1.5,
+        sun_boost: 0.6, grade_strength: 0.0, ..Default::default()
+    };
+    let capture = |renderer: &mut Renderer, hdr| {
+        renderer.set_enhanced_settings(EnhancedSettings { hdr, ..settings });
+        renderer.render(&view, &targets, &camera);
+        texture_to_rgba(renderer, &output, width, height).unwrap()
+    };
+    let aspect = width as f32 / height as f32;
+    let projection = Mat4::perspective_rh(renderer.lens.vertical_fov(aspect), aspect,
+        renderer.lens.near, renderer.lens.far.unwrap_or(132.0));
+    let inverse = (projection * Mat4::look_to_rh(camera.pos, camera.forward(), camera.up())).inverse();
+    let world: Vec<_> = (0..width * height).map(|pixel| {
+        let ndc = Vec3::new((pixel % width) as f32 + 0.5, (pixel / width) as f32 + 0.5, 0.5);
+        let ray = inverse.project_point3(Vec3::new(ndc.x / width as f32 * 2.0 - 1.0,
+            1.0 - ndc.y / height as f32 * 2.0, ndc.z)) - camera.pos;
+        let p = camera.pos - ray * (camera.pos.y / ray.y);
+        (p.is_finite() && p.x > 0.25 && p.x < 7.75 && -p.z > 0.25 && -p.z < 7.75)
+            .then_some([p.x, -p.z])
+    }).collect();
+    for (mode, name) in [(3, "terrain-fused"), (1, "terrain-two-pass")] {
+        renderer.set_ground_rendering(mode);
+        let native = capture(&mut renderer, false);
+        let hdr = capture(&mut renderer, true);
+        write_evidence(&[(&format!("{name}-native"), &native), (&format!("{name}-hdr"), &hdr)], (width, height));
+        assert_eq!(renderer.sun_shadows.as_ref().expect("fixture did not execute real sun shadows").resolution, 4096);
+        let ground = renderer.ground.as_ref().unwrap();
+        assert!(ground.has_shadow[0] && ground.materials[0].is_some(), "native shadow palette was not bound");
+        assert!(ground.indices[0][0].is_empty(), "fine cells unexpectedly replaced coarse ROAM triangles");
+        assert_eq!(ground.indices[0][1].len(), 6, "fixture must retain only its two coarse root triangles");
+        assert!(ground.indices[0][1].iter().all(|&index| scene.meshes[0].vertices[index as usize].color[3] == 0.0),
+            "coarse vertices must skip every closed interior lattice point");
+        let (mut closed, mut exposed, mut transitions, mut edges) = (0, 0, 0, 0);
+        let (mut max_error, mut max_gradient) = (0.0f32, 0i16);
+        for (pixel, point) in world.iter().enumerate() {
+            let Some([x, z]) = *point else { continue; };
+            let (ix, iz) = (x.floor() as usize, z.floor() as usize);
+            let (u, v) = (x.fract(), z.fract());
+            let sky = (openness(ix, iz) * (1.0 - u) + openness(ix + 1, iz) * u) * (1.0 - v)
+                + (openness(ix, iz + 1) * (1.0 - u) + openness(ix + 1, iz + 1) * u) * v;
+            let at = pixel * 4;
+            assert!((32..=160).contains(&native[at]), "fixture lost its native midtone sand");
+            for channel in 0..3 {
+                let base = f32::from(native[at + channel]);
+                let delta = i16::from(hdr[at + channel]) - i16::from(native[at + channel]);
+                // Below the tone knee: exactly native * (1 + .6 * .6 * sky).
+                // Two codes cover native/output quantization, f16 and dither.
+                let error = (f32::from(delta) - base * 0.36 * sky).abs();
+                max_error = max_error.max(error);
+                assert!(error <= 2.0, "{name}: non-bilinear sky-fill wedge at {x},{z}, channel {channel}: delta {delta}, sky {sky}, error {error}");
+                if (3.0..5.0).contains(&x) && (3.0..5.0).contains(&z) {
+                    assert!(delta.abs() <= 1, "{name}: closed island received HDR sky fill");
+                }
+                if sky == 1.0 { assert!(delta >= 8, "{name}: exposed sand control received no positive boost"); }
+                for neighbor in [pixel + 1, pixel + width as usize] {
+                    let Some(Some([nx, nz])) = world.get(neighbor) else { continue; };
+                    let gradient = (i16::from(hdr[neighbor * 4 + channel]) - i16::from(hdr[at + channel])).abs();
+                    // Bilinear 0/1 lattice has |dsky/dx|, |dsky/dz| <= 1.
+                    // Thus this is a geometric Lipschitz bound, not a tuned
+                    // smoothness tolerance that could hide diagonal wedges.
+                    let bound = (base * 0.36 * ((nx - x).abs() + (nz - z).abs())).ceil() as i16 + 2;
+                    max_gradient = max_gradient.max(gradient);
+                    assert!(gradient <= bound, "{name}: terrain pixel gradient {gradient} exceeds bilinear bound {bound}");
+                    edges += 1;
+                }
+            }
+            closed += usize::from((3.0..5.0).contains(&x) && (3.0..5.0).contains(&z));
+            exposed += usize::from(sky == 1.0);
+            transitions += usize::from(sky > 0.0 && sky < 1.0);
+        }
+        assert!(closed > 100 && exposed > 100 && transitions > 100 && edges > 1000,
+            "insufficient rendered terrain coverage: closed {closed}, exposed {exposed}, transitions {transitions}, edges {edges}");
+        eprintln!("{name}: max exposure residual {max_error:.3} codes (bound 2), max adjacent gradient {max_gradient} codes; closed {closed}, exposed {exposed}, transitions {transitions}");
+    }
+}
+
 fn write_evidence(images: &[(&str, &[u8])], size: (u32, u32)) {
     let Some(directory) = std::env::var_os("AOMAC_GFX_SHADOW_FAIRNESS_OUT") else { return; };
     let directory = std::path::PathBuf::from(directory);

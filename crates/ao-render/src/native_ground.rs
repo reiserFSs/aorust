@@ -28,6 +28,24 @@ impl NativeGround {
         else { GroundPath::Simple }
     }
 }
+
+/// Terrain-only lanes: native palette scale and world-to-patch sky openness UVs.
+pub(super) fn material_uniform(s: &ao_scene::Submesh, patch: &ao_scene::ground_detail::GroundPatch) -> [f32; 32] {
+    let mut u = crate::mat_uniform(s);
+    u[12] = patch.shadow_uv_scale[0];
+    u[14] = patch.shadow_uv_scale[1];
+    let scale = 1.0 / (patch.cells as f32 * patch.cell_size);
+    u[24..28].copy_from_slice(&[scale, scale, -patch.origin[0] as f32 / patch.cells as f32, -patch.origin[1] as f32 / patch.cells as f32]);
+    u
+}
+
+/// Baked sky openness at the fine lattice nodes, independent of selected ROAM triangles.
+/// Alpha stores occlusion; invert it after the bake closes every roofed-cell corner.
+pub(super) fn sky_openness(patch: &ao_scene::ground_detail::GroundPatch, vertices: &[ao_scene::Vertex]) -> Vec<u8> {
+    let start = patch.lattice_start as usize;
+    vertices[start..start + (patch.cells + 1).pow(2)].iter()
+        .map(|v| ((1.0 - v.color[3].clamp(0.0, 1.0)) * 255.0).round() as u8).collect()
+}
 /// CPU recipe only; geometry/actor buffers do not change on a ground-family refresh.
 pub(super) struct Composite {
     pub(super) key: ao_scene::TextureKey,
@@ -78,6 +96,29 @@ pub(super) fn composite_images(recipes: &[Composite], textures: &std::collection
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sky_openness_uses_baked_lattice_and_arbitrary_patch_mapping() {
+        use ao_scene::{ground_detail::GroundPatch, Submesh, Vertex};
+        let patch = GroundPatch {
+            origin: [-7, 11], cells: 2, cell_size: 2.5, lattice_start: 4,
+            shadow_uv_scale: [0.125, 0.25], ..Default::default()
+        };
+        // Fine tile duplicates intentionally disagree: only the shared lattice is authoritative.
+        let mut vertices = vec![Vertex { color: [1.0, 1.0, 1.0, 0.0], ..Default::default() }; 4];
+        let alpha = [1.0, 1.0, 0.5, 1.0, 1.0, 0.0, 0.75, 0.25, 0.0];
+        vertices.extend(alpha.map(|a| Vertex { color: [1.0, 1.0, 1.0, a], ..Default::default() }));
+        let mask = sky_openness(&patch, &vertices);
+        assert_eq!(mask, [0, 0, 128, 0, 0, 255, 64, 191, 255]);
+        assert!([mask[0], mask[1], mask[3], mask[4]].iter().all(|&a| a == 0),
+            "all bilinear contributions to a closed cell remain closed");
+        let u = material_uniform(&Submesh::new(vec![], None), &patch);
+        assert_eq!([u[12], u[14]], patch.shadow_uv_scale);
+        for (world, expected) in [([-17.5, 27.5], [0.0, 0.0]), ([-12.5, 32.5], [1.0, 1.0])] {
+            let uv = [world[0] * u[24] + u[26], world[1] * u[25] + u[27]];
+            assert!(uv.into_iter().zip(expected).all(|(a, b)| (a - b).abs() < 1e-6));
+        }
+    }
+
     #[test]
     fn ground_composites_reuse_policy_mips_across_orientations_and_family_refresh() {
         use ao_scene::{TextureKey, TextureSource};

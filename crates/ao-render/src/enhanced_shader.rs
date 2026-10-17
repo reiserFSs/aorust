@@ -70,8 +70,8 @@ pub(super) fn source(shadows: bool, ao: bool, bloom: bool, hdr: bool) -> String 
         let fragment_input = if receiving { "surface" } else { "i" };
         let sun = match name.as_str() {
             _ if !hdr => "vec4<f32>(0.0)",
-            "fs_opaque" | "fs_fade_opaque" | "fs_fade_test" | "fs_test" | "fs_blend" => "enhanced_sun(i, beauty, false)",
-            "fs_ground_fused" | "fs_ground_base" | "fs_ground_simple" => "enhanced_sun(i, beauty, true)",
+            "fs_opaque" | "fs_fade_opaque" | "fs_fade_test" | "fs_test" | "fs_blend" => "enhanced_sun(i, beauty, false, 0.0)",
+            "fs_ground_fused" | "fs_ground_base" | "fs_ground_simple" => "enhanced_sun(i, beauty, true, terrain_sky_open(i.wpos))",
             // ZERO/SRCCOLOR must extinguish only direct exposure under a roof;
             // sky eligibility, native fog and coverage belong to the base pass.
             "fs_ground_shadow" if shadows => "vec4<f32>(enhanced_sun_visibility, 1.0, 1.0, 1.0)",
@@ -244,7 +244,7 @@ fn ground_fog(i: VOut) -> f32 {{ return i.fog; }}
     enhanced_sun_visibility = select(1.0, 0.0, p.x >= 2.0);
     let fog = select(0.5, 0.0, p.x >= 2.0);
     let alpha = select(1.0, 0.0, p.x >= 3.0);
-    return enhanced_sun(VOut(0u, fog, vec4<f32>(1.0), vec4<f32>(1.0, 1.0, 1.0, alpha)), vec4<f32>(1.0), p.x >= 2.0);
+    return enhanced_sun(VOut(0u, fog, vec4<f32>(1.0), vec4<f32>(1.0, 1.0, 1.0, alpha)), vec4<f32>(1.0), p.x >= 2.0, 1.0 - alpha);
 }}
 "#);
         let shader = r.device.create_shader_module(wgpu::ShaderModuleDescriptor {

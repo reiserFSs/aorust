@@ -496,6 +496,21 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     image::save_buffer(out.join(format!("{name}-emissive-mask.png")),
                         &mask, size.0, size.1, image::ColorType::Rgba8)?;
                 }
+                if measure && std::env::var_os("AOMAC_GFX_FRAME_TIMING").is_some() {
+                    off.prepare_frozen_rendering();
+                    off.set_gpu_timing(true)?;
+                    let mut frames = Vec::with_capacity(600);
+                    for sample in 0..720 {
+                        off.render_frozen()?;
+                        let ms = off.read_frame_gpu_ms()?.context("frame GPU timer did not record")?;
+                        if sample >= 120 { frames.push(ms); }
+                    }
+                    off.set_gpu_timing(false)?;
+                    frames.sort_by(f64::total_cmp);
+                    let percentiles = [0.50_f64, 0.95, 0.99].map(|p| frames[(p * frames.len() as f64).ceil() as usize - 1]);
+                    std::fs::write(out.join(format!("{name}-frame-gpu.txt")),
+                        format!("profile={profile}\nresolution=1920x1200\nwarmup=120\nsamples=600\nunits=milliseconds\nframe_p50_p95_p99={percentiles:?}\n"))?;
+                }
                 if measure && profile == "shadows" && std::env::var_os("AOMAC_GFX_SHADOW_TIMING").is_some() {
                     graphics_shadow_timing(&mut off, &out, &name)?;
                 }
@@ -581,6 +596,8 @@ fn graphics_fixture_views(actor: &ao_net::n3::dynel::SimpleCharFullUpdate) -> Ve
     ] {
         views.push((format!("{name}-authored"), 4582, 2648.69, Camera { pos: eye, yaw, pitch, roll: 0.0 }));
     }
+    views.push(("icc-shadow-edges-authored".into(), 4582, 2648.69,
+        Camera::look_at([922.0, 26.0, -750.0].into(), [905.0, 23.0, -770.0].into())));
     for (name, eye, at) in [
         ("borealis-street", [679.6, 74.5, -476.7], [679.6, 74.5, -477.7]),
         ("borealis-foliage", [652.0, 65.3, -420.0], [651.8296, 73.42179, -428.4731]),
@@ -637,9 +654,9 @@ fn graphics_fixture_snapshot_keys_share_only_matching_playfield_and_time() -> an
     for (_, pf, time, _) in &views {
         *keys.entry((*pf, time.to_bits())).or_default() += 1;
     }
-    assert_eq!(views.len(), 17);
+    assert_eq!(views.len(), 18);
     assert_eq!(keys.len(), 9);
-    assert_eq!(keys[&(4582, 2648.69_f32.to_bits())], 3);
+    assert_eq!(keys[&(4582, 2648.69_f32.to_bits())], 4);
     assert_eq!(keys[&(800, 0.0_f32.to_bits())], 4);
     assert_eq!(keys[&(800, 3240.0_f32.to_bits())], 2);
     assert_eq!(keys[&(127, 3240.0_f32.to_bits())], 1);
@@ -761,6 +778,12 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             settings.sun_shadows = true;
             (settings.shadow_map_size, settings.shadow_softness, settings.shadow_strength) = (1024, 0.0, 1.0);
         }
+        "shadow-edges" | "shadow-edges-hdr" | "shadow-edges-hdr-only" => {
+            settings.sun_shadows = profile != "shadow-edges-hdr-only";
+            settings.hdr = profile != "shadow-edges";
+            (settings.shadow_map_size, settings.shadow_strength, settings.shadow_softness) = (4096, 0.45, 1.5);
+            (settings.sun_boost, settings.grade_strength) = (0.5, 0.8);
+        }
         "ao" => settings.ambient_occlusion = true,
         "bloom" => settings.emissive_bloom = true,
         "grass" => settings.ground_grass = true,
@@ -789,7 +812,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             ao_radius: 1.75, ao_strength: 1.5, bloom_strength: 0.6,
             grass_density: 1.0, grass_distance: 50.0, sun_boost: 0.5, grade_strength: 0.8, contact_strength: 0.4,
         },
-        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|all|all-no-bloom|all-before"),
+        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|all|all-no-bloom|all-before"),
     }
     Ok(settings)
 }
@@ -808,6 +831,15 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
         let s = graphics_fixture_settings(name).unwrap();
         assert_eq!([s.sun_shadows, s.ambient_occlusion, s.emissive_bloom, s.ground_grass], expected);
         assert_eq!((s.hdr, s.contact_shadows), (matches!(name, "all" | "all-before"), matches!(name, "all" | "all-before")));
+    }
+    for (name, shadows, hdr) in [
+        ("shadow-edges", true, false), ("shadow-edges-hdr", true, true), ("shadow-edges-hdr-only", false, true),
+    ] {
+        let s = graphics_fixture_settings(name).unwrap();
+        assert_eq!((s.sun_shadows, s.hdr), (shadows, hdr));
+        assert!(!s.ambient_occlusion && !s.emissive_bloom && !s.ground_grass && !s.contact_shadows);
+        assert_eq!((s.shadow_map_size, s.shadow_strength, s.shadow_softness), (4096, 0.45, 1.5));
+        assert_eq!((s.sun_boost, s.grade_strength), (0.5, 0.8));
     }
     assert!(graphics_fixture_settings("contact").unwrap().contact_shadows);
     let isolated = graphics_fixture_settings("shadows-hdr-contact").unwrap();
@@ -829,7 +861,7 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
     let actor = graphics_fixture_actor().unwrap();
     assert_eq!(actor.name, "Testy");
     let views = graphics_fixture_views(&actor);
-    assert_eq!(views.iter().map(|view| &view.0).collect::<std::collections::HashSet<_>>().len(), 17);
+    assert_eq!(views.iter().map(|view| &view.0).collect::<std::collections::HashSet<_>>().len(), 18);
     for (light, expected_time) in [("day", 3240.0), ("dusk", 4860.0), ("night", 0.0)] {
         let newland = views.iter().find(|view| view.0 == format!("newland-{light}")).unwrap();
         assert_eq!((newland.1, newland.2), (566, expected_time));
@@ -839,6 +871,10 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
     }
     assert_eq!(views.iter().filter(|view| view.0.starts_with("icc-actor-")).count(), 1);
     assert!(views.iter().filter(|view| view.1 == 4582).all(|view| view.0.ends_with("-authored") && view.2 == 2648.69));
+    let beach = views.iter().find(|view| view.0 == "icc-shadow-edges-authored").unwrap();
+    let expected = Camera::look_at([922.0, 26.0, -750.0].into(), [905.0, 23.0, -770.0].into());
+    assert_eq!(beach.3.pos, expected.pos);
+    assert_eq!((beach.3.yaw, beach.3.pitch, beach.3.roll), (expected.yaw, expected.pitch, expected.roll));
     for name in ["borealis-street", "borealis-foliage"] {
         for (light, expected_time) in [("sun-low", 4600.0), ("sunset", 4860.0)] {
             let view_name = format!("{name}-{light}");

@@ -54,10 +54,19 @@ fn enhanced_emission(i: VOut, beauty: vec4<f32>) -> vec4<f32> {
     emission = min(beauty.rgb, emission * (1.0 - native_fog(i.fog)));
     return vec4<f32>(emission, beauty.a);
 }
+// Sample the full conservative lattice, not the selected ROAM triangle's
+// vertex alphas: coarse triangles can span many roof/shoreline cells.
+fn terrain_sky_open(world: vec3<f32>) -> f32 {
+    let dimensions = vec2<f32>(textureDimensions(holo1));
+    let lattice = clamp(vec2<f32>(world.x, -world.z) * mat.uv_camera.xy + mat.uv_camera.zw,
+        vec2<f32>(0.0), vec2<f32>(1.0));
+    let uv = (lattice * (dimensions - vec2<f32>(1.0)) + vec2<f32>(0.5)) / dimensions;
+    return textureSampleLevel(holo1, samp_clamp, uv, 0.0).r;
+}
 var<private> enhanced_sun_visibility: f32 = 1.0;
 // r: fog/shadow-attenuated directional share; g: roof-tested, fog-attenuated terrain sky visibility;
 // b: native fog amount. Terrain alpha defaults closed until collision baking.
-fn enhanced_sun(i: VOut, beauty: vec4<f32>, ground: bool) -> vec4<f32> {
+fn enhanced_sun(i: VOut, beauty: vec4<f32>, ground: bool, sky_visibility: f32) -> vec4<f32> {
     // A single frame-uniform fog colour cannot describe material-local fog.
     // Keep those receivers native rather than expose a wrongly subtracted surface.
     if mat.scroll.z > 1.5 { return vec4<f32>(0.0, 0.0, 0.0, beauty.a); }
@@ -66,6 +75,6 @@ fn enhanced_sun(i: VOut, beauty: vec4<f32>, ground: bool) -> vec4<f32> {
     }
     let fog = select(native_fog(i.fog), ground_fog(i), ground);
     let share = dot(i.sun_share.xyz, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let sky_open = select(0.0, clamp(1.0 - i.color.a, 0.0, 1.0) * (1.0 - fog), ground);
+    let sky_open = sky_visibility * (1.0 - fog);
     return vec4<f32>(share * enhanced_sun_visibility * (1.0 - fog), sky_open, fog, beauty.a);
 }

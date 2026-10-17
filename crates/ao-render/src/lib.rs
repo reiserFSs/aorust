@@ -1546,10 +1546,9 @@ impl Renderer {
         // One bind group per distinct (texture, base colour, emissive, glow mask).
         let mut mat_of: HashMap<(usize, usize, bool, [u32; 32]), usize> = HashMap::new();
         let mut mats: Vec<wgpu::BindGroup> = vec![];
-        let mut material = |dev: &Renderer, view: usize, s: &ao_scene::Submesh, ground_scale: Option<[f32; 2]>| {
-            let mut u = mat_uniform(s);
+        let mut material = |dev: &Renderer, view: usize, s: &ao_scene::Submesh, ground_patch: Option<&ao_scene::ground_detail::GroundPatch>| {
+            let u = ground_patch.map_or_else(|| mat_uniform(s), |p| native_ground::material_uniform(s, p));
             let env_view = s.stage1_env_texture.and_then(|key| view_of.get(&key).copied()).unwrap_or(0);
-            if let Some([x, z]) = ground_scale { u[12] = x; u[14] = z; }
             *mat_of.entry((view, env_view, s.texture_clamp, u.map(f32::to_bits))).or_insert_with(|| {
                 let ub = dev.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
                     label: None,
@@ -1618,11 +1617,10 @@ impl Renderer {
                 let count = indices.len() as u32 - first;
                 if count > 0 {
                     let view = s.texture.and_then(|k| view_of.get(&k).copied()).unwrap_or(0);
-                    let mat = material(self, view, s, scene.ground_detail.iter().find(|p| p.mesh == mi).map(|p| p.shadow_uv_scale));
+                    let mat = material(self, view, s, scene.ground_detail.iter().find(|p| p.mesh == mi));
                     ground_materials[mi][si] = mat;
                     if let (Some(patch), Some(key)) = (scene.ground_detail.iter().find(|p| p.mesh == mi), s.texture) {
-                        let mut uniform = mat_uniform(s);
-                        uniform[12] = patch.shadow_uv_scale[0]; uniform[14] = patch.shadow_uv_scale[1];
+                        let uniform = native_ground::material_uniform(s, patch);
                         ground_texture_materials.insert(mat, (key, uniform));
                     }
                     let d = Draw { mesh: mi, first_index: first, count, mat, pipe: world_material_pipe(s),
@@ -1717,9 +1715,21 @@ impl Renderer {
             for p in &scene.ground_detail {
                 has_shadow[p.mesh] = p.shadow_texture.is_some();
                 let view = &views[p.shadow_texture.and_then(|k| view_of.get(&k).copied()).unwrap_or(0)];
+                let size = wgpu::Extent3d { width: p.cells as u32 + 1, height: p.cells as u32 + 1, depth_or_array_layers: 1 };
+                let sky = self.device.create_texture_tracked(&wgpu::TextureDescriptor {
+                    label: Some("ground baked sky openness"), size, mip_level_count: 1, sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::R8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[],
+                });
+                self.queue.write_texture(sky.as_image_copy(), &native_ground::sky_openness(p, &scene.meshes[p.mesh].vertices),
+                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size.width), rows_per_image: Some(size.height) }, size);
+                let sky_view = sky.create_view_tracked(&Default::default());
                 materials[p.mesh] = Some(self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
                     label: Some("native ground shadow palette"), layout: &self.holo_layout,
-                    entries: &[0, 1].map(|binding| wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(view) }),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&sky_view) },
+                    ],
                 }));
             }
             GroundRun { detail: ao_scene::ground_detail::GroundDetail::new(scene.ground_detail.clone()), indices, draws, scratch: Vec::with_capacity(capacity), materials, has_shadow, texture_materials: ground_texture_materials.into_iter().map(|(mat,(key,u))| (mat,key,u)).collect(), composites, green: grass::green_masks(scene), sky_open: grass::baked_sky_open(scene) }
