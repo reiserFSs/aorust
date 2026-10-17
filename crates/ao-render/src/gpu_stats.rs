@@ -135,11 +135,15 @@ impl TextureViewStatsExt for wgpu::Texture {
     }
 }
 
-/// Explicit opt-in GPU encoder-span timing for offline evidence. Construction allocates one query pair and
-/// two persistent buffers; an absent timer performs no timestamp, resolve, copy or readback work.
+/// Explicit opt-in GPU pass-boundary timing for offline evidence. Construction allocates one query pair
+/// and two persistent buffers; an absent timer performs no timestamp, resolve, copy or readback work.
 ///
-/// Encode `begin` before the frame and `end` after it, submit that encoder, then call `read_ms` before reuse.
-/// This measures a GPU timestamp span, not CPU encoding, presentation, or physical GPU memory residency.
+/// Attach `begin_compute_pass` to an actual skinning dispatch pass, or `begin_pass` to the first actual
+/// shadow/world pass if no compute pass starts the span. Use `is_recording` to avoid overwriting that start.
+/// Attach `end_pass` to the final output pass (or use `begin_pass(true)` when one render pass is the entire
+/// span). Submit that encoder, then call `read_ms` before reuse. It waits for rendering completion before
+/// resolving counters in a separate submission. GUI work outside these boundaries, CPU encoding and
+/// presentation are excluded.
 pub struct FrameGpuTimer {
     queries: wgpu::QuerySet,
     resolve: wgpu::Buffer,
@@ -153,7 +157,7 @@ pub struct FrameGpuTimer {
 enum TimerState {
     Idle,
     Recording,
-    Pending,
+    Ready,
     Failed,
 }
 
@@ -165,12 +169,15 @@ fn advance_timer(state: &mut TimerState, expected: TimerState, next: TimerState)
 
 fn timestamp_ms(start: u64, end: u64, period_ns: f32) -> anyhow::Result<f64> {
     anyhow::ensure!(period_ns.is_finite() && period_ns > 0.0, "GPU timestamp period unavailable or invalid");
-    Ok(end.wrapping_sub(start) as f64 * f64::from(period_ns) / 1_000_000.0)
+    let ticks = end.checked_sub(start).ok_or_else(|| anyhow::anyhow!(
+        "GPU timestamp counters reversed: start={start}, end={end}, period_ns={period_ns}"
+    ))?;
+    Ok(ticks as f64 * f64::from(period_ns) / 1_000_000.0)
 }
 
 impl FrameGpuTimer {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> anyhow::Result<Self> {
-        let required = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        let required = wgpu::Features::TIMESTAMP_QUERY;
         anyhow::ensure!(device.features().contains(required), "GPU frame timestamps unsupported: device needs {required:?}");
         let period_ns = queue.get_timestamp_period();
         timestamp_ms(0, 0, period_ns)?;
@@ -191,22 +198,56 @@ impl FrameGpuTimer {
         Ok(Self { queries, resolve, readback, period_ns, state: TimerState::Idle, mapped: Default::default() })
     }
 
-    pub fn begin(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        advance_timer(&mut self.state, TimerState::Idle, TimerState::Recording).expect("GPU timer begin requires previous readback");
-        encoder.write_timestamp(&self.queries, 0);
+    /// Whether an earlier compute/render pass has already supplied this frame's starting boundary.
+    pub fn is_recording(&self) -> bool {
+        self.state == TimerState::Recording
     }
 
-    pub fn end(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        advance_timer(&mut self.state, TimerState::Recording, TimerState::Pending).expect("GPU timer end requires begin");
-        encoder.write_timestamp(&self.queries, 1);
+    /// Attach to the first compute pass only when it actually dispatches work.
+    pub fn begin_compute_pass(&mut self) -> wgpu::ComputePassTimestampWrites<'_> {
+        advance_timer(&mut self.state, TimerState::Idle, TimerState::Recording).expect("GPU timer begin requires previous readback");
+        wgpu::ComputePassTimestampWrites {
+            query_set: &self.queries,
+            beginning_of_pass_write_index: Some(0),
+            end_of_pass_write_index: None,
+        }
+    }
+
+    /// Beginning-of-pass writes avoid encoder timestamp reordering. `last_pass` also writes the end
+    /// timestamp when the world pass is the final output pass, without adding a dummy render pass.
+    pub fn begin_pass(&mut self, last_pass: bool) -> wgpu::RenderPassTimestampWrites<'_> {
+        let next = if last_pass { TimerState::Ready } else { TimerState::Recording };
+        advance_timer(&mut self.state, TimerState::Idle, next).expect("GPU timer begin requires previous readback");
+        wgpu::RenderPassTimestampWrites {
+            query_set: &self.queries,
+            beginning_of_pass_write_index: Some(0),
+            end_of_pass_write_index: last_pass.then_some(1),
+        }
+    }
+
+    /// Attach only to the final render pass that actually executes (world, composite, haze or screen).
+    pub fn end_pass(&mut self) -> wgpu::RenderPassTimestampWrites<'_> {
+        advance_timer(&mut self.state, TimerState::Recording, TimerState::Ready).expect("GPU timer end requires begin");
+        wgpu::RenderPassTimestampWrites {
+            query_set: &self.queries,
+            beginning_of_pass_write_index: None,
+            end_of_pass_write_index: Some(1),
+        }
+    }
+
+    /// Blocking offline-only read, after render submission. Wait for the final pass's counter samples
+    /// before resolving them, then submit and wait for the separate resolve/copy/readback work.
+    /// Any failure retires this timer; no CPU timing substitute or reversed-counter repair is used.
+    pub fn read_ms(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> anyhow::Result<f64> {
+        advance_timer(&mut self.state, TimerState::Ready, TimerState::Failed)?;
+        device.poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|error| anyhow::anyhow!("GPU timed render completion poll: {error}"))?;
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("offline GPU timestamps after render completion"),
+        });
         encoder.resolve_query_set(&self.queries, 0..2, &self.resolve, 0);
         encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.readback, 0, 16);
-    }
-
-    /// Blocking offline-only read, after submission. A readback/poll failure retires this timer rather than
-    /// returning a CPU substitute or allowing a late failed mapping callback to contaminate a later sample.
-    pub fn read_ms(&mut self, device: &wgpu::Device) -> anyhow::Result<f64> {
-        advance_timer(&mut self.state, TimerState::Pending, TimerState::Failed)?;
+        queue.submit([encoder.finish()]);
         let mapped = self.mapped.clone();
         self.readback.slice(..).map_async(wgpu::MapMode::Read, move |result| {
             *mapped.lock() = Some(result);
@@ -228,8 +269,9 @@ impl FrameGpuTimer {
         let end = u64::from_le_bytes(bytes[8..16].try_into().expect("timestamp buffer end"));
         drop(bytes);
         self.readback.unmap();
+        let ms = timestamp_ms(start, end, self.period_ns)?;
         self.state = TimerState::Idle;
-        timestamp_ms(start, end, self.period_ns)
+        Ok(ms)
     }
 }
 
@@ -238,18 +280,28 @@ mod timing_tests {
     use super::*;
 
     #[test]
-    fn timestamp_conversion_wrap_and_frame_order() {
+    fn timestamp_conversion_rejects_reversal_and_enforces_frame_order() {
         assert_eq!(timestamp_ms(10, 1_000_010, 2.0).unwrap(), 2.0);
-        assert_eq!(timestamp_ms(u64::MAX - 2, 2, 1_000_000.0).unwrap(), 5.0);
+        assert_eq!(timestamp_ms(42, 42, 1.0).unwrap(), 0.0);
+        for (start, end) in [(1_000_010, 10), (u64::MAX - 2, 2)] {
+            let error = timestamp_ms(start, end, 1.0).unwrap_err().to_string();
+            assert!(error.contains(&format!("start={start}")));
+            assert!(error.contains(&format!("end={end}")));
+        }
         for period in [0.0, -1.0, f32::NAN, f32::INFINITY] {
             assert!(timestamp_ms(0, 1, period).is_err());
         }
         let mut state = TimerState::Idle;
-        assert!(advance_timer(&mut state, TimerState::Recording, TimerState::Pending).is_err());
+        assert!(advance_timer(&mut state, TimerState::Ready, TimerState::Failed).is_err());
         advance_timer(&mut state, TimerState::Idle, TimerState::Recording).unwrap();
         assert!(advance_timer(&mut state, TimerState::Idle, TimerState::Recording).is_err());
-        advance_timer(&mut state, TimerState::Recording, TimerState::Pending).unwrap();
-        advance_timer(&mut state, TimerState::Pending, TimerState::Idle).unwrap();
-        assert!(advance_timer(&mut state, TimerState::Pending, TimerState::Idle).is_err());
+        advance_timer(&mut state, TimerState::Recording, TimerState::Ready).unwrap();
+        assert!(advance_timer(&mut state, TimerState::Recording, TimerState::Ready).is_err());
+        advance_timer(&mut state, TimerState::Ready, TimerState::Failed).unwrap();
+        assert!(advance_timer(&mut state, TimerState::Idle, TimerState::Recording).is_err());
+        // Successful readback is the only production path back to Idle.
+        state = TimerState::Idle;
+        advance_timer(&mut state, TimerState::Idle, TimerState::Ready).unwrap();
+        advance_timer(&mut state, TimerState::Ready, TimerState::Failed).unwrap();
     }
 }

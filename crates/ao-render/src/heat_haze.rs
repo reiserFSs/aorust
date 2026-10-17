@@ -112,7 +112,7 @@ impl HeatHaze {
         if !self.active { return None; }
         self.gpu.as_ref()?.target.as_ref().map(|target| &target.view)
     }
-    pub fn draw(&self, encoder: &mut wgpu::CommandEncoder, output: &wgpu::TextureView) {
+    pub fn draw(&self, encoder: &mut wgpu::CommandEncoder, output: &wgpu::TextureView, timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>) {
         if !self.active { return; }
         let Some(gpu) = &self.gpu else { return; };
         let Some(target) = &gpu.target else { return; };
@@ -120,7 +120,7 @@ impl HeatHaze {
             label: Some("native FX41 resolved-color distortion"), color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: output, resolve_target: None, depth_slice: None,
                 ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-            })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+            })], depth_stencil_attachment: None, timestamp_writes: timestamps, occlusion_query_set: None, multiview_mask: None,
         });
         pass.set_pipeline(&gpu.pipeline);
         pass.set_bind_group(0, &target.bind, &[]);

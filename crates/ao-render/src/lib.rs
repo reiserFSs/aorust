@@ -624,7 +624,7 @@ pub struct Renderer {
     msaa_samples: u32,
     /// Sample counts the adapter actually supports for both the surface colour format and [`DEPTH`] (always includes 1).
     msaa_supported: Vec<u32>,
-    enhanced_msaa_supported: Vec<u32>,
+    auxiliary_msaa: wgpu::TextureFormatFeatureFlags,
     texture_policy: native_texture::Policy,
     pipes: Pipelines,
     actor_pipes: Pipelines,
@@ -829,7 +829,8 @@ fn compile_pipeline(
             _ => (fs, state, depth_write),
         };
         let target = wgpu::ColorTargetState { format, blend: state, write_mask: wgpu::ColorWrites::ALL };
-        let targets = [Some(target.clone()), settings.ambient_occlusion.then(|| target.clone()), settings.emissive_bloom.then_some(target)];
+        let auxiliary = wgpu::ColorTargetState { format: enhanced::AUX, blend: state, write_mask: wgpu::ColorWrites::ALL };
+        let targets = [Some(target), settings.ambient_occlusion.then(|| auxiliary.clone()), settings.emissive_bloom.then_some(auxiliary)];
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(fs),
             // Ground effects 8-11 sample `ground_palette` (holo0) at bind group 2; liquids (12/13) use `fs_blend`,
@@ -853,7 +854,7 @@ fn compile_pipeline(
                 module: shader,
                 entry_point: Some(fs),
                 compilation_options: Default::default(),
-                targets: if format == enhanced::HDR { &targets } else { &targets[..1] },
+                targets: if settings.any_enabled() { &targets } else { &targets[..1] },
             }),
             primitive: wgpu::PrimitiveState {
                 topology: if effect == 14 { wgpu::PrimitiveTopology::PointList } else { wgpu::PrimitiveTopology::TriangleList },
@@ -982,7 +983,7 @@ impl Renderer {
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: None,
-                required_features: (adapter.features() & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES | wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS))
+                required_features: (adapter.features() & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES | wgpu::Features::TIMESTAMP_QUERY))
                     | if adapter.get_info().backend == wgpu::Backend::Metal { wgpu::Features::PASSTHROUGH_SHADERS } else { wgpu::Features::empty() },
                 required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -1005,8 +1006,7 @@ impl Renderer {
             let depth = adapter.get_texture_format_features(DEPTH).flags.supported_sample_counts();
             color.into_iter().filter(|c| depth.contains(c)).collect()
         };
-        let hdr_counts = adapter.get_texture_format_features(enhanced::HDR).flags.supported_sample_counts();
-        let enhanced_msaa_supported = msaa_supported.iter().copied().filter(|count| hdr_counts.contains(count)).collect();
+        let auxiliary_msaa = adapter.get_texture_format_features(enhanced::AUX).flags;
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene"),
@@ -1126,7 +1126,7 @@ impl Renderer {
             anisotropy: 1,
             msaa_samples: 1,
             msaa_supported,
-            enhanced_msaa_supported,
+            auxiliary_msaa,
             texture_policy: Default::default(),
             pipes,
             actor_pipes,
@@ -1226,8 +1226,10 @@ impl Renderer {
     /// live toggle). Callers that keep a [`Targets`] across frames must rebuild it when [`Renderer::msaa_samples`] changes
     /// (`Targets::sample_count`). The single world pass resolves once and discards its transient MSAA/depth attachments.
     pub fn set_msaa_samples(&mut self, requested: u32) {
-        let supported = if self.enhanced_settings.any_enabled() { &self.enhanced_msaa_supported } else { &self.msaa_supported };
-        let level = clamp_msaa_samples(requested.max(1), supported);
+        let auxiliary = self.enhanced_settings.ambient_occlusion || self.enhanced_settings.emissive_bloom;
+        let level = if auxiliary {
+            self.msaa_supported.iter().copied().filter(|&count| count <= requested && self.auxiliary_msaa.sample_count_supported(count)).max().unwrap_or(1)
+        } else { clamp_msaa_samples(requested.max(1), &self.msaa_supported) };
         if level == self.msaa_samples { return; }
         self.msaa_samples = level;
         self.pipes.invalidate();
@@ -1271,14 +1273,12 @@ impl Renderer {
     pub fn enhanced_target_bytes(&self) -> u64 {
         self.enhanced_frame.as_ref().map_or(0, |frame| {
             let pixels = u64::from(frame.size.0) * u64::from(frame.size.1);
-            let colour = 8 * (1 + u64::from(frame.ambient.is_some()) + u64::from(frame.emissive.is_some()));
+            let colour = 4 + 8 * (u64::from(frame.ambient.is_some()) + u64::from(frame.emissive.is_some()));
             let samples = u64::from(frame.sample_count);
             pixels * (colour + 4 * samples + if samples > 1 { colour * samples + 4 } else { 0 })
         })
     }
-    fn world_format(&self) -> wgpu::TextureFormat {
-        if self.enhanced_settings.any_enabled() { enhanced::HDR } else { self.format }
-    }
+    fn world_format(&self) -> wgpu::TextureFormat { self.format }
     /// Explicit offline instrumentation; disabled by default and owns no resources then.
     /// After each render, read the result before encoding another timed frame.
     pub fn set_gpu_timing(&mut self, enabled: bool) -> Result<()> {
@@ -1286,7 +1286,7 @@ impl Renderer {
         Ok(())
     }
     pub fn read_frame_gpu_ms(&mut self) -> Result<Option<f64>> {
-        self.gpu_timer.as_mut().map(|timer| timer.read_ms(&self.device)).transpose()
+        self.gpu_timer.as_mut().map(|timer| timer.read_ms(&self.device, &self.queue)).transpose()
     }
 
     // The native P8 shadow palette is filtered in framebuffer space. It is
@@ -2060,7 +2060,6 @@ impl Renderer {
             }
         }
         let mut enc = self.device.create_command_encoder(&Default::default());
-        if let Some(timer) = &mut self.gpu_timer { timer.begin(&mut enc); }
         self.encode_actor_skins(&mut enc);
         let inst_buf = self.gpu.inst_bufs.get(self.frame);
         if let Some(buf) = inst_buf {
@@ -2163,7 +2162,7 @@ impl Renderer {
         self.heat_haze.prepare(&self.device, &self.queue, self.format, t.size);
         let world_resolve = self.heat_haze.source().unwrap_or(resolve);
         let enhanced_frame = self.enhanced_frame.as_ref();
-        let world_target = enhanced_frame.map_or(world_resolve, |frame| &frame.hdr);
+        let world_target = enhanced_frame.map_or(world_resolve, |frame| &frame.colour);
         let msaa_target = enhanced_frame.and_then(|frame| frame.msaa.as_ref().and_then(|views| views[0].as_ref())).or(t.msaa.as_ref().filter(|_| enhanced_frame.is_none()));
         let attachments = [
             Some(wgpu::RenderPassColorAttachment { view: msaa_target.unwrap_or(world_target), resolve_target: msaa_target.map(|_| world_target), depth_slice: None,
@@ -2171,6 +2170,10 @@ impl Renderer {
             enhanced_frame.and_then(|frame| frame.attachment(1)),
             enhanced_frame.and_then(|frame| frame.attachment(2)),
         ];
+        let final_world = enhanced_frame.is_none() && self.heat_haze.source().is_none() && self.screen.layers.is_empty();
+        let timestamps = self.gpu_timer.as_mut().and_then(|timer| {
+            if timer.is_recording() { final_world.then(|| timer.end_pass()) } else { Some(timer.begin_pass(final_world)) }
+        });
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
@@ -2180,7 +2183,7 @@ impl Renderer {
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: if enhanced_frame.is_some() { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: timestamps,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2261,13 +2264,15 @@ impl Renderer {
         }
         if let Some(frame) = enhanced_frame {
             frame.resolve_depth(&mut enc);
-            frame.composite(&mut enc, world_resolve, None);
+            let timestamps = if self.heat_haze.source().is_none() && self.screen.layers.is_empty() { self.gpu_timer.as_mut().map(FrameGpuTimer::end_pass) } else { None };
+            frame.composite(&mut enc, world_resolve, None, timestamps);
         }
-        self.heat_haze.draw(&mut enc, resolve);
-        self.screen.draw(&mut enc,resolve);
+        let timestamps = if self.heat_haze.source().is_some() && self.screen.layers.is_empty() { self.gpu_timer.as_mut().map(FrameGpuTimer::end_pass) } else { None };
+        self.heat_haze.draw(&mut enc, resolve, timestamps);
+        let timestamps = if !self.screen.layers.is_empty() { self.gpu_timer.as_mut().map(FrameGpuTimer::end_pass) } else { None };
+        self.screen.draw(&mut enc, resolve, timestamps);
         self.drawn_visuals.extend(self.pending_visuals.get_mut().drain());
         self.stats = FrameStats { instances: self.vis.len(), draw_calls: calls.get() };
-        if let Some(timer) = &mut self.gpu_timer { timer.end(&mut enc); }
         self.queue.submit([enc.finish()])
     }
 }

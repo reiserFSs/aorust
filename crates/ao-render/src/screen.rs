@@ -78,10 +78,10 @@ impl ScreenPass {
             queue.write_buffer(&gpu.frames[index].0,0,bytemuck::cast_slice(&data));
         }
     }
-    pub fn draw(&self,enc:&mut wgpu::CommandEncoder,resolve:&wgpu::TextureView) {
+    pub fn draw(&self,enc:&mut wgpu::CommandEncoder,resolve:&wgpu::TextureView,timestamps:Option<wgpu::RenderPassTimestampWrites<'_>>) {
         if self.layers.is_empty() {return;}
         let Some(gpu)=&self.gpu else {return};
-        let mut pass=enc.begin_render_pass(&wgpu::RenderPassDescriptor {label:Some("native viewport sprites"),color_attachments:&[Some(wgpu::RenderPassColorAttachment {view:resolve,resolve_target:None,depth_slice:None,ops:wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}})],depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None,multiview_mask:None});
+        let mut pass=enc.begin_render_pass(&wgpu::RenderPassDescriptor {label:Some("native viewport sprites"),color_attachments:&[Some(wgpu::RenderPassColorAttachment {view:resolve,resolve_target:None,depth_slice:None,ops:wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}})],depth_stencil_attachment:None,timestamp_writes:timestamps,occlusion_query_set:None,multiview_mask:None});
         for (index,layer) in self.layers.iter().enumerate() {
             pass.set_pipeline(&gpu.pipes[&(layer.source_blend,layer.destination_blend)]);pass.set_bind_group(0,&gpu.frames[index].1,&[]);
             for _ in 0..layer.repetitions {pass.draw(0..3,0..1);}
@@ -113,12 +113,13 @@ pub(super) fn depth_clear_pipeline(device:&wgpu::Device,format:wgpu::TextureForm
         label:Some("native viewport depth clear"),bind_group_layouts:&[],immediate_size:0,
     });
     let target = wgpu::ColorTargetState {format,blend:None,write_mask:wgpu::ColorWrites::empty()};
-    let targets = [Some(target.clone()), settings.ambient_occlusion.then(|| target.clone()), settings.emissive_bloom.then_some(target)];
+    let auxiliary=wgpu::ColorTargetState {format:crate::enhanced::AUX,blend:None,write_mask:wgpu::ColorWrites::empty()};
+    let targets = [Some(target), settings.ambient_occlusion.then(|| auxiliary.clone()), settings.emissive_bloom.then_some(auxiliary)];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label:Some("native viewport depth clear"),layout:Some(&layout),
         vertex:wgpu::VertexState {module:&shader,entry_point:Some("vs"),compilation_options:Default::default(),buffers:&[]},
         fragment:Some(wgpu::FragmentState {module:&shader,entry_point:Some("fs"),compilation_options:Default::default(),
-            targets:if format==crate::enhanced::HDR {&targets} else {&targets[..1]}}),
+            targets:if settings.any_enabled() {&targets} else {&targets[..1]}}),
         primitive:Default::default(),
         depth_stencil:Some(wgpu::DepthStencilState {format:DEPTH,depth_write_enabled:Some(true),depth_compare:Some(wgpu::CompareFunction::Always),stencil:Default::default(),bias:Default::default()}),
         multisample:wgpu::MultisampleState {count:samples,..Default::default()},multiview_mask:None,cache:None,

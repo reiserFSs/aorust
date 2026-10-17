@@ -1409,22 +1409,28 @@ quality dispatch/reset preservation, and root width limits with and without the 
 These tests are source coverage, not a claim of enabled-effect image or performance validation.
 
 The renderer's optional boundary (`ao-render/enhanced.rs`, `enhanced_shader.rs`) keeps the
-same native ordered world draws. Any enabled effect selects display-space RGBA16F HDR and
-a stored, sampleable depth attachment. Ambient-share and data-marked emission attachments
+same native ordered world draws. Any enabled effect selects a colour attachment with the
+**same gamma-space UNORM format as faithful**, plus a stored, sampleable depth attachment.
+HDR/tonemapping is deliberately deferred: RGBA16F changed native per-draw saturation and
+quantization (ICC neutral maximum error 41 byte levels; failed evidence retained under
+`~/aomac-handoff/gfx/core-native-icc-neutral-1920`). Ambient-share and data-marked emission attachments
 are independently allocated only for AO and bloom respectively, including their MSAA copies.
 MSAA retains its native coverage; a minimum-sample depth resolve supplies single-sample
-`Depth32Float` for postprocessing. The composite is an identity clamp: existing world shaders
-already output framebuffer-space colour, so applying an sRGB transfer or exposure would be
-incorrect. It runs before native heat haze, viewport sprites and GUI. Shadows alter only the
+`Depth32Float` for postprocessing. The composite is an identity UNORM copy: existing world
+shaders already output framebuffer-space colour, so applying an sRGB transfer or exposure
+would be incorrect. It runs before native heat haze, viewport sprites and GUI. Shadows alter only the
 attributable sun share in the Enhanced shader; AO subtracts only the ambient-share attachment,
 not the whole image. Bloom consumes authored emission, never a brightness threshold.
 All four flags off select the original shader/attachments and world pass with no optional
 textures, composite, depth resolve or timer buffers; switching off releases the Enhanced frame.
 The offline neutral profile is explicitly `ground_grass=true, grass_density=0`, not all-off.
-HDR blend/quantization is not mathematically identical to UNORM blending; neutral differences
-are measured by the offscreen fixture rather than described as exact.
-`Renderer::set_gpu_timing(true)` explicitly allocates `FrameGpuTimer` only if both timestamp
-features are supported; `read_frame_gpu_ms` reads each submitted frame before timer reuse.
+Neutral execution must retain exact native blend/quantization, not widen the old pixel tolerances.
+`Renderer::set_gpu_timing(true)` explicitly allocates `FrameGpuTimer` only when timestamp queries
+are supported; descriptor timestamps span the first actual skin/world pass through the last
+presentation/heat-haze/viewport pass. Encoder timestamp writes can reorder on Metal and are not
+used. Results resolve after the final pass and are mapped only after submission completion;
+reversed counters are errors, never unsigned wraparound durations.
+`read_frame_gpu_ms` reads each submitted frame before timer reuse.
 This synchronous instrumentation is offline-only and disabled by default.
 
 | aomac page / control | Key → store | Runtime consumer | Status |
