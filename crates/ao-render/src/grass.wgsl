@@ -35,7 +35,7 @@ fn grass_hash(input: u32) -> u32 {
 }
 // Share of a cell's blades that survive at a distance: the CPU instances only the ranks that can (grass.rs).
 fn thinning_keep(dist: f32) -> f32 {
-    let d = max(dist - 12.0, 0.0) / 16.0;
+    let d = max(dist - 12.0, 0.0) / 12.0;
     return 1.0 / (1.0 + d * d);
 }
 fn grass_unit(v: u32) -> f32 { return f32(v & 0x00ffffffu) / 16777216.0; }
@@ -133,7 +133,7 @@ struct GOut {
     @location(9) fog: f32,
     @location(10) @interpolate(flat) path: u32,
     @location(11) @interpolate(flat) normal: vec4<f32>, // xyz: normal; w: same baked sky openness as terrain
-    @location(12) @interpolate(flat) coverage: f32,
+    @location(12) @interpolate(flat) coverage: vec2<f32>, // field coverage, then geometry-LOD AO share
 }
 
 // Raw light visibility, before the artistic shadow-strength floor used by beauty.
@@ -172,7 +172,7 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     let by_range = 1.0 - smoothstep(0.7 * radius, radius, dist);
     let fade = by_rank * by_range;
     if fade <= 0.002 { return o; }
-    o.coverage = by_range;
+    o.coverage = vec2<f32>(by_range, 1.0);
     let widen = min(inverseSqrt(keep), 6.0);
 
     // The terrain under the root: slope, and distance from neighbouring path, soil or rock.
@@ -261,8 +261,10 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     let step = vertex >> 1u;
     let section = select(select(0u, step + 1u, step > 0u), step * 3u, band >= 2u);
     let t = SECTION_T[kind][section];
-    // Complete the geometric morph before the CPU can select band 2 (~40 m nearest cell edge).
-    let simple_tuft = smoothstep(28.0, 36.0, dist);
+    // Complete the geometric morph before the CPU can select band 2 (~33 m nearest cell edge).
+    let simple_tuft = smoothstep(24.0, 30.0, dist);
+    // Half-resolution AO cannot resolve root/tip tufts: fade their receiving share with the geometry.
+    o.coverage.y = 1.0 - simple_tuft;
     let profile = mix(SECTION_W[kind][section], 1.0 - t, simple_tuft);
     let side = select(-1.0, 1.0, (vertex & 1u) != 0u);
     let is_head = kind >= 2u && section >= 2u;
@@ -325,7 +327,8 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
         if hb(hj, 3u) < 0.15 { colour = hj % 6u; }
         head = FLOWERS[colour] * (0.85 + 0.15 * v2);
     }
-    o.head = vec4<f32>(head, select(0.0, 1.0, is_head));
+    // Fade the flat head-colour flag too: the three-vertex tuft must not change colour at the band switch.
+    o.head = vec4<f32>(head, select(0.0, 1.0 - simple_tuft, is_head));
     let canopy = clamp(0.55 * (1.0 - rim) * (0.5 + vigour) + 0.6 * clump - 0.05, 0.0, 1.0);
     let grad = mix(0.9, 1.2, t);
     let ao = (1.0 - 0.55 * canopy * (1.0 - t) * (1.0 - t)) / (1.0 - 0.275 * canopy);
@@ -417,7 +420,7 @@ fn fs_grass(i: GOut) -> GrassOutput {
     var output: GrassOutput;
     // Hardware alpha-to-coverage dithers the outer field without fragment discard.
     // At one sample the geometric shrink remains the continuous fade.
-    output.color = vec4<f32>(color, i.coverage);
+    output.color = vec4<f32>(color, i.coverage.x);
     //__AMBIENT_WRITE__
     //__AO_RECEIVE__
     //__EMISSIVE_WRITE__

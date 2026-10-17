@@ -13,7 +13,7 @@ const OCCLUSION_GAIN = 4.0;
 struct Params {
     inverse_vp: mat4x4<f32>,
     vp: mat4x4<f32>,
-    control: vec4<f32>, // radius, strength, original fog-end depth, height
+    control: vec4<f32>, // radius, strength, original fog-end depth, grass present
 }
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var depth: texture_depth_2d;
@@ -25,33 +25,58 @@ struct Params {
 fn inside(pixel: vec2<i32>) -> bool {
     return all(pixel >= vec2<i32>(0)) && all(pixel < vec2<i32>(textureDimensions(depth)));
 }
-fn depth_at(pixel: vec2<i32>) -> f32 {
-    let z = textureLoad(depth, clamp(pixel, vec2<i32>(0), vec2<i32>(textureDimensions(depth)) - 1), 0);
+fn raw_depth_at(pixel: vec2<i32>) -> f32 {
+    let coord = clamp(pixel, vec2<i32>(0), vec2<i32>(textureDimensions(depth)) - 1);
+    let z = textureLoad(depth, coord, 0);
     return select(z, 1.0, z >= params.control.z);
+}
+fn occluder_share_at(pixel: vec2<i32>) -> f32 {
+    if params.control.w > 0.0 {
+        let coord = clamp(pixel, vec2<i32>(0), vec2<i32>(textureDimensions(depth)) - 1);
+        // Current visible grass writes a negative alpha; ordinary surfaces stay opaque.
+        // ponytail: mixed MSAA edge pixels become porous; use min-depth-owned tags if edge AO fidelity matters.
+        return clamp(textureLoad(ambient, coord, 0).a + 1.0, 0.0, 1.0);
+    }
+    return 1.0;
+}
+fn depth_sample(pixel: vec2<i32>) -> vec2<f32> {
+    let z = raw_depth_at(pixel);
+    if z >= 1.0 { return vec2<f32>(1.0, 1.0); }
+    let share = occluder_share_at(pixel);
+    return vec2<f32>(select(z, 1.0, share == 0.0), share);
 }
 fn world(pixel: vec2<i32>, z: f32) -> vec3<f32> {
     let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(textureDimensions(depth));
     let p = params.inverse_vp * vec4<f32>(uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), z, 1.0);
     return p.xyz / p.w;
 }
-// Pick an actual primary-view sample rather than averaging foreground/background.
-fn half_pixel(pixel: vec2<i32>) -> vec2<i32> {
-    var selected = pixel * 2;
-    var z = depth_at(selected);
+struct HalfSample {
+    pixel: vec2<i32>,
+    z: f32,
+    share: f32,
+}
+// Pick and cache an actual primary-view sample rather than averaging depths.
+fn half_sample(pixel: vec2<i32>) -> HalfSample {
+    let first = pixel * 2;
+    let sample = depth_sample(first);
+    var selected = HalfSample(first, sample.x, sample.y);
     for (var y = 0; y < 2; y++) {
         for (var x = 0; x < 2; x++) {
-            let candidate = pixel * 2 + vec2<i32>(x, y);
-            let d = depth_at(candidate);
-            if inside(candidate) && d < z { selected = candidate; z = d; }
+            if x == 0 && y == 0 { continue; }
+            let candidate = first + vec2<i32>(x, y);
+            if !inside(candidate) { continue; }
+            let d = depth_sample(candidate);
+            if d.x < selected.z { selected = HalfSample(candidate, d.x, d.y); }
         }
     }
     return selected;
 }
 fn normal(pixel: vec2<i32>, p: vec3<f32>) -> vec3<f32> {
-    let left = p - world(pixel - vec2<i32>(1, 0), depth_at(pixel - vec2<i32>(1, 0)));
-    let right = world(pixel + vec2<i32>(1, 0), depth_at(pixel + vec2<i32>(1, 0))) - p;
-    let up = p - world(pixel - vec2<i32>(0, 1), depth_at(pixel - vec2<i32>(0, 1)));
-    let down = world(pixel + vec2<i32>(0, 1), depth_at(pixel + vec2<i32>(0, 1))) - p;
+    // Porosity must not turn neighboring blade depths into far-plane normals.
+    let left = p - world(pixel - vec2<i32>(1, 0), raw_depth_at(pixel - vec2<i32>(1, 0)));
+    let right = world(pixel + vec2<i32>(1, 0), raw_depth_at(pixel + vec2<i32>(1, 0))) - p;
+    let up = p - world(pixel - vec2<i32>(0, 1), raw_depth_at(pixel - vec2<i32>(0, 1)));
+    let down = world(pixel + vec2<i32>(0, 1), raw_depth_at(pixel + vec2<i32>(0, 1))) - p;
     let dx = select(right, left, dot(left, left) < dot(right, right));
     let dy = select(down, up, dot(up, up) < dot(down, down));
     let cross_n = cross(dy, dx);
@@ -70,14 +95,15 @@ fn selected_pixel(half: vec2<i32>, sample: vec2<u32>) -> vec2<i32> {
     return half * 2 + vec2<i32>(i32((sample.x >> 16u) & 1u), i32((sample.x >> 17u) & 1u));
 }
 @fragment fn estimate(@builtin(position) position: vec4<f32>) -> @location(0) vec2<u32> {
-    let pixel = half_pixel(vec2<i32>(position.xy));
-    let z = depth_at(pixel);
+    let center = half_sample(vec2<i32>(position.xy));
+    let pixel = center.pixel;
+    let z = center.z;
     if z >= 1.0 { return encoded(0.0, z, pixel); }
     let p = world(pixel, z);
     let n = normal(pixel, p);
     let clip = params.vp * vec4<f32>(p, 1.0);
     let projection_y = length(vec3<f32>(params.vp[0].y, params.vp[1].y, params.vp[2].y));
-    let radius_pixels = clamp(params.control.x * projection_y * params.control.w / (2.0 * max(clip.w, 0.01)), 1.0, 64.0);
+    let radius_pixels = clamp(params.control.x * projection_y * f32(textureDimensions(depth).y) / (2.0 * max(clip.w, 0.01)), 1.0, 64.0);
     // Fixed screen-space pattern (no time term): static frames are bit-stable.
     let noise = fract(52.9829189 * fract(dot(position.xy, vec2<f32>(0.06711056, 0.00583715))));
     var occlusion = 0.0;
@@ -88,19 +114,20 @@ fn selected_pixel(half: vec2<i32>, sample: vec2<u32>) -> vec2<i32> {
             let t = (f32(step) + fract(noise * 7.0 + f32(step) * 0.618)) / f32(STEPS);
             let sample_pixel = pixel + vec2<i32>(round(axis * (t * radius_pixels + 1.0)));
             if !inside(sample_pixel) { continue; }
-            let sample_z = depth_at(sample_pixel);
+            let sample_z = raw_depth_at(sample_pixel);
             if sample_z >= 1.0 { continue; }
             let delta = world(sample_pixel, sample_z) - p;
             let normal_distance = dot(n, delta);
             if normal_distance <= 0.0 { continue; }
             let distance = length(delta);
             if distance < 0.01 || distance >= params.control.x { continue; }
-            occlusion += max(normal_distance / distance - 0.15, 0.0) * (1.0 - distance / params.control.x);
+            let contribution = max(normal_distance / distance - 0.15, 0.0) * (1.0 - distance / params.control.x);
+            if contribution > 0.0 { occlusion += contribution * occluder_share_at(sample_pixel); }
         }
     }
     // Strength is an exponent on the open fraction: 0 -> neutral, always within [0, 1].
     let open = 1.0 - clamp(OCCLUSION_GAIN * occlusion / f32(DIRECTIONS * STEPS), 0.0, 1.0);
-    return encoded(1.0 - pow(open, params.control.y), z, pixel);
+    return encoded((1.0 - pow(open, params.control.y)) * center.share, z, pixel);
 }
 // Strict world-space depth rejection prevents background AO crossing silhouettes.
 fn bilateral(center: vec3<f32>, candidate: vec3<f32>) -> f32 {
@@ -133,8 +160,10 @@ fn bilateral(center: vec3<f32>, candidate: vec3<f32>) -> f32 {
 }
 @fragment fn composite(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let pixel = vec2<i32>(position.xy);
-    let z = depth_at(pixel);
+    let z = raw_depth_at(pixel);
     if z >= 1.0 { return vec4<f32>(0.0); }
+    let receiver = textureLoad(ambient, pixel, 0);
+    if params.control.w > 0.0 && clamp(receiver.a + 1.0, 0.0, 1.0) == 0.0 { return vec4<f32>(0.0); }
     let p = world(pixel, z);
     let half_coord = (vec2<f32>(pixel) + 0.5) * 0.5 - 0.5;
     let base = vec2<i32>(floor(half_coord));
@@ -154,5 +183,5 @@ fn bilateral(center: vec3<f32>, candidate: vec3<f32>) -> f32 {
         }
     }
     let occlusion = select(0.0, sum / max(weight, 0.00001), weight > 0.0);
-    return vec4<f32>(textureLoad(ambient, pixel, 0).rgb * min(occlusion * SKY_BOOST, 1.0), 0.0);
+    return vec4<f32>(receiver.rgb * min(occlusion * SKY_BOOST, 1.0), 0.0);
 }

@@ -342,6 +342,7 @@ impl Grass {
         }
         draws
     }
+    pub fn has_draws(&self) -> bool { !self.draws.is_empty() }
     pub fn resource_bytes(&self) -> usize { MAX_CELLS * (std::mem::size_of::<Cell>() + 4 * BANDS) + std::mem::size_of::<Params>() + (noise::SIZE * noise::SIZE * 8) as usize + self.green_bytes }
 }
 /// Fine tile vertices and coarse lattice vertices share the same native samples.
@@ -408,7 +409,7 @@ fn slope_mask([a, b, c, d]: [f32; 4], size: f32, parity: u32) -> u32 {
 }
 /// Share of a cell's blades that survive at `distance` from the eye (grass.wgsl `thinning_keep`).
 fn thinning_keep(distance: f32) -> f32 {
-    let d = (distance - 12.0).max(0.0) / 16.0;
+    let d = (distance - 12.0).max(0.0) / 12.0;
     1.0 / (1.0 + d * d)
 }
 fn hash(mut value: u32) -> u32 { value ^= value >> 16; value = value.wrapping_mul(0x7feb352d); value ^= value >> 15; value = value.wrapping_mul(0x846ca68b); value ^ (value >> 16) }
@@ -420,8 +421,9 @@ fn shader_source(channels: (bool, bool, bool), shadows: bool) -> String {
         .replace("//__EMISSIVE_FIELD__", if channels.1 { "@location(2) emissive: vec4<f32>," } else { "" })
         .replace("//__SUN_FIELD__", if channels.2 { "@location(3) sun: vec4<f32>," } else { "" })
         .replace("//__AMBIENT_WRITE__", if channels.0 { "output.ambient = vec4<f32>(0.0, 0.0, 0.0, 1.0);" } else { "" })
+        // Alpha is AO porosity, not beauty opacity: -16 survives even one of eight covered MSAA samples.
         .replace("//__AO_RECEIVE__", if channels.0 {
-            "let indirect = select(i.dlight, max(clamp(i.light + palette, vec3<f32>(0.0), vec3<f32>(1.0)) - i.light, vec3<f32>(0.0)), i.path > 0u);\n    let extinction = (1.0 - fog) * select(1.0, 1.0 - fog, i.path > 1u);\n    let receiving = albedo * (light * 0.8 + min(light, indirect) * 0.2) * extinction;\n    output.ambient = vec4<f32>(min(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), max(receiving, vec3<f32>(0.0))), 1.0);"
+            "let indirect = select(i.dlight, max(clamp(i.light + palette, vec3<f32>(0.0), vec3<f32>(1.0)) - i.light, vec3<f32>(0.0)), i.path > 0u);\n    let extinction = (1.0 - fog) * select(1.0, 1.0 - fog, i.path > 1u);\n    let sky_fraction = clamp(indirect / max(light, vec3<f32>(0.001)), vec3<f32>(0.0), vec3<f32>(1.0));\n    let ao_lod = i.coverage.y;\n    let receiving = albedo * light * ao_share(sky_fraction) * extinction * ao_lod;\n    output.ambient = vec4<f32>(min(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), max(receiving, vec3<f32>(0.0))), mix(-16.0, 1.0, ao_lod));"
         } else { "" })
         .replace("//__SHADOW_VISIBILITY__", if shadows { "visibility = grass_sun_visibility(i.root + i.normal.xyz * 0.05, i.normal.xyz);" } else { "" })
         .replace("//__EMISSIVE_WRITE__", if channels.1 { "output.emissive = vec4<f32>(0.0);" } else { "" })
@@ -805,8 +807,13 @@ mod tests {
         assert_eq!(slope_mask([0.0, 0.0, 0.0, 16.0], 4.0, 0), 1, "one cliff triangle cannot erase its flat neighbor");
         assert!(MAX_CELLS * (std::mem::size_of::<Cell>() + 4 * BANDS) + std::mem::size_of::<Params>() < 3 * 1024 * 1024);
         assert_eq!(thinning_keep(12.0), 1.0);
-        assert_eq!(thinning_keep(28.0), 0.5);
-        assert_eq!(thinning_keep(60.0), 0.1);
+        assert_eq!(thinning_keep(24.0), 0.5);
+        assert_eq!(thinning_keep(48.0), 0.1);
+        assert!(thinning_keep(30.0) > 0.25, "geometry morph must finish before a cell can use three vertices");
+        let shader = include_str!("grass.wgsl");
+        assert!(shader.contains("max(dist - 12.0, 0.0) / 12.0"), "CPU and GPU thinning must agree");
+        assert!(shader.contains("smoothstep(24.0, 30.0, dist)"));
+        assert!(shader.contains("select(0.0, 1.0 - simple_tuft, is_head)"), "head colour must finish fading before the topology switch");
         let mut cell = Cell { origin: [0.0; 4], heights: [0.0, 2.0, 4.0, 8.0], identity: [0; 4], normals: [[0.0; 4]; 4] };
         for parity in 0..2 {
             cell.identity[2] = parity;
@@ -841,6 +848,10 @@ mod blade_appearance_tests {
             let source = super::shader_source((ao, bloom, hdr), shadows);
             assert_eq!(source.contains("output.emissive = vec4<f32>(0.0);"), bloom);
             assert_eq!(source.contains("let receiving = albedo *"), ao);
+            assert_eq!(source.contains("fn ao_share("), ao, "grass must reuse the terrain AO budget");
+            assert_eq!(source.contains("let ao_lod = i.coverage.y;"), ao,
+                "subpixel distant tufts must not retain near-blade self-occlusion");
+            assert_eq!(source.contains("mix(-16.0, 1.0, ao_lod)"), ao, "AO-only porosity must survive MSAA resolve");
             assert_eq!(source.contains("output.sun = "), hdr);
             assert_eq!(source.contains("dot(sun_share, vec3<f32>(0.2126, 0.7152, 0.0722))"), hdr,
                 "HDR daylight eligibility must use the native terrain's luma weights");

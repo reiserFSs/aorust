@@ -1,5 +1,8 @@
 //! Paired grass evidence on the shared offline fixture snapshots; no server/window.
 //! AOMAC_GFX_VIEW selects one view; AOMAC_GFX_PNG_ONLY=1 omits raw RGBA files.
+//! AOMAC_GFX_CAPTURE_ONLY=1 retains explicit tile + 320-frame warmup, skips GPU timing/reverse order.
+//! AOMAC_GFX_AO / AOMAC_GFX_SHADOWS (sun) / AOMAC_GFX_CONTACT override EFFECTS with 0/1.
+//! AOMAC_GFX_ASSERT_SPECKS=0 records baseline ablations; the speck regression is on by default.
 use super::{Shot, camera, graphics_fixture_actor, graphics_fixture_views};
 use ao_gui::Gui;
 use ao_render::{EnhancedSettings, Offscreen};
@@ -24,11 +27,17 @@ fn grass_offline_capture_and_timing() -> anyhow::Result<()> {
 fn run(out: &std::path::Path) -> anyhow::Result<()> {
     let selected = std::env::var("AOMAC_GFX_VIEW").ok();
     let png_only = std::env::var("AOMAC_GFX_PNG_ONLY").is_ok_and(|value| value == "1");
+    let capture_only = std::env::var("AOMAC_GFX_CAPTURE_ONLY").is_ok_and(|value| value == "1");
+    let assert_specks = !std::env::var("AOMAC_GFX_ASSERT_SPECKS").is_ok_and(|value| value == "0");
     // AOMAC_GFX_DENSITY: grass density (default 1); AOMAC_GFX_EFFECTS=1: sun/contact shadows, AO and bloom in both variants.
     // AOMAC_GFX_HDR=1: the HDR present; AOMAC_GFX_MSAA: requested samples (default 1).
     // AOMAC_GFX_DISTANCE: grass distance (settings default); AOMAC_GFX_DAY_TIME: Newland day time only (default 3240).
     let density = std::env::var("AOMAC_GFX_DENSITY").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
     let effects = std::env::var("AOMAC_GFX_EFFECTS").is_ok_and(|value| value == "1");
+    let effect_override = |key| std::env::var(key).map_or(effects, |value| value != "0");
+    let ao = effect_override("AOMAC_GFX_AO");
+    let shadows = effect_override("AOMAC_GFX_SHADOWS");
+    let contact = effect_override("AOMAC_GFX_CONTACT");
     let hdr = std::env::var("AOMAC_GFX_HDR").is_ok_and(|value| value == "1");
     let msaa = std::env::var("AOMAC_GFX_MSAA").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1);
     let grass_distance = std::env::var("AOMAC_GFX_DISTANCE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or_else(|| EnhancedSettings::default().grass_distance);
@@ -41,8 +50,10 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
     let mut changed_views = 0;
     let mut negative_views = 0;
     let mut positive_views = 0;
-    let mut report = format!("fixture=graphics_offline_fixture\nsize=1920x1200\nrenderer_time=0\ndt=0\ncrt_seed=1\nweather=clear\nmsaa_requested={msaa}\nanisotropy=1\nwarmup_frames=320\nmeasured_frames=600\ntiming=FrameGpuTimer whole-frame neutral Enhanced UNORM versus grass incremental contribution, not isolated draw timestamp\nvisual_acceptance=unexercised\n");
-    writeln!(report, "selected_view={selected:?}\npng_only={png_only}")?;
+    let measured_frames = if capture_only { 0 } else { 600 };
+    let timing = if capture_only { "unexercised (capture only)" } else { "FrameGpuTimer whole-frame neutral Enhanced UNORM versus grass incremental contribution, not isolated draw timestamp" };
+    let mut report = format!("fixture=graphics_offline_fixture\nsize=1920x1200\nrenderer_time=0\ndt=0\ncrt_seed=1\nweather=clear\nmsaa_requested={msaa}\nanisotropy=1\nwarmup_frames=320\nmeasured_frames={measured_frames}\ntiming={timing}\nvisual_acceptance=unexercised\n");
+    writeln!(report, "selected_view={selected:?}\npng_only={png_only}\ncapture_only={capture_only}\nassert_specks={assert_specks}\nao={ao}\nsun_shadows={shadows}\ncontact_shadows={contact}")?;
     for (key, program, args) in [
         ("revision", "git", vec!["rev-parse".into(), "HEAD".into()]),
         ("resource_sha256", "shasum", vec!["-a".into(), "256".into(), dir.join("cd_image/rdb.db").into_os_string()]),
@@ -121,7 +132,7 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
         let mut baseline_raw = None;
         let mut allocated = [None; 2];
         // Repeat opposite ordering to expose simple thermal/order drift.
-        for (round, order) in [[0usize, 1], [1, 0]].into_iter().enumerate() {
+        for (round, order) in [[0usize, 1], [1, 0]].into_iter().take(if capture_only { 1 } else { 2 }).enumerate() {
             for variant in order {
                 ao_scene::crt_srand(1);
                 let mut lens = camera::lens(scene.lens.unwrap_or_default(), false);
@@ -134,7 +145,7 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                 off.host.fog_density_scale = Some(1.0);
                 off.host.grass_exposure = Some(exposure.clone());
                 off.host.grass_wind = weather.wind;
-                let settings = EnhancedSettings { sun_shadows: effects, contact_shadows: effects, ambient_occlusion: effects, emissive_bloom: effects, hdr, ground_grass: true, grass_distance, grass_density: if variant == 0 { 0.0 } else { density }, ..Default::default() };
+                let settings = EnhancedSettings { sun_shadows: shadows, contact_shadows: contact, ambient_occlusion: ao, emissive_bloom: effects, hdr, ground_grass: true, grass_distance, grass_density: if variant == 0 { 0.0 } else { density }, ..Default::default() };
                 off.host.enhanced_settings = Some(settings);
                 // The extended field can need more than 320 streamed exposure frames.
                 // Record its up-front cost separately; the paired GPU measurement is stationary/warmed.
@@ -142,36 +153,46 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                 let warm_started = std::time::Instant::now();
                 off.warm_grass_tiles();
                 writeln!(report, "explicit_grass_warm_wall_ms={}", warm_started.elapsed().as_secs_f64() * 1000.0)?;
-                off.set_gpu_timing(true)?;
-                let mut gpu = Vec::with_capacity(600);
-                let mut prepare = Vec::with_capacity(600);
+                if !capture_only { off.set_gpu_timing(true)?; }
+                let mut gpu = Vec::with_capacity(measured_frames);
+                let mut prepare = Vec::with_capacity(measured_frames);
                 let mut generation = Vec::with_capacity(320);
                 let mut list = Default::default();
-                for frame in 0..920 {
+                for frame in 0..320 + measured_frames {
                     list = off.frame(&mut shot, 0.0);
-                    let ms = off.read_frame_gpu_ms()?.context("GPU timestamps unavailable")?;
+                    let ms = if capture_only { None } else { Some(off.read_frame_gpu_ms()?.context("GPU timestamps unavailable")?) };
                     if frame >= 320 {
-                        gpu.push(ms);
+                        gpu.push(ms.context("measured frame missing GPU timestamp")?);
                         prepare.push(off.evidence_grass_metrics().1 as f64 / 1_000_000.0);
                     }
                     else { generation.push(off.evidence_grass_metrics().1 as f64 / 1_000_000.0); }
                 }
-                off.set_gpu_timing(false)?;
+                if !capture_only { off.set_gpu_timing(false)?; }
                 let (bytes, _, cells) = off.evidence_grass_metrics();
-                let gpu_stats = percentiles(&mut gpu);
-                let prepare_stats = percentiles(&mut prepare);
                 let generation_mean = generation.iter().sum::<f64>() / generation.len() as f64;
                 let generation_max = generation.iter().copied().fold(0.0, f64::max);
                 let generation_stats = percentiles(&mut generation);
-                medians[variant] = gpu_stats.0;
+                let timing_stats = if capture_only { None } else {
+                    let gpu_stats = percentiles(&mut gpu);
+                    let prepare_stats = percentiles(&mut prepare);
+                    medians[variant] = gpu_stats.0;
+                    Some((gpu_stats, prepare_stats))
+                };
                 allocated[variant] = off.gpu_allocated_bytes();
                 let max_blade_candidates = cells * (1536.0 * settings.clamped().grass_density / 2.0).round().max(1.0) as usize * variant;
-                writeln!(report, "view={name} pf={pf} time={time} camera={fixed:?} lens={lens:?} settings={settings:?} round={round} variant={variant} gpu_ms_p50_p95_p99={gpu_stats:?} prepare_wall_ms_p50_p95_p99={prepare_stats:?} effect_gpu_payload_bytes={bytes} cells={cells} max_blade_candidates={max_blade_candidates}")?;
+                writeln!(report, "view={name} pf={pf} time={time} camera={fixed:?} lens={lens:?} settings={settings:?} round={round} variant={variant} effect_gpu_payload_bytes={bytes} cells={cells} max_blade_candidates={max_blade_candidates}")?;
+                if let Some((gpu_stats, prepare_stats)) = timing_stats {
+                    writeln!(report, "gpu_ms_p50_p95_p99={gpu_stats:?} prepare_wall_ms_p50_p95_p99={prepare_stats:?}")?;
+                } else {
+                    writeln!(report, "gpu_timing=unexercised prepare_measured_timing=unexercised")?;
+                }
                 writeln!(report, "generation_wall_ms_p50_p95_p99={generation_stats:?} generation_mean_ms={generation_mean} generation_max_ms={generation_max}")?;
                 writeln!(report, "native_metal_allocated_bytes={:?} shared_enhanced_target_bytes={}", allocated[variant], off.enhanced_target_bytes())?;
                 if round == 0 && variant == 1 { writeln!(report, "grass_diagnostics_view={name}\n{}", off.evidence_grass_diagnostics())?; }
                 std::fs::write(out.join("manifest.txt"), &report)?;
-                ensure!(variant == 0 || prepare_stats.1 <= 0.2, "{name}: grass generation/prepare p95 exceeds 0.2 ms: {prepare_stats:?}");
+                if let Some((_, prepare_stats)) = timing_stats {
+                    ensure!(variant == 0 || prepare_stats.1 <= 0.2, "{name}: grass generation/prepare p95 exceeds 0.2 ms: {prepare_stats:?}");
+                }
                 ensure!(variant == 0 || generation_mean <= 0.2, "{name}: amortised grass generation exceeds 0.2 ms: {generation_mean}");
                 if round == 0 {
                     let raw = off.rgba(&shot, &list)?;
@@ -182,6 +203,19 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                         let baseline = baseline_raw.as_ref().context("neutral capture missing")?;
                         let differing = raw.iter().zip(baseline).filter(|(a, b)| a != b).count();
                         writeln!(report, "view={name} neutral_vs_grass_differing_bytes={differing}")?;
+                        if name == "borealis-grass-ground-far-day" {
+                            // The retained AFTER detail places this rectangle on the far green hills.
+                            // Allow new isolated dark pixels in at most 0.05% of this run's green area.
+                            // This permits real blade edges, not the old carpet's 3.4% pepper noise.
+                            let specks = dark_specks(baseline, &raw, size.0 as usize, size.1 as usize, [550, 300, 1400, 600]);
+                            let tolerance = specks.0.div_ceil(2000).max(8);
+                            writeln!(report, "view={name} speck_roi=[550,300,1400,600] speck_window=7x7 speck_luma=rec709_encoded_rgb speck_ratio=0.6 speck_drop=0.06 speck_green=40_of_49_paired_off_g_gt_1.15r_and_1.15b eligible_pixels={} variant=0 dark_outliers={} variant=1 dark_outliers={} new_dark_outliers={} tolerance={tolerance} speck_acceptance={}", specks.0, specks.1, specks.2, specks.3, if assert_specks { "enforced" } else { "unexercised_ablation" })?;
+                            std::fs::write(out.join("manifest.txt"), &report)?;
+                            ensure!(specks.0 > 100_000, "{name}: paired green terrain mask is empty or camera/palette drifted: {specks:?}");
+                            if assert_specks {
+                                ensure!(specks.3 <= tolerance, "{name}: new grass dark specks exceed 0.05% of eligible pixels ({tolerance}): {specks:?}");
+                            }
+                        }
                         if differing > 0 { changed_views += 1; }
                         if pf == 127 { ensure!(cells == 0 && differing == 0, "indoor grass changed the image"); }
                         if pf == 127 || name == "icc-platform-authored" {
@@ -191,7 +225,9 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                     }
                 }
             }
-            writeln!(report, "view={name} round={round} incremental_grass_gpu_frame_p50_ms={}", medians[1] - medians[0])?;
+            if !capture_only {
+                writeln!(report, "view={name} round={round} incremental_grass_gpu_frame_p50_ms={}", medians[1] - medians[0])?;
+            }
             if let [Some(before), Some(after)] = allocated {
                 writeln!(report, "view={name} round={round} native_metal_allocated_delta_bytes={}", after as i128 - before as i128)?;
             }
@@ -202,6 +238,67 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
     ensure!(changed_views > 0 || (positive_views == 0 && negative_views > 0), "fixture has no visible grass contribution or verified negative-only selection");
     std::fs::write(out.join("manifest.txt"), &report)?;
     Ok(())
+}
+
+/// Paired 7x7 median test in encoded PNG RGB, not a linear-light radiometry claim.
+/// The retained far AFTER image locates this ROI on hills; a 40/49 green-neighbour
+/// mask from grass-OFF rejects rocks, structures, water and their silhouette edges.
+/// Count broad shadows only if they contain a genuinely isolated dark outlier.
+fn dark_specks(
+    baseline: &[u8],
+    grass: &[u8],
+    width: usize,
+    height: usize,
+    roi: [usize; 4],
+) -> (usize, usize, usize, usize) {
+    assert_eq!(baseline.len(), width * height * 4);
+    assert_eq!(grass.len(), baseline.len());
+    assert!(roi[0] >= 3 && roi[1] >= 3 && roi[2] + 3 <= width && roi[3] + 3 <= height);
+    let luma = |rgb: &[u8]| (0.2126 * rgb[0] as f32 + 0.7152 * rgb[1] as f32 + 0.0722 * rgb[2] as f32) / 255.0;
+    let mut counts = (0, 0, 0, 0);
+    for y in roi[1]..roi[3] {
+        for x in roi[0]..roi[2] {
+            let mut off_luma = [0.0; 49];
+            let mut on_luma = [0.0; 49];
+            let mut green = 0;
+            let mut sample = 0;
+            for ny in y - 3..=y + 3 {
+                for nx in x - 3..=x + 3 {
+                    let offset = (ny * width + nx) * 4;
+                    let rgb = &baseline[offset..offset + 3];
+                    green += usize::from(rgb[1] as f32 > 1.15 * rgb[0] as f32 && rgb[1] as f32 > 1.15 * rgb[2] as f32);
+                    off_luma[sample] = luma(rgb);
+                    on_luma[sample] = luma(&grass[offset..offset + 3]);
+                    sample += 1;
+                }
+            }
+            if green < 40 { continue; }
+            let offset = (y * width + x) * 4;
+            let off_median = *off_luma.select_nth_unstable_by(24, f32::total_cmp).1;
+            let on_median = *on_luma.select_nth_unstable_by(24, f32::total_cmp).1;
+            let is_outlier = |value: f32, median: f32| value < median * 0.6 && median - value > 0.06;
+            let off_dark = is_outlier(luma(&baseline[offset..offset + 3]), off_median);
+            let on_dark = is_outlier(luma(&grass[offset..offset + 3]), on_median);
+            counts.0 += 1;
+            counts.1 += usize::from(off_dark);
+            counts.2 += usize::from(on_dark);
+            counts.3 += usize::from(on_dark && !off_dark);
+        }
+    }
+    counts
+}
+
+#[test]
+fn grass_dark_specks_reject_uniform_shadow() {
+    let plane = [90, 180, 70, 255].repeat(32 * 32);
+    let mut speck = plane.clone();
+    speck[(16 * 32 + 16) * 4..(16 * 32 + 16) * 4 + 3].fill(0);
+    let roi = [3, 3, 29, 29];
+    assert_eq!(dark_specks(&plane, &plane, 32, 32, roi), (676, 0, 0, 0));
+    assert_eq!(dark_specks(&plane, &speck, 32, 32, roi), (676, 0, 1, 1));
+    let shadow = [27, 54, 21, 255].repeat(32 * 32);
+    assert_eq!(dark_specks(&plane, &shadow, 32, 32, roi), (676, 0, 0, 0));
+    assert_eq!(dark_specks(&speck, &speck, 32, 32, roi), (676, 1, 1, 0));
 }
 
 fn percentiles(samples: &mut [f64]) -> (f64, f64, f64) {

@@ -1,4 +1,4 @@
-//! Half-resolution diffuse-contact AO. Inputs are exclusively current visible depth.
+//! Half-resolution diffuse-contact AO from current visible depth and grass porosity tags.
 use crate::gpu_stats::GpuStatsExt;
 use glam::Mat4;
 
@@ -61,7 +61,7 @@ impl AmbientOcclusion {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, depth: &wgpu::TextureView, ambient: &wgpu::TextureView, colour: &wgpu::TextureView, size: (u32, u32), vp: Mat4, radius: f32, strength: f32, fog_depth: f32, mut timer: Option<&mut crate::FrameGpuTimer>) {
+    pub(super) fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, depth: &wgpu::TextureView, ambient: &wgpu::TextureView, colour: &wgpu::TextureView, size: (u32, u32), vp: Mat4, radius: f32, strength: f32, fog_depth: f32, grass_present: bool, mut timer: Option<&mut crate::FrameGpuTimer>) {
         if !radius.is_finite() || radius <= 0.0 || !strength.is_finite() || strength <= 0.0 || size.0 == 0 || size.1 == 0 { return; }
         if self.targets.as_ref().is_none_or(|targets| targets.size != size || targets.depth != *depth || targets.ambient != *ambient) {
             let create = |label| device.create_texture_tracked(&wgpu::TextureDescriptor {
@@ -82,7 +82,7 @@ impl AmbientOcclusion {
             self.targets = Some(Targets { size, depth: depth.clone(), ambient: ambient.clone(), raw_bind: bind(&filtered), blur_bind: bind(&raw), raw, filtered });
         }
         let targets = self.targets.as_ref().expect("AO targets allocated");
-        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&Params { inverse_vp: vp.inverse().to_cols_array_2d(), vp: vp.to_cols_array_2d(), control: [radius, strength.clamp(0.0, 2.0), fog_depth, size.1 as f32] }));
+        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&Params { inverse_vp: vp.inverse().to_cols_array_2d(), vp: vp.to_cols_array_2d(), control: [radius, strength.clamp(0.0, 2.0), fog_depth, u32::from(grass_present) as f32] }));
         for (index, (label, pipeline, input, output, load)) in [
             ("ambient AO estimate", &self.estimate, &targets.raw_bind, &targets.raw, wgpu::LoadOp::Clear(wgpu::Color::BLACK)),
             ("ambient AO bilateral blur", &self.blur, &targets.blur_bind, &targets.filtered, wgpu::LoadOp::Clear(wgpu::Color::BLACK)),
@@ -128,7 +128,7 @@ impl crate::Renderer {
         let Some(ambient) = frame.ambient.as_ref() else { return; };
         let ao = self.ambient_occlusion.get_or_insert_with(|| AmbientOcclusion::new(&self.device, self.format));
         ao.encode(&self.device, &self.queue, encoder, &frame.resolved_depth, ambient, &frame.colour,
-            frame.size, vp, settings.ao_radius, settings.ao_strength, fog_depth, None);
+            frame.size, vp, settings.ao_radius, settings.ao_strength, fog_depth, self.grass.as_ref().is_some_and(|grass| grass.has_draws()), None);
     }
 
     /// AO-owned textures/uniform plus its ambient MRT, excluding shared colour/depth
@@ -147,6 +147,20 @@ mod tests {
     #[test]
     fn half_resolution_memory_covers_odd_extents() {
         assert_eq!(super::AmbientOcclusion::incremental_bytes((3, 5)), 2 * 3 * 16 + 144);
+    }
+
+    #[test]
+    fn porous_grass_tag_survives_one_of_eight_msaa_samples() {
+        let share = |alpha: f32| (alpha + 1.0).clamp(0.0, 1.0);
+        for covered in 1..=8 {
+            // Remaining samples belong to ordinary surfaces (alpha 1).
+            let resolved = (-16.0 * covered as f32 + (8 - covered) as f32) / 8.0;
+            assert!(resolved <= -1.0);
+            assert_eq!(share(resolved), 0.0);
+        }
+        assert_eq!(share(1.0), 1.0);
+        assert_eq!(share(0.0), 1.0);
+        assert_eq!(share(-0.5), 0.5);
     }
 
     #[test]
@@ -337,7 +351,7 @@ struct Params { vp: mat4x4<f32> }
                     depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
                 });
             }
-            ao.encode(device, queue, &mut encoder, &depth, ambient_view, &colour_view, (width, height), vp, 1.5, 1.0, super::fog_depth_limit(0.1, 100.0, fog_end), timer.as_mut());
+            ao.encode(device, queue, &mut encoder, &depth, ambient_view, &colour_view, (width, height), vp, 1.5, 1.0, super::fog_depth_limit(0.1, 100.0, fog_end), false, timer.as_mut());
             let readback = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("AO fairness readback"), size: u64::from(width) * u64::from(height) * 4, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
             encoder.copy_texture_to_buffer(wgpu::TexelCopyTextureInfo { texture: &colour, mip_level: 0, origin: Default::default(), aspect: wgpu::TextureAspect::All }, wgpu::TexelCopyBufferInfo { buffer: &readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) } }, wgpu::Extent3d { width, height, depth_or_array_layers: 1 });
             queue.submit([encoder.finish()]);
