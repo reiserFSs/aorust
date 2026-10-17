@@ -435,7 +435,7 @@ mod tests {
         assert_eq!(empty, capture(&mut r, ao), "AO cannot mark an empty dark sky");
         assert_eq!(empty, capture(&mut r, shadows), "shadows cannot mark an empty dark sky");
         assert_eq!(empty, capture(&mut r, bloom), "dark sky is not a bloom emitter");
-        assert!(r.emissive_seed_rgba().unwrap().unwrap().chunks_exact(4)
+        assert!(r.emissive_seed_rgba().unwrap().unwrap().as_chunks::<4>().0.iter()
             .all(|pixel| pixel[..3] == [0, 0, 0]));
 
         for textured in [false, true] {

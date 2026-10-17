@@ -453,7 +453,7 @@ mod tests {
                 let list = off.frame(&mut shot, 0.0);
                 let pixels = off.rgba(&shot, &list)?;
                 ensure!(pixels.len() == (size.0 * size.1 * 4) as usize, "invalid capture size");
-                let changed = pixels.chunks_exact(4).zip(baseline.chunks_exact(4)).filter(|(a, b)| a != b).count();
+                let changed = pixels.as_chunks::<4>().0.iter().zip(baseline.as_chunks::<4>().0.iter()).filter(|(a, b)| a != b).count();
                 visible_frames += usize::from(changed > 0);
                 image::save_buffer(out.join(format!("{stem}.png")), &pixels, size.0, size.1, image::ColorType::Rgba8)?;
                 if bloom {
@@ -462,7 +462,7 @@ mod tests {
                     ensure!(seed.len() == pixels.len() && baseline_seed.len() == pixels.len(), "invalid emissive capture size");
                     image::save_buffer(out.join(format!("{stem}-emissive_seed_rgba.png")), &seed, size.0, size.1, image::ColorType::Rgba8)?;
                     image::save_buffer(out.join(format!("{stem}-scene-emissive_seed_rgba.png")), &baseline_seed, size.0, size.1, image::ColorType::Rgba8)?;
-                    let changed_seed = seed.chunks_exact(4).zip(baseline_seed.chunks_exact(4)).filter(|(a, b)| a != b).count();
+                    let changed_seed = seed.as_chunks::<4>().0.iter().zip(baseline_seed.as_chunks::<4>().0.iter()).filter(|(a, b)| a != b).count();
                     eprintln!("{stem}: emissive_seed_changed_pixels={changed_seed}");
                 }
                 eprintln!("{stem}: strike_time={:.6} source={source:?} camera={:?} fans={} bolt_segments={} changed_pixels={changed}", fx.elapsed, shot.camera, fx.fan_count(), fx.bolt_count());
