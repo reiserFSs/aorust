@@ -514,9 +514,12 @@ asserts AO never increases a component. The MRT regression covers both static
 and actor materials: ordinary, reduced baked/prelit, unlit, self-lit and
 emissive, plus an occluded emitter; baked receiving colour is checked against
 20% of actual beauty.
-AO's two RG32U half-resolution targets cache the exact selected pixel offset,
-half-precision AO and full32 depth, avoiding repeated four-depth reselection
-inside the filters. Targets plus the uniform cost
-`ceil(width/2) * ceil(height/2) * 16 + 144` bytes (excluding shared Enhanced
-depth/ambient targets and driver allocation overhead), and are dropped when
-the AO switch is disabled.
+AO's two RGBA32U half-resolution targets cache the exact selected 2×2 pixel
+offset, exact device depth, f16 normal and f16 AO (16 bytes per texel each),
+matching the contact-shadow cache layout. Blur and upsample candidate taps read
+the cached normal/depth instead of reselecting four depths or reconstructing
+primary depth/normals. Targets plus the uniform cost
+`ceil(width/2) * ceil(height/2) * 32 + 144` bytes (18,432,144 at 1920×1200;
+excluding shared Enhanced depth/ambient targets and driver allocation overhead),
+and are dropped when the AO switch is disabled. Strength 1.5 and radius
+1.75 m are unchanged.

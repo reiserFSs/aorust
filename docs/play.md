@@ -832,19 +832,25 @@ AOMAC_GFX_OUT=/tmp/contact-grain-after \
 ```
 
 **Recorded fix result (2026-10-18).** Accepted evidence:
-`~/aomac-handoff/gfx/v3/AoGrain/after-relative-five` (AO) and
+`~/aomac-handoff/gfx/v3/AoGrain/ao-cached` (AO, authoritative; it supersedes
+`after-relative-five`, kept as the historical pre-cache run) and
 `~/aomac-handoff/gfx/v3/AoGrain/contact-cached` (contact, authoritative; it
 supersedes `contact-final`, kept as the historical unoptimized run). Other
-`after*` directories there are rejected or diagnostic runs.
+`after*` directories there are rejected or diagnostic runs. Run logs are the
+`*-run.log` files in the same directory (e.g. `ao-cached-run.log`,
+`ao-precache-repeat-run.log`).
 
 | Effect | Static grain MSE | Tiny mean codes | Tiny >2 count | Orbit mean codes | Orbit >2 count |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | AO before | 0.00709256425634166 | 3.418431057669665 | 5661749 | 8.270776727091926 | 7257147 |
-| AO after | 0.00517782982414801 | 1.1980629383225236 | 1797442 | 6.358997685843572 | 5025889 |
+| AO after, pre-cache (`after-relative-five`, historical) | 0.00517782982414801 | 1.1980629383225236 | 1797442 | 6.358997685843572 | 5025889 |
+| **AO after, cached (`ao-cached`, accepted)** | 0.00517780959797533 | 1.19818129296252951 | 1797477 | 6.35908105216398489 | 5026010 |
 | Contact before | 0.00063275435109123 | 1.318216025873466 | 2004863 | 2.643878401054905 | 2604297 |
 | Contact after, unoptimized (`contact-final`, historical) | 0.00047179592596340 | 0.34540546083893997 | 566951 | 2.07279738594694 | 2265083 |
 | **Contact after, cached (`contact-cached`, accepted)** | 0.00047182003454393 | 0.34538396887111705 | 566912 | 2.07276039724203676 | 2265047 |
 
+Accepted cached AO maxima: tiny 254.81335725799096, orbit 254.81212498469327
+codes, equal to (not above) the pre-fix maxima.
 Accepted cached contact maxima: tiny 114.37383097862528, orbit
 118.90174569473930 codes (pre-fix 119.63359267776153 / 122.25109918158317);
 static mean normalized attenuation 0.04568450671863875 (pre-fix
@@ -852,14 +858,21 @@ static mean normalized attenuation 0.04568450671863875 (pre-fix
 are unchanged.
 
 Both effects' on/off eight static frames are strictly byte-identical after 32
-common plus 4 effect-phase warmup frames; the AO-off and contact-off
-before/after PNGs are byte-exact. Paired ICC whole-frame contribution rose from
-0.399294067 to 1.071250400 ms (AO). Contact went from 0.471834475 ms (original)
-to 2.272893075 ms (unoptimized fix, historical) and 0.702560750 ms with the
-accepted cache, within the user's ≤0.8 ms target. These are explicit cost
-increases from whole-frame on-minus-off pairs, not isolated GPU pass timers. A
-lazy-normal AO cost experiment (1.16066155 ms) was reverted; sample counts and
-thresholds were not reduced.
+common plus 4 effect-phase warmup frames (also re-observed for `ao-cached`); the
+AO-off and contact-off before/after PNGs are byte-exact against the original
+pre-fix baselines. Paired ICC whole-frame contribution (on minus off) for AO:
+0.399294067 ms original pre-fix; 1.071250400 ms for the uncached fix in an
+earlier GPU lease. In one later exclusive GPU lease, ABBA off/on/on/off with 30
+warmup and 60 samples per phase, the preserved pre-cache executable measured
+1.595249575 ms (`ao-precache-repeat`) and the cached release 1.029945108 ms
+(`ao-cached`), −35.4% within that lease. The two leases differ by clock
+variance: the 35% saving is not relative to 1.071250400 ms, and both epochs are
+reported as measured. Contact went from 0.471834475 ms (original) to
+2.272893075 ms (unoptimized fix, historical) and 0.702560750 ms with the
+accepted cache, within the user's ≤0.8 ms target. All are whole-frame
+on-minus-off pairs, not isolated GPU pass timers. A lazy-normal AO cost
+experiment (1.16066155 ms) was reverted; sample counts and thresholds were not
+reduced.
 
 The contact cache stores, per half-resolution texel, the selected 2×2
 full-resolution pixel offset, exact device z, f16 normal and f16 AO in one
@@ -867,8 +880,21 @@ full-resolution pixel offset, exact device z, f16 normal and f16 AO in one
 bytes at 1920×1200 (formerly 9,216,000). Blur and upsample candidate taps no
 longer reconstruct primary depth/normal; the same three pipelines, 5×5
 triangular 25-tap kernel, nine phases and no temporal history remain. The
-geometry cache is independent of the AO toggle, because AO samples porosity
-differently.
+geometry cache is independent of the AO toggle and is not shared with AO: AO
+selects its depth sample with porosity weighting (grass), while contact uses the
+raw minimum depth, so the two caches select different samples.
+
+**AO cache follow-up (after contact publication, at Main's request).** AO
+(`ambient_occlusion.rs` and its WGSL) now uses the same `Rgba32Uint` layout:
+selected 2×2 offset, exact depth, f16 normal and f16 AO, so its filter taps
+read cached normal/depth without reconstruction. The full cache doubles AO
+target memory: 32 bytes per half-resolution sample across two targets, or
+18,432,000 bytes at 1920×1200 (formerly `RG32Uint`, 16 bytes per sample,
+9,216,000 bytes); see `docs/zone/world.md` §11. AO keeps its own cache with
+its own porosity-weighted sample selection rather than reusing contact's
+raw-minimum selection. Default strength 1.5 and radius 1.75 m are unchanged.
+The accepted `ao-cached` row and timing above are this cached build; it passed
+release tests and strict workspace clippy.
 
 Root cause: the original noise had already been fixed per frame, so an idle
 camera revealed spatial pepper rather than shimmer. Both CPU transforms now

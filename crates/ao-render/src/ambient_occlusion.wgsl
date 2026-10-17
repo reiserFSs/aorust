@@ -87,23 +87,27 @@ fn normal(pixel: vec2<i32>, p: vec3<f32>) -> vec3<f32> {
     let cross_n = cross(dy, dx);
     return cross_n / max(length(cross_n), 0.00001);
 }
-// Keep depth at full precision; AO needs only half precision for UNORM output.
-// Cache the selected 2x2 offset rather than reloading four depths at every
-// bilateral tap (including each full-resolution upsample tap).
-fn encoded(value: f32, z: f32, pixel: vec2<i32>) -> vec2<u32> {
+// Keep depth at full precision and selected 2x2 offsets exact. Cache the
+// selected-surface normal once so bilateral taps need no depth-normal gathers.
+// AO and normals use half precision; degenerate normals stay degenerate.
+fn encoded(value: f32, z: f32, pixel: vec2<i32>, n: vec3<f32>) -> vec4<u32> {
     let offset = u32(pixel.x & 1) | (u32(pixel.y & 1) << 1u);
-    return vec2<u32>(pack2x16float(vec2<f32>(value, 0.0)) | (offset << 16u), bitcast<u32>(z));
+    return vec4<u32>(pack2x16float(vec2<f32>(value, 0.0)) | (offset << 16u), bitcast<u32>(z),
+        pack2x16float(n.xy), pack2x16float(vec2<f32>(n.z, 0.0)));
 }
-fn value_of(sample: vec2<u32>) -> f32 { return unpack2x16float(sample.x).x; }
-fn depth_of(sample: vec2<u32>) -> f32 { return bitcast<f32>(sample.y); }
-fn selected_pixel(half: vec2<i32>, sample: vec2<u32>) -> vec2<i32> {
+fn value_of(sample: vec4<u32>) -> f32 { return unpack2x16float(sample.x).x; }
+fn depth_of(sample: vec4<u32>) -> f32 { return bitcast<f32>(sample.y); }
+fn normal_of(sample: vec4<u32>) -> vec3<f32> {
+    return vec3<f32>(unpack2x16float(sample.z), unpack2x16float(sample.w).x);
+}
+fn selected_pixel(half: vec2<i32>, sample: vec4<u32>) -> vec2<i32> {
     return half * 2 + vec2<i32>(i32((sample.x >> 16u) & 1u), i32((sample.x >> 17u) & 1u));
 }
-@fragment fn estimate(@builtin(position) position: vec4<f32>) -> @location(0) vec2<u32> {
+@fragment fn estimate(@builtin(position) position: vec4<f32>) -> @location(0) vec4<u32> {
     let center = half_sample(vec2<i32>(position.xy));
     let pixel = center.pixel;
     let z = center.z;
-    if z >= 1.0 { return encoded(0.0, z, pixel); }
+    if z >= 1.0 { return encoded(0.0, z, pixel, vec3<f32>(0.0)); }
     let homogeneous = world_homogeneous(pixel, z);
     let p = homogeneous.xyz / homogeneous.w;
     let n = normal(pixel, p);
@@ -136,7 +140,7 @@ fn selected_pixel(half: vec2<i32>, sample: vec2<u32>) -> vec2<i32> {
     }
     // Strength is an exponent on the open fraction: 0 -> neutral, always within [0, 1].
     let open = 1.0 - clamp(OCCLUSION_GAIN * occlusion / f32(DIRECTIONS * STEPS), 0.0, 1.0);
-    return encoded((1.0 - pow(open, params.control.y)) * center.share, z, pixel);
+    return encoded((1.0 - pow(open, params.control.y)) * center.share, z, pixel, n);
 }
 // Reject separation across either surface, not tangential separation along it:
 // a fixed Euclidean cutoff otherwise rejects even adjacent texels at distance.
@@ -153,12 +157,12 @@ fn bilateral(center: vec3<f32>, center_normal: vec3<f32>, candidate: vec3<f32>, 
     if distance >= cutoff { return 0.0; }
     return 1.0 - distance / max(cutoff, 0.001);
 }
-@fragment fn blur(@builtin(position) position: vec4<f32>) -> @location(0) vec2<u32> {
+@fragment fn blur(@builtin(position) position: vec4<f32>) -> @location(0) vec4<u32> {
     let pixel = vec2<i32>(position.xy);
-    let center = textureLoad(ao_input, pixel, 0).rg;
+    let center = textureLoad(ao_input, pixel, 0);
     if depth_of(center) >= 1.0 { return center; }
     let p = world(selected_pixel(pixel, center), depth_of(center));
-    let n = normal(selected_pixel(pixel, center), p);
+    let n = normal_of(center);
     var sum = value_of(center) * 9.0;
     var weight = 9.0;
     // Two convolved 3-wide boxes give symmetric weights 1,2,3,2,1. Every
@@ -168,17 +172,18 @@ fn bilateral(center: vec3<f32>, center_normal: vec3<f32>, candidate: vec3<f32>, 
             if x == 0 && y == 0 { continue; }
             let neighbor = pixel + vec2<i32>(x, y);
             if any(neighbor < vec2<i32>(0)) || any(neighbor >= vec2<i32>(textureDimensions(ao_input))) { continue; }
-            let sample = textureLoad(ao_input, neighbor, 0).rg;
+            let sample = textureLoad(ao_input, neighbor, 0);
             if depth_of(sample) >= 1.0 { continue; }
             let sample_pixel = selected_pixel(neighbor, sample);
             let sample_p = world(sample_pixel, depth_of(sample));
             let spatial = f32((3 - abs(x)) * (3 - abs(y)));
-            let w = spatial * bilateral(p, n, sample_p, normal(sample_pixel, sample_p));
+            let w = spatial * bilateral(p, n, sample_p, normal_of(sample));
             sum += value_of(sample) * w;
             weight += w;
         }
     }
-    return encoded(sum / weight, depth_of(center), selected_pixel(pixel, center));
+    // Filter only AO; preserve the exact cached geometry through the blur.
+    return vec4<u32>(pack2x16float(vec2<f32>(sum / weight, 0.0)) | (center.x & 196608u), center.yzw);
 }
 @fragment fn composite(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let pixel = vec2<i32>(position.xy);
@@ -197,12 +202,12 @@ fn bilateral(center: vec3<f32>, center_normal: vec3<f32>, candidate: vec3<f32>, 
         for (var x = 0; x < 2; x++) {
             let neighbor = base + vec2<i32>(x, y);
             if any(neighbor < vec2<i32>(0)) || any(neighbor >= vec2<i32>(textureDimensions(ao_input))) { continue; }
-            let sample = textureLoad(ao_input, neighbor, 0).rg;
+            let sample = textureLoad(ao_input, neighbor, 0);
             if depth_of(sample) >= 1.0 { continue; }
             let spatial = select(1.0 - fraction.x, fraction.x, x == 1) * select(1.0 - fraction.y, fraction.y, y == 1);
             let sample_pixel = selected_pixel(neighbor, sample);
             let sample_p = world(sample_pixel, depth_of(sample));
-            let w = spatial * bilateral(p, n, sample_p, normal(sample_pixel, sample_p));
+            let w = spatial * bilateral(p, n, sample_p, normal_of(sample));
             sum += value_of(sample) * w;
             weight += w;
         }
