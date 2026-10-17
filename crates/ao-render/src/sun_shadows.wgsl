@@ -116,5 +116,11 @@ fn sun_visibility(world: vec3<f32>, normal: vec3<f32>) -> f32 {
     let blend = smoothstep(end - (end - start) * 0.1, end, depth);
     if layer < 2u { visible = mix(visible, cascade_visibility(world, normal, layer + 1u), blend); }
     else { visible = mix(visible, 1.0, blend); }
+    // Camera-local fog may end before the stable cascade envelope. Retain a
+    // smooth receiver fade there, including native materials that disable fog.
+    if shadow_frame.eye.w < shadow_frame.splits.z {
+        let fade_start = max(shadow_frame.splits.w, shadow_frame.eye.w * 0.9);
+        visible = mix(visible, 1.0, smoothstep(fade_start, shadow_frame.eye.w, depth));
+    }
     return mix(1.0, visible, clamp(shadow_frame.forward.w, 0.0, 1.0));
 }
