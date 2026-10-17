@@ -1202,8 +1202,13 @@ impl Offscreen {
     /// Explicit single-sample persistent target for frozen-snapshot timing, without environment overrides.
     pub fn evidence_timing(fe: &dyn Frontend, size: (u32, u32)) -> Result<Self> {
         let mut off = Self::evidence(fe, size)?;
-        off.perf = Some(OffscreenPerf::explicit(&off.r, size, Some(1)));
+        off.prepare_frozen_rendering();
         Ok(off)
+    }
+
+    /// Installs a persistent target after the frozen capture, without advancing renderer counters.
+    pub fn prepare_frozen_rendering(&mut self) {
+        if self.perf.is_none() { self.perf = Some(OffscreenPerf::explicit(&self.r, self.size, Some(1))); }
     }
 
     /// Renders existing scene/actors/camera without frontend updates or capture/readback allocation.
@@ -1235,6 +1240,11 @@ impl Offscreen {
 
     /// Overrides the rendered/picking camera after frontend updates; `None` restores normal following.
     pub fn fixed_camera(&mut self, camera: Option<Camera>) { self.fixed_camera = camera; }
+
+    pub fn set_shadow_gpu_timing(&mut self, enabled: bool) -> Result<()> { self.r.set_shadow_gpu_timing(enabled) }
+    pub fn read_shadow_gpu_ms(&mut self) -> Result<Option<f64>> { self.r.read_shadow_gpu_ms() }
+    pub fn shadow_resident_bytes(&self) -> u64 { self.r.shadow_resident_bytes() }
+    pub fn gpu_allocated_bytes(&self) -> Option<usize> { native_gpu_allocated_bytes(&self.r) }
 
     /// Starts a fresh measured interval without rebuilding the renderer or its resources.
     pub fn perf_reset(&mut self) {

@@ -23,6 +23,10 @@ mod enhanced;
 mod enhanced_shader;
 mod ambient_occlusion;
 mod sky_probe;
+mod sun_shadows;
+mod shadow_pass;
+#[cfg(test)]
+mod shadow_tests;
 use gpu_stats::{GpuStatsExt, TextureViewStatsExt};
 pub use native_ground::GroundPath;
 
@@ -607,6 +611,10 @@ pub struct Renderer {
     ambient_occlusion: Option<ambient_occlusion::AmbientOcclusion>,
     gpu_timer: Option<FrameGpuTimer>,
     pub stats: FrameStats,
+    sun_shadows: Option<sun_shadows::SunShadows>,
+    shadow_sun: Option<[f32; 3]>,
+    shadow_timer: Option<FrameGpuTimer>,
+    shadow_timer_pending: bool,
     /// Seconds driving `Submesh::uv_scroll` (the viewer advances it; screenshots leave it at 0).
     pub time: f32,
     globals: wgpu::Buffer,
@@ -1110,6 +1118,10 @@ impl Renderer {
             pending_visuals: Default::default(),
             actor_visual_retirements: Vec::new(),
             heat_haze: Default::default(),
+            sun_shadows: None,
+            shadow_sun: None,
+            shadow_timer: None,
+            shadow_timer_pending: false,
             realistic_water: true,
             liquid_edge: [0.0; 3],
             water_light: None,
@@ -1251,18 +1263,31 @@ impl Renderer {
         let settings = settings.clamped();
         if self.enhanced_settings == settings { return; }
         let changed_path = self.enhanced_settings.any_enabled() != settings.any_enabled()
+            || self.enhanced_settings.sun_shadows != settings.sun_shadows
             || self.enhanced_settings.ambient_occlusion != settings.ambient_occlusion
             || self.enhanced_settings.emissive_bloom != settings.emissive_bloom;
         self.enhanced_settings = settings;
         if !settings.ambient_occlusion { self.ambient_occlusion = None; }
+        if !settings.sun_shadows { self.sun_shadows = None; }
         if changed_path { self.enhanced_frame = None; }
         if !settings.any_enabled() {
             self.enhanced_frame = None;
             self.enhanced_shader = None;
         } else if self.enhanced_shader.is_none() || changed_path {
             self.enhanced_shader = Some(self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("Enhanced world"), source: wgpu::ShaderSource::Wgsl(enhanced_shader::source(false, settings.ambient_occlusion, settings.emissive_bloom).into()),
+                label: Some("Enhanced world"), source: wgpu::ShaderSource::Wgsl(enhanced_shader::source(settings.sun_shadows, settings.ambient_occlusion, settings.emissive_bloom).into()),
             }));
+        }
+        if changed_path {
+            let shadow_layout = settings.sun_shadows.then(|| sun_shadows::receiver_layout(&self.device));
+            let mut ordinary = vec![Some(&self.g_layout), Some(&self.tex_layout)];
+            let mut holo = vec![Some(&self.g_layout), Some(&self.tex_layout), Some(&self.holo_layout)];
+            if let Some(shadow_layout) = shadow_layout.as_ref() {
+                ordinary.extend([None, Some(shadow_layout)]);
+                holo.push(Some(shadow_layout));
+            }
+            self.pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("world optional shadow receiver"), bind_group_layouts: &ordinary, immediate_size: 0 });
+            self.holo_pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("holo optional shadow receiver"), bind_group_layouts: &holo, immediate_size: 0 });
         }
         if settings.any_enabled() { self.set_msaa_samples(self.msaa_samples); }
         if changed_path {
@@ -1286,6 +1311,7 @@ impl Renderer {
     /// Explicit offline instrumentation; disabled by default and owns no resources then.
     /// After each render, read the result before encoding another timed frame.
     pub fn set_gpu_timing(&mut self, enabled: bool) -> Result<()> {
+        if enabled && self.shadow_timer.is_some() { return Err(anyhow!("frame and shadow GPU timing must be sampled separately")); }
         self.gpu_timer = if enabled { Some(FrameGpuTimer::new(&self.device, &self.queue)?) } else { None };
         Ok(())
     }
@@ -1313,6 +1339,7 @@ impl Renderer {
         self.sky_dot_counter = 0.0;
         self.sky.directional_epoch = self.time;
         self.water_light = scene.water_light;
+        self.sun_shadows = None;
         self.sky.clouds.clear();
         self.ground_state.recreate();
         let bc_supported = self.device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
@@ -1565,6 +1592,7 @@ impl Renderer {
     /// mesh/material set (zone or weather change) still falls through to a full rebuild.
     pub fn set_sky(&mut self, scene: &Scene) {
         self.water_light = scene.water_light;
+        self.update_shadow_sun(scene);
         for (k, t) in &scene.textures {
             if t.width > 0 && t.height > 0 && t.rgba.len() == (t.width * t.height * 4) as usize && !self.sky_views.contains_key(k) {
                 let v = self.texture_view(&t.rgba, t.width, t.height, t.source);
@@ -1688,6 +1716,8 @@ impl Renderer {
             sky_yaw: scene.sky_yaw.clone(),
             sky_wave_spin: scene.sky_wave_spin.clone(),
             environment: scene.environment,
+            ground_light: scene.ground_light,
+            sun_authored: scene.sun_authored,
             directional_lights: scene.directional_lights.clone(),
             meshes: scene.meshes.iter().map(|mesh| ao_scene::Mesh {
                 vertices: if mesh.submeshes.iter().any(|sub| sub.sun_flicker) { mesh.vertices.clone() } else { vec![] },
@@ -1727,6 +1757,7 @@ impl Renderer {
             }
         }
         if let Some(env) = self.sky.pose.environment { self.env.sun_dir = env.sun_dir; }
+        self.shadow_sun = shadow_pass::authored_sun(&self.sky.pose);
     }
 
     /// `set_sky` calls since the renderer started that fell through to a full rebuild, for leak regressions: in
@@ -2065,8 +2096,7 @@ impl Renderer {
         }
         let mut enc = self.device.create_command_encoder(&Default::default());
         self.encode_actor_skins(&mut enc);
-        let inst_buf = self.gpu.inst_bufs.get(self.frame);
-        if let Some(buf) = inst_buf {
+        if let Some(buf) = self.gpu.inst_bufs.get(self.frame) {
             if !self.vis.is_empty() {
                 self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&self.vis));
             }
@@ -2100,8 +2130,7 @@ impl Renderer {
             }
             run.grid=grid;
         }
-        let sky_buf = self.sky.bufs.get(self.frame);
-        if let Some(buf) = sky_buf {
+        if let Some(buf) = self.sky.bufs.get(self.frame) {
             // translation = camera; a spinning instance turns about its pivot (relative to the camera) first
             let time = self.time;
             let xf: Vec<[[f32; 4]; 4]> = self
@@ -2156,6 +2185,9 @@ impl Renderer {
         }
         self.sorted.sort_by(|a, b| actors::bucket_order(a.0, a.1, b.0, b.1)
             .then_with(|| b.4.cmp(&a.4)).then_with(|| a.3.cmp(&b.3)));
+        self.encode_enhanced_shadows(&mut enc, cam, t.size, env, far);
+        let inst_buf = self.gpu.inst_bufs.get(self.frame);
+        let sky_buf = self.sky.bufs.get(self.frame);
 
         if self.enhanced_settings.any_enabled() && self.enhanced_frame.as_ref().is_none_or(|frame| frame.size != t.size || frame.sample_count != self.msaa_samples) {
             self.enhanced_frame = Some(enhanced::EnhancedFrame::new(&self.device, self.format, t.size, self.msaa_samples, self.enhanced_settings));
@@ -2196,6 +2228,9 @@ impl Renderer {
             let draw = |pass: &mut wgpu::RenderPass, d: &Draw, insts: std::ops::Range<u32>, sky: bool| {
                 if pipe.get() != d.pipe {
                     pass.set_pipeline(if d.pipe >= 1000 { &self.ground_pipes[d.pipe - 1000] } else { &self.pipes[d.pipe] });
+                    if self.enhanced_settings.sun_shadows {
+                        pass.set_bind_group(3, &self.sun_shadows.as_ref().expect("shadow maps prepared before world").receiver, &[]);
+                    }
                     pipe.set(d.pipe);
                 }
                 if mesh.get() != (sky, d.mesh) {

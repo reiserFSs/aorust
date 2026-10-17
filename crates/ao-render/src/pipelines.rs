@@ -27,7 +27,6 @@ impl From<Vec<Slot>> for Pipelines {
     fn from(slots: Vec<Slot>) -> Self { Self(slots) }
 }
 impl Pipelines {
-    #[cfg(test)]
     pub fn spec(&self, index: usize) -> Spec {
         match self.0[index].source {
             Source::Compile(spec) => spec,

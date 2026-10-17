@@ -9,6 +9,8 @@ use std::sync::{Arc, Weak};
 
 #[path = "skinning.rs"]
 mod skinning;
+#[path = "shadow_actors.rs"]
+mod shadow_actors;
 #[cfg(test)]
 #[path = "native_skin_tests.rs"]
 mod native_skin_tests;
@@ -717,6 +719,9 @@ impl Renderer {
                     let pipe = mesh_effect_pipe(pipe, effect, d.projection_pass);
                     if pipe_c.get() != pipe {
                         pass.set_pipeline(&self.actor_pipes[pipe]);
+                        if self.enhanced_settings.sun_shadows {
+                            pass.set_bind_group(3, &self.sun_shadows.as_ref().expect("shadow maps prepared before actors").receiver, &[]);
+                        }
                         pipe_c.set(pipe);
                     }
                     if mat_c.get() != (it.model, d.mat) {

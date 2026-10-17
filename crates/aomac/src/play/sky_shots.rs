@@ -410,7 +410,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         for (name, pf, time, fixed) in views {
             ao_scene::crt_srand(1);
             let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
-            let capture = || -> anyhow::Result<(Vec<u8>, Lens, usize, usize)> {
+            let capture = |measure: bool| -> anyhow::Result<(Vec<u8>, Lens, usize, usize)> {
                 // Both renderers consume the exact same immutable snapshot, as effect comparisons do.
                 ao_scene::crt_srand(1);
                 let mut lens = camera::lens(scene.lens.unwrap_or_default(), false);
@@ -439,12 +439,16 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     off.host.actors.push(avatar.frame());
                     list = off.frame(&mut shot, 0.0);
                 }
-                Ok((off.rgba(&shot, &list)?, lens, counts.0, counts.1))
+                let raw = off.rgba(&shot, &list)?;
+                if measure && profile == "shadows" && std::env::var_os("AOMAC_GFX_SHADOW_TIMING").is_some() {
+                    graphics_shadow_timing(&mut off, &out, &name)?;
+                }
+                Ok((raw, lens, counts.0, counts.1))
             };
-            let (raw, lens, meshes, instances) = capture().with_context(|| format!("capture {name}"))?;
+            let (raw, lens, meshes, instances) = capture(true).with_context(|| format!("capture {name}"))?;
             std::fs::write(out.join(format!("{name}.rgba")), &raw)?;
             image::save_buffer(out.join(format!("{name}.png")), &raw, size.0, size.1, image::ColorType::Rgba8)?;
-            let (repeated, _, _, _) = capture().with_context(|| format!("repeat {name}"))?;
+            let (repeated, _, _, _) = capture(false).with_context(|| format!("repeat {name}"))?;
             let differing = |other: &[u8]| raw.iter().zip(other).filter(|(a, b)| a != b).count() + raw.len().abs_diff(other.len());
             let repeat_differences = differing(&repeated);
             if repeat_differences != 0 {
@@ -557,4 +561,44 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
     }
     assert!(graphics_fixture_settings("unknown").is_err());
     assert_eq!(graphics_fixture_actor().unwrap().name, "Testy");
+}
+
+fn graphics_shadow_timing(off: &mut Offscreen, directory: &std::path::Path, name: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::fmt::Write;
+    let mut report = String::from("resolution=1920x1200\nwarmup=120\nsamples=600\nunits=milliseconds\nmap_and_frame_spans_sampled_separately=true\n");
+    off.prepare_frozen_rendering();
+    let percentiles = |samples: &mut Vec<f64>| {
+        samples.sort_by(f64::total_cmp);
+        [0.50, 0.95, 0.99].map(|p| samples[((samples.len() - 1) as f64 * p).round() as usize])
+    };
+    for (label, profile) in [("faithful", "faithful"), ("shadows", "shadows"), ("neutral", "neutral"),
+        ("neutral-repeat", "neutral"), ("shadows-repeat", "shadows")] {
+        let settings = graphics_fixture_settings(profile)?;
+        off.set_enhanced_settings(settings);
+        let mut maps = Vec::with_capacity(600);
+        if settings.sun_shadows {
+            off.set_shadow_gpu_timing(true)?;
+            for sample in 0..720 {
+                off.render_frozen()?;
+                let Some(ms) = off.read_shadow_gpu_ms()? else { break; }; // Authored night/no-sun: no shadow pass exists.
+                if sample >= 120 { maps.push(ms); }
+            }
+            off.set_shadow_gpu_timing(false)?;
+        }
+        let mut frames = Vec::with_capacity(600);
+        off.set_gpu_timing(true)?;
+        for sample in 0..720 {
+            off.render_frozen()?;
+            let ms = off.read_frame_gpu_ms()?.context("frame GPU timer did not record")?;
+            if sample >= 120 { frames.push(ms); }
+        }
+        let frame_ms = percentiles(&mut frames);
+        let map_ms = (!maps.is_empty()).then(|| percentiles(&mut maps));
+        writeln!(report, "profile={label} frame_p50_p95_p99={frame_ms:?} shadow_map_p50_p95_p99={map_ms:?} shadow_samples={} logical_shadow_bytes={} enhanced_target_bytes={} native_metal_allocated_bytes={:?}",
+            maps.len(), off.shadow_resident_bytes(), off.enhanced_target_bytes(), off.gpu_allocated_bytes())?;
+        off.set_gpu_timing(false)?;
+    }
+    std::fs::write(directory.join(format!("{name}-gpu.txt")), report)?;
+    Ok(())
 }
