@@ -423,14 +423,19 @@ fn shader_source(channels: (bool, bool, bool), shadows: bool) -> String {
         .replace("//__AO_RECEIVE__", if channels.0 {
             "let indirect = select(i.dlight, max(clamp(i.light + palette, vec3<f32>(0.0), vec3<f32>(1.0)) - i.light, vec3<f32>(0.0)), i.path > 0u);\n    let extinction = (1.0 - fog) * select(1.0, 1.0 - fog, i.path > 1u);\n    let receiving = albedo * (light * 0.8 + min(light, indirect) * 0.2) * extinction;\n    output.ambient = vec4<f32>(min(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), max(receiving, vec3<f32>(0.0))), 1.0);"
         } else { "" })
-        .replace("//__SHADOW_VISIBILITY__", if shadows { "visibility = grass_sun_visibility(i.root + i.normal * 0.05, i.normal);" } else { "" })
+        .replace("//__SHADOW_VISIBILITY__", if shadows { "visibility = grass_sun_visibility(i.root + i.normal.xyz * 0.05, i.normal.xyz);" } else { "" })
         .replace("//__EMISSIVE_WRITE__", if channels.1 { "output.emissive = vec4<f32>(0.0);" } else { "" })
-        // Direct sun only: mask.g is terrain sky-openness, never inferred from a blade's sun share.
-        .replace("//__SUN_WRITE__", if channels.2 { "let sun_luma = dot(sun_share, vec3<f32>(0.2126, 0.7152, 0.0722));\n    output.sun = vec4<f32>(sun_luma * visibility * (1.0 - fog), 0.0, visibility, 1.0);" } else { "" });
+        // Same roof-tested terrain alpha and fog contract as the ground receiver.
+        .replace("//__SUN_WRITE__", if channels.2 { "let sun_luma = dot(sun_share, vec3<f32>(0.2126, 0.7152, 0.0722));\n    output.sun = vec4<f32>(sun_luma * grass_direct_visibility * (1.0 - fog), i.normal.w * (1.0 - fog), fog, 1.0);" } else { "" });
     let mut source = format!("{}\nconst GRASS_MAX_CELLS: u32 = {MAX_CELLS}u;\n{grass}", crate::shader_source::load("shader.wgsl", include_str!("shader.wgsl")));
+    if channels.0 { crate::enhanced_shader::append_ao_share(&mut source); }
     if shadows {
         crate::enhanced_shader::append_shadow_receiver(&mut source, 2);
-        source.push_str(&crate::shader_source::load("grass_shadow.wgsl", include_str!("grass_shadow.wgsl")));
+        let receiver = crate::shader_source::load("grass_shadow.wgsl", include_str!("grass_shadow.wgsl"));
+        source.push_str(&receiver.replace(
+            "    return mix(1.0, visible, clamp(shadow_frame.forward.w, 0.0, 1.0));",
+            "    grass_direct_visibility = visible;\n    return mix(1.0, visible, clamp(shadow_frame.forward.w, 0.0, 1.0));",
+        ));
     }
     source
 }
@@ -454,10 +459,26 @@ fn terrain_height(ground: &GroundRun, x: i32, z: i32) -> Option<f32> {
     })
 }
 
+pub(super) fn baked_sky_open(scene: &ao_scene::Scene) -> Vec<Vec<f32>> {
+    scene.ground_detail.iter().map(|patch| patch.fine_cells.iter().map(|cell| {
+        cell.vertices.iter().map(|&index| {
+            scene.meshes.get(patch.mesh).and_then(|mesh| mesh.vertices.get(index as usize))
+                .filter(|vertex| vertex.color[3].is_finite())
+                .map_or(0.0, |vertex| (1.0 - vertex.color[3]).clamp(0.0, 1.0))
+        }).fold(1.0, f32::min)
+    }).collect()).collect()
+}
+
 /// Matches ao-formats/terrain.rs's central differences, including global edges.
 /// Computed once with tile exposure, never in the steady-state CPU prepare loop.
 fn terrain_normals(ground: &GroundRun, grid: [i32; 2], size: f32) -> Option<[[f32; 4]; 4]> {
     let mut normals = [[0.0; 4]; 4];
+    let sky_open = ground.detail.patches().iter().enumerate().find_map(|(index, patch)| {
+        let x = grid[0].checked_sub(patch.origin[0])?;
+        let z = grid[1].checked_sub(patch.origin[1])?;
+        if x < 0 || z < 0 || x as usize >= patch.cells || z as usize >= patch.cells { return None; }
+        ground.sky_open.get(index)?.get(z as usize * patch.cells + x as usize).copied()
+    }).unwrap_or(0.0);
     for (out, [dx, dz]) in normals.iter_mut().zip([[0, 0], [1, 0], [0, 1], [1, 1]]) {
         let (x, z) = (grid[0] + dx, grid[1] + dz);
         let center = terrain_height(ground, x, z)?;
@@ -471,7 +492,7 @@ fn terrain_normals(ground: &GroundRun, grid: [i32; 2], size: f32) -> Option<[[f3
         let dx = (right.unwrap_or(center) - left.unwrap_or(center)) / width;
         let dz = -(front.unwrap_or(center) - back.unwrap_or(center)) / depth;
         let length = (dx * dx + 1.0 + dz * dz).sqrt();
-        *out = [-dx / length, 1.0 / length, -dz / length, 0.0];
+        *out = [-dx / length, 1.0 / length, -dz / length, sky_open];
     }
     Some(normals)
 }
@@ -824,6 +845,10 @@ mod blade_appearance_tests {
             assert_eq!(source.contains("dot(sun_share, vec3<f32>(0.2126, 0.7152, 0.0722))"), hdr,
                 "HDR daylight eligibility must use the native terrain's luma weights");
             assert_eq!(source.contains("visibility = grass_sun_visibility("), shadows);
+            assert_eq!(source.contains("i.normal.w * (1.0 - fog), fog, 1.0)"), hdr,
+                "grass must share terrain sky openness and native fog channels");
+            assert_eq!(source.contains("grass_direct_visibility = visible;"), shadows,
+                "the HDR sun mask excludes beauty's retained shadow floor");
             // Creating the pipeline validates the shader against the real bind-group layouts.
             let _grass = super::Grass::new(&renderer.device, &renderer.queue, &super::GreenMasks::default(), &renderer.g_layout, &renderer.tex_layout, &renderer.holo_layout, 1, (ao, bloom, hdr), shadows, renderer.format);
         }
@@ -884,6 +909,8 @@ mod green_ground_admission_tests {
         };
         scene.textures.insert(key(1), picture([60, 104, 40]));
         scene.textures.insert(key(2), picture([150, 110, 70]));
+        // Floor occupancy admits all green cells, but only one has roof-tested open sky.
+        for vertex in &mut scene.meshes[0].vertices[4..8] { vertex.color[3] = 0.0; }
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let mut renderer = crate::Renderer::new(&instance, None).expect("native grass admission GPU");
         renderer.set_msaa_samples(1);
@@ -911,6 +938,14 @@ mod green_ground_admission_tests {
         assert_eq!(grids, [[0, 1], [1, 0], [1, 1]].into_iter().collect(),
             "the soil cell stays absent while every green neighbour generates");
         assert_eq!(grass.cells.len(), grids.len(), "native cells must not generate duplicate grass");
+        let check_sky = |cells: &[super::Cell]| {
+            for cell in cells {
+                let expected = if cell.origin[0] == 2.0 && cell.origin[1] == 0.0 { 1.0 } else { 0.0 };
+                assert!(cell.normals.iter().all(|normal| normal[3] == expected),
+                    "floor occupancy must never stand in for baked terrain sky proof");
+            }
+        };
+        check_sky(&grass.cells);
         let bare = |grid: [i32; 2]| grass.cells.iter().find(|cell| [(cell.origin[0] / cell.origin[2]) as i32, (-cell.origin[1] / cell.origin[2]) as i32] == grid).map(|cell| cell.identity[3] >> 8);
         assert_eq!((bare([1, 0]), bare([0, 1]), bare([1, 1])), (Some(0b0000_0001), Some(0b0000_0100), Some(0b0001_0000)),
             "each green cell records which side or corner touches the soil tile (west, north, north-west)");
@@ -928,5 +963,6 @@ mod green_ground_admission_tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(coarse_grids, grids, "every green tile still generates on fully coarse terrain");
         assert_eq!(coarse_grass.cells.len(), grids.len());
+        check_sky(&coarse_grass.cells);
     }
 }
