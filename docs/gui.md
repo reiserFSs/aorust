@@ -1433,6 +1433,21 @@ reversed counters are errors, never unsigned wraparound durations.
 `read_frame_gpu_ms` reads each submitted frame before timer reuse.
 This synchronous instrumentation is offline-only and disabled by default.
 
+Measured headlessly on Apple M4 Pro (20 GPU cores), 1920×1200, 1× MSAA:
+the ten-view all-off cutover is byte-identical to the pre-Enhanced baseline
+(`~/aomac-handoff/gfx/core-faithful-cutover-1920`, 92,160,000 compared bytes).
+The corrected native ICC neutral image is also byte-exact; its explicit ABBA benchmark
+(120 warmups + 600 samples per profile) measured off/neutral GPU p50
+0.500875/0.541708 ms and CPU encode-submit p50 0.576000/0.592125 ms.
+Raw samples, PNG/RGBA, source patch and environment limitations are retained in
+`~/aomac-handoff/gfx/core-native-icc-unorm-completed-1920`.
+This is a boundary comparison under shared-machine load, not combined-effect or controlled
+thermal/power acceptance. Reproduce with ignored test
+`native_icc_neutral_pixels_and_gpu_timing` and a new `AOMAC_GFX_CORE_OUT` directory.
+The original encoder-timestamp numbers are invalid and retained only as failed evidence;
+deferred GPU counter resolution fixes the reproduced incomplete-counter ordering problem
+([wgpu #9414](https://github.com/gfx-rs/wgpu/issues/9414)).
+
 | aomac page / control | Key → store | Runtime consumer | Status |
 |---|---|---|---|
 | `Enhanced` / `Texture Sharpening (anisotropic filtering)` | `AomacTextureSharpening` → DV Main (index 0-4) | `flow.rs::frame` maps the index to 1/2/4/8/16 → `Host.anisotropy` → `Renderer::set_anisotropy` rebuilds the world + clamp-address samplers; default index 0 = 1x, matching retail `FUN_10041ede`/`docs/screens.md` "max anisotropy 1" (audit item 2) | **AOMAC-ONLY, LIVE; not a retail control** |
