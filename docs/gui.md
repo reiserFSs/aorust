@@ -1419,6 +1419,14 @@ An advancing-time diagnostic independently exposed a newly admitted actor sprite
 **184.73 ms**. The switch regression freezes simulation with `dt=0` to test reuse of the
 same scene rather than hide this unrelated lazy first-use compilation behind a tolerance.
 Logs and profiles: `~/aomac-handoff/gfx/v3/ToggleLand-profile-{fixed-time,cold-symbols}/`.
+Final ordinary-source release run after rebasing onto `6d9e47fa`: cold install
+**920.4 ms**, **91** rendered frames, maximum cold-switch frame **28.63 ms**,
+zero frame-thread world compiles; warm off/on **12.53/42.30 ms**, zero total world
+compiles. The subsequent synchronous fresh-renderer control was driver-cache-warm
+(**19.55 ms**), unlike the independently cold-symbol control above.
+The full faithful fixture passed all **17 views / 34 independent captures**, with
+exact byte equality against the clean pre-change `d56be26` baseline:
+`~/aomac-handoff/gfx/v3/ToggleLand-{before,after}/`. No window or server was used.
 
 MSAA is independently selectable. HDR is a scene-path switch, not a master switch: with it on the world pass writes
 a fourth attachment: red is the surface's direct-sun share x raw shadow visibility x (1 - native fog);
