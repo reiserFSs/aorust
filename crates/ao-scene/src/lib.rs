@@ -450,6 +450,17 @@ impl Default for ActorFrame {
     }
 }
 
+/// Current authored moon pose, including the loaded mesh factory frame.
+/// SpaceLight illuminates the disc only; absent world energy cannot cast shadows.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MoonSource {
+    pub toward_light: [f32; 3],
+    pub world_gamma_budget: Option<[f32; 3]>,
+    /// Centre in the resource snapshot, before the current sky-instance transform.
+    pub resource_center: [f32; 3],
+    pub sky_instance: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Scene {
     pub textures: HashMap<TextureKey, Texture>,
@@ -467,6 +478,13 @@ pub struct Scene {
     pub spawn_look_at: Option<[f32; 3]>,
     /// `None` = renderer defaults.
     pub environment: Option<Environment>,
+    /// Authored GroundLightCurrent gamma colour and toward-GroundLightDirection, scene space (DS1005d589).
+    /// Metadata only: Environment keeps the faithful light and actual Sun1 direction.
+    pub ground_light: Option<([f32; 3], [f32; 3])>,
+    /// True only when the authored ground-light expressions were evaluated.
+    pub sun_authored: bool,
+    /// Moon1/2/3 authored poses; no world moon energy is inferred from disc lighting.
+    pub moons: [Option<MoonSource>; 3],
     /// Native WaterLightCurrent and direction towards WaterLightDirection (DS1003f3db uses DAT10150264).
     /// Colour is linear; water has independent authored tracks, not the ground sun's doubled diffuse.
     pub water_light: Option<([f32; 3], [f32; 3])>,

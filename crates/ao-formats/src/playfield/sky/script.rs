@@ -582,9 +582,168 @@ fn term_rotation(obj: &Obj, ctx: &Ctx, term: &str, depth: u32) -> Option<Quat> {
     Some(Quat { w, x, y, z })
 }
 
+/// Metadata-only scalar lookup: do not alter the existing sky evaluator's interfaces.
+fn eval_expr_field(objects: &[Obj], obj: &Obj, ctx: &Ctx, expr: &str, depth: u32) -> Option<f32> {
+    eval(expr, &|name| if name == "GAME.CurrentDayIntensity" {
+        let game = objects.iter().find(|o| o.name == "GAME")?;
+        eval_field(game, ctx, game.field("CurrentDayIntensity")?, depth + 1)
+    } else if name.starts_with("GAME.") && !matches!(name,
+        "GAME.GameDayTime" | "GAME.CurrentDayTime" | "GAME.DayTimeFactor" |
+        "GAME.ThickCloudsIntensity" | "GAME.OffsetFromHQ_X" | "GAME.OffsetFromHQ_Z" |
+        "GAME.GameDeltaTime" | "GAME.HighAltitudeWindX" | "GAME.HighAltitudeWindZ" |
+        "GAME.CurrentNightIntensity") && !name.starts_with("GAME.GameWaveCurve") {
+        None
+    } else {
+        variable(objects, obj, ctx, name, depth)
+    })
+}
+
+fn components_expr<const N: usize>(objects: &[Obj], obj: &Obj, ctx: &Ctx, inner: &str, depth: u32) -> Option<[f32; N]> {
+    let mut values = [0.0; N];
+    if !inner.contains(',') {
+        let mut expressions = inner.split_whitespace();
+        for value in &mut values { *value = eval_expr_field(objects, obj, ctx, expressions.next()?, depth)?; }
+        return expressions.next().is_none().then_some(values);
+    }
+    let mut expressions = inner.split(',');
+    for value in &mut values { *value = eval_expr_field(objects, obj, ctx, expressions.next()?, depth)?; }
+    expressions.next().is_none().then_some(values)
+}
+
+/// Native left-to-right vector expressions (FXS10005600), isolated to celestial metadata.
+/// Unsupported typed operators fail closed rather than truncating to the first literal.
+pub fn vector_expr(objects: &[Obj], obj: &Obj, ctx: &Ctx, expr: &str, depth: u32) -> Option<[f32; 3]> {
+    if depth > MAX_NEST { return None; }
+    if depth == 0 { reset_budget(); }
+    spend()?;
+    let b = expr.as_bytes();
+    let mut pos = 0;
+    let mut value = vector_operand(objects, obj, ctx, b, &mut pos, depth)?;
+    loop {
+        skip_ws(b, &mut pos);
+        if pos == b.len() { return Some(value); }
+        let rest = std::str::from_utf8(&b[pos..]).ok()?;
+        if let Some(rhs) = rest.strip_prefix("[ROT]") {
+            let mut end = 0;
+            typed_atom(rhs.as_bytes(), &mut end)?;
+            let q = rotation_expr(objects, obj, ctx, rhs[..end].trim(), depth + 1)?;
+            // FXS10005600 vector/RHS quaternion/op12 ->100054af.
+            value = q.rotate(value);
+            pos += 5 + end;
+            continue;
+        }
+        let normalize = rest.starts_with("[NORMALIZE]");
+        let op = *b.get(pos)?;
+        if normalize { pos += 11; } else if b"+-*/".contains(&op) { pos += 1; } else { return None; }
+        let mut end = pos;
+        let token = typed_atom(b, &mut end)?;
+        if normalize {
+            let scale = eval_expr_field(objects, obj, ctx, token, depth + 1)?;
+            let length = value.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if length > 0.0 { value = value.map(|v| v / length * scale); }
+        } else if let Some(rhs) = vector_expr(objects, obj, ctx, token, depth + 1) {
+            value = std::array::from_fn(|i| match op { b'+' => value[i] + rhs[i], b'-' => value[i] - rhs[i],
+                b'*' => value[i] * rhs[i], _ => f32::NAN });
+            if op == b'/' { return None; }
+        } else {
+            let rhs = eval_expr_field(objects, obj, ctx, token, depth + 1)?;
+            value = match op { b'*' => value.map(|v| v * rhs),
+                b'/' if rhs != 0.0 => value.map(|v| v / rhs), b'/' => [0.0; 3], _ => return None };
+        }
+        pos = end;
+    }
+}
+
+/// One typed operand; scalar formulas inside vector components retain scalar evaluation.
+fn typed_atom<'a>(b: &'a [u8], pos: &mut usize) -> Option<&'a str> {
+    skip_ws(b, pos);
+    let start = *pos;
+    if b.get(*pos..*pos + 2).is_some_and(|s| s == b"v(" || s == b"q(") {
+        *pos += 2;
+        let mut nest = 1;
+        while let Some(&c) = b.get(*pos) {
+            *pos += 1;
+            if c == b'(' { nest += 1; }
+            if c == b')' { nest -= 1; if nest == 0 { break; } }
+        }
+        if nest != 0 { return None; }
+    } else {
+        if b.get(*pos) == Some(&b'-') { *pos += 1; }
+        while b.get(*pos).is_some_and(|c| c.is_ascii_alphanumeric() || b"._".contains(c)) { *pos += 1; }
+    }
+    (*pos > start).then(|| std::str::from_utf8(&b[start..*pos]).ok()).flatten()
+}
+
+fn vector_operand(objects: &[Obj], obj: &Obj, ctx: &Ctx, b: &[u8], pos: &mut usize, depth: u32) -> Option<[f32; 3]> {
+    let token = typed_atom(b, pos)?;
+    if let Some(inner) = token.strip_prefix("v(").and_then(|s| s.strip_suffix(')')) {
+        return components_expr(objects, obj, ctx, inner, depth + 1);
+    }
+    match token {
+        "GAME.CutY" => Some([1.0, 0.0, 1.0]),
+        "GAME.UpDirection" => Some([0.0, 1.0, 0.0]),
+        _ => vector_expr(objects, obj, ctx, obj.field(token.strip_prefix("This.")?)?, depth + 1),
+    }
+}
+
+/// Metadata-only quaternion evaluation, including vector-to-vector [ROT].
+pub fn rotation_expr(objects: &[Obj], obj: &Obj, ctx: &Ctx, expr: &str, depth: u32) -> Option<Quat> {
+    if depth > MAX_NEST { return None; }
+    if depth == 0 { reset_budget(); }
+    spend()?;
+    if let Some((left, right)) = expr.split_once("[ROT]") {
+        if let (Some(a), Some(b)) = (vector_expr(objects, obj, ctx, left.trim(), depth + 1), vector_expr(objects, obj, ctx, right.trim(), depth + 1)) {
+            let [x, y, z, w] = ao_scene::mover::rot_between(a, b);
+            return Some(Quat { x, y, z, w });
+        }
+        return Some(rotation_expr(objects, obj, ctx, left.trim(), depth + 1)?.then(rotation_expr(objects, obj, ctx, right.trim(), depth + 1)?));
+    }
+    let expr = expr.trim();
+    if let Some(field) = expr.strip_prefix("This.") {
+        if obj.name != "GAME" || !matches!(field, "GameSun1Rotation" | "GameSun2Rotation") {
+            return rotation_expr(objects, obj, ctx, obj.field(field)?, depth + 1);
+        }
+    }
+    if let Some(rest) = expr.strip_prefix("v(") {
+        let (axis, angle) = rest.split_once(')')?;
+        return Some(Quat::axis_angle(components_expr(objects, obj, ctx, axis, depth + 1)?,
+            eval_expr_field(objects, obj, ctx, angle.trim().trim_start_matches(',').trim(), depth + 1)?));
+    }
+    if let Some(rest) = expr.strip_prefix("q(").and_then(|s| s.strip_suffix(')')) {
+        let [x, y, z, w] = components_expr(objects, obj, ctx, rest, depth + 1)?;
+        return Some(Quat { x, y, z, w });
+    }
+    match expr {
+        "GAME.Sun1Rotation" | "GAME.Sun2Rotation" | "GAME.GameSun1Rotation" | "GAME.GameSun2Rotation" => term_rotation(obj, ctx, expr, depth),
+        "This.GameSun1Rotation" | "This.GameSun2Rotation" if obj.name == "GAME" => term_rotation(obj, ctx, expr, depth),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn celestial_expressions_are_strict_without_changing_legacy_vectors() {
+        let objects = parse_objects(concat!(
+            "Object Source\n{\n Vector Loop: This.Loop\n Quaternion LoopRotation: This.LoopRotation\n",
+            " Quaternion Unit1Rotation: v(0,0,1), 90\n Quaternion Unit2Rotation: v(0,1,0), 30\n}\n"
+        ));
+        let obj = &objects[0];
+        let ctx = Ctx::at(0.0);
+        assert_eq!(vector(obj, &ctx, "v(1,2,3", 0), Some([1.0, 2.0, 3.0]), "DotStars legacy caller omits closing paren");
+        assert_eq!(vector_expr(&objects, obj, &ctx, "v(1,2,3", 0), None);
+        assert_eq!(vector_expr(&objects, obj, &ctx, "This.Unit1Rotation", 0), None, "axis-angle is not a vector");
+        assert_eq!(vector_expr(&objects, obj, &ctx, "This.Loop", 0), None);
+        assert!(rotation_expr(&objects, obj, &ctx, "This.LoopRotation", 0).is_none());
+        assert_eq!(vector_expr(&objects, obj, &ctx, "v( 0 1 0 )", 0), Some([0.0, 1.0, 0.0]));
+        let expression = "This.Unit1Rotation [ROT] This.Unit2Rotation";
+        let expected = rotation(obj, &ctx, expression, 0).unwrap().rotate([0.0, 0.0, 1.0]);
+        let actual = rotation_expr(&objects, obj, &ctx, expression, 0).unwrap().rotate([0.0, 0.0, 1.0]);
+        assert!((0..3).all(|k| (actual[k] - expected[k]).abs() < 1e-6));
+        assert!(rotation_expr(&objects, obj, &ctx, "q(0,0,0,1) junk", 0).is_none());
+    }
 
     const SCRIPT: &str = "\
 Object Moon2

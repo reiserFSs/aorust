@@ -597,6 +597,40 @@ mod tests {
         assert_eq!(sample(&[7.0], 0.75), 7.0);
     }
 
+    #[test]
+    fn installed_penumbra_uses_authored_ground_expression_not_rgb_track_or_sun1() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client/cd_image/twk");
+        if !dir.join("Tweak_Shadowlands_SunLight_Penumbra.txt").is_file() { return; }
+        let mut text = String::new();
+        let mut seen = HashSet::new();
+        flatten(&dir, "Tweak_GAME.txt", &mut seen, &mut text, false);
+        flatten(&dir, "Tweak_Shadowlands_SunLight_Penumbra.txt", &mut seen, &mut text, false);
+        let objects = script::parse_objects(&text);
+        for time in [0.0, 1620.0, 3240.0, 4860.0] {
+            let ctx = game_context(&objects, time);
+            let (color, direction) = layers::ground_light(&objects, &ctx).expect("native Penumbra expressions");
+            let incident = ctx.sun1.rotate([0.0, 0.0, 1.0]);
+            // DS1005d589 rotates local +Z by GroundLightDirection (slot +2f4).
+            // Metadata is toward-light: negate that AO ray, then mirror scene Z.
+            let expected = [-2.0 * incident[0], 1.0, 2.0 * incident[2]];
+            let length = expected.iter().map(|v| v * v).sum::<f32>().sqrt();
+            assert!((0..3).all(|k| (direction[k] - expected[k] / length).abs() < 2e-5));
+            let light = objects.iter().find(|object| object.name == "SunLight").unwrap();
+            let glr = script::vector_expr(&objects, light, &ctx, light.field("GLR").unwrap(), 0).unwrap();
+            let ray = script::rotation_expr(&objects, light, &ctx, light.field("GroundLightDirection").unwrap(), 0).unwrap().rotate([0.0, 0.0, 1.0]);
+            let expected_ao = [2.0 * incident[0] / length, -1.0 / length, 2.0 * incident[2] / length];
+            assert!((0..3).all(|k| (glr[k] - expected_ao[k]).abs() < 2e-5), "authored GLR vector");
+            assert!((0..3).all(|k| (ray[k] - glr[k]).abs() < 2e-5), "GLD [ROT] GLR maps native +Z onto GLR");
+            assert!(direction[1] > 0.0);
+            if time == 0.0 { assert_eq!(color, [0.0; 3]); }
+            if time == 3240.0 {
+                let expected = [1.0 - 0.5 * 62.0 / 255.0, 1.0 - 0.6 * 145.0 / 255.0, 1.0 - 0.5 * 211.0 / 255.0];
+                assert!((0..3).all(|k| (color[k] - expected[k]).abs() < 2e-5));
+            }
+        }
+    }
+
     fn real_tweaks(id: u32) -> Option<Tweaks> {
         let dir = std::path::PathBuf::from(std::env::var_os("HOME")?).join("Games/ProjectRubiKa/client");
         Tweaks::load(&dir, id, true)

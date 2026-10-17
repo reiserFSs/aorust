@@ -51,6 +51,9 @@ pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Sce
         ..super::game_context(objs, sky.day_time)
     };
     scene.water_light=water_light(objs,&ctx);
+    scene.ground_light = ground_light(objs, &ctx);
+    scene.sun_authored = scene.ground_light.is_some();
+    scene.moons = [None; 3];
     scene.directional_lights = horizon_lights(objs, &ctx);
     let mut b = Builder { store, names, ctx, objs, sky, scene, sorts };
     // (sort, mesh, constant spin, aurora simulation, wave driven turns)
@@ -88,6 +91,18 @@ pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Sce
         scene.sky_colors.extend(colors.map(|(sim, gain)| SkyColors { mesh: scene.meshes.len() - 1, sim, gain }));
         scene.sky.push(Instance { mesh: scene.meshes.len() - 1, transform: IDENTITY });
         scene.sky_pose_objects.extend(object.map(|object| (scene.sky.len() - 1, object)));
+        if let Some(moon) = object.and_then(|index|
+            ["Moon1", "Moon2", "Moon3"].iter().position(|name| *name == objs[index].name)) {
+            let vertices = &scene.meshes[scene.meshes.len() - 1].vertices;
+            if !vertices.is_empty() {
+                let center = std::array::from_fn(|k|
+                    vertices.iter().map(|v| v.pos[k]).sum::<f32>() / vertices.len() as f32);
+                if let Some(direction) = unit_direction(center) {
+                    scene.moons[moon] = Some(ao_scene::MoonSource { toward_light: direction,
+                        world_gamma_budget: None, resource_center: center, sky_instance: scene.sky.len() - 1 });
+                }
+            }
+        }
         if object.is_some_and(|index| objs[index].field("RotationType").is_some_and(|value| value.trim() == "e_LockToCameraY")) {
             scene.sky_yaw.push(scene.sky.len() - 1);
         }
@@ -149,6 +164,15 @@ pub(super) fn pose_source(objs: Vec<Obj>, hq_offset: [f32; 2]) -> impl FnMut(f32
                 }
             }
         }
+        snapshot.ground_light = ground_light(&objs, &current);
+        snapshot.sun_authored = snapshot.ground_light.is_some();
+        for moon in snapshot.moons.iter_mut().flatten() {
+            if let Some(instance) = snapshot.sky.get(moon.sky_instance) {
+                let center = std::array::from_fn(|k| instance.transform[3][k]
+                    + (0..3).map(|j| instance.transform[j][k] * moon.resource_center[j]).sum::<f32>());
+                if let Some(direction) = unit_direction(center) { moon.toward_light = direction; }
+            }
+        }
         if let Some(env) = &mut snapshot.environment {
             env.sun_dir = scene(current.sun1.rotate(super::SUN_LOCAL));
         }
@@ -159,6 +183,22 @@ pub(super) fn pose_source(objs: Vec<Obj>, hq_offset: [f32; 2]) -> impl FnMut(f32
 fn sun_alpha(rotation: Quat) -> f32 {
     let height = rotation.rotate([0.0, 0.0, -1.0])[1];
     ((height * 100.0).clamp(0.0, 1.0).powi(4) * 255.0).trunc() / 255.0
+}
+
+/// DS1005d589 binds authored GroundLightCurrent/Direction, including Penumbra's GLD [ROT] GLR.
+/// Gamma colour is metadata only; the faithful Environment is left untouched.
+pub(super) fn ground_light(objs: &[Obj], ctx: &Ctx) -> Option<([f32; 3], [f32; 3])> {
+    let light = objs.iter().find(|o| o.name == "SunLight")?;
+    let color = script::vector_expr(objs, light, ctx, light.field("GroundLightCurrent")?, 0)?;
+    let rotation = script::rotation_expr(objs, light, ctx, light.field("GroundLightDirection")?, 0)?;
+    let direction = scene(rotation.rotate(super::SUN_LOCAL));
+    if !color.iter().chain(direction.iter()).all(|v| v.is_finite()) { return None; }
+    Some((color, direction))
+}
+
+fn unit_direction(vector: [f32; 3]) -> Option<[f32; 3]> {
+    let length = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+    (length.is_finite() && length > 1e-8).then(|| vector.map(|v| v / length))
 }
 
 /// DS1005d589 binds the actual SunLight formulas, not merely the RGB tracks.
@@ -732,6 +772,65 @@ fn wave_curves_read(o: &Obj, expr: &str, depth: u32) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn authored_ground_metadata_keeps_penumbra_direction_and_night_energy() {
+        let objects = script::parse_objects(concat!(
+            "Object GAME\n{\n Float CurrentDayTime: This.GameDayTime\n Float DayTimeFactor: This.CurrentDayTime / 6480\n",
+            " Float DayIntensity [5]: 0,0,1,1,0\n Float CurrentDayIntensity: This.DayIntensity[This.DayTimeFactor]\n",
+            " Quaternion Sun1Rotation: This.GameSun1Rotation\n}\n",
+            "Object SunLight\n{\n Vector GLD: v(0,0,1)\n",
+            " Vector GLR: This.GLD [ROT] GAME.Sun1Rotation * GAME.CutY * 2 - GAME.UpDirection [NORMALIZE] 1\n",
+            " Quaternion GroundLightDirection: This.GLD [ROT] This.GLR\n",
+            " Vector GroundLightCurrent: v(GAME.CurrentDayIntensity,GAME.CurrentDayIntensity,GAME.CurrentDayIntensity)\n}\n"
+        ));
+        let mut source = pose_source(objects.clone(), [0.0; 2]);
+        let environment = ao_scene::Environment { sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 0.5, fog_end: 800.0,
+            ambient: [0.0; 3], sun_color: [0.2, 0.3, 0.4], sun_dir: [0.0, 1.0, 0.0], sun_specular: 1.0 };
+        let mut snapshot = Scene { environment: Some(environment), ..Default::default() };
+        for time in [0.0, 1620.0, 3240.0, 4860.0] {
+            let ctx = super::super::game_context(&objects, time);
+            let incident = ctx.sun1.rotate([0.0, 0.0, 1.0]);
+            let expected = unit_direction([-2.0 * incident[0], 1.0, 2.0 * incident[2]]).unwrap();
+            let (color, direction) = ground_light(&objects, &ctx).unwrap();
+            assert!((0..3).all(|k| (direction[k] - expected[k]).abs() < 2e-5));
+            assert!(direction[1] > 0.0);
+            if time == 0.0 { assert_eq!(color, [0.0; 3]); }
+            if time == 3240.0 { assert_eq!(color, [1.0; 3]); }
+            source(time, &mut snapshot);
+            assert_eq!(snapshot.ground_light, Some((color, direction)));
+            assert!(snapshot.sun_authored);
+            assert_eq!(snapshot.environment.as_ref().unwrap().sun_color, [0.2, 0.3, 0.4]);
+            let actual_sun = scene(ctx.sun1.rotate(super::super::SUN_LOCAL));
+            assert_eq!(snapshot.environment.as_ref().unwrap().sun_dir, actual_sun);
+        }
+        let unsupported = script::parse_objects("Object SunLight\n{\n Vector GroundLightCurrent: v(GAME.Unsupported,0,0)\n Quaternion GroundLightDirection: q(0,0,0,1)\n}\n");
+        assert!(ground_light(&unsupported, &Ctx::at(0.0)).is_none());
+        assert!(ground_light(&[], &Ctx::at(0.0)).is_none());
+    }
+
+    #[test]
+    fn moon_source_keeps_loaded_factory_pose_and_current_frame_without_world_energy() {
+        let objects = script::parse_objects("Object Moon1\n{\n Unsigned FXID e_GenericMeshObject\n Quaternion Rotation v(0,1,0), GAME.CurrentDayTime / 6480 * -360 - 90\n}\n");
+        let rotation = |time: f32| Quat::axis_angle([0.0, 1.0, 0.0], time / 6480.0 * -360.0 - 90.0);
+        let factory_center = [3.0, 4.0, -5.0];
+        let mut source = pose_source(objects, [0.0; 2]);
+        let mut snapshot = Scene { sky: vec![Instance { mesh: 0, transform: IDENTITY }],
+            sky_pose_objects: vec![(0, 0)], ..Default::default() };
+        for baked in [0.0, 10.0] {
+            snapshot.day_time = baked;
+            let center = scene(rotation(baked).rotate(factory_center));
+            snapshot.moons[0] = Some(ao_scene::MoonSource { toward_light: unit_direction(center).unwrap(),
+                resource_center: center, sky_instance: 0, world_gamma_budget: None });
+            source(11.0, &mut snapshot);
+            let moon = snapshot.moons[0].unwrap();
+            let expected = unit_direction(scene(rotation(11.0).rotate(factory_center))).unwrap();
+            assert!((0..3).all(|k| (moon.toward_light[k] - expected[k]).abs() < 1e-5));
+            assert!(moon.world_gamma_budget.is_none());
+            assert!(snapshot.ground_light.is_none());
+            assert!(!snapshot.sun_authored, "a posed disc never invents world sunlight");
+        }
+    }
+
+    #[test]
     fn inferno_horizon_lights_use_authored_cardinal_directions_and_palette_clock() {
         let Some(tweaks) = real_tweaks(4605) else { return };
         let objects = tweaks.objects();
@@ -810,7 +909,8 @@ mod tests {
             " Quaternion Sun2Rotation: q(0.836913,-0.1626300,0.384351,0.354122)\n}\n",
             "Object Sun1\n{\n Unsigned FXID: e_SunRays\n Quaternion Rotation: GAME.Sun1Rotation\n}\n",
             "Object Sun2\n{\n Unsigned FXID: e_SunRays\n Quaternion Rotation: GAME.Sun2Rotation\n}\n",
-            "Object Moon\n{\n Unsigned FXID: e_GenericMeshObject\n Quaternion Rotation: v(0,1,1), GAME.CurrentDayTime / 3240 * 360 + 90\n}\n"
+            "Object Moon\n{\n Unsigned FXID: e_GenericMeshObject\n Quaternion Rotation: v(0,1,1), GAME.CurrentDayTime / 3240 * 360 + 90\n}\n",
+            "Object SunLight\n{\n Vector GroundLightCurrent: v(0.2,0.3,0.4)\n Quaternion GroundLightDirection: GAME.Sun1Rotation\n}\n"
         ));
         let expected = scene(super::super::rot(super::super::SUN1_ROT).rotate(super::super::SUN_LOCAL));
         let mut pose = pose_source(objects, [0.0; 2]);
@@ -832,6 +932,8 @@ mod tests {
                 }
                 let actual = snapshot.environment.as_ref().unwrap().sun_dir;
                 assert!((0..3).all(|k| (actual[k] - expected[k]).abs() < 1e-6));
+                assert_eq!(snapshot.ground_light, Some(([0.2, 0.3, 0.4], expected)));
+                assert!(snapshot.sun_authored);
                 assert_eq!(snapshot.day_time, baked, "native clock must not be rewritten");
             }
         }
