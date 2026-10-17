@@ -84,7 +84,16 @@ Ported from the decompiled PRK launcher (`MainWindow.DownloadLatestVersion`, `Ht
   Full-source half/byte quantizers changed 38,961/308,215 faithful bytes (max2),
   so were rejected. Per-sheet stores stabilized control runs but cost +3.402 ms
   at actual4× MSAA, so were rejected too. The beauty-only sky control passed six
-  fixed independent pairs with zero faithful image differences (`sky-beauty-only-order-*`).
+  fixed independent pairs with zero faithful image differences against the
+  **native-thirty-draw same-pass control** (`sky-beauty-only-order-*`).
+  This is not historical grouped-four identity: decoded `historical-v3/faithful`
+  versus `final-faithful` differs in eight ICC-platform channel bytes (maximum one),
+  with the other sixteen views exact. Those same eight deltas already exist in
+  `sky-precision-native-order-2-native30-faithful`, before beauty-pass isolation;
+  that native-thirty control and the final isolated sky are byte-identical.
+  Native-draw-topology rounding is **[INFERENCE]**, not a proven ALU/driver mechanism.
+  The thirty submissions follow DisplaySystem `10054e07`'s per-sheet
+  `RenderTriangleList` and Randy `10021e41`'s immediate `DrawIndexedPrimitive`.
   At true4× MSAA, 120 warmups/600 ABC/CBA samples gave GPU medians
   1.472250/1.418250/1.367875 ms for grouped/native30/isolated beauty sky:
   −0.104375 ms versus the original, with zero differing first-frame bytes
