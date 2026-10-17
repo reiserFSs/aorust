@@ -101,19 +101,6 @@ impl Renderer {
         // The primary pass uses only the native visible list. Cascades also
         // admit loaded static geometry in their bounded light volumes.
         self.prepare_actor_shadows(&mut shadows);
-        if !shadows.actor_ids.is_empty() {
-            for &(_, _, list, index, _) in &self.sorted {
-                let draw = &[&self.gpu.opaque, &self.gpu.blended, &self.gpu.liquid][list as usize][index];
-                shadows.ensure_pipeline(self, false, draw.pipe, true, self.world.pipes.spec(draw.pipe));
-            }
-            if let Some(ground) = &self.ground {
-                for draw in &self.gpu.opaque {
-                    if ground.materials[draw.mesh].is_some() {
-                        shadows.ensure_pipeline(self, false, draw.pipe, true, self.world.pipes.spec(draw.pipe));
-                    }
-                }
-            }
-        }
         self.prepare_static_shadow_casters(&mut shadows, &frame);
         if !shadows.actor_ids.is_empty() {
             let timestamp_writes = self.shadow_timestamp(false);
@@ -162,7 +149,6 @@ impl Renderer {
         }
         for (index, draw) in self.gpu.opaque.iter().enumerate() {
             if draw.count == 0 || self.ground.as_ref().is_some_and(|ground| ground.materials[draw.mesh].is_some()) { continue; }
-            let first_command = shadows.static_commands.len();
             for slot in self.gpu.mesh_range[draw.mesh].clone() {
                 let instance = &self.gpu.insts[slot];
                 if instance.hidden || (!self.spaceships_shown && self.spaceship_slots[slot])
@@ -177,9 +163,6 @@ impl Renderer {
                     }
                     push_static_shadow_command(&mut shadows.static_commands, index, slot as u32);
                 }
-            }
-            if shadows.static_commands.len() != first_command {
-                shadows.ensure_pipeline(self, false, draw.pipe, false, self.world.pipes.spec(draw.pipe));
             }
         }
         if shadows.static_transforms.len() > shadows.static_capacity {
@@ -206,7 +189,7 @@ impl Renderer {
         let mut draw_one = |pass: &mut wgpu::RenderPass, draw: &Draw, range: std::ops::Range<u32>| {
             let Some((vertices, indices)) = &self.gpu.meshes[draw.mesh] else { return; };
             if primary || pipe != Some(draw.pipe) {
-                let Some(Some(pipeline)) = shadows.pipelines.get(&(false, draw.pipe, primary)) else { return; };
+                let Some(Some(pipeline)) = shadows.compiled.pipelines.get(&(false, draw.pipe, primary)) else { return; };
                 pass.set_pipeline(pipeline);
                 pipe = Some(draw.pipe);
             }

@@ -12,10 +12,9 @@ pub(super) struct PoseGpu {
 }
 
 impl Renderer {
-    pub(super) fn prepare_actor_skins(&mut self, frames: &[ActorFrame]) {
-        if !frames.iter().any(|f| f.skin_pose.is_some() && self.act.models.get(&f.model).is_some_and(|m| m.native_skin.is_some())) { return; }
+    pub(crate) fn warm_skin_pipeline(&mut self) {
         let native_metal = self.act.native_metal;
-        let (_, layout) = self.act.skin_pipeline.get_or_insert_with(|| {
+        self.act.skin_pipeline.get_or_insert_with(|| {
             let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("CAT compute bindings"),
                 entries: &std::array::from_fn::<_, 4, _>(|binding| wgpu::BindGroupLayoutEntry {
@@ -41,11 +40,15 @@ impl Renderer {
                     label: Some("native CAT scalar skin"), source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("skinning.wgsl", include_str!("skinning.wgsl"))),
                 })
             };
-            let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            let pipeline = crate::pipeline_creation::compute(&self.device, &wgpu::ComputePipelineDescriptor {
                 label: Some("native CAT skin"), layout: Some(&pipeline_layout), module: &shader, entry_point: Some("skin"), compilation_options: Default::default(), cache: None,
             });
             (pipeline, layout)
         });
+    }
+    pub(super) fn prepare_actor_skins(&mut self, frames: &[ActorFrame]) {
+        if !frames.iter().any(|f| f.skin_pose.is_some() && self.act.models.get(&f.model).is_some_and(|m| m.native_skin.is_some())) { return; }
+        let (_, layout) = self.act.skin_pipeline.as_ref().expect("CAT pipeline warmed at startup");
         for frame in frames {
             let Some(palette) = &frame.skin_pose else { continue };
             let Some(model) = self.act.models.get(&frame.model) else { continue };

@@ -8,17 +8,6 @@ impl Renderer {
         for (index, item) in self.act.items.iter().enumerate() {
             let group = *shadows.actor_groups.entry(item.actor).or_insert(index as u32 + 1);
             shadows.actor_ids.push(group);
-            if !matches!(item.rendering_effect, 0 | 2) { continue; }
-            let model = &self.act.models[&item.model];
-            let Some(mesh) = &model.meshes[item.mesh] else { continue; };
-            for draw in &mesh.draws {
-                if !matches!(actor_priority(item.priority.or(visual_priority(draw, actor_visual_key(item, draw), &self.drawn_visuals)), item.faded, item.rendering_effect, blended_pipe(draw.pipe)), 0..=7 | 10) { continue; }
-                let slot = mesh_effect_pipe(if item.faded { faded_pipe(draw.pipe) } else { draw.pipe }, item.rendering_effect, draw.projection_pass);
-                for primary in [true, false] {
-                    if !primary && item.faded { continue; }
-                    shadows.ensure_pipeline(self, true, slot, primary, self.world.actor_pipes.spec(slot));
-                }
-            }
         }
         if !shadows.actor_ids.is_empty() {
             self.queue.write_buffer(&shadows.actor_ids_buffer, 0, bytemuck::cast_slice(&shadows.actor_ids));
@@ -40,7 +29,7 @@ impl Renderer {
             for draw in &mesh.draws {
                 if !matches!(actor_priority(item.priority.or(visual_priority(draw, actor_visual_key(item, draw), &self.drawn_visuals)), item.faded, item.rendering_effect, blended_pipe(draw.pipe)), 0..=7 | 10) { continue; }
                 let slot = mesh_effect_pipe(if item.faded { faded_pipe(draw.pipe) } else { draw.pipe }, item.rendering_effect, draw.projection_pass);
-                let Some(Some(pipeline)) = shadows.pipelines.get(&(true, slot, primary)) else { continue; };
+                let Some(Some(pipeline)) = shadows.compiled.pipelines.get(&(true, slot, primary)) else { continue; };
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(1, &model.mats[draw.mat], &[]);
                 pass.draw_indexed(draw.first_index..draw.first_index + draw.count, 0, index as u32..index as u32 + 1);

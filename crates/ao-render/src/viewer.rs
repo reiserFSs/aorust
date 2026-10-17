@@ -788,6 +788,7 @@ impl State {
 
     /// True = quit requested.
     fn frame(&mut self) -> bool {
+        let _frame = crate::pipeline_creation::FrameGuard::enter();
         let now = Instant::now();
         if self.perf {
             self.perf_gap = self.perf_gap.max((now - self.last).as_secs_f64());
@@ -1245,6 +1246,7 @@ impl Offscreen {
     pub fn enhanced_settings(&self) -> crate::EnhancedSettings { self.r.enhanced_settings() }
     pub fn world_pipeline_compiles(&self) -> u64 { self.r.world_pipeline_compiles() }
     pub fn world_frame_thread_compiles(&self) -> u64 { self.r.world_frame_thread_compiles() }
+    pub fn frame_thread_compiles(&self) -> u64 { self.r.frame_thread_compiles() }
     pub fn world_variant_cache_len(&self) -> usize { self.r.world_variant_cache_len() }
     pub fn emissive_seed_rgba(&self) -> Result<Option<Vec<u8>>> { self.r.emissive_seed_rgba() }
 
@@ -1308,6 +1310,7 @@ impl Offscreen {
 
     /// One `Frontend::frame`, applying what it asked of the host.
     pub fn frame(&mut self, fe: &mut dyn Frontend, dt: f32) -> ao_gui::DrawList {
+        let _frame = crate::pipeline_creation::FrameGuard::enter();
         if self.perf.as_ref().is_some_and(|p| p.count == p.samples.len()) { self.perf_report("interval"); }
         let start = self.perf.as_ref().map(|_| Instant::now());
         let cpu_start = start.map(|_| perf_thread_cpu());
@@ -1406,6 +1409,7 @@ impl Offscreen {
 
     /// Captures a single frame as tightly packed, row-major RGBA8.
     pub fn rgba(&mut self, fe: &dyn Frontend, list: &ao_gui::DrawList) -> Result<Vec<u8>> {
+        let _frame = crate::pipeline_creation::FrameGuard::enter();
         let tex = self.r.device.create_texture_tracked(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d { width: self.size.0, height: self.size.1, depth_or_array_layers: 1 },

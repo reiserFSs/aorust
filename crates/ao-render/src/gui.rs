@@ -146,7 +146,7 @@ impl GuiRenderer {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("gui"), source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("gui.wgsl", include_str!("gui.wgsl"))) });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("gui"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
         let attrs = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Uint32];
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let pipeline = crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
             label: Some("gui"),
             layout: Some(&pl),
             vertex: wgpu::VertexState {

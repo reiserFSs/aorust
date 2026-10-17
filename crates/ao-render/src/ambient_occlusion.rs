@@ -44,7 +44,7 @@ impl AmbientOcclusion {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("diffuse-contact HBAO-lite"), source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("ambient_occlusion.wgsl", include_str!("ambient_occlusion.wgsl"))) });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("ambient AO"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
-        let make_pipeline = |entry, format, blend| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let make_pipeline = |entry, format, blend| crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
             label: Some(entry), layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(entry), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask: wgpu::ColorWrites::RED | wgpu::ColorWrites::GREEN | if entry == "composite" { wgpu::ColorWrites::BLUE } else { wgpu::ColorWrites::empty() } })] }),
@@ -59,6 +59,8 @@ impl AmbientOcclusion {
         let params = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("ambient AO parameters"), size: std::mem::size_of::<Params>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         Self { layout, params, estimate, blur, composite, targets: None }
     }
+
+    pub(super) fn release_targets(&mut self) { self.targets = None; }
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, depth: &wgpu::TextureView, ambient: &wgpu::TextureView, colour: &wgpu::TextureView, size: (u32, u32), vp: Mat4, radius: f32, strength: f32, fog_depth: f32, grass_present: bool, mut timer: Option<&mut crate::FrameGpuTimer>) {
@@ -126,7 +128,7 @@ impl crate::Renderer {
         if !settings.ambient_occlusion || settings.ao_radius <= 0.0 || settings.ao_strength <= 0.0 { return; }
         let Some(frame) = self.enhanced_frame.as_ref() else { return; };
         let Some(ambient) = frame.ambient.as_ref() else { return; };
-        let ao = self.ambient_occlusion.get_or_insert_with(|| AmbientOcclusion::new(&self.device, self.format));
+        let ao = self.ambient_occlusion.as_mut().expect("AO pipelines warmed at startup");
         ao.encode(&self.device, &self.queue, encoder, &frame.resolved_depth, ambient, &frame.colour,
             frame.size, vp, settings.ao_radius, settings.ao_strength, fog_depth, self.grass.as_ref().is_some_and(|grass| grass.has_draws()), None);
     }
@@ -274,9 +276,24 @@ mod tests {
         assert!(capture(&r, Some(true)).as_chunks::<4>().0.iter().all(|pixel| pixel[..3] == [0,0,0]), "occluded glow actor cannot seed bloom");
         assert!(r.ambient_occlusion_incremental_bytes() > 0);
         assert!(r.ambient_occlusion.is_some(), "AO must have encoded before testing resource retirement");
+        let enabled = r.enhanced_settings;
+        let frame_compiles = crate::pipeline_creation::frame_thread_compiles();
         r.set_enhanced_settings(EnhancedSettings::default());
         assert_eq!(r.ambient_occlusion_incremental_bytes(), 0);
-        assert!(r.ambient_occlusion.is_none(), "off immediately releases AO pipelines, buffers and targets");
+        let ao = r.ambient_occlusion.as_ref().expect("off retains precompiled AO pipelines");
+        assert!(ao.targets.is_none(), "off immediately releases AO targets and their frame views");
+        assert_eq!(ao.target_bytes(), 0);
+        for _ in 0..2 {
+            r.set_enhanced_settings(enabled);
+            r.render(&view, &targets, &Camera::look_at(Vec3::ZERO, Vec3::NEG_Z));
+            assert!(r.ambient_occlusion_incremental_bytes() > 0);
+            r.set_enhanced_settings(EnhancedSettings::default());
+            r.render(&view, &targets, &Camera::look_at(Vec3::ZERO, Vec3::NEG_Z));
+            assert!(r.ambient_occlusion.as_ref().unwrap().targets.is_none());
+            assert_eq!(r.ambient_occlusion_incremental_bytes(), 0);
+        }
+        assert_eq!(crate::pipeline_creation::frame_thread_compiles(), frame_compiles,
+            "repeated AO toggles must reuse startup/variant pipelines without frame-thread compilation");
     }
 
     fn check_primary_depth((width, height): (u32, u32), measure: bool) {

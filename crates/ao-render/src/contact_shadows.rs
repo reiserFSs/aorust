@@ -53,7 +53,7 @@ impl ContactShadows {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("contact shadows"), source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("contact_shadows.wgsl", include_str!("contact_shadows.wgsl"))) });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("contact shadows"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
-        let make_pipeline = |entry, format, blend, write_mask| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let make_pipeline = |entry, format, blend, write_mask| crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
             label: Some(entry), layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(entry), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask })] }),
@@ -69,6 +69,8 @@ impl ContactShadows {
         let params = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("contact shadow parameters"), size: std::mem::size_of::<Params>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         Self { layout, params, estimate, blur, composite, targets: None }
     }
+
+    pub(super) fn release_targets(&mut self) { self.targets = None; }
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, depth: &wgpu::TextureView, sun: &wgpu::TextureView, colour: &wgpu::TextureView, size: (u32, u32), vp: Mat4, eye: Vec3, toward_sun: Vec3, near: f32, far: f32, strength: f32) {
@@ -129,7 +131,7 @@ impl crate::Renderer {
         if !settings.contact_shadows || settings.contact_strength <= 0.0 { return; }
         let Some(frame) = self.enhanced_frame.as_ref() else { return; };
         let Some(sun) = frame.sun.as_ref() else { return; };
-        let contact = self.contact_shadows.get_or_insert_with(|| ContactShadows::new(&self.device, self.format));
+        let contact = self.contact_shadows.as_mut().expect("contact pipelines warmed at startup");
         contact.encode(&self.device, &self.queue, encoder, &frame.resolved_depth, sun, &frame.colour, frame.size, vp, eye, toward_sun, self.lens.near, far, settings.contact_strength);
     }
 }

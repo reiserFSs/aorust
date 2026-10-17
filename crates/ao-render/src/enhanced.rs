@@ -25,7 +25,7 @@ pub(super) struct EnhancedFrame {
     depth_resolve: Option<(wgpu::RenderPipeline, wgpu::BindGroup)>,
 }
 impl EnhancedFrame {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32, u32), samples: u32, settings: crate::EnhancedSettings) -> Self {
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32, u32), samples: u32, settings: crate::EnhancedSettings, compiled: &EnhancedPipelines) -> Self {
         let make = |format, count, label| device.create_texture_tracked(&wgpu::TextureDescriptor {
             label: Some(label), size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: count, dimension: wgpu::TextureDimension::D2, format,
@@ -38,8 +38,9 @@ impl EnhancedFrame {
         let depth = make(DEPTH, samples, "Enhanced sampleable depth");
         let resolved_depth = if samples == 1 { depth.clone() } else { make(DEPTH, 1, "Enhanced resolved depth") };
         let msaa = (samples > 1).then(|| [Some(make(format, samples, "Enhanced MSAA native colour")), settings.ambient_occlusion.then(|| make(AUX, samples, "Enhanced MSAA ambient")), settings.emissive_bloom.then(|| make(AUX, samples, "Enhanced MSAA emission")), settings.needs_sun_mask().then(|| make(AUX, samples, "Enhanced MSAA sun mask"))]);
-        let (composite, composite_bg) = pipeline(device, format, &colour, false);
-        let depth_resolve = (samples > 1).then(|| pipeline(device, DEPTH, &depth, true));
+        let composite = compiled.colour.clone();
+        let composite_bg = bind(device, &compiled.colour_layout, &colour);
+        let depth_resolve = (samples > 1).then(|| (compiled.depth.clone(), bind(device, &compiled.depth_layout, &depth)));
         Self { size, sample_count: samples, colour, ambient, emissive, sun, depth, resolved_depth, msaa, composite, composite_bg, depth_resolve }
     }
     pub fn attachment(&self, index: usize) -> Option<wgpu::RenderPassColorAttachment<'_>> {
@@ -68,7 +69,24 @@ impl EnhancedFrame {
         pass.set_pipeline(&self.composite); pass.set_bind_group(0, input.unwrap_or(&self.composite_bg), &[]); pass.draw(0..3, 0..1);
     }
 }
-fn pipeline(device: &wgpu::Device, format: wgpu::TextureFormat, input: &wgpu::TextureView, depth: bool) -> (wgpu::RenderPipeline, wgpu::BindGroup) {
+pub(super) struct EnhancedPipelines {
+    colour: wgpu::RenderPipeline,
+    colour_layout: wgpu::BindGroupLayout,
+    depth: wgpu::RenderPipeline,
+    depth_layout: wgpu::BindGroupLayout,
+}
+impl EnhancedPipelines {
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let (colour, colour_layout) = pipeline(device, format, false);
+        let (depth, depth_layout) = pipeline(device, DEPTH, true);
+        Self { colour, colour_layout, depth, depth_layout }
+    }
+    pub fn source_layout(&self) -> &wgpu::BindGroupLayout { &self.colour_layout }
+}
+fn bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, input: &wgpu::TextureView) -> wgpu::BindGroup {
+    device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("Enhanced boundary"), layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(input) }] })
+}
+fn pipeline(device: &wgpu::Device, format: wgpu::TextureFormat, depth: bool) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
     let source = if depth {
         "@group(0) @binding(0) var image: texture_depth_multisampled_2d;\n@fragment fn fs(@builtin(position) p: vec4<f32>) -> @builtin(frag_depth) f32 { var z=1.0; for(var s=0u;s<textureNumSamples(image);s+=1u){z=min(z,textureLoad(image,vec2<i32>(p.xy),i32(s)));} return z; }"
     } else {
@@ -79,17 +97,16 @@ fn pipeline(device: &wgpu::Device, format: wgpu::TextureFormat, input: &wgpu::Te
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("Enhanced boundary"), entries: &[wgpu::BindGroupLayoutEntry {
         binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: if depth { wgpu::TextureSampleType::Depth } else { wgpu::TextureSampleType::Float { filterable: false } }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: depth }, count: None,
     }] });
-    let bg = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("Enhanced boundary"), layout: &layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(input) }] });
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Enhanced boundary"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
     let targets = [Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })];
-    let pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    let pipe = crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
         label: Some("Enhanced boundary"), layout: Some(&pl),
         vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
         fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), compilation_options: Default::default(), targets: if depth { &[] } else { &targets } }),
         primitive: Default::default(), depth_stencil: depth.then_some(wgpu::DepthStencilState { format: DEPTH, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }),
         multisample: Default::default(), multiview_mask: None, cache: None,
     });
-    (pipe, bg)
+    (pipe, layout)
 }
 
 #[cfg(test)]

@@ -70,12 +70,12 @@ impl Pass {
         pass.draw(0..3, 0..1);
     }
 }
-impl Bloom {
-    /// `beauty` is the native colour (UNORM path) or the exposed HDR scene. With `halo`, the final
-    /// half-resolution level is written there (the HDR `present` adds it above white); otherwise a
-    /// UNORM-range composite is built and exposed through `present`.
-    pub fn new(device: &wgpu::Device, size: (u32, u32), beauty: &wgpu::TextureView,
-        emission: &wgpu::TextureView, presentation: &wgpu::BindGroupLayout, halo: Option<&wgpu::TextureView>) -> Self {
+pub(super) struct BloomPipelines {
+    layout: wgpu::BindGroupLayout,
+    pipelines: [wgpu::RenderPipeline; 4],
+}
+impl BloomPipelines {
+    pub fn new(device: &wgpu::Device) -> Self {
         let source = [glare().as_ref(), crate::shader_source::load("bloom.wgsl", include_str!("bloom.wgsl")).as_ref()].concat();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Visible-source bounded bloom"), source: wgpu::ShaderSource::Wgsl(source.into()) });
         let entries = std::array::from_fn::<_, 4, _>(|i| wgpu::BindGroupLayoutEntry {
@@ -89,12 +89,22 @@ impl Bloom {
         });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("Bloom inputs"), entries: &entries });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Bloom kernels"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
-        let pipelines = ["seed_down", "down", "up", "composite"].map(|entry| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let pipelines = ["seed_down", "down", "up", "composite"].map(|entry| crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
             label: Some(entry), layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("fullscreen"), compilation_options: Default::default(), buffers: &[] },
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(entry), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
         }));
+        Self { layout, pipelines }
+    }
+}
+impl Bloom {
+    /// Targets remain lazy; kernels are shared across sizes and HDR modes.
+    pub fn new(device: &wgpu::Device, size: (u32, u32), beauty: &wgpu::TextureView,
+        emission: &wgpu::TextureView, presentation: &wgpu::BindGroupLayout, halo: Option<&wgpu::TextureView>,
+        compiled: &BloomPipelines) -> Self {
+        let layout = &compiled.layout;
+        let pipelines = compiled.pipelines.clone();
         let hdr = halo.is_some();
         let params = device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor { label: Some("Bloom strength"), contents: bytemuck::cast_slice(&[0.0_f32, f32::from(u8::from(hdr)), 0.0, 0.0]), usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST });
         let levels = sizes(size);
@@ -102,13 +112,13 @@ impl Bloom {
         for (i, &level) in levels.iter().enumerate() {
             let source = if i == 0 { emission } else { &down[i - 1].target };
             let out = if i == 0 && levels.len() == 1 { halo.cloned() } else { None };
-            down.push(Pass::new(device, &layout, [source, emission, beauty], &params, out.unwrap_or_else(|| target(device, level))));
+            down.push(Pass::new(device, layout, [source, emission, beauty], &params, out.unwrap_or_else(|| target(device, level))));
         }
         let mut up: Vec<Pass> = Vec::with_capacity(levels.len().saturating_sub(1));
         for i in (0..levels.len() - 1).rev() {
             let coarse = up.last().map_or(&down[i + 1].target, |pass| &pass.target);
             let out = if i == 0 { halo.cloned() } else { None };
-            up.push(Pass::new(device, &layout, [&down[i].target, coarse, emission], &params, out.unwrap_or_else(|| target(device, levels[i]))));
+            up.push(Pass::new(device, layout, [&down[i].target, coarse, emission], &params, out.unwrap_or_else(|| target(device, levels[i]))));
         }
         let pyramid: u64 = levels.iter().enumerate().map(|(i, &(w, h))| u64::from(w) * u64::from(h) * if i + 1 == levels.len() { 1 } else { 2 }).sum();
         let (present, composite, bytes) = if hdr {
@@ -119,7 +129,7 @@ impl Bloom {
             let output = target(device, size);
             let present = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("Bloom presentation"),
                 layout: presentation, entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&output) }] });
-            (Some(present), Some(Pass::new(device, &layout, [beauty, halo, emission], &params, output)),
+            (Some(present), Some(Pass::new(device, layout, [beauty, halo, emission], &params, output)),
                 8 * (u64::from(size.0) * u64::from(size.1) + pyramid))
         };
         Self { size, present, hdr, down, up, composite, params, strength: 0.0, pipelines, bytes }
@@ -149,7 +159,7 @@ impl crate::Renderer {
         if self.bloom.as_ref().is_none_or(|bloom| bloom.size != frame.size || bloom.is_hdr() != grade.is_some()) {
             let emission = frame.emissive.as_ref().expect("enabled bloom owns its world emission mask");
             self.bloom = Some(Bloom::new(&self.device, frame.size, grade.map_or(&frame.colour, |grade| grade.hdr_view()), emission,
-                &frame.composite.get_bind_group_layout(0), grade.map(|grade| grade.halo_view())));
+                &frame.composite.get_bind_group_layout(0), grade.map(|grade| grade.halo_view()), &self.bloom_pipelines));
         }
     }
     /// Explicit offline diagnostic; no resources or passes exist until requested.
@@ -268,7 +278,7 @@ pub(crate) mod tests {
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None }] });
             let (bv, ev, ov) = (beauty.create_view(&Default::default()), emission.create_view(&Default::default()), out.create_view(&Default::default()));
-            let bloom = Bloom::new(&r.device, size, &bv, &ev, &presentation, hdr.then_some(&ov));
+            let bloom = Bloom::new(&r.device, size, &bv, &ev, &presentation, hdr.then_some(&ov), &r.bloom_pipelines);
             let out = bloom.composite.as_ref().map_or(out, |composite| composite.target.texture().clone());
             Self { r, size, beauty, emission, out, out_size, bloom }
         }
@@ -777,7 +787,7 @@ pub(crate) mod tests {
             entries: &[wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None }] });
-        let mut bloom = Bloom::new(&r.device, size, &beauty, &emission, &presentation, None);
+        let mut bloom = Bloom::new(&r.device, size, &beauty, &emission, &presentation, None, &r.bloom_pipelines);
         let mut encoder = r.device.create_command_encoder(&Default::default());
         {
             // Synthetic worst-coverage marked source, not a claim about a zone.

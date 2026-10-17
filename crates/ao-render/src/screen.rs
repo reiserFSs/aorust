@@ -35,6 +35,11 @@ fn factor(value:u32)->wgpu::BlendFactor {
     use wgpu::BlendFactor::*;
     match value {1=>Zero,2=>One,3=>Src,4=>OneMinusSrc,5|12=>SrcAlpha,6|13=>OneMinusSrcAlpha,7=>DstAlpha,8=>OneMinusDstAlpha,9=>Dst,10=>OneMinusDst,11=>SrcAlphaSaturated,_=>Zero}
 }
+fn blend_key(source: u32, destination: u32) -> (u32, u32) {
+    let destination = match source { 12 => 6, 13 => 5, _ => destination };
+    let canonical = |value| match value { 2..=11 => value, 12 => 5, 13 => 6, _ => 1 };
+    (canonical(source), canonical(destination))
+}
 impl ScreenPass {
     pub fn upload(&mut self,device:&wgpu::Device,queue:&wgpu::Queue,key:TextureKey,texture:&ao_scene::Texture,policy:crate::native_texture::Policy) {
         self.init(device,queue);
@@ -54,18 +59,30 @@ impl ScreenPass {
         let mut textures=HashMap::new();textures.insert(None,upload(device,queue,&white,Default::default()));
         self.gpu=Some(ScreenGpu {layout,shader,sampler,textures,pipes:HashMap::new(),frames:vec![]});
     }
-    pub fn prepare(&mut self,device:&wgpu::Device,queue:&wgpu::Queue,format:wgpu::TextureFormat,_size:(u32,u32)) {
+    pub fn warm_pipelines(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) {
+        self.init(device, queue);
+        let gpu = self.gpu.as_mut().unwrap();
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&gpu.layout)], immediate_size: 0 });
+        for source in 1..=11 {
+            for destination in 1..=11 {
+                gpu.pipes.entry((source, destination)).or_insert_with(|| {
+                    let component = wgpu::BlendComponent { src_factor: factor(source), dst_factor: factor(destination), operation: wgpu::BlendOperation::Add };
+                    crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
+                        label: Some("native viewport blend"), layout: Some(&pl),
+                        vertex: wgpu::VertexState { module: &gpu.shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+                        fragment: Some(wgpu::FragmentState { module: &gpu.shader, entry_point: Some("fs"), compilation_options: Default::default(),
+                            targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState { color: component, alpha: component }), write_mask: wgpu::ColorWrites::ALL })] }),
+                        primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
+                    })
+                });
+            }
+        }
+    }
+    pub fn prepare(&mut self,device:&wgpu::Device,queue:&wgpu::Queue,_format:wgpu::TextureFormat,_size:(u32,u32)) {
         if self.layers.is_empty() {return;}
         self.init(device,queue);
         let gpu=self.gpu.as_mut().unwrap();
         for (index,layer) in self.layers.iter().enumerate() {
-            let key=(layer.source_blend,layer.destination_blend);
-            gpu.pipes.entry(key).or_insert_with(|| {
-                let destination=match key.0 {12=>6,13=>5,_=>key.1};
-                let component=wgpu::BlendComponent {src_factor:factor(key.0),dst_factor:factor(destination),operation:wgpu::BlendOperation::Add};
-                let pl=device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {label:None,bind_group_layouts:&[Some(&gpu.layout)],immediate_size:0});
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {label:Some("native viewport blend"),layout:Some(&pl),vertex:wgpu::VertexState {module:&gpu.shader,entry_point:Some("vs"),compilation_options:Default::default(),buffers:&[]},fragment:Some(wgpu::FragmentState {module:&gpu.shader,entry_point:Some("fs"),compilation_options:Default::default(),targets:&[Some(wgpu::ColorTargetState {format,blend:Some(wgpu::BlendState {color:component,alpha:component}),write_mask:wgpu::ColorWrites::ALL})]}),primitive:Default::default(),depth_stencil:None,multisample:Default::default(),multiview_mask:None,cache:None})
-            });
             let data=[layer.color,layer.uv];
             if index>=gpu.frames.len() {
                 let buffer=device.create_buffer_tracked(&wgpu::BufferDescriptor {label:None,size:32,usage:wgpu::BufferUsages::UNIFORM|wgpu::BufferUsages::COPY_DST,mapped_at_creation:false});
@@ -83,7 +100,7 @@ impl ScreenPass {
         let Some(gpu)=&self.gpu else {return};
         let mut pass=enc.begin_render_pass(&wgpu::RenderPassDescriptor {label:Some("native viewport sprites"),color_attachments:&[Some(wgpu::RenderPassColorAttachment {view:resolve,resolve_target:None,depth_slice:None,ops:wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}})],depth_stencil_attachment:None,timestamp_writes:timestamps,occlusion_query_set:None,multiview_mask:None});
         for (index,layer) in self.layers.iter().enumerate() {
-            pass.set_pipeline(&gpu.pipes[&(layer.source_blend,layer.destination_blend)]);pass.set_bind_group(0,&gpu.frames[index].1,&[]);
+            pass.set_pipeline(&gpu.pipes[&blend_key(layer.source_blend,layer.destination_blend)]);pass.set_bind_group(0,&gpu.frames[index].1,&[]);
             for _ in 0..layer.repetitions {pass.draw(0..3,0..1);}
         }
     }
@@ -115,7 +132,7 @@ pub(super) fn depth_clear_pipeline(device:&wgpu::Device,format:wgpu::TextureForm
     let target = wgpu::ColorTargetState {format,blend:None,write_mask:wgpu::ColorWrites::empty()};
     let auxiliary=wgpu::ColorTargetState {format:crate::enhanced::AUX,blend:None,write_mask:wgpu::ColorWrites::empty()};
     let targets = [Some(target), settings.ambient_occlusion.then(|| auxiliary.clone()), settings.emissive_bloom.then(|| auxiliary.clone()), settings.needs_sun_mask().then_some(auxiliary)];
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
         label:Some("native viewport depth clear"),layout:Some(&layout),
         vertex:wgpu::VertexState {module:&shader,entry_point:Some("vs"),compilation_options:Default::default(),buffers:&[]},
         fragment:Some(wgpu::FragmentState {module:&shader,entry_point:Some("fs"),compilation_options:Default::default(),
@@ -135,6 +152,14 @@ mod tests {
         assert_eq!(factor(3),wgpu::BlendFactor::Src);
         assert_eq!(factor(10),wgpu::BlendFactor::OneMinusDst);
         assert_eq!(ScreenLayer::default().uv,[0.0,0.0,1.0,1.0]);
+        for source in 0..=15 {
+            for destination in 0..=15 {
+                let (canonical_source, canonical_destination) = blend_key(source, destination);
+                let authored_destination = match source { 12 => 6, 13 => 5, _ => destination };
+                assert_eq!(factor(canonical_source), factor(source));
+                assert_eq!(factor(canonical_destination), factor(authored_destination));
+            }
+        }
     }
     #[test]
     #[ignore="offscreen Metal viewport texture regression"]

@@ -2181,6 +2181,7 @@ fn enhanced_option_switch_reuses_compiled_variants() {
     let baseline_compiles = o.world_pipeline_compiles();
     assert!(baseline_compiles > 0, "the fixture must draw real world pipelines");
     let baseline_frame_compiles = o.world_frame_thread_compiles();
+    let baseline_total_frame_compiles = o.frame_thread_compiles();
 
     // An unseen combination stays on the worker, including the first frame that installs it.
     eprintln!("ENHANCED_SWITCH_BEGIN");
@@ -2198,6 +2199,8 @@ fn enhanced_option_switch_reuses_compiled_variants() {
         cold_frames += 1;
         assert_eq!(o.world_frame_thread_compiles() - baseline_frame_compiles, 0,
             "cold switch frame {cold_frames} compiled on the frame thread");
+        assert_eq!(o.frame_thread_compiles(), baseline_total_frame_compiles,
+            "cold switch frame {cold_frames} created a render or compute pipeline on the frame thread");
         assert!(o.enhanced_settings() == off || o.enhanced_settings() == on,
             "the old variant must remain active until the complete new variant installs");
         std::thread::sleep(Duration::from_millis(4));
@@ -2221,10 +2224,12 @@ fn enhanced_option_switch_reuses_compiled_variants() {
         assert_eq!(o.enhanced_settings(), expected, "cached {phase} must install in the same frame");
         assert_eq!(o.world_pipeline_compiles(), warm_compiles, "{phase} must compile absolutely nothing");
         assert_eq!(o.world_frame_thread_compiles(), baseline_frame_compiles, "{phase} must not compile on the frame thread");
+        assert_eq!(o.frame_thread_compiles(), baseline_total_frame_compiles, "{phase} must not create render or compute pipelines on the frame thread");
         for index in 1..60 {
             warm_worst = warm_worst.max(frame(&mut o, &mut r.p, phase, index));
             assert_eq!(o.world_pipeline_compiles(), warm_compiles, "{phase} frame {index} must compile absolutely nothing");
             assert_eq!(o.world_frame_thread_compiles(), baseline_frame_compiles, "{phase} frame {index} must not compile on the frame thread");
+            assert_eq!(o.frame_thread_compiles(), baseline_total_frame_compiles, "{phase} frame {index} must not create render or compute pipelines on the frame thread");
             std::thread::sleep(Duration::from_millis(4));
         }
         warm_timings.push((phase, toggle_ms, first));

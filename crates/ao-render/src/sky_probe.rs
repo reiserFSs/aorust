@@ -71,7 +71,7 @@ impl Renderer {
             label: Some("portable sky probe"),
             bind_group_layouts: &[Some(&self.g_layout), Some(&self.tex_layout), Some(&tag_layout)], immediate_size: 0,
         });
-        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let pipeline = crate::pipeline_creation::render(&self.device, &wgpu::RenderPipelineDescriptor {
             label: Some("actual sky pixel probe"), layout: Some(&layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_probe"), compilation_options: Default::default(), buffers: &[
                 wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Vertex, attributes: &vertex_attrs },

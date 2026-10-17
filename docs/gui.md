@@ -1412,12 +1412,12 @@ pipeline compiler call (wgpu-core `device/resource.rs::create_render_pipeline`,
 `device/queue.rs::submit`; wgpu-hal `metal/device.rs::load_shader`).
 There is therefore no evidence of the proposed one-second shared-device-lock block
 in this controlled run. The historical **1175 ms** frame has no saved stack/stage trace,
-so its exact cause remains unresolved, not attributed to “noise.” Effect-specific
-postprocessing/shadow pipelines still initialize separately from the world-set counter.
-An advancing-time diagnostic independently exposed a newly admitted actor sprite slot
-(AlphaBlend, two-sided, actor=true, sprite=true): **198.57 ms**, of which preparation was
-**184.73 ms**. The switch regression freezes simulation with `dt=0` to test reuse of the
-same scene rather than hide this unrelated lazy first-use compilation behind a tolerance.
+so its exact cause remains unresolved, not attributed to “noise.” At that revision,
+effect-specific postprocessing/shadow pipelines initialized separately from the
+world-set counter. An advancing-time diagnostic independently exposed a newly admitted
+actor sprite slot (AlphaBlend, two-sided, actor=true, sprite=true): **198.57 ms**, of
+which preparation was **184.73 ms**. The switch regression froze simulation with
+`dt=0` to isolate that switch; the first-use regression below covers changing content.
 Logs and profiles: `~/aomac-handoff/gfx/v3/ToggleLand-profile-{fixed-time,cold-symbols}/`.
 Final ordinary-source release run after rebasing onto `6d9e47fa`: cold install
 **920.4 ms**, **91** rendered frames, maximum cold-switch frame **28.63 ms**,
@@ -1427,6 +1427,77 @@ compiles. The subsequent synchronous fresh-renderer control was driver-cache-war
 The full faithful fixture passed all **17 views / 34 independent captures**, with
 exact byte equality against the clean pre-change `d56be26` baseline:
 `~/aomac-handoff/gfx/v3/ToggleLand-{before,after}/`. No window or server was used.
+
+##### Pipeline readiness before the first world frame
+
+World, actor (including nameplates/tags and every rendering-effect/material state),
+ground, liquid/lava and both sky attachment paths are compiled as a complete variant:
+the initial faithful variant at renderer construction, subsequent live Enhanced
+and MSAA variants on the existing background switch worker. Exact-equivalent
+descriptors share pipeline handles; explicit synchronous fixture setters remain available.
+The render path only selects prepared handles, including when actors or clouds first
+appear after a variant has been installed; it never invalidates/recompiles a sky slot.
+
+The lazy-pipeline sweep also found grass day/night, shadow caster/admission and
+visibility compute, AO, contact shadows, bloom, HDR grading, Enhanced boundary,
+viewport blend, heat haze, and native CAT skin compute pipelines. Those now retain
+startup/per-variant compiled handles independently of lazy size-dependent targets.
+Resize, zone changes and effect toggles may allocate targets but do not compile.
+GUI's single pipeline already belongs to `GuiRenderer::new`; `ao-gui` itself creates
+no GPU pipelines. Explicit pixel-probe/test pipelines are not gameplay initializers.
+
+`Renderer::frame_thread_compiles` counts actual render **and compute** pipeline
+creation in nested frame scopes, in addition to the world-variant counters.
+`ao-render`'s ignored `first_use_after_zone_ready` regression starts without actors,
+then introduces tag/sprite actors, six native rendering effects, all five liquid
+styles, and an unseen actor material after a background variant install; every
+first-use and warm frame must compile exactly zero pipelines. Retaining compiled
+handles does not eagerly allocate optional full-size attachments, and disabling
+AO/contact shadows still releases their targets.
+
+Baseline offscreen first-use measurement at `3f82a934` (128×128, Metal, fast profile):
+startup **28.768 ms**; first actor/nameplate/tag frame **225.936 ms** submit /
+**227.249 ms** GPU-complete, with **3** world pipeline compilations, versus
+**0.160 / 1.448 ms** for the next identical frame. First holo/additive-effect frames
+took **162.110 / 174.609 ms** submit and each compiled once; a late material after
+the async bloom variant took **609.922 ms** submit. This is an actual failing
+runtime regression, not a source-text assertion or a widened latency tolerance.
+
+Release result, same 128×128 scene: first tag/sprite frame **0.203 ms** submit /
+**1.343 ms** GPU-complete; first effects **0.096–0.243 ms**, first liquids
+**0.627 / 1.973 ms**, all with **zero total render/compute and world frame-thread
+compilations**. The all-Enhanced first late-slot frame was **16.291 / 36.984 ms**
+(target allocation/encoding, zero compilation); resize and viewport-blend first use
+also compiled zero. Initial faithful preparation creates **548** distinct
+world/actor/ground/depth-clear pipelines after exact descriptor reuse, rather than
+the 1,653 non-alias slots. A full Enhanced variant adds **673** world/depth-clear
+creations on its worker, including its separate faithful sky attachment path.
+
+Measured renderer construction was **456.127 ms** with the driver cache warm,
+plus **0.442 ms** upload-to-ready: **427.801 ms** above the baseline combined
+startup (**28.768 ms**). A source-equivalent cold-key probe (only `vertex_fog` and
+all calls renamed consistently in temporary native/grass/shadow WGSL overrides)
+measured **2193.506 ms** renderer construction and **0.134 ms** upload; the first
+tag frame remained **0.180 / 1.474 ms**, with zero pipeline compilation. This
+deliberately refreshes the native shader key, not every driver cache entry; it is
+not a universal fully-cold startup bound. The overrides are not shipped.
+Baseline frame timing used the fast profile; final measurements use release.
+`sample` recorded Metal compilation under the existing `enhanced world variant`
+worker, not the render stack. Evidence:
+`~/aomac-handoff/gfx/v3/SpriteWarm-{before-first-use,after-first-use,cold-first-use}.txt`
+and `SpriteWarm-after-first-use-sample.txt`.
+Matched fast-profile confirmation: first tag/sprite frame **0.214 / 1.502 ms**
+versus baseline **225.936 / 227.249 ms**, with zero compiles; renderer startup
+**1678.693 ms** plus **0.277 ms** upload, an added **1650.202 ms** against that
+baseline. Separate release/cold-key results above expose the driver/profile variation.
+Final release gates: **177 ao-render tests passed / 14 ignored**, standalone live-MSAA
+regression passed, **45 flow tests passed / 3 ignored**, and the extended real-ICC
+switch regression passed (**71 frames**, **805.7 ms** install, **23.55 ms** worst
+cold-switch frame, zero frame-thread compilations; warm roundtrip zero total compiles).
+The faithful fixture passed **17 views / 34 captures**, exactly byte-equal to
+`SpriteWarm-before`; workspace release all-target Clippy passed with `-D warnings`.
+Combined output: `~/aomac-handoff/gfx/v3/SpriteWarm-warmup-gates.txt`.
+
 
 MSAA is independently selectable. HDR is a scene-path switch, not a master switch: with it on the world pass writes
 a fourth attachment: red is the surface's direct-sun share x raw shadow visibility x (1 - native fog);

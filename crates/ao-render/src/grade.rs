@@ -15,9 +15,13 @@ pub(super) struct Grade {
     present: wgpu::RenderPipeline,
 }
 
-impl Grade {
-    /// `source_layout` is the Enhanced single-texture boundary layout; `sun` is the world pass's sun mask.
-    pub fn new(device: &wgpu::Device, output: wgpu::TextureFormat, size: (u32, u32), source_layout: &wgpu::BindGroupLayout, sun: &wgpu::TextureView) -> Self {
+pub(super) struct GradePipelines {
+    aux_layout: wgpu::BindGroupLayout,
+    expose: wgpu::RenderPipeline,
+    present: wgpu::RenderPipeline,
+}
+impl GradePipelines {
+    pub fn new(device: &wgpu::Device, output: wgpu::TextureFormat, source_layout: &wgpu::BindGroupLayout) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Enhanced HDR grade"), source: wgpu::ShaderSource::Wgsl([crate::bloom::glare().as_ref(), crate::shader_source::load("grade.wgsl", include_str!("grade.wgsl")).as_ref()].concat().into()) });
         let aux_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("Enhanced grade inputs"), entries: &[
             wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
@@ -28,12 +32,20 @@ impl Grade {
                 ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
         ] });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Enhanced grade"), bind_group_layouts: &[Some(source_layout), Some(&aux_layout)], immediate_size: 0 });
-        let make = |entry, format| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let make = |entry, format| crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
             label: Some(entry), layout: Some(&layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(entry), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
         });
+        Self { expose: make("expose", HDR), present: make("present", output), aux_layout }
+    }
+}
+impl Grade {
+    /// Only target-sized resources are allocated here.
+    pub fn new(device: &wgpu::Device, size: (u32, u32), source_layout: &wgpu::BindGroupLayout,
+        sun: &wgpu::TextureView, compiled: &GradePipelines) -> Self {
+        let aux_layout = &compiled.aux_layout;
         let hdr = device.create_texture_tracked(&wgpu::TextureDescriptor {
             label: Some("Enhanced HDR scene"), size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: HDR,
@@ -50,12 +62,12 @@ impl Grade {
         let params = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("Enhanced grade parameters"), size: 48, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let hdr_bg = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("Enhanced HDR scene"), layout: source_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr) }] });
-        let aux_bg = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("Enhanced grade inputs"), layout: &aux_layout, entries: &[
+        let aux_bg = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("Enhanced grade inputs"), layout: aux_layout, entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(sun) },
             wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&halo) },
         ] });
-        Self { size, hdr_bg, hdr, halo, aux_bg, params, expose: make("expose", HDR), present: make("present", output) }
+        Self { size, hdr_bg, hdr, halo, aux_bg, params, expose: compiled.expose.clone(), present: compiled.present.clone() }
     }
 
     pub fn bytes(size: (u32, u32)) -> u64 {
@@ -122,7 +134,7 @@ impl crate::Renderer {
         let Some(frame) = self.enhanced_frame.as_ref() else { self.grade = None; return; };
         if self.grade.as_ref().is_none_or(|grade| grade.size != frame.size) {
             let sun = frame.sun.as_ref().expect("HDR owns its world sun mask");
-            self.grade = Some(Grade::new(&self.device, self.format, frame.size, &frame.composite.get_bind_group_layout(0), sun));
+            self.grade = Some(Grade::new(&self.device, frame.size, &frame.composite.get_bind_group_layout(0), sun, &self.grade_pipelines));
         }
         if let Some(grade) = &self.grade {
             grade.set_grade(&self.queue, self.enhanced_settings.grade_strength, time_of_day(self.sky.pose.daylight, self.env.sun_dir));
@@ -157,7 +169,8 @@ mod tests {
             ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None }] });
         let base_view = base.create_view(&Default::default());
         let base_bg = r.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&base_view) }] });
-        let grade = Grade::new(&r.device, r.format, (256, 1), &layout, &sun_tex.create_view(&Default::default()));
+        let compiled = GradePipelines::new(&r.device, r.format, &layout);
+        let grade = Grade::new(&r.device, (256, 1), &layout, &sun_tex.create_view(&Default::default()), &compiled);
         grade.set_grade(&r.queue, strength, tod);
         let mut encoder = r.device.create_command_encoder(&Default::default());
         grade.expose(&r.queue, &mut encoder, &base_bg, 0.0, 0.0);
@@ -198,7 +211,8 @@ mod tests {
             ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None }] });
         let base_view = base.create_view(&Default::default());
         let base_bg = r.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&base_view) }] });
-        let grade = Grade::new(&r.device, r.format, size, &layout, &sun_tex.create_view(&Default::default()));
+        let compiled = GradePipelines::new(&r.device, r.format, &layout);
+        let grade = Grade::new(&r.device, size, &layout, &sun_tex.create_view(&Default::default()), &compiled);
         grade.set_grade(&r.queue, 0.0, tod);
         grade.set_fog_color(&r.queue, fog_color);
         let halo_size = crate::bloom::halo_size(size);

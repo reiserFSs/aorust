@@ -122,10 +122,7 @@ pub(crate) struct SunShadows {
     pub primary_ids: wgpu::TextureView,
     pub size: (u32, u32),
     pub resolution: u32,
-    pub shader: wgpu::ShaderModule,
-    pub caster_pipeline_layout: wgpu::PipelineLayout,
-    pub primary_pipeline_layout: wgpu::PipelineLayout,
-    pub pipelines: std::collections::HashMap<(bool, usize, bool), Option<wgpu::RenderPipeline>>,
+    pub compiled: std::sync::Arc<Compiled>,
     /// Current-frame union-of-cascades casters, in original draw/instance order.
     pub static_commands: Vec<(usize, std::ops::Range<u32>)>,
     pub static_transforms: Vec<[[f32; 4]; 4]>,
@@ -136,24 +133,87 @@ pub(crate) struct SunShadows {
     pub actor_ids_buffer: wgpu::Buffer,
     actor_visibility: wgpu::Buffer,
     actor_capacity: usize,
-    caster_layout: wgpu::BindGroupLayout,
-    visibility_layout: wgpu::BindGroupLayout,
-    visibility_pipeline: wgpu::ComputePipeline,
     visibility_group: wgpu::BindGroup,
     uniforms: [wgpu::Buffer; CASCADES],
 }
-impl SunShadows {
-    pub fn new(renderer: &super::Renderer, size: (u32, u32), resolution: u32) -> Self {
-        let device = &renderer.device;
+/// Size-independent shadow programs, shared by every runtime target allocation.
+pub(crate) struct Compiled {
+    pub pipelines: std::collections::HashMap<(bool, usize, bool), Option<wgpu::RenderPipeline>>,
+    caster_layout: wgpu::BindGroupLayout,
+    visibility_layout: wgpu::BindGroupLayout,
+    visibility_pipeline: wgpu::ComputePipeline,
+}
+impl Compiled {
+    pub fn new(device: &wgpu::Device, globals: &wgpu::BindGroupLayout, material: &wgpu::BindGroupLayout) -> Self {
         let uniform_entry = wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false,
                 min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<ShadowUniform>() as u64) }, count: None };
         let storage_entry = wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true },
                 has_dynamic_offset: false, min_binding_size: None }, count: None };
-        let receiver_layout = receiver_layout(device);
         let caster_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sun shadow current-frame admission"), entries: &[uniform_entry, storage_entry] });
+        let visibility_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("current-frame actor visibility reduction"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+        let visibility_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("current-frame actor visibility reduction"), source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("shadow_visibility.wgsl", include_str!("shadow_visibility.wgsl"))),
+        });
+        let visibility_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("current-frame actor visibility reduction"), bind_group_layouts: &[Some(&visibility_layout)], immediate_size: 0,
+        });
+        let visibility_pipeline = crate::pipeline_creation::compute(device, &wgpu::ComputePipelineDescriptor {
+            label: Some("current-frame actor visibility reduction"), layout: Some(&visibility_pipeline_layout),
+            module: &visibility_shader, entry_point: Some("visible_actors"), compilation_options: Default::default(), cache: None,
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("native current-frame shadow casters"),
+            source: wgpu::ShaderSource::Wgsl(shader_source()),
+        });
+        let caster_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sun caster layout"),
+            bind_group_layouts: &[Some(globals), Some(material), None, Some(&caster_layout)],
+            immediate_size: 0,
+        });
+        let primary_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("primary shadow admission layout"),
+            bind_group_layouts: &[Some(globals), Some(material)],
+            immediate_size: 0,
+        });
+        let (world, actors, _) = super::build_pipelines();
+        let mut pipelines = std::collections::HashMap::new();
+        let mut unique = std::collections::HashMap::new();
+        for (actor, slots) in [(false, &world), (true, &actors)] {
+            for slot in 0..slots.len() {
+                let spec = slots.spec(slot);
+                for primary in [false, true] {
+                    let pipeline = pipeline_key(spec, primary).map(|key| {
+                        unique.entry(key).or_insert_with(|| compile_pipeline(device, &shader,
+                            if primary { &primary_pipeline_layout } else { &caster_pipeline_layout },
+                            spec, primary).expect("eligible shadow pipeline")).clone()
+                    });
+                    pipelines.insert((actor, slot, primary), pipeline);
+                }
+            }
+        }
+        Self { pipelines, caster_layout, visibility_layout, visibility_pipeline }
+    }
+}
+impl SunShadows {
+    pub fn new(renderer: &super::Renderer, size: (u32, u32), resolution: u32) -> Self {
+        let device = &renderer.device;
+        let compiled = renderer.shadow_pipelines.clone();
+        let caster_layout = &compiled.caster_layout;
+        let visibility_layout = &compiled.visibility_layout;
+        let receiver_layout = receiver_layout(device);
         let texture = |label, width, height, layers, format| device.create_texture_tracked(&wgpu::TextureDescriptor {
             label: Some(label), size: wgpu::Extent3d { width, height, depth_or_array_layers: layers },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format,
@@ -184,48 +244,13 @@ impl SunShadows {
             layout: &receiver_layout, entries: &receiver_entries });
         let actor_capacity = 64;
         let (actor_ids_buffer, actor_visibility) = admission_buffers(device, actor_capacity);
-        let cascade_groups = caster_groups(device, &caster_layout, &uniforms, &actor_visibility);
-        let visibility_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("current-frame actor visibility reduction"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint,
-                        view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
-                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false, min_binding_size: None }, count: None },
-            ],
-        });
-        let visibility_group = visibility_group(device, &visibility_layout, &primary_ids, &actor_visibility);
-        let visibility_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("current-frame actor visibility reduction"), source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("shadow_visibility.wgsl", include_str!("shadow_visibility.wgsl"))),
-        });
-        let visibility_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("current-frame actor visibility reduction"), bind_group_layouts: &[Some(&visibility_layout)], immediate_size: 0,
-        });
-        let visibility_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("current-frame actor visibility reduction"), layout: Some(&visibility_pipeline_layout),
-            module: &visibility_shader, entry_point: Some("visible_actors"), compilation_options: Default::default(), cache: None,
-        });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("native current-frame shadow casters"),
-            source: wgpu::ShaderSource::Wgsl(shader_source()),
-        });
-        let caster_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("sun caster layout"),
-            bind_group_layouts: &[Some(&renderer.g_layout), Some(&renderer.tex_layout), None, Some(&caster_layout)],
-            immediate_size: 0,
-        });
-        let primary_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("primary shadow admission layout"),
-            bind_group_layouts: &[Some(&renderer.g_layout), Some(&renderer.tex_layout)],
-            immediate_size: 0,
-        });
+        let cascade_groups = caster_groups(device, caster_layout, &uniforms, &actor_visibility);
+        let visibility_group = visibility_group(device, visibility_layout, &primary_ids, &actor_visibility);
         Self { receiver, grass_receiver: None, array, sampler, cascade_groups, layers, _maps: maps,
-            primary_depth, primary_ids, size, resolution, uniforms, shader, caster_pipeline_layout, primary_pipeline_layout,
-            pipelines: Default::default(), static_commands: Vec::new(), static_transforms: Vec::new(),
+            primary_depth, primary_ids, size, resolution, uniforms, compiled,
+            static_commands: Vec::new(), static_transforms: Vec::new(),
             static_instances: None, static_capacity: 0, actor_ids: Vec::new(), actor_groups: Default::default(),
-            actor_ids_buffer, actor_visibility, actor_capacity, caster_layout, visibility_layout, visibility_pipeline, visibility_group }
+            actor_ids_buffer, actor_visibility, actor_capacity, visibility_group }
     }
     #[allow(clippy::too_many_arguments)]
     pub fn grass_bind(&self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, cells: &wgpu::Buffer, params: &wgpu::Buffer, visible: &wgpu::Buffer, noise: &wgpu::TextureView, noise_sampler: &wgpu::Sampler, mask: &wgpu::TextureView) -> wgpu::BindGroup {
@@ -243,19 +268,12 @@ impl SunShadows {
             ],
         })
     }
-    pub fn ensure_pipeline(&mut self, renderer: &super::Renderer, actor: bool, slot: usize, primary: bool, spec: super::PipelineSpec) {
-        self.pipelines.entry((actor, slot, primary)).or_insert_with(|| compile_pipeline(
-            &renderer.device, &self.shader,
-            if primary { &self.primary_pipeline_layout } else { &self.caster_pipeline_layout },
-            spec, primary,
-        ));
-    }
     pub fn prepare_actor_admission(&mut self, device: &wgpu::Device, count: usize) {
         if count > self.actor_capacity {
             self.actor_capacity = count.next_power_of_two();
             (self.actor_ids_buffer, self.actor_visibility) = admission_buffers(device, self.actor_capacity);
-            self.cascade_groups = caster_groups(device, &self.caster_layout, &self.uniforms, &self.actor_visibility);
-            self.visibility_group = visibility_group(device, &self.visibility_layout, &self.primary_ids, &self.actor_visibility);
+            self.cascade_groups = caster_groups(device, &self.compiled.caster_layout, &self.uniforms, &self.actor_visibility);
+            self.visibility_group = visibility_group(device, &self.compiled.visibility_layout, &self.primary_ids, &self.actor_visibility);
         }
         self.actor_ids.clear();
         self.actor_groups.clear();
@@ -267,7 +285,7 @@ impl SunShadows {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("current-frame actor visibility reduction"), timestamp_writes: None,
         });
-        pass.set_pipeline(&self.visibility_pipeline);
+        pass.set_pipeline(&self.compiled.visibility_pipeline);
         pass.set_bind_group(0, &self.visibility_group, &[]);
         pass.dispatch_workgroups(self.size.0.div_ceil(8), self.size.1.div_ceil(8), 1);
     }
@@ -315,12 +333,8 @@ fn visibility_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, ids: 
 use bytemuck::Zeroable;
 
 
-/// Compile only the native opaque/cutout states whose geometry is unchanged.
-/// Projection/effect and blended depth writers are not fair reusable casters.
-pub(crate) fn compile_pipeline(
-    device: &wgpu::Device, shader: &wgpu::ShaderModule, layout: &wgpu::PipelineLayout,
-    spec: super::PipelineSpec, primary: bool,
-) -> Option<wgpu::RenderPipeline> {
+// These are exactly the descriptor fields that vary between eligible slots.
+fn pipeline_key(spec: super::PipelineSpec, primary: bool) -> Option<(bool, bool, bool, bool, wgpu::CompareFunction, bool)> {
     use super::Blend;
     if primary {
         let base_write = spec.sprite || matches!(spec.blend, Blend::Opaque | Blend::AlphaTest);
@@ -333,6 +347,20 @@ pub(crate) fn compile_pipeline(
     } else if spec.sky || spec.env || spec.fade || spec.sprite || spec.flip_depth
         || !matches!(spec.blend, Blend::Opaque | Blend::AlphaTest)
         || !matches!(spec.effect, 0 | 2 | 3 | 7..=9 | 11) { return None; }
+    let compare = if !primary || spec.effect == 2 { wgpu::CompareFunction::LessEqual } else {
+        spec.compare.unwrap_or(if matches!(spec.effect, 8 | 9 | 11) { wgpu::CompareFunction::Less } else { wgpu::CompareFunction::LessEqual })
+    };
+    Some((primary, spec.actor, matches!(spec.blend, Blend::AlphaTest), primary && !spec.two_sided, compare, primary && spec.effect == 7))
+}
+
+/// Compile only the native opaque/cutout states whose geometry is unchanged.
+/// Projection/effect and blended depth writers are not fair reusable casters.
+pub(crate) fn compile_pipeline(
+    device: &wgpu::Device, shader: &wgpu::ShaderModule, layout: &wgpu::PipelineLayout,
+    spec: super::PipelineSpec, primary: bool,
+) -> Option<wgpu::RenderPipeline> {
+    use super::Blend;
+    pipeline_key(spec, primary)?;
     let test = matches!(spec.blend, Blend::AlphaTest);
     let vertex = match (primary, spec.actor) {
         (true, false) => "vs_shadow_primary_static",
@@ -361,7 +389,7 @@ pub(crate) fn compile_pipeline(
     ];
     let targets = [Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R32Uint,
         blend: None, write_mask: wgpu::ColorWrites::ALL })];
-    Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    Some(crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
         label: Some(fragment), layout: Some(layout),
         vertex: wgpu::VertexState { module: shader, entry_point: Some(vertex), compilation_options: Default::default(),
             buffers: if spec.actor { &buffers } else { &buffers[..2] } },
@@ -389,6 +417,24 @@ pub(crate) fn compile_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_bundle_covers_every_world_and_actor_caster_slot() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let renderer = crate::Renderer::new(&instance, None).expect("shadow WGSL requires offscreen GPU");
+        let compiled = &renderer.shadow_pipelines;
+        let (world, actors, _) = crate::build_pipelines();
+        assert_eq!(compiled.pipelines.len(), 2 * (world.len() + actors.len()));
+        for (actor, slots) in [(false, &world), (true, &actors)] {
+            for slot in 0..slots.len() {
+                for primary in [false, true] {
+                    assert_eq!(compiled.pipelines[&(actor, slot, primary)].is_some(),
+                        pipeline_key(slots.spec(slot), primary).is_some(),
+                        "caster slot {actor}/{slot}/{primary} was not prepared at startup");
+                }
+            }
+        }
+        assert!(renderer.sun_shadows.is_none(), "warming must not allocate cascade targets");
+    }
     fn frame(eye: Vec3, sun: Vec3) -> CascadeFrame {
         CascadeFrame::new(eye, -Vec3::Z, Vec3::Y, 1.0, 1.5, 0.1, 90.0, sun, RESOLUTION).unwrap()
     }

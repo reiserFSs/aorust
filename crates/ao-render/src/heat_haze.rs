@@ -99,12 +99,15 @@ impl HeatHaze {
         if !self.active { return; }
         integrate(&mut self.uv, &mut self.velocity);
     }
+    pub fn warm_pipeline(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) {
+        self.gpu.get_or_insert_with(|| Gpu::new(device, format));
+    }
     pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat, size: (u32, u32)) {
         if !self.active { return; }
         for (index, vertex) in self.vertices.iter_mut().enumerate() {
             vertex.uv = self.uv[index].to_array();
         }
-        let gpu = self.gpu.get_or_insert_with(|| Gpu::new(device, format));
+        let gpu = self.gpu.as_mut().expect("heat haze pipeline warmed at startup");
         if gpu.target.as_ref().is_none_or(|target| target.size != size) { gpu.resize(device, format, size); }
         queue.write_buffer(&gpu.vertices, 0, bytemuck::cast_slice(&self.vertices));
     }
@@ -139,7 +142,7 @@ impl Gpu {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("native heat haze"), source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("heat_haze.wgsl", include_str!("heat_haze.wgsl"))) });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
         let attributes = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let pipeline = crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
             label: Some("native heat haze"), layout: Some(&pipeline_layout), vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: 16, step_mode: wgpu::VertexStepMode::Vertex, attributes: &attributes }] },
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() }, depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,

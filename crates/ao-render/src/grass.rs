@@ -71,6 +71,15 @@ struct Candidate {
     grid: [i32; 2],
     distance: f32,
 }
+/// Day/night programs and their layout; no ground buffers or textures.
+#[derive(Clone)]
+pub(super) struct Compiled {
+    pipeline: [wgpu::RenderPipeline; 2],
+    layout: wgpu::BindGroupLayout,
+    samples: u32,
+    channels: (bool, bool, bool),
+    shadows: bool,
+}
 pub(super) struct Grass {
     pipeline: [wgpu::RenderPipeline; 2],
     bind: Option<wgpu::BindGroup>,
@@ -109,9 +118,9 @@ pub(super) struct Grass {
     last_path: super::GroundPath,
     pending: bool,
 }
-impl Grass {
+impl Compiled {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, green: &GreenMasks, globals: &wgpu::BindGroupLayout, material: &wgpu::BindGroupLayout, palette: &wgpu::BindGroupLayout, samples: u32, channels: (bool, bool, bool), shadows: bool, format: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device, globals: &wgpu::BindGroupLayout, material: &wgpu::BindGroupLayout, palette: &wgpu::BindGroupLayout, samples: u32, channels: (bool, bool, bool), shadows: bool, format: wgpu::TextureFormat) -> Self {
         let mut entries = vec![
             wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
             wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
@@ -146,7 +155,7 @@ impl Grass {
                     alpha: wgpu::BlendComponent::REPLACE,
                 });
             }
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
                 label: Some(if night { "night ground grass" } else { "ground grass" }), layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_grass"), compilation_options: wgpu::PipelineCompilationOptions {
                     constants: &[("GRASS_NIGHT_PASS", f64::from(u8::from(night)))], ..Default::default()
@@ -159,6 +168,12 @@ impl Grass {
                 multisample: wgpu::MultisampleState { count: samples, alpha_to_coverage_enabled: samples > 1, ..Default::default() }, multiview_mask: None, cache: None,
             })
         });
+        Self { pipeline, layout, samples, channels, shadows }
+    }
+}
+impl Grass {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, green: &GreenMasks, compiled: &Compiled) -> Self {
+        let Compiled { pipeline, layout, samples, channels, shadows } = compiled.clone();
         let cells_buffer = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("grass cell cache"), size: (MAX_CELLS * std::mem::size_of::<Cell>()) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let params_buffer = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("grass wind and benders"), size: std::mem::size_of::<Params>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let visible_buffer = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("grass visible cells"), size: (BANDS * MAX_CELLS * 4) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -570,7 +585,7 @@ impl super::Renderer {
             return;
         };
         if self.grass.as_ref().is_none_or(|grass| grass.samples != self.msaa_samples() || grass.channels != (settings.ambient_occlusion, settings.emissive_bloom, settings.needs_sun_mask()) || grass.shadows != settings.sun_shadows) {
-            self.grass = Some(Grass::new(&self.device, &self.queue, &ground.green, &self.g_layout, &self.tex_layout, &self.holo_layout, self.msaa_samples(), (settings.ambient_occlusion, settings.emissive_bloom, settings.needs_sun_mask()), settings.sun_shadows, self.format));
+            self.grass = Some(Grass::new(&self.device, &self.queue, &ground.green, &self.world.grass));
             if let Some(shadows) = &mut self.sun_shadows { shadows.grass_receiver = None; }
         }
     }
@@ -971,7 +986,7 @@ mod blade_appearance_tests {
             assert_eq!(source.contains("grass_direct_visibility = visible;"), shadows,
                 "the HDR sun mask excludes beauty's retained shadow floor");
             // Creating the pipeline validates the shader against the real bind-group layouts.
-            let _grass = super::Grass::new(&renderer.device, &renderer.queue, &super::GreenMasks::default(), &renderer.g_layout, &renderer.tex_layout, &renderer.holo_layout, 1, (ao, bloom, hdr), shadows, renderer.format);
+            let _grass = super::Compiled::new(&renderer.device, &renderer.g_layout, &renderer.tex_layout, &renderer.holo_layout, 1, (ao, bloom, hdr), shadows, renderer.format);
         }
     }
 }

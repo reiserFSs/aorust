@@ -11,6 +11,9 @@ mod viewer;
 mod screen;
 #[cfg(test)]
 mod depth_clear_tests;
+#[cfg(test)]
+mod first_use_tests;
+mod pipeline_creation;
 pub use screen::{ScreenLayer,ViewportDepthClear};
 mod native_fog;
 pub use native_fog::{NativeFog,SharedNativeFog,NativeFogControl};
@@ -656,6 +659,10 @@ pub struct Renderer {
     enhanced_frame: Option<enhanced::EnhancedFrame>,
     bloom: Option<bloom::Bloom>,
     grade: Option<grade::Grade>,
+    enhanced_pipelines: enhanced::EnhancedPipelines,
+    bloom_pipelines: bloom::BloomPipelines,
+    grade_pipelines: grade::GradePipelines,
+    shadow_pipelines: std::sync::Arc<sun_shadows::Compiled>,
     ambient_occlusion: Option<ambient_occlusion::AmbientOcclusion>,
     contact_shadows: Option<contact_shadows::ContactShadows>,
     gpu_timer: Option<FrameGpuTimer>,
@@ -845,77 +852,24 @@ fn compile_pipeline(
     spec: PipelineSpec,
 ) -> wgpu::RenderPipeline {
     let (layout, holo_pipeline_layout) = layouts;
-    let PipelineSpec { blend, two_sided, sky, env, fade, sprite, actor, flip_depth, effect, compare } = spec;
+    let pipelines::Descriptor { fs, vs, state, depth_write, compare, actor, holo, points, cull, bias } = spec.descriptor();
     let f4 = |o| wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: o, shader_location: 4 + (o / 16) as u32 };
     let inst_attrs = [f4(0), f4(16), f4(32), f4(48)];
     let actor_attrs = [f4(0), f4(16), f4(32), f4(48), f4(64), f4(80), f4(96), f4(112)];
     let vert_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
-    let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
-    let one_one = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
-        let (fs, state, depth_write) = match blend {
-            _ if env => ("fs_env", Some(wgpu::BlendState { color: one_one, alpha: one_one }), false),
-            _ if sprite => ("fs_sprite", Some(wgpu::BlendState::ALPHA_BLENDING), true),
-            Blend::Opaque if fade => ("fs_fade_opaque", Some(wgpu::BlendState::ALPHA_BLENDING), true),
-            Blend::AlphaTest if fade => ("fs_fade_test", Some(wgpu::BlendState::ALPHA_BLENDING), true),
-            Blend::Opaque => ("fs_opaque", None, true),
-            Blend::AlphaTest => ("fs_test", None, true),
-            Blend::AlphaBlend => ("fs_blend", Some(wgpu::BlendState::ALPHA_BLENDING), false),
-            Blend::Additive => ("fs_add", Some(wgpu::BlendState { color: add, alpha: wgpu::BlendComponent::OVER }), false),
-            Blend::ZeroSourceColor | Blend::DestinationColorSourceColor | Blend::PremultipliedAlpha | Blend::SourceColorOne => ("fs_blend", Some(native_blend_state(blend)), false),
-            Blend::AdditiveOne => ("fs_add_one", Some(wgpu::BlendState { color: one_one, alpha: one_one }), false),
-        };
-        let fs = if sky {
-            match blend {
-                Blend::Opaque => "fs_sky_opaque",
-                Blend::AlphaTest => "fs_sky_test",
-                Blend::Additive => "fs_sky_add",
-                Blend::AdditiveOne => "fs_sky_add_one",
-                _ => "fs_sky_blend",
-            }
-        } else { fs };
-        let depth_write = if sky { flip_depth } else { depth_write ^ flip_depth };
-        let (fs, state, depth_write) = match effect {
-            1 => ("fs_holo", Some(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::Src, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent::OVER }), false),
-            // DS1006c005 handles RTriMesh mode 2 without SetMaterial. CAT
-            // stays on its ordinary material pipeline (selected by provenance).
-            2 => (fs, state, true),
-            4..=6 => ("fs_mesh_add", Some(wgpu::BlendState { color: add, alpha: add }), false),
-            8 => ("fs_ground_fused", None, true),
-            9 => ("fs_ground_base", None, true),
-            10 => ("fs_ground_shadow", Some(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::Src, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent::REPLACE }), false),
-            11 => ("fs_ground_simple", None, true),
-            12 | 13 => {
-                let component = wgpu::BlendComponent {
-                    src_factor: if effect == 12 { wgpu::BlendFactor::SrcAlpha } else { wgpu::BlendFactor::OneMinusSrcAlpha },
-                    dst_factor: if effect == 12 { wgpu::BlendFactor::OneMinusSrcAlpha } else { wgpu::BlendFactor::SrcAlpha },
-                    operation: wgpu::BlendOperation::Add,
-                };
-                ("fs_blend", Some(wgpu::BlendState { color: component, alpha: component }), true)
-            },
-            14 => ("fs_sky_add", Some(wgpu::BlendState { color: one_one, alpha: one_one }), false),
-            15..=17 => {
-                let component = wgpu::BlendComponent {
-                    src_factor: if effect == 16 { wgpu::BlendFactor::OneMinusSrcAlpha } else { wgpu::BlendFactor::SrcAlpha },
-                    dst_factor: if effect == 16 { wgpu::BlendFactor::SrcAlpha } else { wgpu::BlendFactor::OneMinusSrcAlpha },
-                    operation: wgpu::BlendOperation::Add,
-                };
-                (if effect == 17 { "fs_lava_crust" } else { "fs_lava" }, Some(wgpu::BlendState { color: component, alpha: component }), true)
-            },
-            _ => (fs, state, depth_write),
-        };
         let target = wgpu::ColorTargetState { format, blend: state, write_mask: wgpu::ColorWrites::ALL };
         let auxiliary = wgpu::ColorTargetState { format: enhanced::AUX, blend: state, write_mask: wgpu::ColorWrites::ALL };
         let sun_mask = settings.needs_sun_mask().then(|| auxiliary.clone());
         let targets = [Some(target), settings.ambient_occlusion.then(|| ambient_target(state, depth_write)), settings.emissive_bloom.then_some(auxiliary), sun_mask];
-        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
             label: Some(fs),
             // Ground effects 8-11 sample `ground_palette` (holo0) at bind group 2; liquids (12/13) use `fs_blend`,
             // which never samples group 2, so they must stay on the 2-group layout (no draw path for `self.gpu.liquid`
             // binds a group 2 - `DisplaySystem_t::Render`'s liquid list carries no palette texture).
-            layout: Some(if effect == 1 || (8..=11).contains(&effect) { holo_pipeline_layout } else { layout }),
+            layout: Some(if holo { holo_pipeline_layout } else { layout }),
             vertex: wgpu::VertexState {
                 module: shader,
-                entry_point: Some(if effect == 14 { "vs_sky_points" } else if (15..=17).contains(&effect) { "vs_lava" } else if (8..=11).contains(&effect) { "vs_ground" } else if matches!(effect, 12 | 13) { "vs_liquid" } else if actor && matches!(effect, 1 | 4..=6) { "vs_actor" } else if sky { "vs_sky" } else if env { "vs_env" } else if actor { "vs_actor" } else { "vs" }),
+                entry_point: Some(vs),
                 compilation_options: Default::default(),
                 buffers: &[
                     wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Vertex, attributes: &vert_attrs },
@@ -933,20 +887,18 @@ fn compile_pipeline(
                 targets: &targets[..enhanced::target_count(&settings)],
             }),
             primitive: wgpu::PrimitiveState {
-                topology: if effect == 14 { wgpu::PrimitiveTopology::PointList } else { wgpu::PrimitiveTopology::TriangleList },
+                topology: if points { wgpu::PrimitiveTopology::PointList } else { wgpu::PrimitiveTopology::TriangleList },
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: (!two_sided && !matches!(effect, 1 | 4..=6)).then_some(wgpu::Face::Back),
+                cull_mode: cull.then_some(wgpu::Face::Back),
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH,
                 depth_write_enabled: Some(depth_write),
-                // Randy 10041f98 sets ZFUNC=LESSEQUAL; ordinary/CAT base draws
-                // and DS 1006c61d effects 1..7 do not replace ZFUNC.
-                depth_compare: Some(if effect == 2 { wgpu::CompareFunction::LessEqual } else { compare.unwrap_or(if sky { wgpu::CompareFunction::Always } else if env || matches!(effect, 0..=7 | 10 | 12 | 13 | 15..=17) { wgpu::CompareFunction::LessEqual } else { wgpu::CompareFunction::Less }) }),
+                depth_compare: Some(compare),
                 stencil: Default::default(),
                 // Only the native mesh-effect mode 7 authors a depth bias.
-                bias: if effect == 7 { wgpu::DepthBiasState { constant: -1, slope_scale: 0.0, clamp: 0.0 } } else { Default::default() },
+                bias: if bias { wgpu::DepthBiasState { constant: -1, slope_scale: 0.0, clamp: 0.0 } } else { Default::default() },
             }),
             // Audit item 4 (aomac Enhanced, opt-in): only the hard-cutout alpha-test shaders (`shade`/`shade_sky`'s
             // `mode == 1u`, no blend state of their own) benefit; blended/additive pipelines already have real alpha
@@ -1157,13 +1109,17 @@ impl Renderer {
         });
         let compiles = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let frame_compiles = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let empty = || Pipelines::from(Vec::new());
-        let none = (empty(), empty(), empty());
         let world_key = variant::Key::of(EnhancedSettings::default(), 1);
         let world = variant::Request::new(
             &device, &shader, format, (&g_layout, &tex_layout, &holo_layout),
-            world_key, EnhancedSettings::default(), false, (&none.0, &none.1, &none.2),
+            world_key, EnhancedSettings::default(),
             &compiles, &frame_compiles).build(false);
+        let enhanced_pipelines = enhanced::EnhancedPipelines::new(&device, format);
+        let bloom_pipelines = bloom::BloomPipelines::new(&device);
+        let grade_pipelines = grade::GradePipelines::new(&device, format, enhanced_pipelines.source_layout());
+        let shadow_pipelines = std::sync::Arc::new(sun_shadows::Compiled::new(&device, &g_layout, &tex_layout));
+        let ambient_occlusion = Some(ambient_occlusion::AmbientOcclusion::new(&device, format));
+        let contact_shadows = Some(contact_shadows::ContactShadows::new(&device, format));
         let mut r = Self {
             device,
             queue,
@@ -1172,8 +1128,12 @@ impl Renderer {
             enhanced_frame: None,
             bloom: None,
             grade: None,
-            ambient_occlusion: None,
-            contact_shadows: None,
+            enhanced_pipelines,
+            bloom_pipelines,
+            grade_pipelines,
+            shadow_pipelines,
+            ambient_occlusion,
+            contact_shadows,
             gpu_timer: None,
             cpu_timings: None,
             grass: None,
@@ -1249,6 +1209,9 @@ impl Renderer {
             screen: Default::default(),
         };
         r.act.native_metal = adapter.get_info().backend == wgpu::Backend::Metal;
+        r.warm_skin_pipeline();
+        r.screen.warm_pipelines(&r.device, &r.queue, r.format);
+        r.heat_haze.warm_pipeline(&r.device, r.format);
         r.upload(&Scene::default());
         Ok(r)
     }
@@ -1335,8 +1298,10 @@ impl Renderer {
             self.request_enhanced_settings(settings);
         } else if let Some(settings) = settings {
             self.set_enhanced_settings(settings);
-        } else if let Some(samples) = samples {
-            self.set_msaa_samples(samples);
+        } else if samples.is_some() {
+            let settings = self.pending_world.as_ref().map_or(self.enhanced_settings, |pending| pending.settings);
+            let key = variant::Key::of(settings, self.clamp_msaa(self.requested_msaa, settings));
+            self.request_world(key, settings, true);
         }
     }
 
@@ -1372,7 +1337,7 @@ impl Renderer {
         }
         let request = variant::Request::new(
             &self.device, &self.shader, self.format, (&self.g_layout, &self.tex_layout, &self.holo_layout),
-            key, settings, self.isolate_sky(), (&self.world.pipes, &self.world.actor_pipes, &self.world.ground_pipes),
+            key, settings,
             &self.world_compiles, &self.world_frame_compiles);
         if defer {
             self.pending_world = Some(request.spawn(key, settings));
@@ -1387,6 +1352,7 @@ impl Renderer {
         let previous = std::mem::replace(&mut self.world, world);
         let previous_key = std::mem::replace(&mut self.world_key, key);
         if previous.msaa != self.world.msaa {
+            self.release_effect_targets();
             self.enhanced_frame = None;
             self.bloom = None;
             self.grade = None;
@@ -1404,10 +1370,22 @@ impl Renderer {
             || previous.needs_sun_mask() != settings.needs_sun_mask();
         self.enhanced_settings = settings;
         if !settings.ground_grass || settings.grass_density <= 0.0 { self.grass = None; }
-        if !settings.ambient_occlusion { self.ambient_occlusion = None; }
-        if !settings.contact_shadows { self.contact_shadows = None; }
+        if !settings.ambient_occlusion {
+            self.ambient_occlusion.as_mut().expect("startup AO pipelines").release_targets();
+        }
+        if !settings.contact_shadows {
+            self.contact_shadows.as_mut().expect("startup contact pipelines").release_targets();
+        }
         if !settings.sun_shadows { self.sun_shadows = None; }
-        if changed_frame { self.enhanced_frame = None; self.bloom = None; self.grade = None; }
+        if changed_frame {
+            self.release_effect_targets();
+            self.enhanced_frame = None; self.bloom = None; self.grade = None;
+        }
+    }
+
+    fn release_effect_targets(&mut self) {
+        self.ambient_occlusion.as_mut().expect("startup AO pipelines").release_targets();
+        self.contact_shadows.as_mut().expect("startup contact pipelines").release_targets();
     }
 
     fn await_enhanced_world(&mut self) {
@@ -1427,11 +1405,9 @@ impl Renderer {
     pub fn world_pipeline_compiles(&self) -> u64 { self.world_compiles.load(std::sync::atomic::Ordering::Relaxed) }
     pub fn world_frame_thread_compiles(&self) -> u64 { self.world_frame_compiles.load(std::sync::atomic::Ordering::Relaxed) }
     pub fn world_variant_cache_len(&self) -> usize { self.world_variants.len() }
+    /// All instrumented pipeline creations inside this thread's render scopes.
+    pub fn frame_thread_compiles(&self) -> u64 { pipeline_creation::frame_thread_compiles() }
 
-    fn compile_world(&self) -> variant::Compile {
-        self.world.compile(&self.device, &self.shader, self.world_format(), self.enhanced_settings,
-            self.world_compiles.clone(), self.world_frame_compiles.clone())
-    }
     pub fn enhanced_settings(&self) -> EnhancedSettings { self.enhanced_settings }
     /// Logical optional attachment bytes, not driver allocation/alignment or total GPU residency.
     pub fn enhanced_target_bytes(&self) -> u64 {
@@ -1445,7 +1421,6 @@ impl Renderer {
             + self.bloom.as_ref().map_or(0, |bloom| bloom.bytes)
             + self.grade.as_ref().map_or(0, |grade| grade::Grade::bytes(grade.size))
     }
-    fn world_format(&self) -> wgpu::TextureFormat { self.format }
     /// Explicit offline instrumentation; disabled by default and owns no resources then.
     /// After each render, read the result before encoding another timed frame.
     pub fn set_gpu_timing(&mut self, enabled: bool) -> Result<()> {
@@ -2167,6 +2142,7 @@ impl Renderer {
 
     /// Draws one frame into `resolve` (a view of the output texture).
     pub fn render(&mut self, resolve: &wgpu::TextureView, t: &Targets, cam: &Camera) -> wgpu::SubmissionIndex {
+        let _compile_scope = pipeline_creation::FrameGuard::enter();
         let timed = self.cpu_timings.is_some();
         let prepare_start = timed.then(std::time::Instant::now);
         let mut cpu = FrameCpuTimings::default();
@@ -2239,39 +2215,16 @@ impl Renderer {
         }
         self.frame = (self.frame + 1) % INST_RING;
         self.prepare_actors(cam.pos, cam.forward(), &planes);
-        self.prepare_actor_pipelines();
         let grass_start = timed.then(std::time::Instant::now);
         self.prepare_enhanced_grass(cam, vp, env.fog_end.max(env.fog_start + 1e-3), 0.5 * t.size.1 as f32 / (0.5 * self.lens.vertical_fov(aspect)).tan());
         if let Some(start) = grass_start { cpu.grass_prepare_ms = start.elapsed().as_secs_f64() * 1000.0; }
         let isolate_sky = self.isolate_sky();
-        if isolate_sky != self.world.sky_isolation {
-            self.world.pipes.invalidate_sky();
-            self.world.sky_isolation = isolate_sky;
-        }
         self.sky_beauty_only = isolate_sky;
-        {
-            let compile = self.compile_world();
-            let compile = |spec: PipelineSpec| compile.pipeline(spec, isolate_sky && spec.sky);
-            if let Some(ground) = &self.ground {
-                for (mesh, material) in ground.materials.iter().enumerate() {
-                    if material.is_none() || self.vis_range[mesh].is_empty() { continue; }
-                    let path = if ground.has_shadow[mesh] { self.ground_state.path() } else { GroundPath::Simple };
-                    let base = match path { GroundPath::Fused => 0, GroundPath::ShadowsTwoPass => 1, GroundPath::Simple => 3 };
-                    self.world.ground_pipes.ensure(base, &compile);
-                    if path == GroundPath::ShadowsTwoPass { self.world.ground_pipes.ensure(2, &compile); }
-                }
-            }
-            for d in self.gpu.opaque.iter().chain(&self.gpu.blended).chain(&self.gpu.liquid)
-                .chain(self.sky.draws.iter().map(|(draw, _)| draw)) {
-                if d.count == 0 { continue; }
-                if d.pipe >= 1000 { self.world.ground_pipes.ensure(d.pipe - 1000, &compile); }
-                else { self.world.pipes.ensure(d.pipe, &compile); }
-            }
-        }
         if self.enhanced_settings.any_enabled() && self.enhanced_frame.as_ref().is_none_or(|frame| frame.size != t.size || frame.sample_count != self.world.msaa) {
+            self.release_effect_targets();
             self.bloom = None;
             self.grade = None;
-            self.enhanced_frame = Some(enhanced::EnhancedFrame::new(&self.device, self.format, t.size, self.world.msaa, self.enhanced_settings));
+            self.enhanced_frame = Some(enhanced::EnhancedFrame::new(&self.device, self.format, t.size, self.world.msaa, self.enhanced_settings, &self.enhanced_pipelines));
         }
         self.prepare_enhanced_grade(env.fog_color);
         self.prepare_enhanced_bloom();
@@ -2421,7 +2374,9 @@ impl Renderer {
             let (pipe, mesh, mat) = (std::cell::Cell::new(usize::MAX), std::cell::Cell::new((false, usize::MAX)), std::cell::Cell::new((false, usize::MAX)));
             let draw = |pass: &mut wgpu::RenderPass, d: &Draw, insts: std::ops::Range<u32>, sky: bool| {
                 if pipe.get() != d.pipe {
-                    pass.set_pipeline(if d.pipe >= 1000 { &self.world.ground_pipes[d.pipe - 1000] } else { &self.world.pipes[d.pipe] });
+                    pass.set_pipeline(if d.pipe >= 1000 { &self.world.ground_pipes[d.pipe - 1000] }
+                        else if sky && isolate_sky { &self.world.native_sky_pipes.as_ref().unwrap_or(&self.world.pipes)[d.pipe] }
+                        else { &self.world.pipes[d.pipe] });
                     pipe.set(d.pipe);
                 }
                 if mesh.get() != (sky, d.mesh) {

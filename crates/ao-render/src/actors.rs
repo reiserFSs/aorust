@@ -608,17 +608,6 @@ impl Renderer {
     }
 
 
-    pub(super) fn prepare_actor_pipelines(&mut self) {
-        let compile = self.compile_world();
-        for it in &self.act.items {
-            let model = &self.act.models[&it.model];
-            let Some(mesh) = model.meshes[it.mesh].as_ref() else { continue };
-            for draw in &mesh.draws {
-                let pipe = if it.faded { faded_pipe(draw.pipe) } else { draw.pipe };
-                self.world.actor_pipes.ensure(mesh_effect_pipe(pipe, it.rendering_effect, draw.projection_pass), &|spec| compile.pipeline(spec, false));
-            }
-        }
-    }
 
     /// Frustum-culls the submitted actors, fills the instance buffer; called by `render` before the pass.
     pub(crate) fn prepare_actors(&mut self, cam: Vec3, forward: Vec3, planes: &[Vec4; 6]) {
