@@ -24,19 +24,24 @@ fn grass_offline_capture_and_timing() -> anyhow::Result<()> {
 fn run(out: &std::path::Path) -> anyhow::Result<()> {
     let selected = std::env::var("AOMAC_GFX_VIEW").ok();
     let png_only = std::env::var("AOMAC_GFX_PNG_ONLY").is_ok_and(|value| value == "1");
-    // AOMAC_GFX_DENSITY: grass density (default 1); AOMAC_GFX_EFFECTS=1: shadows, AO and bloom on in both variants;
-    // AOMAC_GFX_HDR=1: the HDR present; AOMAC_GFX_MSAA: samples (default 1).
+    // AOMAC_GFX_DENSITY: grass density (default 1); AOMAC_GFX_EFFECTS=1: sun/contact shadows, AO and bloom in both variants.
+    // AOMAC_GFX_HDR=1: the HDR present; AOMAC_GFX_MSAA: requested samples (default 1).
+    // AOMAC_GFX_DISTANCE: grass distance (settings default); AOMAC_GFX_DAY_TIME: Newland day time only (default 3240).
     let density = std::env::var("AOMAC_GFX_DENSITY").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
     let effects = std::env::var("AOMAC_GFX_EFFECTS").is_ok_and(|value| value == "1");
     let hdr = std::env::var("AOMAC_GFX_HDR").is_ok_and(|value| value == "1");
     let msaa = std::env::var("AOMAC_GFX_MSAA").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1);
+    let grass_distance = std::env::var("AOMAC_GFX_DISTANCE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or_else(|| EnhancedSettings::default().grass_distance);
+    let newland_day_time = std::env::var("AOMAC_GFX_DAY_TIME").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(3240.0);
     let dir = ao_gui::client_dir();
     let store = ao_rdb::RecordStore::open(&dir)?;
     let actor = graphics_fixture_actor()?;
     let weather = ao_formats::weather::State::clear();
     let size = (1920, 1200);
     let mut changed_views = 0;
-    let mut report = String::from("fixture=graphics_offline_fixture\nsize=1920x1200\nrenderer_time=0\ndt=0\ncrt_seed=1\nweather=clear\nmsaa=1\nanisotropy=1\nwarmup_frames=320\nmeasured_frames=600\ntiming=FrameGpuTimer whole-frame neutral Enhanced UNORM versus grass incremental contribution, not isolated draw timestamp\nvisual_acceptance=unexercised\n");
+    let mut negative_views = 0;
+    let mut positive_views = 0;
+    let mut report = format!("fixture=graphics_offline_fixture\nsize=1920x1200\nrenderer_time=0\ndt=0\ncrt_seed=1\nweather=clear\nmsaa_requested={msaa}\nanisotropy=1\nwarmup_frames=320\nmeasured_frames=600\ntiming=FrameGpuTimer whole-frame neutral Enhanced UNORM versus grass incremental contribution, not isolated draw timestamp\nvisual_acceptance=unexercised\n");
     writeln!(report, "selected_view={selected:?}\npng_only={png_only}")?;
     for (key, program, args) in [
         ("revision", "git", vec!["rev-parse".into(), "HEAD".into()]),
@@ -50,12 +55,14 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
     let mut views = Vec::new();
     for (name, pf, time, reference) in [
         ("icc-grass-ground", 4582, 2648.69, ao_render::Vec3::new(933.5, 26.0, -748.0)),
-        ("newland-grass-ground", 566, 4700.0, ao_render::Vec3::new(0.0, 0.0, 0.0)),
+        ("newland-grass-ground", 566, 3240.0, ao_render::Vec3::new(0.0, 0.0, 0.0)),
         ("borealis-grass-ground", 800, 3240.0, ao_render::Vec3::new(652.0, 65.3, -420.0)),
     ] {
         if selected.as_deref().is_some_and(|view| !view.starts_with(name)) { continue; }
         ao_scene::crt_srand(1);
-        let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
+        // Keep Newland's original scene time for the exact same reference/autopicked camera.
+        let camera_time = if pf == 566 { 4700.0 } else { time };
+        let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, camera_time, 0, Some(weather))?;
         let surface = Rc::new(RefCell::new(ao_formats::playfield::collision::Collision::load(&store, pf)?));
         let exposure = super::super::player::grass_exposure_surface(surface.clone());
         // A zero reference means the middle of the playfield's ground.
@@ -64,8 +71,13 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                 (patch.origin[0] as f32 + patch.cells as f32 * 0.5) * patch.cell_size, 0.0, -(patch.origin[1] as f32 + patch.cells as f32 * 0.5) * patch.cell_size),
             _ => reference,
         };
-        let (fixed, tile, grid) = grass_ground_camera(&scene, &surface.borrow(), &exposure, reference)
-            .with_context(|| format!("finding exposed grass in {name}"))?;
+        // Pin the pre-cutover ICC camera: exposure admission changes must not move the comparison.
+        let (fixed, tile, grid) = if pf == 4582 {
+            (ao_render::Camera { pos: ao_render::Vec3::new(938.0, 25.7, -750.0), yaw: 0.0, pitch: -0.18534796, roll: 0.0 }, 258, [234, 189])
+        } else {
+            grass_ground_camera(&scene, &surface.borrow(), &exposure, reference)
+                .with_context(|| format!("finding exposed grass in {name}"))?
+        };
         writeln!(report, "grass_view={name} pf={pf} native_tile={tile} grid={grid:?} camera={fixed:?}")?;
         // The same ground from further back and higher: mid and far fields, thinning towards the distance.
         let forward = fixed.forward();
@@ -80,7 +92,8 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                 eye.y = ground.unwrap_or(fixed.pos.y - 1.7) + 1.7 + lift;
             }
             let view = if distance > 0.0 { ao_render::Camera::look_at(eye, target) } else { fixed };
-            for (light, light_time) in [("day", time), ("dusk", 4860.0)].into_iter().chain((pf == 800).then_some(("night", 0.0))) {
+            let day_time = if pf == 566 { newland_day_time } else { time };
+            for (light, light_time) in [("day", day_time), ("dusk", 4860.0)].into_iter().chain((pf == 800).then_some(("night", 0.0))) {
                 views.push((format!("{name}-{tag}{light}"), pf, light_time, view));
             }
         }
@@ -99,6 +112,7 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
     }
     std::fs::write(out.join("manifest.txt"), &report)?;
     for (name, pf, time, fixed) in views {
+        positive_views += usize::from(pf != 127 && name != "icc-platform-authored");
         ao_scene::crt_srand(1);
         let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
         let exposure = super::super::player::grass_exposure_surface(Rc::new(RefCell::new(
@@ -120,8 +134,14 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                 off.host.fog_density_scale = Some(1.0);
                 off.host.grass_exposure = Some(exposure.clone());
                 off.host.grass_wind = weather.wind;
-                let settings = EnhancedSettings { sun_shadows: effects, ambient_occlusion: effects, emissive_bloom: effects, hdr, ground_grass: true, grass_density: if variant == 0 { 0.0 } else { density }, ..Default::default() };
+                let settings = EnhancedSettings { sun_shadows: effects, contact_shadows: effects, ambient_occlusion: effects, emissive_bloom: effects, hdr, ground_grass: true, grass_distance, grass_density: if variant == 0 { 0.0 } else { density }, ..Default::default() };
                 off.host.enhanced_settings = Some(settings);
+                // The extended field can need more than 320 streamed exposure frames.
+                // Record its up-front cost separately; the paired GPU measurement is stationary/warmed.
+                off.frame(&mut shot, 0.0);
+                let warm_started = std::time::Instant::now();
+                off.warm_grass_tiles();
+                writeln!(report, "explicit_grass_warm_wall_ms={}", warm_started.elapsed().as_secs_f64() * 1000.0)?;
                 off.set_gpu_timing(true)?;
                 let mut gpu = Vec::with_capacity(600);
                 let mut prepare = Vec::with_capacity(600);
@@ -145,7 +165,8 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                 let generation_stats = percentiles(&mut generation);
                 medians[variant] = gpu_stats.0;
                 allocated[variant] = off.gpu_allocated_bytes();
-                writeln!(report, "view={name} pf={pf} time={time} camera={fixed:?} lens={lens:?} settings={settings:?} round={round} variant={variant} gpu_ms_p50_p95_p99={gpu_stats:?} prepare_wall_ms_p50_p95_p99={prepare_stats:?} effect_gpu_payload_bytes={bytes} cells={cells} max_blade_candidates={}", cells * 256 * variant)?;
+                let max_blade_candidates = cells * (1536.0 * settings.clamped().grass_density / 2.0).round().max(1.0) as usize * variant;
+                writeln!(report, "view={name} pf={pf} time={time} camera={fixed:?} lens={lens:?} settings={settings:?} round={round} variant={variant} gpu_ms_p50_p95_p99={gpu_stats:?} prepare_wall_ms_p50_p95_p99={prepare_stats:?} effect_gpu_payload_bytes={bytes} cells={cells} max_blade_candidates={max_blade_candidates}")?;
                 writeln!(report, "generation_wall_ms_p50_p95_p99={generation_stats:?} generation_mean_ms={generation_mean} generation_max_ms={generation_max}")?;
                 writeln!(report, "native_metal_allocated_bytes={:?} shared_enhanced_target_bytes={}", allocated[variant], off.enhanced_target_bytes())?;
                 if round == 0 && variant == 1 { writeln!(report, "grass_diagnostics_view={name}\n{}", off.evidence_grass_diagnostics())?; }
@@ -163,6 +184,10 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                         writeln!(report, "view={name} neutral_vs_grass_differing_bytes={differing}")?;
                         if differing > 0 { changed_views += 1; }
                         if pf == 127 { ensure!(cells == 0 && differing == 0, "indoor grass changed the image"); }
+                        if pf == 127 || name == "icc-platform-authored" {
+                            ensure!(differing == 0, "{name}: grass leaked into a negative-control floor view");
+                            negative_views += 1;
+                        }
                     }
                 }
             }
@@ -173,8 +198,8 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
             std::fs::write(out.join("manifest.txt"), &report)?;
         }
     }
-    writeln!(report, "changed_views={changed_views}")?;
-    ensure!(changed_views > 0, "fixture has no visible grass contribution; do not claim a visual/performance pass");
+    writeln!(report, "changed_views={changed_views}\nnegative_views={negative_views}\npositive_views={positive_views}")?;
+    ensure!(changed_views > 0 || (positive_views == 0 && negative_views > 0), "fixture has no visible grass contribution or verified negative-only selection");
     std::fs::write(out.join("manifest.txt"), &report)?;
     Ok(())
 }

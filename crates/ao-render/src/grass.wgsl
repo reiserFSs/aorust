@@ -3,14 +3,14 @@
 // Every blade is generated here from its cell: no CPU blade records. Blade shapes, tufting, species, wind and gusts,
 // the character push, the minimum drawn width and the distance fade follow ao-vk's procedural grass
 // (https://github.com/wannabuh/ao-vk, MIT, rvk/grass.cpp + shaders/grass*.glsl; see THIRD_PARTY). Placement and colour
-// come from the real terrain instead: the cell's native material, its authored-vegetation/neighbour exclusion, the
-// terrain's own tile texel and lightmap under each root.
+// come from the real terrain instead: each root's oriented green-texel mask, neighbouring bare ground,
+// terrain tile colour, native palette and lighting.
 struct GrassCell { origin: vec4<f32>, heights: vec4<f32>, identity: vec4<u32>, normals: array<vec4<f32>, 4> }
 struct GrassParams {
     wind_time: vec4<f32>, // x, y: unit wind direction; z: wind clock (s); w: grass radius
     limits: vec4<f32>,    // x: blades per cell; y: pixels per unit at depth 1; z: least blade width (px); w: bender count
     wind: vec4<f32>,      // x: wind strength (1 = a fresh breeze); y: gust share
-    bands: vec4<f32>,     // blades instanced per cell in each distance band
+    bands: array<vec4<f32>, 2>, // blades instanced per cell in eight distance bands
     benders: array<vec4<f32>, 16>,
 }
 @group(3) @binding(0) var<storage, read> grass_cells: array<GrassCell>;
@@ -26,7 +26,7 @@ struct GrassParams {
 const GRASS_HEIGHT: f32 = 0.4;
 const GRASS_MAX_HEIGHT: f32 = 0.5;
 const NOISE_PERIOD: f32 = 64.0;
-const MEADOW_LUMA: f32 = 0.5;
+const MEADOW_LUMA: f32 = 0.42;
 const LUMA: vec3<f32> = vec3<f32>(0.299, 0.587, 0.114);
 
 fn grass_hash(input: u32) -> u32 {
@@ -34,7 +34,10 @@ fn grass_hash(input: u32) -> u32 {
     v ^= v >> 15u; v *= 0x846ca68bu; return v ^ (v >> 16u);
 }
 // Share of a cell's blades that survive at a distance: the CPU instances only the ranks that can (grass.rs).
-fn thinning_keep(dist: f32, radius: f32) -> f32 { return 1.0 - 0.8 * smoothstep(0.25 * radius, 0.9 * radius, dist); }
+fn thinning_keep(dist: f32) -> f32 {
+    let d = max(dist - 12.0, 0.0) / 16.0;
+    return 1.0 / (1.0 + d * d);
+}
 fn grass_unit(v: u32) -> f32 { return f32(v & 0x00ffffffu) / 16777216.0; }
 // Byte n (0..3) of a hash as 0..1: one hash feeds four decisions.
 fn hb(h: u32, n: u32) -> f32 { return f32((h >> (8u * n)) & 255u) / 255.0; }
@@ -130,6 +133,7 @@ struct GOut {
     @location(9) fog: f32,
     @location(10) @interpolate(flat) path: u32,
     @location(11) @interpolate(flat) normal: vec3<f32>,
+    @location(12) @interpolate(flat) coverage: f32,
 }
 
 @vertex
@@ -139,7 +143,7 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     // The instance index carries its distance band in the top bits, then runs over the band's visible cells' blades.
     let band = instance >> 28u;
     let within = instance & 0x0fffffffu;
-    let band_stride = u32(grass_params.bands[band]);
+    let band_stride = u32(grass_params.bands[band / 4u][band % 4u]);
     let c = grass_cells[grass_visible[band * GRASS_MAX_CELLS + within / band_stride]];
     let k = within % band_stride;
     let stride = u32(grass_params.limits.x);
@@ -157,24 +161,24 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     var root = vec3<f32>(c.origin.x + uv.x * size, grass_height(c, uv) - 0.02, c.origin.y - uv.y * size);
     let eye = g.eye.xyz;
     let dist = distance(root.xz, eye.xz);
-    // Distance LOD without popping: blades thin out by rank (the survivors widen to cover), then shrink into the
-    // ground over the last third; the colour goes over to the ground's.
+    // Stable rank prefixes form wider, sparse tufts in the distance. Rank transitions shrink smoothly;
+    // the outer field also dithers coverage, rather than cutting a ring into the terrain.
     let rank = (f32(k) + 0.5) / f32(stride);
-    let keep = thinning_keep(dist, radius);
-    let by_rank = smoothstep(0.0, 1.0, clamp((keep - rank) / 0.08, 0.0, 1.0));
-    let by_range = smoothstep(0.0, 1.0, clamp((radius - dist) / (radius * 0.35), 0.0, 1.0));
+    let keep = thinning_keep(dist);
+    let by_rank = smoothstep(0.0, min(0.08, keep * 0.25), max(keep - rank, 0.0));
+    let by_range = 1.0 - smoothstep(0.7 * radius, radius, dist);
     let fade = by_rank * by_range;
     if fade <= 0.002 { return o; }
-    let widen = 1.0 + 1.2 * smoothstep(0.2 * radius, 0.8 * radius, dist);
+    o.coverage = by_range;
+    let widen = min(inverseSqrt(keep), 6.0);
 
-    // The terrain under the root: slope, and how close it is to the edge of the grass ground (a neighbour cell that
-    // is a path, rock, authored vegetation or other material).
+    // The terrain under the root: slope, and distance from neighbouring path, soil or rock.
     let w4 = grass_weights(c.identity.z, uv);
     var ground_n = vec3<f32>(0.0);
     for (var j = 0u; j < 4u; j += 1u) { ground_n += w4[j] * c.normals[j].xyz; }
     ground_n = normalize(ground_n);
-    // Only gentle ground grows grass: thinning from 32 degrees, none past 40.
-    if hb(hw, 0u) > (ground_n.y - 0.766) / 0.084 { return o; }
+    // Green hills remain grassy; only near-vertical cliff faces thin out (60 to 75 degrees).
+    if hb(hw, 0u) > (ground_n.y - 0.2588) / 0.2412 { return o; }
     // Grass grows where the ground's own picture is green, texel by texel: a transition tile's soil stays bare.
     let tile_uv = grass_uv(c.identity.y & 255u, uv);
     let layer = i32(c.identity.y >> 8u);
@@ -238,7 +242,7 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     let yaw = f32((hk >> 8u) & 0xffffu) * (6.2831853 / 65536.0);
     let tall = 1.0 + 0.5 * (field0.z - 0.5);
     var height = GRASS_HEIGHT * (0.45 + 1.2 * v0) * tall * (1.0 + 0.35 * (1.0 - rim) * vigour) * (0.65 + 0.35 * edge);
-    var half_width = 0.5 * (0.03 + 0.03 * v2) * 0.6;
+    var half_width = 0.5 * (0.03 + 0.03 * v2) * 0.9;
     var droop = 0.06 + 0.18 * v4;
     switch kind {
         case 1u: { height *= 0.7 + 0.2 * v4; half_width *= 1.9; droop = 0.2 + 0.25 * v4; }
@@ -250,10 +254,13 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     height = select(height, 0.4 + (height - 0.4) * 0.3, height > 0.4);
     height = min(height, GRASS_MAX_HEIGHT);
 
-    // The cross section of this vertex.
-    let section = vertex >> 1u;
+    // Curved near blades retain root, shoulder and tip; distant tufts need only root and tip.
+    let step = vertex >> 1u;
+    let section = select(select(0u, step + 1u, step > 0u), step * 3u, band >= 2u);
     let t = SECTION_T[kind][section];
-    let profile = SECTION_W[kind][section];
+    // Complete the geometric morph before the CPU can select band 2 (~40 m nearest cell edge).
+    let simple_tuft = smoothstep(28.0, 36.0, dist);
+    let profile = mix(SECTION_W[kind][section], 1.0 - t, simple_tuft);
     let side = select(-1.0, 1.0, (vertex & 1u) != 0u);
     let is_head = kind >= 2u && section >= 2u;
 
@@ -263,15 +270,17 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     let lean_dir = lean_field / (length(lean_field) + 1e-6) * (0.05 + 0.22 * field1.z);
     let scatter = (v2 - 0.5) * 0.18;
     let fan = 0.3 * min(rim * 1.5, 1.0);
-    var up = normalize(vec3<f32>(ground_n.x + lean_dir.x + rr.x * scatter + out_dir.x * fan, ground_n.y,
-        ground_n.z + lean_dir.y + rr.z * scatter + out_dir.y * fan));
+    // Growth tends upwards on steep hills, rather than turning a green cliff into horizontal fur.
+    let growth_n = normalize(mix(ground_n, vec3<f32>(0.0, 1.0, 0.0), 1.0 - smoothstep(0.5, 0.85, ground_n.y)));
+    var up = normalize(vec3<f32>(growth_n.x + lean_dir.x + rr.x * scatter + out_dir.x * fan, growth_n.y,
+        growth_n.z + lean_dir.y + rr.z * scatter + out_dir.y * fan));
     // Seen from above an upright field is mostly the ground between blades: the steeper the view, the further they
     // lean (each its own way) and the wider they are drawn.
     let to_eye = eye - root;
     let steep = smoothstep(0.4, 0.95, to_eye.y / max(length(to_eye), 1e-3));
     let tilt = 0.45 * steep * edge * edge;
     let up_view = normalize(up * cos(tilt) + rr * sin(tilt));
-    let axis0 = root + up_view * (height * t) + rr * (droop * height * t * t);
+    let axis0 = root + up_view * (height * t) + rr * (droop * height * mix(t * t, t, simple_tuft));
     let pos = root + (axis0 - root) * fade;
 
     // Wind: waves running through the field (the upper blade bending most) with gusts on top.
@@ -282,7 +291,7 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     let strength = grass_params.wind.x;
     let lean_level = select(1.0 + 1.3 * (1.0 - exp(-(strength - 1.0) / 1.2)), strength, strength <= 1.0);
     let phase = root.x * 0.3 + root.z * 0.25 + yaw;
-    let hh = height * fade * lean_level * t * t;
+    let hh = height * fade * lean_level * mix(t * t, t, simple_tuft);
     let above = height * t * fade;
     let wind_dir3 = vec3<f32>(wd.x, 0.0, wd.y);
     let wind_bend = bend_keeping_length(wind_dir3 * (0.16 * hh * grass_sway(aa, time, phase, gust) + 0.7 * hh * gust), above);
@@ -330,7 +339,7 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     o.shape = vec4<f32>(t, side, grad * ao,
         (1.0 + sunlit * 0.3 * side * dot(right, sun)) * (1.0 + 0.45 * (gust - GUST_MEAN * grass_params.wind.y) * t));
     o.mixes = vec4<f32>(0.55 * (1.0 - smoothstep(0.0, 0.4, t)),
-        min(0.7 * smoothstep(0.55 * radius, radius, dist) + 0.5 * (1.0 - 1.0 / widen_px), 0.85),
+        max(0.95 * smoothstep(24.0, 80.0, dist), min(0.7 * smoothstep(0.55 * radius, radius, dist) + 0.5 * (1.0 - 1.0 / widen_px), 0.85)),
         0.4 * through * sunlit, 0.94 + 0.12 * v0);
 
     // Terrain lighting as the native ground has it: the sun at each of the four corners, Gouraud-interpolated, and
@@ -344,7 +353,7 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     let simple = c.origin.w < 0.5;
     o.spec = select(without_sun, clamp(without_sun + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), simple);
     for (var j = 0u; j < 4u; j += 1u) {
-        let light = clamp(g.sun_g.rgb * max(dot(normalize(c.normals[j].xyz), g.sun_dir.xyz), 0.0) + local, vec3<f32>(0.0), vec3<f32>(1.0));
+        let light = clamp(g.sun_g.rgb * max(dot(c.normals[j].xyz, g.sun_dir.xyz), 0.0) + local, vec3<f32>(0.0), vec3<f32>(1.0));
         o.light += w4[j] * select(light, clamp(light + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), simple);
         o.dlight += w4[j] * (clamp(light + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) - light);
     }
@@ -363,24 +372,32 @@ struct GrassOutput {
 }
 @fragment
 fn fs_grass(i: GOut) -> GrassOutput {
-    // The terrain's own texel and lightmap under the root.
-    let ground = sample_clamped(tex, i.uv).rgb;
+    // Use the native mip chain once: full-detail roots near the camera, the composite's 8x8 tile mip far away.
+    let coarse_level = max(log2(f32(textureDimensions(tex).x) / 8.0), 0.0) * min(i.mixes.y / 0.95, 1.0);
+    var ground: vec3<f32>;
+    if mat.flags.x > 0.5 {
+        ground = textureSampleLevel(tex, samp_clamp, i.uv, coarse_level).rgb;
+    } else {
+        ground = textureSampleLevel(tex, samp, i.uv, coarse_level).rgb;
+    }
     let palette = sample_clamped(holo0, vec2<f32>(i.root.x, -i.root.z) * mat.wave.xz).rgb;
-    var light = select(i.light, clamp(i.light + palette, vec3<f32>(0.0), vec3<f32>(1.0)), i.path > 0u);
-    let without_sun = select(i.spec, clamp(i.spec + palette, vec3<f32>(0.0), vec3<f32>(1.0)), i.path > 0u);
+    var light = i.light;
     var visibility = 1.0;
     //__SHADOW_VISIBILITY__
-    let sun_share = max(light - without_sun, vec3<f32>(0.0));
+    // Match native ground: remove the pre-palette direct sun, THEN add/clamp the baked palette.
+    let sun_share = max(i.light - i.spec, vec3<f32>(0.0));
     light = max(light - sun_share * (1.0 - visibility), vec3<f32>(0.0));
+    light = select(light, clamp(light + palette, vec3<f32>(0.0), vec3<f32>(1.0)), i.path > 0u);
     // Blade colour: the meadow's green at the ground texel's brightness, the root growing out of the texel itself,
     // each over its blade's area averaging 1 so the field is as bright as the ground it stands on.
     let green = mix(ground, vec3<f32>(0.20, 0.44, 0.10), 0.8);
     var hue = (vec3<f32>(0.44, 0.62, 0.30) * 0.45 + green * 0.55) * vec3<f32>(0.88, 0.92, 0.82);
     hue = mix(hue, vec3<f32>(0.62, 0.56, 0.30) * 0.6, i.hue.w) * i.hue.rgb;
     let ground_luma = dot(ground, LUMA);
-    // Sunlit daytime grass may be as vivid as a meadow (ao-vk's 0.34 luminance) where the ground texel is duller;
-    // shade, night and fog leave it at the texel's own brightness and never above it.
-    let lit = smoothstep(0.2, 0.5, dot(light, LUMA)) * (1.0 - i.fog);
+    // Only surviving direct daylight can lift the dull substrate towards meadow luminance.
+    // Ambient/local lights alone must not brighten night or covered ground.
+    let daylight = clamp(dot(sun_share, LUMA) * 2.5, 0.0, 1.0) * visibility * smoothstep(0.0, 0.1, g.sun_dir.y);
+    let lit = smoothstep(0.2, 0.5, dot(light, LUMA)) * daylight * (1.0 - i.fog);
     let target_luma = mix(ground_luma, max(ground_luma, MEADOW_LUMA), lit);
     let body = hue * (target_luma / max(dot(hue, LUMA), 1e-3)) * i.mixes.w;
     let vein = 1.04 - 0.14 * exp(-i.shape.y * i.shape.y * 12.0);
@@ -395,7 +412,9 @@ fn fs_grass(i: GOut) -> GrassOutput {
         color = mix(albedo, g.fog_g.rgb, fog) * mix(light, vec3<f32>(1.0), fog);
     }
     var output: GrassOutput;
-    output.color = vec4<f32>(color, 1.0);
+    // Hardware alpha-to-coverage dithers the outer field without fragment discard.
+    // At one sample the geometric shrink remains the continuous fade.
+    output.color = vec4<f32>(color, i.coverage);
     //__AMBIENT_WRITE__
     //__AO_RECEIVE__
     //__EMISSIVE_WRITE__

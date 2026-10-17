@@ -969,30 +969,26 @@ pub(super) fn segment_clear(c: &Collision, a: [f32; 3], b: [f32; 3]) -> bool {
     c.inside(a) && c.inside(b) && !door_closed(c, a, b) && c.line(a, b).is_none() && c.line(b, a).is_none()
 }
 
-/// Enhancement-only exposure: higher native ground or any overhead collision
-/// rejects a sample. No actor geometry participates in this static surface query.
+/// Enhancement-only floor exclusion: native ground may grow grass beneath arches,
+/// but higher collision ground within the 0.5 m blade envelope rejects a sample.
 pub(super) fn grass_exposure_surface(surface: Rc<RefCell<Collision>>) -> ao_render::GrassExposure {
     // Collision triangles are immutable after load. Door state changes affect
-    // character LOS, not this static ground/vertical-ray exposure capability.
+    // character LOS, not this static ground capability. No actors participate.
     let generation = Rc::as_ptr(&surface) as usize as u64;
-    let ceiling = surface.borrow().surface_ceiling().unwrap_or(f32::NEG_INFINITY);
     let ground = Rc::clone(&surface);
     ao_render::GrassExposure {
         generation,
-        query: Rc::new(move |point| grass_point_exposed(&ground.borrow(), point, ceiling)),
+        query: Rc::new(move |point| grass_point_exposed(&ground.borrow(), point)),
         line_of_sight: Rc::new(move |from, to| segment_clear(&surface.borrow(), from, to)),
     }
 }
 
-fn grass_point_exposed(surface: &Collision, point: [f32; 3], ceiling: f32) -> bool {
+fn grass_point_exposed(surface: &Collision, point: [f32; 3]) -> bool {
     // Use the same native plane solve as `ground`, not the renderer's corner
     // interpolation, so ulp differences cannot masquerade as a raised floor.
     let height = surface.terrain_height(point).unwrap_or(point[1]);
     let raised = [point[0], height + 0.5, point[2]];
-    if surface.ground(raised).is_none_or(|ground| ground > height) { return false; }
-    let low = [point[0], height + 0.005, point[2]];
-    let high = [point[0], (height + 1.0).max(ceiling + 1.0), point[2]];
-    surface.line(low, high).is_none() && surface.line(high, low).is_none()
+    surface.ground(raised).is_some_and(|ground| ground <= height)
 }
 
 /// Gamecode `FUN_100ad4bd`: ask the playfield surface for its closest point and
@@ -1588,7 +1584,7 @@ mod tests {
     }
 
     #[test]
-    fn grass_exposure_rejects_raised_floors_and_roof_shelter() {
+    fn grass_exposure_admits_arches_but_excludes_floors_within_blade_height() {
         use ao_scene::{Instance, Mesh, Scene, Submesh, Vertex, IDENTITY};
         let surface = |extra: Option<f32>| {
             let mut scene = Scene::default();
@@ -1605,13 +1601,17 @@ mod tests {
         };
         let exposed = |surface| {
             let capability = grass_exposure_surface(Rc::new(RefCell::new(surface)));
-            (capability.query)([0.0; 3])
+            // The renderer tests all four cell corners and its centre.
+            [[0.0, 0.0], [1.0, 0.0], [0.0, -1.0], [1.0, -1.0], [0.5, -0.5]]
+                .map(|[x, z]| (capability.query)([x, 0.0, z]))
         };
-        assert!(exposed(surface(None)));
-        assert!(!exposed(surface(Some(0.001))), "even a millimetre-high non-terrain floor rejects grass");
-        assert!(!exposed(surface(Some(0.2))), "a low statel floor cannot grow blades through it");
-        assert!(!exposed(surface(Some(3.0))), "a roof excludes sheltered terrain");
-        assert!(!exposed(surface(Some(256.0))), "shelter probing uses loaded geometry bounds, not an arbitrary ray length");
+        assert_eq!(exposed(surface(None)), [true; 5]);
+        for height in [0.001, 0.2, 0.5] {
+            assert_eq!(exposed(surface(Some(height))), [false; 5], "a floor {height} m above native ground must exclude blades up to 0.5 m");
+        }
+        for height in [0.501, 3.0, 256.0] {
+            assert_eq!(exposed(surface(Some(height))), [true; 5], "an arch or building floor {height} m above ground cannot intersect capped blades");
+        }
     }
 
     #[test]

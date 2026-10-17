@@ -33,7 +33,7 @@ impl Default for EnhancedSettings {
         Self {
             sun_shadows: false, ambient_occlusion: false, emissive_bloom: false, ground_grass: false, hdr: false, contact_shadows: false,
             shadow_map_size: 2048, shadow_strength: 0.65, shadow_softness: 1.5, ao_radius: 1.75, ao_strength: 1.5, bloom_strength: 0.6,
-            grass_density: 1.0, grass_distance: 50.0, sun_boost: 0.5, grade_strength: 0.8, contact_strength: 0.4,
+            grass_density: 1.0, grass_distance: 160.0, sun_boost: 0.5, grade_strength: 0.8, contact_strength: 0.4,
         }
     }
 }
@@ -62,7 +62,7 @@ impl EnhancedSettings {
             ao_strength: finite(self.ao_strength, 2.0, defaults.ao_strength),
             bloom_strength: finite(self.bloom_strength, 1.0, defaults.bloom_strength),
             grass_density: finite(self.grass_density, 2.0, defaults.grass_density),
-            grass_distance: finite(self.grass_distance, 60.0, defaults.grass_distance),
+            grass_distance: finite(self.grass_distance, 180.0, defaults.grass_distance),
             sun_boost: finite(self.sun_boost, 0.6, defaults.sun_boost),
             grade_strength: finite(self.grade_strength, 1.0, defaults.grade_strength),
             contact_strength: finite(self.contact_strength, 1.0, defaults.contact_strength),
@@ -94,10 +94,10 @@ mod tests {
         assert!(EnhancedSettings { contact_shadows: true, ..defaults }.needs_sun_mask() && !defaults.needs_sun_mask());
         let bounded = EnhancedSettings {
             shadow_map_size: 0, ao_radius: -1.0, ao_strength: 3.0, bloom_strength: 2.0,
-            grass_density: 4.0, grass_distance: 100.0, ..defaults
+            grass_density: 4.0, grass_distance: 200.0, ..defaults
         }.clamped();
         assert_eq!((bounded.shadow_map_size, bounded.ao_radius, bounded.ao_strength), (256, 0.0, 2.0));
-        assert_eq!((bounded.bloom_strength, bounded.grass_density, bounded.grass_distance), (1.0, 2.0, 60.0));
+        assert_eq!((bounded.bloom_strength, bounded.grass_density, bounded.grass_distance), (1.0, 2.0, 180.0));
         assert_eq!(defaults.shadow_map_size, 2048);
         let shadow = EnhancedSettings { shadow_strength: 2.0, shadow_softness: 9.0, ..defaults }.clamped();
         assert_eq!((shadow.shadow_strength, shadow.shadow_softness), (1.0, 4.0));
