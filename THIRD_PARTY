@@ -21,7 +21,7 @@ rvk/shaders/ffp_main.glsl), MIT licensed. The WGSL is an independent
 reimplementation of the algorithm, not copied source.
 
 HDR tonemap, grade and dither
-=============================
+======================
 
 The highlight knee, sunlit-warm / shade-cool chroma grade and interleaved-gradient
 dither in crates/ao-render/src/grade.wgsl follow the approach of `tonemap.frag`
@@ -34,3 +34,13 @@ crates/ao-render/src/contact_shadows.{rs,wgsl} follow the algorithm of
 `rvk/shaders/contact.frag` and `ao_blur.frag` in ao-vk
 (https://github.com/wannabuh/ao-vk), MIT licensed. The WGSL is an independent
 reimplementation of the algorithm, not copied source.
+
+Bloom pyramid
+=============
+
+The 13-tap Karis-weighted first downsample and 3x3-tent upsample chain in
+crates/ao-render/src/bloom.wgsl follow the structure of rvk/shaders/bloom_down.frag
+and rvk/shaders/bloom_up.frag in ao-vk (https://github.com/wannabuh/ao-vk), MIT
+licensed, including its soft-knee threshold above white. The WGSL is an independent
+reimplementation; the energy-preserving level mix, authored-emission seeds and
+HDR tonemap interaction are specific to this renderer.

@@ -2,12 +2,13 @@
 // `expose` is the only stage that can add light, and only where the world pass wrote a daylight,
 // unshadowed, unfogged sun weight; `present` returns exactly the native colour wherever that weight is 0.
 struct Params {
-    control: vec4<f32>, // x: peak sun boost (0 = faithful)
+    control: vec4<f32>, // x: peak sun boost (0 = faithful), y: bloom strength (0 = no halo)
     grade: vec4<f32>,   // x: chroma grade strength, y: day, z: low-sun, w: night weights
 }
 @group(0) @binding(0) var source: texture_2d<f32>;
 @group(1) @binding(0) var sun: texture_2d<f32>;
 @group(1) @binding(1) var<uniform> params: Params;
+@group(1) @binding(2) var halo: texture_2d<f32>;
 @vertex fn vs(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
     return vec4<f32>(vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u)) * 2.0 - 1.0, 0.0, 1.0);
 }
@@ -58,11 +59,17 @@ fn grade_chroma(rgb: vec3<f32>, sunlit: f32) -> vec3<f32> {
     c = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
     return c * min(1.0, y / max(luma(c), 1e-5));
 }
+// Bloom halo lands here in HDR, above white. Pixels it reaches get the tone curve's white lifted by the
+// halo's own size (`tone(x, beta + head)`): the pixel's own white then maps slightly below 1 and the halo's
+// energy rolls into the shoulder instead of clipping at the pixel's old white. head = 0 (no bloom, or no halo
+// there) is exactly the previous curve. Capped so the cubic stays in its monotone range (beta <= 0.6).
 @fragment fn present(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
     let q = vec2<i32>(p.xy);
     let h = textureLoad(source, q, 0);
-    let beta = boost_at(q);
-    let mapped = max(vec3<f32>(tone(h.r, beta), tone(h.g, beta), tone(h.b, beta)), vec3<f32>(0.0));
+    let glare = glare_received(glare_reconstruct(halo, p.xy), params.control.y);
+    let x = max(h.rgb, vec3<f32>(0.0)) + glare;
+    let beta = min(boost_at(q) + max(glare.r, max(glare.g, glare.b)), 0.6);
+    let mapped = max(vec3<f32>(tone(x.r, beta), tone(x.g, beta), tone(x.b, beta)), vec3<f32>(0.0));
     let sunlit = smoothstep(0.3, 0.7, textureLoad(sun, q, 0).r);
     return vec4<f32>(clamp(grade_chroma(mapped, sunlit) + vec3<f32>(dither(p.xy)), vec3<f32>(0.0), vec3<f32>(1.0)), clamp(h.a, 0.0, 1.0));
 }

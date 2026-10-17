@@ -1399,6 +1399,19 @@ lift. It reads the same sun mask as HDR (the fourth world-pass attachment exists
 without HDR. Night (moonlight weight is about 0.26), dusk, shadowed, fogged, sky, unlit and glow pixels fall below the ramp and
 are untouched, and no actor list or history is read, so hidden actors cannot change a pixel.
 
+Bloom (`emissive_bloom`) is a 7-level pyramid (`bloom.wgsl`, structure from ao-vk `bloom_down/up.frag`, see THIRD_PARTY):
+a 13-tap Karis-weighted first downsample, `[1,3,3,1]` downsamples and a 3x3-tent upsample that mixes each level's own
+light with the wider level (60 % wider, energy-preserving, so halos are round and wide rather than nearest-neighbour
+blocks). Seeds are the world pass's depth-tested authored emission mask (clipped to the visible colour) and, only with
+HDR on, `2 x max(luma - 1.0, 0)` (0.05 soft knee) of the exposed scene: only pixels the expose pass pushed above native
+white (sunlit daylight surfaces) glow; night, shadow and fog have no highlight seeds, and no history is used. The halo is
+added with `strength x 4`. Without HDR it is the UNORM-range composite capped at 64 display codes luma. With HDR the
+frame order is world -> AO -> (contact insertion point) -> `expose` -> bloom pyramid -> `present`, where `present` adds the
+halo in float, still capping the *authored* share of the halo at 64 codes (a night lamp keeps a modest halo; the share
+is tracked in the pyramid's alpha as the highlight luma) while the highlight share is uncapped (bounded by its seed). Tonemap
+interaction: the tone curve's white is lifted by the halo's size, `tone(x, beta + max(halo rgb))` (capped at beta 0.6), so
+bloomed pixels roll into the shoulder instead of clipping at their own old white; with no halo it is the unchanged curve.
+
 | Quality control / DV Main key | Default | Bounds |
 |---|---|---|
 | Shadow Map Size / `AomacShadowMapSize` | 2048 | 256–4096 (UI choices 256/512/1024/2048/4096) |
@@ -1451,7 +1464,7 @@ MSAA retains its native coverage; a minimum-sample depth resolve supplies single
 shaders already output framebuffer-space colour, so applying an sRGB transfer or exposure
 would be incorrect. It runs before native heat haze, viewport sprites and GUI. Shadows alter only the
 attributable sun share in the Enhanced shader; AO subtracts only the ambient-share attachment,
-not the whole image. Bloom consumes authored emission, never a brightness threshold.
+not the whole image. Bloom seeds are authored emission only (never inferred from brightness) plus, with HDR on, highlights.
 All four flags off select the original shader/attachments and world pass with no optional
 textures, composite, depth resolve or timer buffers; switching off releases the Enhanced frame.
 The offline neutral profile is explicitly `ground_grass=true, grass_density=0`, not all-off.

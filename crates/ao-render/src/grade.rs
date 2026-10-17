@@ -8,6 +8,7 @@ pub(super) struct Grade {
     pub size: (u32, u32),
     hdr_bg: wgpu::BindGroup,
     hdr: wgpu::TextureView,
+    halo: wgpu::TextureView,
     aux_bg: wgpu::BindGroup,
     params: wgpu::Buffer,
     expose: wgpu::RenderPipeline,
@@ -17,9 +18,11 @@ pub(super) struct Grade {
 impl Grade {
     /// `source_layout` is the Enhanced single-texture boundary layout; `sun` is the world pass's sun mask.
     pub fn new(device: &wgpu::Device, output: wgpu::TextureFormat, size: (u32, u32), source_layout: &wgpu::BindGroupLayout, sun: &wgpu::TextureView) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Enhanced HDR grade"), source: wgpu::ShaderSource::Wgsl(include_str!("grade.wgsl").into()) });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Enhanced HDR grade"), source: wgpu::ShaderSource::Wgsl([crate::bloom::GLARE, include_str!("grade.wgsl")].concat().into()) });
         let aux_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("Enhanced grade inputs"), entries: &[
             wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+            wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
             wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
@@ -36,39 +39,62 @@ impl Grade {
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: HDR,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
         }).create_view(&Default::default());
+        let halo_size = crate::bloom::halo_size(size);
+        let halo = device.create_texture_tracked(&wgpu::TextureDescriptor {
+            label: Some("Enhanced bloom halo"), size: wgpu::Extent3d { width: halo_size.0, height: halo_size.1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: HDR,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+                | if cfg!(test) { wgpu::TextureUsages::COPY_DST } else { wgpu::TextureUsages::empty() },
+            view_formats: &[],
+        }).create_view(&Default::default());
         let params = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("Enhanced grade parameters"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let hdr_bg = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("Enhanced HDR scene"), layout: source_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr) }] });
         let aux_bg = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("Enhanced grade inputs"), layout: &aux_layout, entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(sun) },
             wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&halo) },
         ] });
-        Self { size, hdr_bg, hdr, aux_bg, params, expose: make("expose", HDR), present: make("present", output) }
+        Self { size, hdr_bg, hdr, halo, aux_bg, params, expose: make("expose", HDR), present: make("present", output) }
     }
 
-    pub fn bytes(size: (u32, u32)) -> u64 { u64::from(size.0) * u64::from(size.1) * 8 + 32 }
+    pub fn bytes(size: (u32, u32)) -> u64 {
+        let halo = crate::bloom::halo_size(size);
+        (u64::from(size.0) * u64::from(size.1) + u64::from(halo.0) * u64::from(halo.1)) * 8 + 32
+    }
 
     /// Chroma grade inputs: strength and the day / low-sun / night weights (see [`time_of_day`]).
     pub fn set_grade(&self, queue: &wgpu::Queue, strength: f32, tod: [f32; 3]) {
         queue.write_buffer(&self.params, 16, bytemuck::cast_slice(&[strength, tod[0], tod[1], tod[2]]));
     }
 
-    /// `base` is the native-range colour (bloomed when bloom is on); the result is written to `output`.
-    pub fn encode(&self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, base: &wgpu::BindGroup, output: &wgpu::TextureView, boost: f32, timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>) {
-        queue.write_buffer(&self.params, 0, bytemuck::cast_slice(&[boost, 0.0, 0.0, 0.0]));
-        for (label, pipeline, input, target, load, timestamp_writes) in [
-            ("Enhanced HDR expose", &self.expose, base, &self.hdr, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), None),
-            ("Enhanced tonemap present", &self.present, &self.hdr_bg, output, wgpu::LoadOp::Clear(wgpu::Color::BLACK), timestamps),
-        ] {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(label), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: target, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load, store: wgpu::StoreOp::Store } })],
-                depth_stencil_attachment: None, timestamp_writes, occlusion_query_set: None, multiview_mask: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, input, &[]);
-            pass.set_bind_group(1, &self.aux_bg, &[]);
-            pass.draw(0..3, 0..1);
-        }
+    /// The exposed scene (colour above 1 only where the sun lifted it): the bloom pyramid's input.
+    pub fn hdr_view(&self) -> &wgpu::TextureView { &self.hdr }
+    /// Half-resolution halo the bloom pyramid writes; `present` adds it above white.
+    pub fn halo_view(&self) -> &wgpu::TextureView { &self.halo }
+
+    fn pass(encoder: &mut wgpu::CommandEncoder, label: &str, pipeline: &wgpu::RenderPipeline, input: &wgpu::BindGroup, aux: &wgpu::BindGroup,
+        target: &wgpu::TextureView, timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: target, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+            depth_stencil_attachment: None, timestamp_writes, occlusion_query_set: None, multiview_mask: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, input, &[]);
+        pass.set_bind_group(1, aux, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    /// Lifts daylight-sun pixels of the native-range colour `base` into the HDR scene. `bloom_strength` is the
+    /// strength `present` will apply to the halo (0 when bloom is off, so a stale halo is never shown).
+    pub fn expose(&self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, base: &wgpu::BindGroup, boost: f32, bloom_strength: f32) {
+        queue.write_buffer(&self.params, 0, bytemuck::cast_slice(&[boost, bloom_strength, 0.0, 0.0]));
+        Self::pass(encoder, "Enhanced HDR expose", &self.expose, base, &self.aux_bg, &self.hdr, None);
+    }
+
+    /// Adds the bloom halo above white, tonemaps and dithers into the 8-bit `output`.
+    pub fn present(&self, encoder: &mut wgpu::CommandEncoder, output: &wgpu::TextureView, timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>) {
+        Self::pass(encoder, "Enhanced tonemap present", &self.present, &self.hdr_bg, &self.aux_bg, output, timestamps);
     }
 }
 
@@ -125,7 +151,8 @@ mod tests {
         let grade = Grade::new(&r.device, r.format, (256, 1), &layout, &sun_tex.create_view(&Default::default()));
         grade.set_grade(&r.queue, strength, tod);
         let mut encoder = r.device.create_command_encoder(&Default::default());
-        grade.encode(&r.queue, &mut encoder, &base_bg, &out.create_view(&Default::default()), 0.0, None);
+        grade.expose(&r.queue, &mut encoder, &base_bg, 0.0, 0.0);
+        grade.present(&mut encoder, &out.create_view(&Default::default()), None);
         r.queue.submit([encoder.finish()]);
         let rgba = crate::texture_to_rgba(&r, &out, 256, 1).unwrap();
         let bgra = r.format == wgpu::TextureFormat::Bgra8Unorm;
@@ -133,7 +160,10 @@ mod tests {
     }
 
     /// Runs the real expose + present shaders over a 256x1 grey ramp; `sun` is the sun weight written to every pixel.
-    fn ramp(boost: f32, sun: f32) -> Vec<u8> {
+    fn ramp(boost: f32, sun: f32) -> Vec<u8> { ramp_halo(boost, sun, [0.0; 4], 0.0) }
+
+    /// As `ramp`, with every halo texel `halo` (rgb, a = highlight luma) applied at bloom `strength`.
+    fn ramp_halo(boost: f32, sun: f32, halo: [f32; 4], strength: f32) -> Vec<u8> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let r = crate::Renderer::new(&instance, None).expect("grade regression needs an offscreen GPU");
         let size = (256, 1);
@@ -155,8 +185,14 @@ mod tests {
         let base_view = base.create_view(&Default::default());
         let base_bg = r.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&base_view) }] });
         let grade = Grade::new(&r.device, r.format, size, &layout, &sun_tex.create_view(&Default::default()));
+        let halo_size = crate::bloom::halo_size(size);
+        let halo_bits: Vec<[u16; 4]> = (0..halo_size.0 * halo_size.1).map(|_| halo.map(crate::bloom::tests::f16_bits)).collect();
+        r.queue.write_texture(grade.halo_view().texture().as_image_copy(), bytemuck::cast_slice(&halo_bits),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(halo_size.0 * 8), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: halo_size.0, height: 1, depth_or_array_layers: 1 });
         let mut encoder = r.device.create_command_encoder(&Default::default());
-        grade.encode(&r.queue, &mut encoder, &base_bg, &out.create_view(&Default::default()), boost, None);
+        grade.expose(&r.queue, &mut encoder, &base_bg, boost, strength);
+        grade.present(&mut encoder, &out.create_view(&Default::default()), None);
         r.queue.submit([encoder.finish()]);
         let pixels = crate::texture_to_rgba(&r, &out, size.0, 1).unwrap();
         pixels.chunks(4).map(|p| p[0]).collect()
@@ -195,5 +231,23 @@ mod tests {
         assert!(lit.windows(2).all(|w| i32::from(w[0]) <= i32::from(w[1]) + 1), "tonemap must stay monotone within dither");
         assert!(lit.iter().enumerate().all(|(i, &v)| i32::from(v) + 1 >= i as i32), "never darker than native");
         assert!(lit[128] >= 128 + 30, "mid-tone sunlit surfaces gain visible brightness: {}", lit[128]);
+    }
+
+    #[test]
+    fn bloom_halo_adds_above_white_with_authored_cap_and_graceful_shoulder() {
+        let native: Vec<u8> = (0..=255).collect();
+        assert_eq!(ramp_halo(0.0, 0.0, [0.2; 4], 0.0), native, "strength 0 (bloom off) ignores a stale halo");
+        assert_eq!(ramp_halo(0.0, 0.0, [0.0; 4], 0.6), native, "an empty halo changes nothing");
+        // Authored (a = 0) glare over black: 0.2 * 0.6 * 4 = 0.48 luma, capped to the 64-code authored budget.
+        let authored = ramp_halo(0.0, 0.0, [0.2, 0.2, 0.2, 0.0], 0.6);
+        assert!((61..=65).contains(&(authored[100] - 100)), "authored night halo keeps the 64 display-code cap: {}", authored[100]);
+        // Highlight glare (a = its luma) is not capped.
+        let lit = ramp_halo(0.35, 1.0, [0.1, 0.1, 0.1, 0.1], 0.6);
+        assert!(lit[100] >= 100 + 58, "highlight halo adds its full energy: {}", lit[100]);
+        assert!(lit.windows(2).all(|w| i32::from(w[0]) <= i32::from(w[1]) + 1), "tonemap stays monotone with halo");
+        assert_eq!(lit[255], 255);
+        assert!(lit[200] < 255 && lit[220] < 255, "halo energy rolls into the shoulder instead of clipping at the pixel's old white: {} {}", lit[200], lit[220]);
+        let plain = ramp(0.35, 1.0);
+        for (i, (&with, &without)) in lit.iter().zip(&plain).enumerate() { assert!(i32::from(with) + 1 >= i32::from(without), "halo never darkens a pixel: {i} {with} {without}"); }
     }
 }

@@ -600,6 +600,9 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
         "bloom" => settings.emissive_bloom = true,
         "grass" => settings.ground_grass = true,
         "hdr" => settings.hdr = true,
+        "hdr-bloom" => { settings.hdr = true; settings.emissive_bloom = true; }
+        "hdr-bloom-max" => { settings.hdr = true; settings.emissive_bloom = true; settings.sun_boost = 0.6; }
+        "hdr-max" => { settings.hdr = true; settings.sun_boost = 0.6; }
         "hdr-neutral" => { settings.hdr = true; settings.sun_boost = 0.0; settings.grade_strength = 0.0; }
         "contact" => settings.contact_shadows = true,
         // Isolates the contact pass: shadows + hdr + contact vs `shadows-hdr`.
@@ -613,7 +616,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             settings.hdr = true;
             settings.contact_shadows = true;
         }
-        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|ao|bloom|grass|hdr|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|all"),
+        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|all"),
     }
     Ok(settings)
 }
@@ -638,6 +641,8 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
     assert!(isolated.sun_shadows && isolated.hdr && isolated.contact_shadows);
     assert!(!graphics_fixture_settings("shadows-hdr").unwrap().contact_shadows);
     assert!(graphics_fixture_settings("hdr").unwrap().hdr);
+    let hdr_bloom = graphics_fixture_settings("hdr-bloom").unwrap();
+    assert!(hdr_bloom.hdr && hdr_bloom.emissive_bloom && !hdr_bloom.sun_shadows);
     let neutral_hdr = graphics_fixture_settings("hdr-neutral").unwrap();
     assert!(neutral_hdr.hdr && neutral_hdr.sun_boost == 0.0);
     assert!(graphics_fixture_settings("unknown").is_err());

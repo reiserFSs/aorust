@@ -2158,8 +2158,8 @@ impl Renderer {
             self.grade = None;
             self.enhanced_frame = Some(enhanced::EnhancedFrame::new(&self.device, self.format, t.size, self.msaa_samples, self.enhanced_settings));
         }
-        self.prepare_enhanced_bloom();
         self.prepare_enhanced_grade();
+        self.prepare_enhanced_bloom();
         let encode_start = timed.then(std::time::Instant::now);
         let mut enc = self.device.create_command_encoder(&Default::default());
         self.encode_actor_skins(&mut enc);
@@ -2388,6 +2388,11 @@ impl Renderer {
         if self.enhanced_settings.contact_shadows {
             self.encode_enhanced_contact_shadows(&mut enc, vp, cam.pos, Vec3::from(env.sun_dir), far);
         }
+        // After AO and contact shadows: expose first so the HDR pyramid reads the lifted scene; non-HDR bloom works on the native colour.
+        let bloom_strength = if self.bloom.is_some() { self.enhanced_settings.bloom_strength } else { 0.0 };
+        if let (Some(grade), Some(frame)) = (&self.grade, self.enhanced_frame.as_ref()) {
+            grade.expose(&self.queue, &mut enc, &frame.composite_bg, self.enhanced_settings.sun_boost, bloom_strength);
+        }
         if let Some(bloom) = &mut self.bloom {
             let bloom_start = timed.then(std::time::Instant::now);
             bloom.encode(&self.queue, &mut enc, self.enhanced_settings.bloom_strength);
@@ -2397,9 +2402,9 @@ impl Renderer {
             let timestamps = if self.heat_haze.source().is_none() && self.screen.layers.is_empty() { self.gpu_timer.as_mut().map(FrameGpuTimer::end_pass) } else { None };
             let output = self.heat_haze.source().unwrap_or(resolve);
             if let Some(grade) = &self.grade {
-                grade.encode(&self.queue, &mut enc, self.bloom.as_ref().map_or(&frame.composite_bg, |bloom| &bloom.present), output, self.enhanced_settings.sun_boost, timestamps);
+                grade.present(&mut enc, output, timestamps);
             } else {
-                frame.composite(&mut enc, output, self.bloom.as_ref().map(|bloom| &bloom.present), timestamps);
+                frame.composite(&mut enc, output, self.bloom.as_ref().and_then(|bloom| bloom.present.as_ref()), timestamps);
             }
         }
         let timestamps = if self.heat_haze.source().is_some() && self.screen.layers.is_empty() { self.gpu_timer.as_mut().map(FrameGpuTimer::end_pass) } else { None };
