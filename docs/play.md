@@ -774,6 +774,9 @@ Slope uses actual triangle gradients, not the direction-dependent corner height
 range; a cell is rejected only where both triangles exceed about 75°. The default
 distance is 160 m (bounded to 180 m), further limited by the original projection
 far plane and fixed cell budget, not by the terrain's fully-fine radius.
+The registered Graphics slider uses the same 160 m default and 180 m maximum.
+Explicit saved preferences are preserved; set **Ground Grass Distance** to 160 m
+or reset that setting to adopt the new default if an older 50 m value was saved.
 This is an artistic Enhanced addition, not a reconstructed retail plant
 distribution. Collision and selection are unchanged.
 
