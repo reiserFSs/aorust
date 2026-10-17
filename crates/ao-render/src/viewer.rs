@@ -1215,16 +1215,17 @@ impl Offscreen {
         Ok(Self { r, targets, gr, host: Host::headless(), size, live: None, perf: None, fixed_camera: None })
     }
 
-    /// Explicit single-sample persistent target for frozen-snapshot timing, without environment overrides.
+    /// Persistent frozen-snapshot timing, single-sample by default; explicit host quality still wins.
     pub fn evidence_timing(fe: &dyn Frontend, size: (u32, u32)) -> Result<Self> {
         let mut off = Self::evidence(fe, size)?;
+        off.host.msaa_samples = Some(1);
         off.prepare_frozen_rendering();
         Ok(off)
     }
 
     /// Installs a persistent target after the frozen capture, without advancing renderer counters.
     pub fn prepare_frozen_rendering(&mut self) {
-        if self.perf.is_none() { self.perf = Some(OffscreenPerf::explicit(&self.r, self.size, Some(1))); }
+        if self.perf.is_none() { self.perf = Some(OffscreenPerf::explicit(&self.r, self.size, None)); }
     }
 
     /// Renders existing scene/actors/camera without frontend updates or capture/readback allocation.
@@ -1434,6 +1435,24 @@ impl Offscreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evidence_timing_honors_explicit_msaa_across_frames() {
+        struct Idle(ao_gui::Gui);
+        impl Frontend for Idle {
+            fn gui(&self) -> &ao_gui::Gui { &self.0 }
+            fn input(&mut self, _: ao_gui::InputEvent, _: &mut Host) {}
+            fn frame(&mut self, dt: f32, _: (u32, u32), _: &mut Host) -> ao_gui::DrawList { self.0.frame(dt) }
+        }
+        let mut fe = Idle(ao_gui::Gui::new(&ao_gui::client_dir(), None).unwrap());
+        let mut off = Offscreen::evidence_timing(&fe, (64, 64)).unwrap();
+        off.host.msaa_samples = Some(4);
+        for _ in 0..2 {
+            off.frame(&mut fe, 0.0);
+            assert_eq!(off.r.msaa_samples(), 4, "the timing target must not overwrite explicit quality");
+            assert_eq!(off.targets.sample_count, 4);
+        }
+    }
 
     #[test]
     fn offscreen_perf_percentiles_use_nearest_rank() {
