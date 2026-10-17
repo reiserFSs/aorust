@@ -169,7 +169,7 @@ pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene, shad
                         mesh.vertices.push(vertex(x + dx, z + dz, tile_uv(raw, [dx as f32, dz as f32])));
                     }
                     base.entry(t).or_default().extend(quad(x, z, b));
-                    fine_cells.push((t, [b, b + 1, b + 2, b + 3]));
+                    fine_cells.push((t, raw, [b, b + 1, b + 2, b + 3]));
                 }
             }
             let mut material_indices = BTreeMap::new();
@@ -182,7 +182,7 @@ pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene, shad
                 s.texture_clamp = true;
                 mesh.submeshes.push(s);
             }
-            let fine_cells = fine_cells.into_iter().map(|(t, vertices)| ao_scene::ground_detail::GroundCell { submesh: material_indices[&t], vertices }).collect();
+            let fine_cells = fine_cells.into_iter().map(|(t, raw, vertices)| ao_scene::ground_detail::GroundCell { submesh: material_indices[&t], vertices, native_tile: t, ground_material: super::ground::ground_material(t) as u8, orientation: (raw >> 14) as u8 }).collect();
             let lattice_start = mesh.vertices.len() as u32;
             let mut heights = Vec::with_capacity((patch + 1) * (patch + 1));
             for z in pz..=ez { for x in px..=ex {
@@ -196,7 +196,7 @@ pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene, shad
             let mut coarse = Submesh::new(vec![lattice_start; patch * patch * 6], Some(key));
             coarse.texture_clamp = true;
             mesh.submeshes.push(coarse);
-            scene.ground_detail.push(ao_scene::ground_detail::GroundPatch { mesh: scene.meshes.len(), origin: [px as i32, pz as i32], cells: patch, cell_size: cs, heights, lattice_start, coarse_submesh, fine_cells, shadow_texture, shadow_uv_scale });
+            scene.ground_detail.push(ao_scene::ground_detail::GroundPatch { mesh: scene.meshes.len(), origin: [px as i32, pz as i32], cells: patch, cell_size: cs, height_scale: tm.height_scale, heights, lattice_start, coarse_submesh, fine_cells, shadow_texture, shadow_uv_scale });
             scene.meshes.push(mesh);
             scene.instances.push(Instance { mesh: scene.meshes.len() - 1, transform: IDENTITY });
         }
@@ -297,11 +297,17 @@ mod tests {
         let mut scene = Scene::default();
         build(&store, 4582, &tm, &mut scene, super::super::sky::ground_shadow_time(crate::playfield::DEFAULT_DAY_TIME)).unwrap();
         assert!(!scene.meshes.is_empty());
-        let mut patches = scene.meshes.iter();
+        assert_eq!(scene.meshes.len(), scene.ground_detail.len());
+        let mut patches = scene.meshes.iter().zip(&scene.ground_detail).enumerate();
         let patch = patch_cells(&tm);
         for pz in (0..tm.verts_z - 1).step_by(patch) {
             for px in (0..tm.verts_x - 1).step_by(patch) {
-                let mesh = patches.next().unwrap();
+                let (mesh_index, (mesh, detail)) = patches.next().unwrap();
+                assert_eq!(detail.mesh, mesh_index);
+                assert_eq!(detail.origin, [px as i32, pz as i32]);
+                assert_eq!(detail.cells, patch);
+                assert_eq!(detail.height_scale, tm.height_scale);
+                assert_eq!(detail.fine_cells.len(), patch * patch);
                 let (ex, ez) = (px + patch, pz + patch);
                 assert_eq!(mesh.vertices.len(), patch * patch * 4 + (patch + 1) * (patch + 1));
                 assert!(mesh.submeshes.iter().all(|s| s.blend != ao_scene::Blend::AlphaBlend && s.texture_clamp));
@@ -311,18 +317,26 @@ mod tests {
                     for x in px..ex {
                         let b = ((z - pz) * (ex - px) + x - px) * 4;
                         let raw = tm.tiles[z * (tm.verts_x - 1) + x];
+                        let cell = &detail.fine_cells[(z - pz) * patch + x - px];
+                        let t = tm.tile_texture[tm.tile(x, z) as usize];
+                        assert_eq!(cell.native_tile, t);
+                        assert_eq!(cell.ground_material, super::super::ground::ground_material(t) as u8);
+                        assert_eq!(cell.orientation, (raw >> 14) as u8);
+                        assert_eq!(cell.vertices, [b as u32, b as u32 + 1, b as u32 + 2, b as u32 + 3]);
                         for (k, (dx, dz)) in [(0, 0), (1, 0), (0, 1), (1, 1)].into_iter().enumerate() {
                             let v = &mesh.vertices[b + k];
                             assert_eq!(v.uv, tile_uv(raw, [dx as f32, dz as f32]));
                             assert_eq!(v.pos, [(x + dx) as f32 * tm.cell_size, tm.height(x + dx, z + dz), -((z + dz) as f32 * tm.cell_size)]);
                             assert_eq!(v.color[3], 1.0);
+                            assert_eq!(mesh.vertices[cell.vertices[k] as usize].pos, v.pos);
                         }
                         let b = b as u32;
                         // Native P0-P2 on even checkerboard cells, P1-P3 on odd cells.
                         let expected = if (x + z).is_multiple_of(2) { [b, b + 1, b + 3, b, b + 3, b + 2] } else { [b, b + 1, b + 2, b + 1, b + 3, b + 2] };
-                        let t = tm.tile_texture[tm.tile(x, z) as usize] as u32;
+                        let t = t as u32;
                         let (texture, indices) = quads.get(&b).unwrap();
                         assert_eq!(*texture, Some(TextureKey { rdb_type: 1_010_006, id: t }));
+                        assert_eq!(mesh.submeshes[cell.submesh].texture, *texture);
                         assert_eq!(**indices, expected);
                     }
                 }

@@ -1,11 +1,17 @@
 //! Native binary ground triangles (DisplaySystem 10031c0a/10031f3c/10038c9c).
 use std::collections::HashMap;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct GroundCell {
     pub submesh: usize,
     /// p00, p10, p01, p11, with each cell's oriented tile UVs.
     pub vertices: [u32; 4],
+    /// Resolved original RDB texture ID; `u16::MAX` when unavailable.
+    pub native_tile: u16,
+    /// Native material class from RDB 1000024/1; zero is unclassified.
+    pub ground_material: u8,
+    /// Raw tile bits 14..15 (DisplaySystem 100374c5).
+    pub orientation: u8,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -14,6 +20,8 @@ pub struct GroundPatch {
     pub origin: [i32; 2],
     pub cells: usize,
     pub cell_size: f32,
+    /// Metres = raw height sample * (height_scale / 256).
+    pub height_scale: f32,
     pub heights: Vec<u16>,
     pub lattice_start: u32,
     pub coarse_submesh: usize,
@@ -234,7 +242,7 @@ mod tests {
         let cells = 8;
         let mut heights = vec![0; 81];
         heights[4 * 9 + 4] = 4096;
-        let patch = GroundPatch { mesh: 0, origin: [0, 0], cells, cell_size: 1.0, heights, lattice_start: 0, coarse_submesh: 0, fine_cells: (0..64).map(|_| GroundCell { submesh: 1, vertices: [81, 82, 83, 84] }).collect(), ..Default::default() };
+        let patch = GroundPatch { mesh: 0, origin: [0, 0], cells, cell_size: 1.0, heights, lattice_start: 0, coarse_submesh: 0, fine_cells: (0..64).map(|_| GroundCell { submesh: 1, vertices: [81, 82, 83, 84], ..Default::default() }).collect(), ..Default::default() };
         let mut detail = GroundDetail::new(vec![patch]);
         assert_eq!(detail.nodes[detail.roots[0]].variance, 16, "native raw ushort residual propagated before >>8");
         assert_eq!(distance_squared([[0, 8], [0, 0], [8, 8]], [4, 4]), 0);
@@ -258,7 +266,7 @@ mod tests {
         let patches = (0..2).map(|x| {
             let mut heights = vec![0; 81];
             if x == 0 { heights[4 * 9 + 7] = 4096; }
-            GroundPatch { mesh: x, origin: [x as i32 * 8, 0], cells: 8, cell_size: 1.0, heights, lattice_start: 0, coarse_submesh: 0, fine_cells: (0..64).map(|_| GroundCell { submesh: 1, vertices: [81, 82, 83, 84] }).collect(), ..Default::default() }
+            GroundPatch { mesh: x, origin: [x as i32 * 8, 0], cells: 8, cell_size: 1.0, heights, lattice_start: 0, coarse_submesh: 0, fine_cells: (0..64).map(|_| GroundCell { submesh: 1, vertices: [81, 82, 83, 84], ..Default::default() }).collect(), ..Default::default() }
         }).collect();
         let mut detail = GroundDetail::new(patches);
         let mut indices = vec![vec![Vec::new(), Vec::new()]; 2];

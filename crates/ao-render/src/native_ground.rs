@@ -140,7 +140,7 @@ mod tests {
         coarse.texture_clamp = true;
         scene.meshes.push(Mesh { vertices, submeshes: vec![fine, coarse] });
         scene.instances.push(Instance { mesh: 0, transform: IDENTITY });
-        scene.ground_detail.push(GroundPatch { mesh: 0, cells: 1, cell_size: 1.0, heights: vec![0; 4], coarse_submesh: 1, fine_cells: vec![GroundCell { submesh: 0, vertices: [0, 1, 2, 3] }], shadow_texture: Some(palette), shadow_uv_scale: [1.0; 2], ..Default::default() });
+        scene.ground_detail.push(GroundPatch { mesh: 0, cells: 1, cell_size: 1.0, heights: vec![0; 4], coarse_submesh: 1, fine_cells: vec![GroundCell { submesh: 0, vertices: [0, 1, 2, 3], ..Default::default() }], shadow_texture: Some(palette), shadow_uv_scale: [1.0; 2], ..Default::default() });
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let mut renderer = Renderer::new(&instance, None).unwrap();
         renderer.upload(&scene);
