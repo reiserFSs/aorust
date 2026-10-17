@@ -41,6 +41,9 @@ pub struct Host {
     /// Colour/depth MSAA sample count (aomac Enhanced option; not retail, default 1 = off). `None` leaves it as it is;
     /// downward-clamped to what the adapter supports by [`Renderer::set_msaa_samples`].
     pub msaa_samples: Option<u32>,
+    /// Independent opt-in graphics effects and quality knobs; drained by both viewer frontends.
+    /// `None` leaves the renderer unchanged; all-off settings return to faithful rendering.
+    pub enhanced_settings: Option<crate::EnhancedSettings>,
     /// Interface scale (aomac Enhanced option, audit item 2): `None`/`Some(0)` = Auto (today's whole backing-scale
     /// rounding), `Some(1..=3)` = a fixed GUI-pixel scale, honoured regardless of window size ([`gui_scale`]).
     /// Drained every frame by the viewer; the very first frame (before the window exists) reads
@@ -181,7 +184,7 @@ impl Host {
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { actor_visual_resets: vec![], actor_visual_retirements: vec![], pointer_warp: None, smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
+        Host { enhanced_settings: None, actor_visual_resets: vec![], actor_visual_retirements: vec![], pointer_warp: None, smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -706,6 +709,9 @@ impl State {
         }
         if let Some(samples) = g.host.msaa_samples.take() {
             self.renderer.set_msaa_samples(samples);
+        }
+        if let Some(settings) = g.host.enhanced_settings.take() {
+            self.renderer.set_enhanced_settings(settings);
         }
         if let Some(scene) = g.host.scene.take() {
             self.renderer.upload(&scene);
@@ -1258,6 +1264,9 @@ impl Offscreen {
         }
         if let Some(samples) = self.host.msaa_samples.take() {
             self.r.set_msaa_samples(samples);
+        }
+        if let Some(settings) = self.host.enhanced_settings.take() {
+            self.r.set_enhanced_settings(settings);
         }
         if self.targets.sample_count != self.r.msaa_samples() {
             self.targets = Targets::new(&self.r, self.size.0, self.size.1);

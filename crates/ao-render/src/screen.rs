@@ -104,7 +104,7 @@ fn upload(device:&wgpu::Device,queue:&wgpu::Queue,image:&ao_scene::Texture,polic
 
 /// DS1000bc0b/Randy1004b75a clears depth at an ordered render-list position.
 /// Writing every sample at depth 1 with Always preserves that operation inside one world pass.
-pub(super) fn depth_clear_pipeline(device:&wgpu::Device,format:wgpu::TextureFormat,samples:u32)->wgpu::RenderPipeline {
+pub(super) fn depth_clear_pipeline(device:&wgpu::Device,format:wgpu::TextureFormat,samples:u32,settings:crate::EnhancedSettings)->wgpu::RenderPipeline {
     let shader=device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label:Some("native viewport depth clear"),
         source:wgpu::ShaderSource::Wgsl(include_str!("depth_clear.wgsl").into()),
@@ -112,11 +112,13 @@ pub(super) fn depth_clear_pipeline(device:&wgpu::Device,format:wgpu::TextureForm
     let layout=device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label:Some("native viewport depth clear"),bind_group_layouts:&[],immediate_size:0,
     });
+    let target = wgpu::ColorTargetState {format,blend:None,write_mask:wgpu::ColorWrites::empty()};
+    let targets = [Some(target.clone()), settings.ambient_occlusion.then(|| target.clone()), settings.emissive_bloom.then_some(target)];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label:Some("native viewport depth clear"),layout:Some(&layout),
         vertex:wgpu::VertexState {module:&shader,entry_point:Some("vs"),compilation_options:Default::default(),buffers:&[]},
         fragment:Some(wgpu::FragmentState {module:&shader,entry_point:Some("fs"),compilation_options:Default::default(),
-            targets:&[Some(wgpu::ColorTargetState {format,blend:None,write_mask:wgpu::ColorWrites::empty()})]}),
+            targets:if format==crate::enhanced::HDR {&targets} else {&targets[..1]}}),
         primitive:Default::default(),
         depth_stencil:Some(wgpu::DepthStencilState {format:DEPTH,depth_write_enabled:Some(true),depth_compare:Some(wgpu::CompareFunction::Always),stencil:Default::default(),bias:Default::default()}),
         multisample:wgpu::MultisampleState {count:samples,..Default::default()},multiview_mask:None,cache:None,

@@ -1,0 +1,81 @@
+//! Opt-in, aomac-only graphics settings. All effects default off.
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EnhancedSettings {
+    pub sun_shadows: bool,
+    pub ambient_occlusion: bool,
+    pub emissive_bloom: bool,
+    pub ground_grass: bool,
+    pub shadow_map_size: u32,
+    pub ao_radius: f32,
+    pub ao_strength: f32,
+    pub bloom_strength: f32,
+    pub grass_density: f32,
+    pub grass_distance: f32,
+}
+
+impl Default for EnhancedSettings {
+    fn default() -> Self {
+        Self {
+            sun_shadows: false, ambient_occlusion: false, emissive_bloom: false, ground_grass: false,
+            shadow_map_size: 1024, ao_radius: 1.0, ao_strength: 1.0, bloom_strength: 0.15,
+            grass_density: 1.0, grass_distance: 30.0,
+        }
+    }
+}
+
+impl EnhancedSettings {
+    pub fn any_enabled(self) -> bool {
+        self.sun_shadows || self.ambient_occlusion || self.emissive_bloom || self.ground_grass
+    }
+
+    /// Bound external preferences, replacing non-finite floats with their defaults.
+    pub fn clamped(self) -> Self {
+        fn finite(value: f32, max: f32, default: f32) -> f32 {
+            if value.is_finite() { value.clamp(0.0, max) } else { default }
+        }
+        let defaults = Self::default();
+        Self {
+            shadow_map_size: self.shadow_map_size.clamp(256, 4096),
+            ao_radius: finite(self.ao_radius, 5.0, defaults.ao_radius),
+            ao_strength: finite(self.ao_strength, 1.0, defaults.ao_strength),
+            bloom_strength: finite(self.bloom_strength, 1.0, defaults.bloom_strength),
+            grass_density: finite(self.grass_density, 2.0, defaults.grass_density),
+            grass_distance: finite(self.grass_distance, 35.0, defaults.grass_distance),
+            ..self
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_flags_and_quality_bounds() {
+        let defaults = EnhancedSettings::default();
+        assert!(!defaults.any_enabled());
+        assert_eq!(defaults.clamped(), defaults);
+        for mask in 0..16 {
+            let settings = EnhancedSettings {
+                sun_shadows: mask & 1 != 0, ambient_occlusion: mask & 2 != 0,
+                emissive_bloom: mask & 4 != 0, ground_grass: mask & 8 != 0,
+                ao_strength: 0.0, bloom_strength: 0.0, grass_density: 0.0, ..defaults
+            };
+            assert_eq!(settings.any_enabled(), mask != 0);
+        }
+        let bounded = EnhancedSettings {
+            shadow_map_size: 0, ao_radius: -1.0, ao_strength: 3.0, bloom_strength: 2.0,
+            grass_density: 4.0, grass_distance: 50.0, ..defaults
+        }.clamped();
+        assert_eq!((bounded.shadow_map_size, bounded.ao_radius, bounded.ao_strength), (256, 0.0, 1.0));
+        assert_eq!((bounded.bloom_strength, bounded.grass_density, bounded.grass_distance), (1.0, 2.0, 35.0));
+        assert_eq!(EnhancedSettings { shadow_map_size: u32::MAX, ..defaults }.clamped().shadow_map_size, 4096);
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(EnhancedSettings {
+                ao_radius: invalid, ao_strength: invalid, bloom_strength: invalid,
+                grass_density: invalid, grass_distance: invalid, ..defaults
+            }.clamped(), defaults);
+        }
+    }
+}

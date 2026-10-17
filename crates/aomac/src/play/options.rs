@@ -184,15 +184,18 @@ fn borders(b: &str) -> String {
 /// The view XML of a page (`ScrollView` of `Root.xml`); `n` numbers the controls over all pages. Controls follow the structure of `OptionCheckBox_c`
 /// (`FUN_100c1be9`), `OptionSlider_c` (`FUN_100c0aa9`: `[label, spacer, value text]` above the slider) and `OptionRadioButtonGroup_c` (`FUN_100c2fd5`: label above the
 /// group, group borders (10, 3, 0, 0)).
-fn page_xml(page: &Page, idx: usize, n: &mut usize) -> String {
-    fn item(it: &Item, n: &mut usize, out: &mut String) {
+fn page_xml(page: &Page, idx: usize, n: &mut usize, text_width: Option<i32>) -> String {
+    fn item(it: &Item, n: &mut usize, out: &mut String, text_width: Option<i32>) {
         match it {
-            Item::Text { value, borders: b } => *out += &format!("<TextView value=\"{}\"{}/>", esc(value), borders(b)),
+            Item::Text { value, borders: b } => {
+                let wrap = text_width.map_or(String::new(), |w| format!(" feature_flags=\"TVF_MULTILINE|TVF_WORD_WRAP\" min_size=\"Point({w},-1)\" max_size=\"Point({w},-1)\""));
+                *out += &format!("<TextView value=\"{}\"{}{wrap}/>", esc(value), borders(b));
+            }
             Item::Spacer { min, max } => *out += &format!("<VLayoutSpacer min_size=\"{min}\" max_size=\"{max}\"/>"),
             Item::Group { borders: b, items } => {
                 *out += &format!("<View{}>", borders(b));
                 for i in items {
-                    item(i, n, out);
+                    item(i, n, out, text_width);
                 }
                 *out += "</View>";
             }
@@ -224,17 +227,16 @@ fn page_xml(page: &Page, idx: usize, n: &mut usize) -> String {
     }
     let mut s = format!("<ScrollView name=\"pg{idx}\" label=\"{}\" v_scrollbar_mode=\"auto\" max_size=\"Point(16000,-1)\"><ScrollViewChild><View h_alignment=\"left\" view_layout=\"vertical\" max_size=\"Point(16000,-1)\" layout_borders=\"Rect(0,0,10,0)\">", esc(&page.label));
     for it in &page.items {
-        item(it, n, &mut s);
+        item(it, n, &mut s, text_width);
+    }
+    if page.label == "Enhanced" {
+        s += "<Button name=\"restore_original_graphics\" label=\"Restore Original\" tooltip=\"Disable sun shadows, ambient occlusion, emissive bloom and ground grass; other preferences are unchanged.\"/>";
     }
     s + "</View></ScrollViewChild></ScrollView>"
 }
 
-/// aomac's own "Enhanced" rendering options: **not retail** (no `Root.xml` control, no RE evidence for either toggle anywhere in
-/// `cd_image/gui` or `text`; `docs/gui.md` "aomac-only additions (non-retail, Enhanced page)"). Both default to the
-/// retail-faithful value they replace in `ao-render`: anisotropy 1x (audit item 2, `docs/screens.md` "max anisotropy 1",
-/// randy31 `FUN_10041ede`) and MSAA off (the MSAA-option decision: no AA option exists anywhere in the client's GUI/text/twk
-/// data). Persisted through the same `DValues`/`Prefs.xml` mechanism as every retail control (`DValues::new` registers the two
-/// variables as `DV Main`, account-independent, surviving restart exactly like `DisplayCompressedTextures`).
+/// aomac-only controls, separate from the retail inventory. All effects default off;
+/// quality knobs and flags use the existing account-independent DV Main persistence.
 fn enhanced_page() -> Page {
     let opt = |var: &str, label: &str, radios: &[(&str, i32)]| Opt {
         ctl: Ctl::Radio(radios.iter().map(|&(l, v)| (l.to_string(), v)).collect()),
@@ -295,6 +297,16 @@ fn enhanced_page() -> Page {
         label: "Enhanced".to_string(),
         items: vec![
             Item::Text { value: "aomac-only additions: none of these exist in the original client. Every default matches retail exactly.".to_string(), borders: String::new() },
+            Item::Opt(check("AomacSunShadows", "Sun Shadows")),
+            Item::Opt(opt("AomacShadowMapSize", "Shadow Map Size", &[("256", 256), ("512", 512), ("1024", 1024), ("2048", 2048), ("4096", 4096)])),
+            Item::Opt(check("AomacAmbientOcclusion", "Ambient Occlusion")),
+            Item::Opt(slider("AomacAoRadius", "Ambient Occlusion Radius", "%.2f m")),
+            Item::Opt(slider("AomacAoStrength", "Ambient Occlusion Strength", "%.2f")),
+            Item::Opt(check("AomacEmissiveBloom", "Emissive Bloom")),
+            Item::Opt(slider("AomacBloomStrength", "Emissive Bloom Strength", "%.2f")),
+            Item::Opt(check("AomacGroundGrass", "Ground Grass")),
+            Item::Opt(slider("AomacGrassDensity", "Ground Grass Density", "%.2fx")),
+            Item::Opt(slider("AomacGrassDistance", "Ground Grass Distance", "%.1f m")),
             Item::Opt(opt("AomacTextureSharpening", "Texture Sharpening (anisotropic filtering)", &[("Off (1x, retail)", 0), ("2x", 1), ("4x", 2), ("8x", 3), ("16x", 4)])),
             Item::Opt(opt("AomacEdgeSmoothing", "Edge Smoothing (MSAA)", &[("Off (retail)", 0), ("2x", 1), ("4x", 2), ("8x", 3)])),
             Item::Opt(opt("AomacInterfaceScale", "Interface Scale", &[("Auto (retail-equivalent)", 0), ("1x", 1), ("2x", 2), ("3x", 3)])),
@@ -414,7 +426,9 @@ impl HudOptions {
         let mut n = 0;
         let mut pages_xml = String::new();
         for (i, p) in self.pages.iter().enumerate() {
-            pages_xml += &page_xml(p, i, &mut n);
+            // Hidden pages also contribute to the selector's preferred width.
+            let text_width = (p.label == "Enhanced").then(|| p.opts().iter().map(|o| gui.text_width(ao_gui::font::FontId::Normal, &o.label) - 1).max().unwrap_or(0));
+            pages_xml += &page_xml(p, i, &mut n, text_width);
         }
         let (quit_win, quit_login) = ["Quit2Windows", "Quit2Login"].map(|k| self.texts.by_key(CAT_GUI, k).unwrap_or_else(|| k.to_string())).into();
         let has_fixed = self.keypages.has_fixed();
@@ -596,6 +610,7 @@ impl HudOptions {
                 match view.as_str() {
                     "b1" => self.actions.push(Action::Quit),
                     "b2" => self.actions.push(Action::Camp),
+                    "restore_original_graphics" => d.restore_original_graphics(),
                     v => {
                         // `c<i>` check box, `r<i>_<value>` radio button
                         if let Some(i) = v.strip_prefix('c').and_then(|n| n.parse::<usize>().ok()) {

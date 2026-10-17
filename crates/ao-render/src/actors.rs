@@ -582,8 +582,11 @@ impl Renderer {
     }
 
     pub(super) fn prepare_actor_pipelines(&mut self) {
-        let compile = |spec| compile_pipeline(&self.device, &self.shader, self.format,
-            &self.pipeline_layout, &self.holo_pipeline_layout, self.msaa_samples, spec);
+        let shader = self.enhanced_shader.as_ref().unwrap_or(&self.shader);
+        let format = self.world_format();
+        let settings = self.enhanced_settings;
+        let compile = |spec| compile_pipeline(&self.device, shader, format,
+            (&self.pipeline_layout, &self.holo_pipeline_layout), settings, self.msaa_samples, spec);
         for it in &self.act.items {
             let model = &self.act.models[&it.model];
             let Some(mesh) = model.meshes[it.mesh].as_ref() else { continue };

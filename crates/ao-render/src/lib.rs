@@ -16,6 +16,11 @@ mod pipelines;
 use pipelines::{Pipelines, Slot as PipelineSlot, Spec as PipelineSpec};
 mod heat_haze;
 mod gpu_stats;
+pub use gpu_stats::FrameGpuTimer;
+mod enhanced_settings;
+pub use enhanced_settings::EnhancedSettings;
+mod enhanced;
+mod enhanced_shader;
 mod sky_probe;
 use gpu_stats::{GpuStatsExt, TextureViewStatsExt};
 pub use native_ground::GroundPath;
@@ -595,6 +600,10 @@ pub struct Renderer {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub format: wgpu::TextureFormat,
+    enhanced_settings: EnhancedSettings,
+    enhanced_frame: Option<enhanced::EnhancedFrame>,
+    enhanced_shader: Option<wgpu::ShaderModule>,
+    gpu_timer: Option<FrameGpuTimer>,
     pub stats: FrameStats,
     /// Seconds driving `Submesh::uv_scroll` (the viewer advances it; screenshots leave it at 0).
     pub time: f32,
@@ -615,6 +624,7 @@ pub struct Renderer {
     msaa_samples: u32,
     /// Sample counts the adapter actually supports for both the surface colour format and [`DEPTH`] (always includes 1).
     msaa_supported: Vec<u32>,
+    enhanced_msaa_supported: Vec<u32>,
     texture_policy: native_texture::Policy,
     pipes: Pipelines,
     actor_pipes: Pipelines,
@@ -754,11 +764,12 @@ fn compile_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
     format: wgpu::TextureFormat,
-    layout: &wgpu::PipelineLayout,
-    holo_pipeline_layout: &wgpu::PipelineLayout,
+    layouts: (&wgpu::PipelineLayout, &wgpu::PipelineLayout),
+    settings: EnhancedSettings,
     msaa: u32,
     spec: PipelineSpec,
 ) -> wgpu::RenderPipeline {
+    let (layout, holo_pipeline_layout) = layouts;
     let PipelineSpec { blend, two_sided, sky, env, fade, sprite, actor, flip_depth, effect, compare } = spec;
     let f4 = |o| wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: o, shader_location: 4 + (o / 16) as u32 };
     let inst_attrs = [f4(0), f4(16), f4(32), f4(48)];
@@ -817,6 +828,8 @@ fn compile_pipeline(
             },
             _ => (fs, state, depth_write),
         };
+        let target = wgpu::ColorTargetState { format, blend: state, write_mask: wgpu::ColorWrites::ALL };
+        let targets = [Some(target.clone()), settings.ambient_occlusion.then(|| target.clone()), settings.emissive_bloom.then_some(target)];
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(fs),
             // Ground effects 8-11 sample `ground_palette` (holo0) at bind group 2; liquids (12/13) use `fs_blend`,
@@ -840,7 +853,7 @@ fn compile_pipeline(
                 module: shader,
                 entry_point: Some(fs),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState { format, blend: state, write_mask: wgpu::ColorWrites::ALL })],
+                targets: if format == enhanced::HDR { &targets } else { &targets[..1] },
             }),
             primitive: wgpu::PrimitiveState {
                 topology: if effect == 14 { wgpu::PrimitiveTopology::PointList } else { wgpu::PrimitiveTopology::TriangleList },
@@ -969,7 +982,7 @@ impl Renderer {
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: None,
-                required_features: (adapter.features() & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES))
+                required_features: (adapter.features() & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES | wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS))
                     | if adapter.get_info().backend == wgpu::Backend::Metal { wgpu::Features::PASSTHROUGH_SHADERS } else { wgpu::Features::empty() },
                 required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -992,6 +1005,8 @@ impl Renderer {
             let depth = adapter.get_texture_format_features(DEPTH).flags.supported_sample_counts();
             color.into_iter().filter(|c| depth.contains(c)).collect()
         };
+        let hdr_counts = adapter.get_texture_format_features(enhanced::HDR).flags.supported_sample_counts();
+        let enhanced_msaa_supported = msaa_supported.iter().copied().filter(|count| hdr_counts.contains(count)).collect();
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene"),
@@ -1073,11 +1088,15 @@ impl Renderer {
             immediate_size: 0,
         });
         let (pipes, actor_pipes, ground_pipes) = build_pipelines();
-        let depth_clear_pipe = screen::depth_clear_pipeline(&device, format, 1);
+        let depth_clear_pipe = screen::depth_clear_pipeline(&device, format, 1, EnhancedSettings::default());
         let mut r = Self {
             device,
             queue,
             format,
+            enhanced_settings: EnhancedSettings::default(),
+            enhanced_frame: None,
+            enhanced_shader: None,
+            gpu_timer: None,
             stats: FrameStats::default(),
             time: 0.0,
             movers: vec![],
@@ -1107,6 +1126,7 @@ impl Renderer {
             anisotropy: 1,
             msaa_samples: 1,
             msaa_supported,
+            enhanced_msaa_supported,
             texture_policy: Default::default(),
             pipes,
             actor_pipes,
@@ -1206,17 +1226,67 @@ impl Renderer {
     /// live toggle). Callers that keep a [`Targets`] across frames must rebuild it when [`Renderer::msaa_samples`] changes
     /// (`Targets::sample_count`). The single world pass resolves once and discards its transient MSAA/depth attachments.
     pub fn set_msaa_samples(&mut self, requested: u32) {
-        let level = clamp_msaa_samples(requested.max(1), &self.msaa_supported);
+        let supported = if self.enhanced_settings.any_enabled() { &self.enhanced_msaa_supported } else { &self.msaa_supported };
+        let level = clamp_msaa_samples(requested.max(1), supported);
         if level == self.msaa_samples { return; }
         self.msaa_samples = level;
         self.pipes.invalidate();
         self.actor_pipes.invalidate();
         self.ground_pipes.invalidate();
-        self.depth_clear_pipe = screen::depth_clear_pipeline(&self.device, self.format, level);
+        self.enhanced_frame = None;
+        self.depth_clear_pipe = screen::depth_clear_pipeline(&self.device, self.world_format(), level, self.enhanced_settings);
     }
 
     pub fn msaa_samples(&self) -> u32 {
         self.msaa_samples
+    }
+
+    /// Optional effects are a clean path switch, not a modification of faithful shader execution.
+    pub fn set_enhanced_settings(&mut self, settings: EnhancedSettings) {
+        let settings = settings.clamped();
+        if self.enhanced_settings == settings { return; }
+        let changed_path = self.enhanced_settings.any_enabled() != settings.any_enabled()
+            || self.enhanced_settings.ambient_occlusion != settings.ambient_occlusion
+            || self.enhanced_settings.emissive_bloom != settings.emissive_bloom;
+        self.enhanced_settings = settings;
+        if changed_path { self.enhanced_frame = None; }
+        if !settings.any_enabled() {
+            self.enhanced_frame = None;
+            self.enhanced_shader = None;
+        } else if self.enhanced_shader.is_none() || changed_path {
+            self.enhanced_shader = Some(self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Enhanced world"), source: wgpu::ShaderSource::Wgsl(enhanced_shader::source(false, settings.ambient_occlusion, settings.emissive_bloom).into()),
+            }));
+        }
+        if settings.any_enabled() { self.set_msaa_samples(self.msaa_samples); }
+        if changed_path {
+            self.pipes.invalidate();
+            self.actor_pipes.invalidate();
+            self.ground_pipes.invalidate();
+            self.depth_clear_pipe = screen::depth_clear_pipeline(&self.device, self.world_format(), self.msaa_samples, settings);
+        }
+    }
+    pub fn enhanced_settings(&self) -> EnhancedSettings { self.enhanced_settings }
+    /// Logical optional attachment bytes, not driver allocation/alignment or total GPU residency.
+    pub fn enhanced_target_bytes(&self) -> u64 {
+        self.enhanced_frame.as_ref().map_or(0, |frame| {
+            let pixels = u64::from(frame.size.0) * u64::from(frame.size.1);
+            let colour = 8 * (1 + u64::from(frame.ambient.is_some()) + u64::from(frame.emissive.is_some()));
+            let samples = u64::from(frame.sample_count);
+            pixels * (colour + 4 * samples + if samples > 1 { colour * samples + 4 } else { 0 })
+        })
+    }
+    fn world_format(&self) -> wgpu::TextureFormat {
+        if self.enhanced_settings.any_enabled() { enhanced::HDR } else { self.format }
+    }
+    /// Explicit offline instrumentation; disabled by default and owns no resources then.
+    /// After each render, read the result before encoding another timed frame.
+    pub fn set_gpu_timing(&mut self, enabled: bool) -> Result<()> {
+        self.gpu_timer = if enabled { Some(FrameGpuTimer::new(&self.device, &self.queue)?) } else { None };
+        Ok(())
+    }
+    pub fn read_frame_gpu_ms(&mut self) -> Result<Option<f64>> {
+        self.gpu_timer.as_mut().map(|timer| timer.read_ms(&self.device)).transpose()
     }
 
     // The native P8 shadow palette is filtered in framebuffer space. It is
@@ -1968,8 +2038,11 @@ impl Renderer {
         self.prepare_actors(cam.pos, &planes);
         self.prepare_actor_pipelines();
         {
-            let compile = |spec| compile_pipeline(&self.device, &self.shader, self.format,
-                &self.pipeline_layout, &self.holo_pipeline_layout, self.msaa_samples, spec);
+            let shader = self.enhanced_shader.as_ref().unwrap_or(&self.shader);
+            let format = self.world_format();
+            let settings = self.enhanced_settings;
+            let compile = |spec| compile_pipeline(&self.device, shader, format,
+                (&self.pipeline_layout, &self.holo_pipeline_layout), settings, self.msaa_samples, spec);
             if let Some(ground) = &self.ground {
                 for (mesh, material) in ground.materials.iter().enumerate() {
                     if material.is_none() || self.vis_range[mesh].is_empty() { continue; }
@@ -1987,6 +2060,7 @@ impl Renderer {
             }
         }
         let mut enc = self.device.create_command_encoder(&Default::default());
+        if let Some(timer) = &mut self.gpu_timer { timer.begin(&mut enc); }
         self.encode_actor_skins(&mut enc);
         let inst_buf = self.gpu.inst_bufs.get(self.frame);
         if let Some(buf) = inst_buf {
@@ -2080,27 +2154,30 @@ impl Renderer {
         self.sorted.sort_by(|a, b| actors::bucket_order(a.0, a.1, b.0, b.1)
             .then_with(|| b.4.cmp(&a.4)).then_with(|| a.3.cmp(&b.3)));
 
+        if self.enhanced_settings.any_enabled() && self.enhanced_frame.as_ref().is_none_or(|frame| frame.size != t.size || frame.sample_count != self.msaa_samples) {
+            self.enhanced_frame = Some(enhanced::EnhancedFrame::new(&self.device, self.format, t.size, self.msaa_samples, self.enhanced_settings));
+        }
         let calls = std::cell::Cell::new(0usize);
         self.screen.prepare(&self.device,&self.queue,self.format,t.size);
         self.heat_haze.update(t.size, vp, cam.pos, cam.forward(), self.liquids.iter().flat_map(|run| run.heat_spheres.iter()));
         self.heat_haze.prepare(&self.device, &self.queue, self.format, t.size);
         let world_resolve = self.heat_haze.source().unwrap_or(resolve);
+        let enhanced_frame = self.enhanced_frame.as_ref();
+        let world_target = enhanced_frame.map_or(world_resolve, |frame| &frame.hdr);
+        let msaa_target = enhanced_frame.and_then(|frame| frame.msaa.as_ref().and_then(|views| views[0].as_ref())).or(t.msaa.as_ref().filter(|_| enhanced_frame.is_none()));
+        let attachments = [
+            Some(wgpu::RenderPassColorAttachment { view: msaa_target.unwrap_or(world_target), resolve_target: msaa_target.map(|_| world_target), depth_slice: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(framebuffer_clear(env.sky_color)), store: if msaa_target.is_some() { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store } } }),
+            enhanced_frame.and_then(|frame| frame.attachment(1)),
+            enhanced_frame.and_then(|frame| frame.attachment(2)),
+        ];
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: t.msaa.as_ref().unwrap_or(world_resolve),
-                    // Resolve only after the complete ordered world list has drawn.
-                    resolve_target: t.msaa.as_ref().map(|_| world_resolve),
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(framebuffer_clear(env.sky_color)),
-                        store: if t.msaa.is_some() { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store },
-                    },
-                })],
+                color_attachments: if enhanced_frame.is_some() { &attachments } else { &attachments[..1] },
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &t.depth,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
+                    view: enhanced_frame.map_or(&t.depth, |frame| &frame.depth),
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: if enhanced_frame.is_some() { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),
                     stencil_ops: None,
                 }),
                 timestamp_writes: None,
@@ -2182,10 +2259,15 @@ impl Renderer {
                 world_phase(&mut pass, priority);
             }
         }
+        if let Some(frame) = enhanced_frame {
+            frame.resolve_depth(&mut enc);
+            frame.composite(&mut enc, world_resolve, None);
+        }
         self.heat_haze.draw(&mut enc, resolve);
         self.screen.draw(&mut enc,resolve);
         self.drawn_visuals.extend(self.pending_visuals.get_mut().drain());
         self.stats = FrameStats { instances: self.vis.len(), draw_calls: calls.get() };
+        if let Some(timer) = &mut self.gpu_timer { timer.end(&mut enc); }
         self.queue.submit([enc.finish()])
     }
 }

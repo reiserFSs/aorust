@@ -861,3 +861,114 @@ fn enhanced_page_options_default_to_retail_and_persist_across_a_restart() {
     assert_eq!(again.get("AomacSmoothText"), Some(&super::super::dvalue::Variant::Bool(true)));
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn enhanced_graphics_default_persistence_independence_and_reset() {
+    use ao_render::EnhancedSettings;
+    let tmp = crate::play::prefs::test_dir().join("aomac-enhanced-effects-persist");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let mut d = DValues::new(&tmp);
+    let names = ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass"];
+    assert_eq!(d.enhanced_settings(), EnhancedSettings::default());
+    d.open_user(&tmp, "account", 7);
+    for mask in 0..16 {
+        for (bit, name) in names.iter().enumerate() {
+            assert!(d.persists(name));
+            d.set(name, Variant::Bool(mask & (1 << bit) != 0));
+        }
+        let expected = EnhancedSettings {
+            sun_shadows: mask & 1 != 0, ambient_occlusion: mask & 2 != 0,
+            emissive_bloom: mask & 4 != 0, ground_grass: mask & 8 != 0, ..Default::default()
+        };
+        assert_eq!(d.enhanced_settings(), expected);
+        d.save_user();
+        let mut again = DValues::new(&tmp);
+        again.open_user(&tmp, "other-account", 99);
+        assert_eq!(again.enhanced_settings(), expected);
+    }
+    d.set("AomacShadowMapSize", Variant::Int(2048));
+    for (name, value) in [
+        ("AomacAoRadius", 2.0), ("AomacAoStrength", 0.5), ("AomacBloomStrength", 0.25),
+        ("AomacGrassDensity", 1.5), ("AomacGrassDistance", 35.0),
+    ] {
+        assert!(d.persists(name));
+        d.set(name, Variant::Float(value));
+    }
+    d.set("AomacTextureSharpening", Variant::Int(4));
+    d.set("AomacEdgeSmoothing", Variant::Int(2));
+    let quality = d.enhanced_settings();
+    d.restore_original_graphics();
+    assert_eq!(d.enhanced_settings(), EnhancedSettings {
+        sun_shadows: false, ambient_occlusion: false, emissive_bloom: false, ground_grass: false, ..quality
+    });
+    assert!(!d.enhanced_settings().any_enabled());
+    assert_eq!(d.get_i64("AomacTextureSharpening"), Some(4));
+    assert_eq!(d.get_i64("AomacEdgeSmoothing"), Some(2));
+    d.save_user();
+    let mut again = DValues::new(&tmp);
+    again.open_user(&tmp, "account", 7);
+    assert_eq!(again.enhanced_settings(), d.enhanced_settings());
+    std::fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
+fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
+    let Some(mut r) = Rig::new() else { return };
+    for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass"] {
+        let view = r.show(name);
+        assert!(!r.gui.checked(r.win(), &view));
+        r.click(&view);
+        assert!(r.d.flag(name));
+    }
+    // MSAA remains independent of all four effects.
+    let view = r.show("AomacEdgeSmoothing");
+    r.click(&format!("{view}_2"));
+    assert_eq!(r.d.get_i64("AomacEdgeSmoothing"), Some(2));
+    let view = r.show("AomacShadowMapSize");
+    r.click(&format!("{view}_2048"));
+    assert_eq!(r.d.enhanced_settings().shadow_map_size, 2048);
+    for (name, value) in [
+        ("AomacAoRadius", 2.5), ("AomacAoStrength", 0.5), ("AomacBloomStrength", 0.25),
+        ("AomacGrassDensity", 1.5), ("AomacGrassDistance", 35.0),
+    ] {
+        let view = r.show(name);
+        let event = Event::SliderChanged { window: r.win(), view, value, final_change: true };
+        assert!(r.opt.event(&mut r.gui, &event, &mut r.d));
+        assert_eq!(r.d.get_f32(name), Some(value as f32));
+    }
+    let id = r.win();
+    assert!(r.opt.event(&mut r.gui, &Event::Clicked {
+        window: id, view: "restore_original_graphics".into(), item: None,
+    }, &mut r.d));
+    r.tick();
+    assert!(!r.d.enhanced_settings().any_enabled());
+    assert_eq!(r.d.enhanced_settings().shadow_map_size, 2048);
+    assert_eq!(r.d.get_i64("AomacEdgeSmoothing"), Some(2));
+    for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass"] {
+        let view = r.show(name);
+        assert!(!r.gui.checked(r.win(), &view));
+    }
+}
+
+#[test]
+fn enhanced_explanations_do_not_widen_native_pages() {
+    let Some(mut r) = Rig::new() else { return };
+    let with_text = r.gui.window_preferred_size_limits(r.win()).unwrap();
+    r.show("AomacSunShadows");
+    let enhanced = r.opt.pages.iter().find(|p| p.label == "Enhanced").unwrap();
+    let width = enhanced.opts().iter().map(|o| r.gui.text_width(ao_gui::font::FontId::Normal, &o.label) - 1).max().unwrap();
+    let source = page_xml(enhanced, 0, &mut 0, Some(width));
+    assert!(source.contains("TVF_MULTILINE|TVF_WORD_WRAP"));
+    for item in &enhanced.items {
+        if let Item::Text { value, .. } = item {
+            assert!(source.contains(&esc(value)));
+        }
+    }
+    r.opt.close(&mut r.gui, &mut r.d);
+    r.opt.pages.iter_mut().find(|p| p.label == "Enhanced").unwrap().items.retain(|item| !matches!(item, Item::Text { .. }));
+    r.opt.open(&mut r.gui, &r.d);
+    r.tick();
+    let without_text = r.gui.window_preferred_size_limits(r.win()).unwrap();
+    assert_eq!(with_text.0.0, without_text.0.0);
+    assert_eq!(with_text.1.0, without_text.1.0);
+}

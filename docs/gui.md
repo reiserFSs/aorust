@@ -1377,6 +1377,56 @@ entry, XML control generation, value sync, click/slider dispatch) unmodified. Ev
 replaces, or to off/Auto for the ones with no retail equivalent, and persists through the same `DValues` → `Prefs.xml`
 mechanism as `DisplayCompressedTextures` (`DV Main`, account-independent, survives restart).
 
+The optional Sun Shadows (`AomacSunShadows`), Ambient Occlusion (`AomacAmbientOcclusion`),
+Emissive Bloom (`AomacEmissiveBloom`) and Ground Grass (`AomacGroundGrass`) checkboxes are
+independent DV Main booleans, all **off** by default, including when an older preferences
+file lacks them. `DValues::enhanced_settings` maps them and the quality controls below to
+`ao_render::EnhancedSettings`; `flow.rs::frame` sends the value through `Host.enhanced_settings`.
+Both windowed and offscreen viewers drain that request into `Renderer::set_enhanced_settings`.
+MSAA is independently selectable; there is no player-facing master/HDR switch.
+
+| Quality control / DV Main key | Default | Bounds |
+|---|---|---|
+| Shadow Map Size / `AomacShadowMapSize` | 1024 | 256–4096 (UI choices 256/512/1024/2048/4096) |
+| Ambient Occlusion Radius / `AomacAoRadius` | 1 m | 0–5 m |
+| Ambient Occlusion Strength / `AomacAoStrength` | 1 | 0–1 |
+| Emissive Bloom Strength / `AomacBloomStrength` | 0.15 | 0–1 |
+| Ground Grass Density / `AomacGrassDensity` | 1 | 0–2 |
+| Ground Grass Distance / `AomacGrassDistance` | 30 m | 0–35 m |
+
+These are aomac-only artistic controls, not reconstructed retail settings. Values are bounded
+at the renderer settings boundary; non-finite floats use the documented defaults.
+**Restore Original** clears only the four effect flags via ordinary DValue writes, preserving
+quality values, anisotropy, MSAA, camera and text preferences; the next frame returns to all-off
+execution and the ordinary preference save persists it. Zero strength/density does not clear
+an enabled flag (offline fixtures can explicitly request neutral Enhanced execution).
+
+Enhanced explanations use native `TextView` multiline/word-wrap
+(`TextRenderer_c::CalculatePreferredSize`, GUI `0x101623ea`), bounded by the widest Enhanced
+control label in the normal font. Hidden explanatory prose therefore does not enlarge every
+retail page. Source regressions cover all 16 flag combinations, account-independent persistence,
+quality dispatch/reset preservation, and root width limits with and without the prose.
+These tests are source coverage, not a claim of enabled-effect image or performance validation.
+
+The renderer's optional boundary (`ao-render/enhanced.rs`, `enhanced_shader.rs`) keeps the
+same native ordered world draws. Any enabled effect selects display-space RGBA16F HDR and
+a stored, sampleable depth attachment. Ambient-share and data-marked emission attachments
+are independently allocated only for AO and bloom respectively, including their MSAA copies.
+MSAA retains its native coverage; a minimum-sample depth resolve supplies single-sample
+`Depth32Float` for postprocessing. The composite is an identity clamp: existing world shaders
+already output framebuffer-space colour, so applying an sRGB transfer or exposure would be
+incorrect. It runs before native heat haze, viewport sprites and GUI. Shadows alter only the
+attributable sun share in the Enhanced shader; AO subtracts only the ambient-share attachment,
+not the whole image. Bloom consumes authored emission, never a brightness threshold.
+All four flags off select the original shader/attachments and world pass with no optional
+textures, composite, depth resolve or timer buffers; switching off releases the Enhanced frame.
+The offline neutral profile is explicitly `ground_grass=true, grass_density=0`, not all-off.
+HDR blend/quantization is not mathematically identical to UNORM blending; neutral differences
+are measured by the offscreen fixture rather than described as exact.
+`Renderer::set_gpu_timing(true)` explicitly allocates `FrameGpuTimer` only if both timestamp
+features are supported; `read_frame_gpu_ms` reads each submitted frame before timer reuse.
+This synchronous instrumentation is offline-only and disabled by default.
+
 | aomac page / control | Key → store | Runtime consumer | Status |
 |---|---|---|---|
 | `Enhanced` / `Texture Sharpening (anisotropic filtering)` | `AomacTextureSharpening` → DV Main (index 0-4) | `flow.rs::frame` maps the index to 1/2/4/8/16 → `Host.anisotropy` → `Renderer::set_anisotropy` rebuilds the world + clamp-address samplers; default index 0 = 1x, matching retail `FUN_10041ede`/`docs/screens.md` "max anisotropy 1" (audit item 2) | **AOMAC-ONLY, LIVE; not a retail control** |

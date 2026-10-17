@@ -192,6 +192,16 @@ impl DValues {
         // concrete renderer values in `options.rs::enhanced_page`/`flow.rs` (audit item 2 texture anisotropy, MSAA-option decision).
         s.add("AomacTextureSharpening", Variant::Int(0), true, CAT_MAIN, Some(Variant::Int(0)), Some(Variant::Int(4)), false);
         s.add("AomacEdgeSmoothing", Variant::Int(0), true, CAT_MAIN, Some(Variant::Int(0)), Some(Variant::Int(3)), false);
+        for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass"] {
+            s.add(name, Variant::Bool(false), true, CAT_MAIN, None, None, false);
+        }
+        s.add("AomacShadowMapSize", Variant::Int(1024), true, CAT_MAIN, Some(Variant::Int(256)), Some(Variant::Int(4096)), false);
+        for (name, default, max) in [
+            ("AomacAoRadius", 1.0, 5.0), ("AomacAoStrength", 1.0, 1.0), ("AomacBloomStrength", 0.15, 1.0),
+            ("AomacGrassDensity", 1.0, 2.0), ("AomacGrassDistance", 30.0, 35.0),
+        ] {
+            s.add(name, Variant::Float(default), true, CAT_MAIN, Some(Variant::Float(0.0)), Some(Variant::Float(max)), false);
+        }
         // Interface scale (audit item 2): 0 Auto (today's whole backing-scale rounding), 1/2/3 fixed GUI pixel scale;
         // read at startup (`Play::new` below, `ao_render::Frontend::interface_scale`) so the login screen honours it too.
         s.add("AomacInterfaceScale", Variant::Int(0), true, CAT_MAIN, Some(Variant::Int(0)), Some(Variant::Int(3)), false);
@@ -216,6 +226,30 @@ impl DValues {
         // bitmap; bitmap fonts (tooltips, shell, chat, name tags) are always pixel art regardless. Default off.
         s.add("AomacSmoothText", Variant::Bool(false), true, CAT_MAIN, None, None, false);
         s
+    }
+
+    /// Independent opt-in effects and bounded quality settings, shared by both viewer frontends.
+    pub fn enhanced_settings(&self) -> ao_render::EnhancedSettings {
+        let defaults = ao_render::EnhancedSettings::default();
+        ao_render::EnhancedSettings {
+            sun_shadows: self.flag("AomacSunShadows"),
+            ambient_occlusion: self.flag("AomacAmbientOcclusion"),
+            emissive_bloom: self.flag("AomacEmissiveBloom"),
+            ground_grass: self.flag("AomacGroundGrass"),
+            shadow_map_size: self.get_i64("AomacShadowMapSize").unwrap_or(i64::from(defaults.shadow_map_size)).clamp(256, 4096) as u32,
+            ao_radius: self.get_f32("AomacAoRadius").unwrap_or(defaults.ao_radius),
+            ao_strength: self.get_f32("AomacAoStrength").unwrap_or(defaults.ao_strength),
+            bloom_strength: self.get_f32("AomacBloomStrength").unwrap_or(defaults.bloom_strength),
+            grass_density: self.get_f32("AomacGrassDensity").unwrap_or(defaults.grass_density),
+            grass_distance: self.get_f32("AomacGrassDistance").unwrap_or(defaults.grass_distance),
+        }.clamped()
+    }
+
+    /// Disable effects without changing quality knobs, MSAA or unrelated preferences.
+    pub fn restore_original_graphics(&mut self) {
+        for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass"] {
+            self.set(name, Variant::Bool(false));
+        }
     }
 
     /// `DistributedValue_c::LoadConfig(file, cat, defaults)` on already read XML text. `defaults` = true adds the variables

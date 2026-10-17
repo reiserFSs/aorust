@@ -1418,6 +1418,7 @@ impl Frontend for Play {
             let msaa = hud.dvalues.get_i64("AomacEdgeSmoothing").unwrap_or(0).clamp(0, 3) as usize;
             host.anisotropy = Some(ANISOTROPY[aniso]);
             host.msaa_samples = Some(MSAA[msaa]);
+            host.enhanced_settings = Some(hud.dvalues.enhanced_settings());
             // live-apply while in game; the initial value (login screen) came from `Play::new`'s startup read.
             self.interface_scale = hud.dvalues.get_i64("AomacInterfaceScale").unwrap_or(0).clamp(0, 3) as u8;
             host.borderless_game = hud.dvalues.flag("AomacBorderlessFullscreen");
