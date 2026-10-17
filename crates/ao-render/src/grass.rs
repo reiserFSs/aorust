@@ -9,7 +9,7 @@ pub(super) use mask::{build as green_masks, GreenMasks};
 
 const MAX_CELLS: usize = 1024;
 /// Blades a cell can hold at the top density (2.0); the density knob scales how many of them are drawn.
-const MAX_BLADES: f32 = 3072.0;
+const MAX_BLADES: f32 = 4096.0;
 const MAX_RADIUS: f32 = 60.0;
 /// Distance bands: a cell far enough away instances half, a quarter or an eighth of its blades (the rest are gone).
 const BANDS: usize = 4;
@@ -352,8 +352,8 @@ fn slope_mask([a, b, c, d]: [f32; 4], size: f32, parity: u32) -> u32 {
 }
 /// Share of a cell's blades that survive at `distance` from the eye (grass.wgsl `thinning_keep`).
 fn thinning_keep(distance: f32, radius: f32) -> f32 {
-    let t = ((distance - 0.12 * radius) / (0.63 * radius)).clamp(0.0, 1.0);
-    1.0 - 0.9 * t * t * (3.0 - 2.0 * t)
+    let t = ((distance - 0.25 * radius) / (0.65 * radius)).clamp(0.0, 1.0);
+    1.0 - 0.8 * t * t * (3.0 - 2.0 * t)
 }
 fn hash(mut value: u32) -> u32 { value ^= value >> 16; value = value.wrapping_mul(0x7feb352d); value ^= value >> 15; value = value.wrapping_mul(0x846ca68b); value ^ (value >> 16) }
 fn cell_seed(x: u32, z: u32, tile: u16) -> u32 { hash(hash(x) ^ hash(z.rotate_left(16)) ^ u32::from(tile)) }

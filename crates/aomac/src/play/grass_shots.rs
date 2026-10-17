@@ -50,6 +50,7 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
     let mut views = Vec::new();
     for (name, pf, time, reference) in [
         ("icc-grass-ground", 4582, 2648.69, ao_render::Vec3::new(933.5, 26.0, -748.0)),
+        ("newland-grass-ground", 566, 4700.0, ao_render::Vec3::new(0.0, 0.0, 0.0)),
         ("borealis-grass-ground", 800, 3240.0, ao_render::Vec3::new(652.0, 65.3, -420.0)),
     ] {
         if selected.as_deref().is_some_and(|view| !view.starts_with(name)) { continue; }
@@ -57,6 +58,12 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
         let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
         let surface = Rc::new(RefCell::new(ao_formats::playfield::collision::Collision::load(&store, pf)?));
         let exposure = super::super::player::grass_exposure_surface(surface.clone());
+        // A zero reference means the middle of the playfield's ground.
+        let reference = match scene.ground_detail.first() {
+            Some(patch) if reference == ao_render::Vec3::ZERO => ao_render::Vec3::new(
+                (patch.origin[0] as f32 + patch.cells as f32 * 0.5) * patch.cell_size, 0.0, -(patch.origin[1] as f32 + patch.cells as f32 * 0.5) * patch.cell_size),
+            _ => reference,
+        };
         let (fixed, tile, grid) = grass_ground_camera(&scene, &surface.borrow(), &exposure, reference)
             .with_context(|| format!("finding exposed grass in {name}"))?;
         writeln!(report, "grass_view={name} pf={pf} native_tile={tile} grid={grid:?} camera={fixed:?}")?;

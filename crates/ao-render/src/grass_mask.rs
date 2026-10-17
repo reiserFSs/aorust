@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 pub(super) const SIZE: usize = 64;
 /// A tile with less green than this (share of its mask) grows nothing: its cells are not even drawn.
-pub(super) const MIN_COVERAGE: f32 = 0.04;
+pub(super) const MIN_COVERAGE: f32 = 0.02;
 
 #[derive(Default)]
 pub(crate) struct GreenMasks {
@@ -30,8 +30,8 @@ impl GreenMasks {
 /// How green one texel is, 0..1: green leads both red (with a little allowance for olive and dry grass) and blue.
 fn greenness(rgb: [u8; 3]) -> f32 {
     let [r, g, b] = rgb.map(f32::from);
-    if g < 24.0 { return 0.0; }
-    ((g - (r * 0.95).max(b * 1.1)) / 10.0).clamp(0.0, 1.0)
+    if g < 20.0 { return 0.0; }
+    ((g - (r * 0.95).max(b * 1.1)) / 6.0).clamp(0.0, 1.0)
 }
 
 fn classify(texture: &ao_scene::Texture) -> [u8; SIZE * SIZE] {

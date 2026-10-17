@@ -23,10 +23,10 @@ struct GrassParams {
 // Which texels of each ground tile picture are green (grass_mask.rs); the cell names its tile's layer.
 @group(3) @binding(8) var grass_mask: texture_2d_array<f32>;
 
-const GRASS_HEIGHT: f32 = 0.3;
+const GRASS_HEIGHT: f32 = 0.4;
 const GRASS_MAX_HEIGHT: f32 = 0.5;
 const NOISE_PERIOD: f32 = 64.0;
-const MEADOW_LUMA: f32 = 0.34;
+const MEADOW_LUMA: f32 = 0.5;
 const LUMA: vec3<f32> = vec3<f32>(0.299, 0.587, 0.114);
 
 fn grass_hash(input: u32) -> u32 {
@@ -34,7 +34,7 @@ fn grass_hash(input: u32) -> u32 {
     v ^= v >> 15u; v *= 0x846ca68bu; return v ^ (v >> 16u);
 }
 // Share of a cell's blades that survive at a distance: the CPU instances only the ranks that can (grass.rs).
-fn thinning_keep(dist: f32, radius: f32) -> f32 { return 1.0 - 0.9 * smoothstep(0.12 * radius, 0.75 * radius, dist); }
+fn thinning_keep(dist: f32, radius: f32) -> f32 { return 1.0 - 0.8 * smoothstep(0.25 * radius, 0.9 * radius, dist); }
 fn grass_unit(v: u32) -> f32 { return f32(v & 0x00ffffffu) / 16777216.0; }
 // Byte n (0..3) of a hash as 0..1: one hash feeds four decisions.
 fn hb(h: u32, n: u32) -> f32 { return f32((h >> (8u * n)) & 255u) / 255.0; }
@@ -180,7 +180,7 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     let layer = i32(c.identity.y >> 8u);
     let reach = 0.5 / size;
     let m0 = textureSampleLevel(grass_mask, grass_noise_sampler, tile_uv, layer, 0.0).r;
-    if m0 < 0.3 { return o; }
+    if m0 < 0.15 { return o; }
     let around = (m0 + textureSampleLevel(grass_mask, grass_noise_sampler, clamp(tile_uv + vec2<f32>(reach, 0.0), vec2<f32>(0.0), vec2<f32>(1.0)), layer, 0.0).r
         + textureSampleLevel(grass_mask, grass_noise_sampler, clamp(tile_uv - vec2<f32>(reach, 0.0), vec2<f32>(0.0), vec2<f32>(1.0)), layer, 0.0).r
         + textureSampleLevel(grass_mask, grass_noise_sampler, clamp(tile_uv + vec2<f32>(0.0, reach), vec2<f32>(0.0), vec2<f32>(1.0)), layer, 0.0).r
@@ -195,8 +195,8 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
         }
     }
     // How far inside the grass this is: the neighbouring cells' green, and the green around the root in its own tile.
-    let edge = min(clamp(edge_distance / 1.2, 0.0, 1.0), smoothstep(0.35, 0.95, around));
-    if hb(hw, 1u) > smoothstep(0.3, 0.7, m0) * (0.3 + 0.7 * edge) { return o; }
+    let edge = min(clamp(edge_distance / 1.2, 0.0, 1.0), smoothstep(0.1, 0.6, around));
+    if hb(hw, 1u) > smoothstep(0.15, 0.45, m0) * (0.3 + 0.7 * edge) { return o; }
 
     // The slow fields at the root (grass_noise.rs): two fetches.
     let noise_uv = root.xz / NOISE_PERIOD;
@@ -247,7 +247,7 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
         default: {}
     }
     // Blades never hide a target: tall ones are compressed towards GRASS_MAX_HEIGHT.
-    height = select(height, 0.3 + (height - 0.3) * 0.4, height > 0.3);
+    height = select(height, 0.4 + (height - 0.4) * 0.3, height > 0.4);
     height = min(height, GRASS_MAX_HEIGHT);
 
     // The cross section of this vertex.
@@ -315,7 +315,7 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     }
     o.head = vec4<f32>(head, select(0.0, 1.0, is_head));
     let canopy = clamp(0.55 * (1.0 - rim) * (0.5 + vigour) + 0.6 * clump - 0.05, 0.0, 1.0);
-    let grad = mix(0.86, 1.1, t);
+    let grad = mix(0.9, 1.2, t);
     let ao = (1.0 - 0.55 * canopy * (1.0 - t) * (1.0 - t)) / (1.0 - 0.275 * canopy);
     // Sun on the blade itself: the lit and shaded edges of a rounded blade (zero-mean), light through its thin upper
     // part when the sun is behind it, a denser canopy keeping a low sun off the lower blades.
@@ -374,13 +374,13 @@ fn fs_grass(i: GOut) -> GrassOutput {
     light = max(light - sun_share * (1.0 - visibility), vec3<f32>(0.0));
     // Blade colour: the meadow's green at the ground texel's brightness, the root growing out of the texel itself,
     // each over its blade's area averaging 1 so the field is as bright as the ground it stands on.
-    let green = mix(ground, vec3<f32>(0.235, 0.416, 0.165), 0.65);
+    let green = mix(ground, vec3<f32>(0.20, 0.44, 0.10), 0.8);
     var hue = (vec3<f32>(0.44, 0.62, 0.30) * 0.45 + green * 0.55) * vec3<f32>(0.88, 0.92, 0.82);
     hue = mix(hue, vec3<f32>(0.62, 0.56, 0.30) * 0.6, i.hue.w) * i.hue.rgb;
     let ground_luma = dot(ground, LUMA);
     // Sunlit daytime grass may be as vivid as a meadow (ao-vk's 0.34 luminance) where the ground texel is duller;
     // shade, night and fog leave it at the texel's own brightness and never above it.
-    let lit = smoothstep(0.55, 0.9, dot(light, LUMA)) * (1.0 - i.fog);
+    let lit = smoothstep(0.2, 0.5, dot(light, LUMA)) * (1.0 - i.fog);
     let target_luma = mix(ground_luma, max(ground_luma, MEADOW_LUMA), lit);
     let body = hue * (target_luma / max(dot(hue, LUMA), 1e-3)) * i.mixes.w;
     let vein = 1.04 - 0.14 * exp(-i.shape.y * i.shape.y * 12.0);
