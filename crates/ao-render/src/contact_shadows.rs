@@ -50,7 +50,7 @@ impl ContactShadows {
                 texture(3, wgpu::TextureSampleType::Float { filterable: false }),
             ],
         });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("contact shadows"), source: wgpu::ShaderSource::Wgsl(include_str!("contact_shadows.wgsl").into()) });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("contact shadows"), source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("contact_shadows.wgsl", include_str!("contact_shadows.wgsl"))) });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("contact shadows"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
         let make_pipeline = |entry, format, blend, write_mask| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(entry), layout: Some(&pipeline_layout),
