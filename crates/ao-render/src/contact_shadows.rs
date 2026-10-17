@@ -49,7 +49,7 @@ impl ContactShadows {
             label: Some("contact shadow inputs"), entries: &[
                 wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 texture(1, wgpu::TextureSampleType::Depth),
-                texture(2, wgpu::TextureSampleType::Float { filterable: false }),
+                texture(2, wgpu::TextureSampleType::Uint),
                 texture(3, wgpu::TextureSampleType::Float { filterable: false }),
             ],
         });
@@ -61,8 +61,8 @@ impl ContactShadows {
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(entry), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask })] }),
             primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
         });
-        let estimate = make_pipeline("estimate", HALF, None, wgpu::ColorWrites::RED | wgpu::ColorWrites::GREEN);
-        let blur = make_pipeline("blur", HALF, None, wgpu::ColorWrites::RED | wgpu::ColorWrites::GREEN);
+        let estimate = make_pipeline("estimate", HALF, None, wgpu::ColorWrites::ALL);
+        let blur = make_pipeline("blur", HALF, None, wgpu::ColorWrites::ALL);
         // colour * (1 - alpha): the shader's alpha is the darkened share of the native colour.
         let composite = make_pipeline("composite", format, Some(wgpu::BlendState {
             color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add },
@@ -128,11 +128,11 @@ impl ContactShadows {
     }
 
     pub(super) fn incremental_bytes(size: (u32, u32)) -> u64 {
-        u64::from(size.0.div_ceil(2)) * u64::from(size.1.div_ceil(2)) * 16 + std::mem::size_of::<Params>() as u64
+        u64::from(size.0.div_ceil(2)) * u64::from(size.1.div_ceil(2)) * 32 + std::mem::size_of::<Params>() as u64
     }
 }
 
-const HALF: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Float;
+const HALF: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Uint;
 
 impl crate::Renderer {
     pub(super) fn encode_enhanced_contact_shadows(&mut self, encoder: &mut wgpu::CommandEncoder, vp: Mat4, eye: Vec3, toward_sun: Vec3, far: f32) {
@@ -196,11 +196,12 @@ mod tests {
             // upsample on the fixture's perspective-sloping ground. A complete
             // phase cycle must become a constant 0.5, not retain a grain tile.
             let source = format!("{}\n{}", crate::shader_source::load("contact_shadows.wgsl", include_str!("contact_shadows.wgsl")), r#"
-@fragment fn phase_fixture(@builtin(position) position: vec4<f32>) -> @location(0) vec2<f32> {
+@fragment fn phase_fixture(@builtin(position) position: vec4<f32>) -> @location(0) vec4<u32> {
     let pixel = half_pixel(vec2<i32>(position.xy));
     let z = depth_at(pixel);
-    if z >= 1.0 { return vec2<f32>(0.0); }
-    return vec2<f32>(phase_noise(position.xy), view_depth(z));
+    if z >= 1.0 { return encoded(0.0, z, pixel, vec3<f32>(0.0)); }
+    let p = world(pixel, z);
+    return encoded(phase_noise(position.xy), z, pixel, normal(pixel, p));
 }
 "#);
             let shader = r.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("contact phase fixture"), source: wgpu::ShaderSource::Wgsl(source.into()) });
@@ -208,7 +209,7 @@ mod tests {
             contact.estimate = r.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("contact phase fixture"), layout: Some(&layout),
                 vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
-                fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("phase_fixture"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: HALF, blend: None, write_mask: wgpu::ColorWrites::RED | wgpu::ColorWrites::GREEN })] }),
+                fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("phase_fixture"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: HALF, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
                 primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
             });
         }
@@ -294,6 +295,6 @@ mod tests {
 
     #[test]
     fn half_resolution_memory_covers_odd_extents() {
-        assert_eq!(ContactShadows::incremental_bytes((3, 5)), 2 * 3 * 16 + std::mem::size_of::<Params>() as u64);
+        assert_eq!(ContactShadows::incremental_bytes((3, 5)), 2 * 3 * 32 + std::mem::size_of::<Params>() as u64);
     }
 }

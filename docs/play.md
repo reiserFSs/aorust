@@ -833,23 +833,42 @@ AOMAC_GFX_OUT=/tmp/contact-grain-after \
 
 **Recorded fix result (2026-10-18).** Accepted evidence:
 `~/aomac-handoff/gfx/v3/AoGrain/after-relative-five` (AO) and
-`~/aomac-handoff/gfx/v3/AoGrain/contact-final` (contact); other `after*`
-directories there are rejected or diagnostic runs.
+`~/aomac-handoff/gfx/v3/AoGrain/contact-cached` (contact, authoritative; it
+supersedes `contact-final`, kept as the historical unoptimized run). Other
+`after*` directories there are rejected or diagnostic runs.
 
 | Effect | Static grain MSE | Tiny mean codes | Tiny >2 count | Orbit mean codes | Orbit >2 count |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | AO before | 0.00709256425634166 | 3.418431057669665 | 5661749 | 8.270776727091926 | 7257147 |
 | AO after | 0.00517782982414801 | 1.1980629383225236 | 1797442 | 6.358997685843572 | 5025889 |
 | Contact before | 0.00063275435109123 | 1.318216025873466 | 2004863 | 2.643878401054905 | 2604297 |
-| Contact after | 0.00047179592596340 | 0.34540546083893997 | 566951 | 2.07279738594694 | 2265083 |
+| Contact after, unoptimized (`contact-final`, historical) | 0.00047179592596340 | 0.34540546083893997 | 566951 | 2.07279738594694 | 2265083 |
+| **Contact after, cached (`contact-cached`, accepted)** | 0.00047182003454393 | 0.34538396887111705 | 566912 | 2.07276039724203676 | 2265047 |
+
+Accepted cached contact maxima: tiny 114.37383097862528, orbit
+118.90174569473930 codes (pre-fix 119.63359267776153 / 122.25109918158317);
+static mean normalized attenuation 0.04568450671863875 (pre-fix
+0.04738310448810818, half-mean floor retained). Recorded bounds and tolerances
+are unchanged.
 
 Both effects' on/off eight static frames are strictly byte-identical after 32
 common plus 4 effect-phase warmup frames; the AO-off and contact-off
 before/after PNGs are byte-exact. Paired ICC whole-frame contribution rose from
-0.399294067 to 1.071250400 ms (AO) and from 0.471834475 to 2.272893075 ms
-(contact). These are explicit cost increases from whole-frame on-minus-off
-pairs, not isolated GPU pass timers. A lazy-normal AO cost experiment
-(1.16066155 ms) was reverted; sample counts and thresholds were not reduced.
+0.399294067 to 1.071250400 ms (AO). Contact went from 0.471834475 ms (original)
+to 2.272893075 ms (unoptimized fix, historical) and 0.702560750 ms with the
+accepted cache, within the user's ≤0.8 ms target. These are explicit cost
+increases from whole-frame on-minus-off pairs, not isolated GPU pass timers. A
+lazy-normal AO cost experiment (1.16066155 ms) was reverted; sample counts and
+thresholds were not reduced.
+
+The contact cache stores, per half-resolution texel, the selected 2×2
+full-resolution pixel offset, exact device z, f16 normal and f16 AO in one
+`Rgba32Uint` texel (16 bytes). Its two half-resolution targets total 18,432,000
+bytes at 1920×1200 (formerly 9,216,000). Blur and upsample candidate taps no
+longer reconstruct primary depth/normal; the same three pipelines, 5×5
+triangular 25-tap kernel, nine phases and no temporal history remain. The
+geometry cache is independent of the AO toggle, because AO samples porosity
+differently.
 
 Root cause: the original noise had already been fixed per frame, so an idle
 camera revealed spatial pepper rather than shimmer. Both CPU transforms now

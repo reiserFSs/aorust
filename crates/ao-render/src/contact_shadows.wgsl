@@ -11,7 +11,7 @@ struct Params {
 }
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var depth: texture_depth_2d;
-@group(0) @binding(2) var half_input: texture_2d<f32>; // r = occlusion, g = view depth (0 = sky)
+@group(0) @binding(2) var half_input: texture_2d<u32>;
 @group(0) @binding(3) var sun_mask: texture_2d<f32>;
 @vertex fn vs(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
     return vec4<f32>(vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u)) * 2.0 - 1.0, 0.0, 1.0);
@@ -54,20 +54,36 @@ fn normal(pixel: vec2<i32>, p: vec3<f32>) -> vec3<f32> {
     let n = cross_n / max(length(cross_n), 0.00001);
     return select(n, -n, dot(n, params.eye.xyz - p) < 0.0);
 }
+// Match AO's packed value/selected-offset and full-precision device depth.
+// Two more words cache half-precision normals so filter taps never rescan
+// primary depth or reconstruct a normal. Degenerate normals stay degenerate.
+fn encoded(value: f32, z: f32, pixel: vec2<i32>, n: vec3<f32>) -> vec4<u32> {
+    let offset = u32(pixel.x & 1) | (u32(pixel.y & 1) << 1u);
+    return vec4<u32>(pack2x16float(vec2<f32>(value, 0.0)) | (offset << 16u), bitcast<u32>(z),
+        pack2x16float(n.xy), pack2x16float(vec2<f32>(n.z, 0.0)));
+}
+fn value_of(sample: vec4<u32>) -> f32 { return unpack2x16float(sample.x).x; }
+fn depth_of(sample: vec4<u32>) -> f32 { return bitcast<f32>(sample.y); }
+fn selected_pixel(half: vec2<i32>, sample: vec4<u32>) -> vec2<i32> {
+    return half * 2 + vec2<i32>(i32((sample.x >> 16u) & 1u), i32((sample.x >> 17u) & 1u));
+}
+fn normal_of(sample: vec4<u32>) -> vec3<f32> {
+    return vec3<f32>(unpack2x16float(sample.z), unpack2x16float(sample.w).x);
+}
 fn phase_noise(position: vec2<f32>) -> f32 {
     let tile = vec2<u32>(position) % vec2<u32>(3u);
     return (f32((tile.x * 3u + tile.y * 7u) % 9u) + 0.5) / 9.0;
 }
-@fragment fn estimate(@builtin(position) position: vec4<f32>) -> @location(0) vec2<f32> {
+@fragment fn estimate(@builtin(position) position: vec4<f32>) -> @location(0) vec4<u32> {
     let pixel = half_pixel(vec2<i32>(position.xy));
     let z = depth_at(pixel);
-    if z >= 1.0 { return vec2<f32>(0.0); }
+    if z >= 1.0 { return encoded(0.0, z, pixel, vec3<f32>(0.0)); }
     let p = world(pixel, z);
     let w = view_depth(z);
-    if w > params.control.w { return vec2<f32>(0.0, w); }
     let n = normal(pixel, p);
+    if w > params.control.w { return encoded(0.0, z, pixel, n); }
     let toward_sun = params.sun.xyz;
-    if dot(n, toward_sun) <= 0.0 { return vec2<f32>(0.0, w); } // faces away: no direct sun anyway
+    if dot(n, toward_sun) <= 0.0 { return encoded(0.0, z, pixel, n); } // faces away: no direct sun anyway
     // Nine stable phases repeat every 3x3 half-resolution pixels. Unlike the
     // unbounded gradient noise, the box filter covers a complete phase cycle.
     let noise = phase_noise(position.xy);
@@ -90,7 +106,7 @@ fn phase_noise(position: vec2<f32>) -> f32 {
         }
     }
     let fade = 1.0 - smoothstep(0.7 * params.control.w, params.control.w, w);
-    return vec2<f32>(occlusion * fade, w);
+    return encoded(occlusion * fade, z, pixel, n);
 }
 // Match the AO symmetric tangent-plane rejection: tangential depth gradients
 // on sloping ground must not discard phases, but silhouettes must not mix.
@@ -104,14 +120,14 @@ fn bilateral(center: vec3<f32>, center_normal: vec3<f32>, candidate: vec3<f32>, 
     if distance >= cutoff { return 0.0; }
     return 1.0 - distance / max(cutoff, 0.001);
 }
-@fragment fn blur(@builtin(position) position: vec4<f32>) -> @location(0) vec2<f32> {
+@fragment fn blur(@builtin(position) position: vec4<f32>) -> @location(0) vec4<u32> {
     let pixel = vec2<i32>(position.xy);
-    let centre = textureLoad(half_input, pixel, 0).rg;
-    if centre.g <= 0.0 { return centre; }
-    let selected = half_pixel(pixel);
-    let p = world(selected, depth_at(selected));
-    let n = normal(selected, p);
-    var sum = centre.r * 9.0;
+    let centre = textureLoad(half_input, pixel, 0);
+    if depth_of(centre) >= 1.0 { return centre; }
+    let p = world(selected_pixel(pixel, centre), depth_of(centre));
+    let n = normal_of(centre);
+    let cutoff = 0.04 * view_depth(depth_of(centre)) + 0.04;
+    var sum = value_of(centre) * 9.0;
     var weight = 9.0;
     // Two convolved 3-tap boxes: 1,2,3,2,1 per axis. Each of the
     // three phase residues has total weight 3, so the wider symmetric
@@ -120,17 +136,17 @@ fn bilateral(center: vec3<f32>, center_normal: vec3<f32>, candidate: vec3<f32>, 
         for (var x = -2; x <= 2; x++) {
             let neighbor = pixel + vec2<i32>(x, y);
             if (x == 0 && y == 0) || any(neighbor < vec2<i32>(0)) || any(neighbor >= vec2<i32>(textureDimensions(half_input))) { continue; }
-            let sample = textureLoad(half_input, neighbor, 0).rg;
-            if sample.g <= 0.0 { continue; }
-            let sample_pixel = half_pixel(neighbor);
-            let sample_p = world(sample_pixel, depth_at(sample_pixel));
+            let sample = textureLoad(half_input, neighbor, 0);
+            if depth_of(sample) >= 1.0 { continue; }
+            let sample_p = world(selected_pixel(neighbor, sample), depth_of(sample));
             let spatial = f32((3 - abs(x)) * (3 - abs(y)));
-            let wgt = spatial * bilateral(p, n, sample_p, normal(sample_pixel, sample_p), 0.04 * centre.g + 0.04);
-            sum += sample.r * wgt;
+            let wgt = spatial * bilateral(p, n, sample_p, normal_of(sample), cutoff);
+            sum += value_of(sample) * wgt;
             weight += wgt;
         }
     }
-    return vec2<f32>(sum / weight, centre.g);
+    // Preserve the exact cached geometry through the filter.
+    return vec4<u32>(pack2x16float(vec2<f32>(sum / weight, 0.0)) | (centre.x & 196608u), centre.yzw);
 }
 // Output alpha is the darkening fraction; the pipeline blends colour * (1 - alpha) onto the native colour.
 @fragment fn composite(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
@@ -151,13 +167,12 @@ fn bilateral(center: vec3<f32>, center_normal: vec3<f32>, candidate: vec3<f32>, 
         for (var x = 0; x < 2; x++) {
             let neighbor = base + vec2<i32>(x, y);
             if any(neighbor < vec2<i32>(0)) || any(neighbor >= vec2<i32>(textureDimensions(half_input))) { continue; }
-            let sample = textureLoad(half_input, neighbor, 0).rg;
-            if sample.g <= 0.0 { continue; }
+            let sample = textureLoad(half_input, neighbor, 0);
+            if depth_of(sample) >= 1.0 { continue; }
             let spatial = select(1.0 - fraction.x, fraction.x, x == 1) * select(1.0 - fraction.y, fraction.y, y == 1);
-            let sample_pixel = half_pixel(neighbor);
-            let sample_p = world(sample_pixel, depth_at(sample_pixel));
-            let wgt = spatial * bilateral(p, n, sample_p, normal(sample_pixel, sample_p), 0.04 * view_depth(z) + 0.04);
-            sum += sample.r * wgt;
+            let sample_p = world(selected_pixel(neighbor, sample), depth_of(sample));
+            let wgt = spatial * bilateral(p, n, sample_p, normal_of(sample), 0.04 * view_depth(z) + 0.04);
+            sum += value_of(sample) * wgt;
             weight += wgt;
         }
     }
