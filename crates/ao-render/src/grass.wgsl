@@ -3,6 +3,9 @@ struct GrassCell { origin: vec4<f32>, heights: vec4<f32>, identity: vec4<u32>, n
 struct GrassParams { wind_time: vec4<f32>, limits: vec4<f32>, benders: array<vec4<f32>, 16> }
 @group(3) @binding(0) var<storage, read> grass_cells: array<GrassCell>;
 @group(3) @binding(1) var<uniform> grass_params: GrassParams;
+// 2..4 remain reserved for the optional shared shadow receiver.
+@group(3) @binding(5) var grass_atlas: texture_2d_array<f32>;
+@group(3) @binding(6) var grass_atlas_sampler: sampler;
 fn grass_hash(input: u32) -> u32 {
     var v = input ^ (input >> 16u); v *= 0x7feb352du;
     v ^= v >> 15u; v *= 0x846ca68bu; return v ^ (v >> 16u);
@@ -56,17 +59,19 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     let density_fade = 1.0 - smoothstep(radius * 0.3, max(radius, 0.001), distance_to_eye);
     let fade = 1.0 - smoothstep(radius * 0.72, max(radius, 0.001), distance_to_eye);
     if fade <= 0.0 || grass_unit(grass_hash(seed ^ 0x993u)) >= grass_params.limits.x * density_fade { return o; }
-    // Three paired cross-sections form two curved strip segments without
-    // increasing the six vertex invocations used by the old straight card.
+    // Three paired cross-sections retain the six-vertex curved strip. The
+    // alpha-tested atlas, rather than a pinched triangle, defines the silhouette.
     let along = f32(vertex / 2u) * 0.5;
     let side = select(-1.0, 1.0, (vertex & 1u) != 0u);
     let corner = vec2<f32>(side, along);
     let angle = grass_unit(grass_hash(seed ^ 0x42u)) * 6.283185307 + f32(blade) * 2.39996323;
     let direction = vec2<f32>(cos(angle), sin(angle));
-    // Mix narrow tapered blades with fuller leaves, keeping every native root.
     let blade_shape = grass_unit(grass_hash(blade_seed ^ 0x128u));
-    let profile = (1.0 - along) * (0.65 + along * (0.7 + blade_shape * 1.2));
-    let width = direction * (corner.x * (0.012 + grass_unit(grass_hash(blade_seed ^ 0x31u)) * 0.016) * profile * fade);
+    let accent = grass_hash(seed ^ 0xaceu) % 128u;
+    var species = grass_hash(seed ^ 0x128u) % 3u;
+    // Only one blade in a rare tuft becomes a tiny flower or leafy weed.
+    if blade == 0u && accent < 3u { species = 3u + accent % 2u; }
+    let width = direction * (corner.x * (0.10 + grass_unit(grass_hash(blade_seed ^ 0x31u)) * 0.035) * fade);
     let height = 0.38 * (0.6 + grass_unit(grass_hash(blade_seed ^ 0x85u)) * 0.8) * fade;
     let wind = clamp(grass_params.wind_time.xy, vec2<f32>(-3.0), vec2<f32>(3.0)) * (sin(grass_params.wind_time.z * 1.7 + root.x * 0.37 + root.z * 0.29) * 0.06 * fade);
     var bend = wind + direction * ((0.03 + grass_unit(grass_hash(blade_seed ^ 0x29u)) * 0.11) * fade);
@@ -94,9 +99,9 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     o.uv = grass_uv(c.identity.y, uv);
     // Ground-root fog: raised tips cannot reduce native extinction.
     o.fog = max(vertex_fog(-(g.view * vec4<f32>(root, 1.0)).z), vertex_fog(-(g.view * vec4<f32>(p, 1.0)).z));
-    o.color = vec4<f32>(c.origin.w, blade_shape, grass_unit(grass_hash(blade_seed ^ 0x619u)), along);
+    o.color = vec4<f32>(c.origin.w, f32(species), grass_unit(grass_hash(blade_seed ^ 0x619u)), along);
     // Blade-local coordinates are independent of terrain UV/palette sampling.
-    o.tint = vec3<f32>(side, along, blade_shape);
+    o.tint = vec3<f32>(side * 0.5 + 0.5, 1.0 - along, blade_shape);
     o.fade = 1.0 - smoothstep(radius * 0.65, max(radius, 0.001), distance_to_eye);
     // Evaluate the same four native terrain-corner Gouraud values, then
     // interpolate on the native diagonal. Blade tips never gain extra light.
@@ -129,22 +134,26 @@ struct GrassOutput {
 }
 @fragment
 fn fs_grass(i: VOut) -> GrassOutput {
+    let leaf = textureSample(grass_atlas, grass_atlas_sampler, i.tint.xy, i32(i.color.g + 0.5));
+    let coverage = clamp((leaf.a - 0.5) / max(fwidth(leaf.a), 0.0001) + 0.5, 0.0, 1.0);
     let palette = ground_palette(i);
-    var light = select(i.light, clamp(i.light + palette, vec3<f32>(0.0), vec3<f32>(1.0)), i.color.r > 0.5);
-    //__SHADOW_RECEIVE__
-    // Deterministic per-blade hue/brightness variation is subtractive: both
-    // sides keep the terrain's lighting budget, and tips never exceed it.
-    let jitter = vec3<f32>(0.88 + i.color.g * 0.12, 0.91 + i.color.b * 0.09, 0.82 + i.color.g * 0.18);
-    let gradient = mix(0.5, 1.0, smoothstep(0.0, 1.0, i.color.w));
-    // A soft central fold and fine longitudinal veins describe the leaf surface
-    // without adding light. Fade subpixel veins rather than letting them shimmer.
-    let ridge = 1.0 - 0.14 * abs(i.tint.x);
-    let vein_visibility = 1.0 - smoothstep(0.15, 0.6, fwidth(i.tint.x));
-    let veins = 1.0 - 0.04 * (0.5 + 0.5 * cos(i.tint.x * 25.0 + i.tint.z * 6.283185307)) * vein_visibility;
-    let tile = ground_tile(i) * jitter * gradient * ridge * veins;
+    // Evaluate derivatives before cutout; empty card texels skip shadow PCF.
+    //__SHADOW_NORMAL__
+    // Atlas root-tip color and folds only modulate the native terrain material.
+    // Neither flowers nor backfaces emit extra light.
+    let jitter = vec3<f32>(0.94 + i.color.b * 0.06, 0.97 + i.color.b * 0.03, 0.92 + i.color.b * 0.08);
+    let tile = ground_tile(i) * leaf.rgb * jitter;
+    if (g.fog.w <= 0.5 && leaf.a < 0.5) || (g.fog.w > 0.5 && coverage <= 0.0) { discard; }
     let bayer = array<f32, 16>(0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
     let pixel = vec2<u32>(i.clip.xy) & vec2<u32>(3u);
     if i.fade <= (bayer[pixel.x + pixel.y * 4u] + 0.5) / 16.0 { discard; }
+    var light = select(i.light, clamp(i.light + palette, vec3<f32>(0.0), vec3<f32>(1.0)), i.color.r > 0.5);
+    let without_sun = select(i.spec, clamp(i.spec + palette, vec3<f32>(0.0), vec3<f32>(1.0)), i.color.r > 0.5);
+    //__SHADOW_RECEIVE__
+    // Backlighting transmits more surviving direct sun, never exceeds the
+    // terrain budget, and cannot brighten indirect light or bypass shadows.
+    let backlit = max(dot(normalize(i.n - g.eye.xyz), g.sun_dir.xyz), 0.0);
+    light = without_sun + max(light - without_sun, vec3<f32>(0.0)) * mix(0.9, 1.0, backlit * backlit);
     let fog = ground_fog(i);
     var color = mix(tile * light, g.fog_g.rgb, fog);
     if i.color.r > 1.5 {
@@ -152,7 +161,7 @@ fn fs_grass(i: VOut) -> GrassOutput {
         color = mix(tile, g.fog_g.rgb, fog) * mix(light, vec3<f32>(1.0), fog);
     }
     var output: GrassOutput;
-    output.color = vec4<f32>(color, 1.0);
+    output.color = vec4<f32>(color, select(1.0, coverage, g.fog.w > 0.5));
     //__AMBIENT_WRITE__
     //__AO_RECEIVE__
     //__EMISSIVE_WRITE__

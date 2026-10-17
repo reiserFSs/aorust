@@ -610,10 +610,17 @@ vegetation geometry. Only native ground material 15 (grass texture IDs 2/258) or
 liquid-overlapped cells, room floors and roads do not. Source-triangle liquid
 bounds conservatively omit some shoreline grass. GPU expansion uses a fixed
 world-cell/texture hash, 128 tuft sites per cell and at most 1024 cells. Each tuft
-spreads 3–7 tapered two-segment strips with seeded narrow/full leaf profiles,
-curved lean, lateral curl and ±40% height variation. Procedural central folds and
-longitudinal veins remain terrain-tinted and subtractive, with derivative-based
-detail fading to avoid subpixel shimmer; no external texture assets are used.
+spreads 3–7 two-segment alpha-tested cards, with curved lean, lateral curl and
+seeded height variation. A small project-original procedural atlas supplies
+several blade/tuft shapes, weeds and sparse tiny flowers, with root-to-tip
+shading and leaf transmission. It is generated when the grass pipeline is
+created (enable or rendering-quality/effect changes), never per frame.
+No external artwork or extracted game images are included (see `THIRD_PARTY`).
+The 64×128×5 RGBA8 array occupies 160 KiB, isolates filtering between species,
+and shares the existing draw calls and six vertices per card. Three grass
+species are selected per tuft; only the first card of 3/128 seeded tufts can
+become a small flower or weed. This is an artistic Enhanced addition, not a
+reconstructed retail plant distribution.
 Density thins stable tuft sites with distance
 rather than reseeding them. The default distance is 50 m (bounded to 60 m), further
 limited by the original projection far plane, native fully-fine terrain radius
@@ -655,8 +662,12 @@ their native equations. Blade tips never acquire a new light budget, and fog is
 at least the root's interpolated native fog.
 Blade tint samples the original texture at its root. Per-blade hue/brightness
 jitter and the darker-base/lighter-tip gradient only subtract from that budget;
-both faces use the same terrain-normal lighting. Ordered dither softens the far
-fade without adding light or retaining temporal/actor history.
+both faces use the same terrain-normal lighting. Subtle directional transmission
+preserves 90–100% of the surviving direct sun share depending on view/sun
+alignment, after shadow reception; indirect light is unchanged and the original
+root lighting budget is never exceeded. Alpha-to-coverage preserves cutout
+edges with MSAA. Ordered dither softens the far fade without adding light or
+retaining temporal/actor history.
 Enhanced sun shadows reuse the world's current-frame cascades, geometric receiver
 plane correction, PCF and cascade transitions at the actual blade position.
 The shader removes only the sun share surviving native corner saturation and
@@ -714,3 +725,9 @@ that canopy-looking cameras show terrain. Its manifest includes per-tile materia
 fine-LOD, exposure and projected-root rejection counts, drawable batch availability,
 effect buffer bytes and native Metal allocation deltas. The timed GPU result is
 the paired whole-frame contribution, not an isolated draw timestamp.
+Set `AOMAC_GFX_VIEW` to select a single view and `AOMAC_GFX_PNG_ONLY=1` to omit
+raw image files. `icc-coastal1` and `icc-coastal2` use scene cameras
+`[660, 24.3, -714]` and `[700, 24, -710]`, both yaw 0 / pitch −0.3;
+`borealis-grass-ground-day` selects the exposed-ground close-up. Each ordering
+warms 320 frames before measuring 600 frames. Coastal2 is an authored-vegetation
+negative control: density zero and one must have identical pixels there.

@@ -209,7 +209,8 @@ impl SunShadows {
             static_instances: None, static_capacity: 0, actor_ids: Vec::new(), actor_groups: Default::default(),
             actor_ids_buffer, actor_visibility, actor_capacity, caster_layout, visibility_layout, visibility_pipeline, visibility_group }
     }
-    pub fn grass_bind(&self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, cells: &wgpu::Buffer, params: &wgpu::Buffer) -> wgpu::BindGroup {
+    #[allow(clippy::too_many_arguments)]
+    pub fn grass_bind(&self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, cells: &wgpu::Buffer, params: &wgpu::Buffer, atlas: &wgpu::TextureView, atlas_sampler: &wgpu::Sampler) -> wgpu::BindGroup {
         device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
             label: Some("grass cells and shared sun receiver"), layout, entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: cells.as_entire_binding() },
@@ -217,6 +218,8 @@ impl SunShadows {
                 wgpu::BindGroupEntry { binding: 2, resource: self.uniforms[0].as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.array) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(atlas) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(atlas_sampler) },
             ],
         })
     }

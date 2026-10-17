@@ -1,4 +1,5 @@
 //! Paired grass evidence on the shared offline fixture snapshots; no server/window.
+//! AOMAC_GFX_VIEW selects one view; AOMAC_GFX_PNG_ONLY=1 omits raw RGBA files.
 use super::{Shot, camera, graphics_fixture_actor, graphics_fixture_views};
 use ao_gui::Gui;
 use ao_render::{EnhancedSettings, Offscreen};
@@ -21,6 +22,8 @@ fn grass_offline_capture_and_timing() -> anyhow::Result<()> {
 }
 
 fn run(out: &std::path::Path) -> anyhow::Result<()> {
+    let selected = std::env::var("AOMAC_GFX_VIEW").ok();
+    let png_only = std::env::var("AOMAC_GFX_PNG_ONLY").is_ok_and(|value| value == "1");
     let dir = ao_gui::client_dir();
     let store = ao_rdb::RecordStore::open(&dir)?;
     let actor = graphics_fixture_actor()?;
@@ -28,6 +31,7 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
     let size = (1920, 1200);
     let mut changed_views = 0;
     let mut report = String::from("fixture=graphics_offline_fixture\nsize=1920x1200\nrenderer_time=0\ndt=0\ncrt_seed=1\nweather=clear\nmsaa=1\nanisotropy=1\nwarmup_frames=320\nmeasured_frames=600\ntiming=FrameGpuTimer whole-frame neutral Enhanced UNORM versus grass incremental contribution, not isolated draw timestamp\nvisual_acceptance=unexercised\n");
+    writeln!(report, "selected_view={selected:?}\npng_only={png_only}")?;
     for (key, program, args) in [
         ("revision", "git", vec!["rev-parse".into(), "HEAD".into()]),
         ("resource_sha256", "shasum", vec!["-a".into(), "256".into(), dir.join("cd_image/rdb.db").into_os_string()]),
@@ -42,6 +46,10 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
         ("icc-grass-ground", 4582, 2648.69, ao_render::Vec3::new(933.5, 26.0, -748.0)),
         ("borealis-grass-ground", 800, 3240.0, ao_render::Vec3::new(652.0, 65.3, -420.0)),
     ] {
+        if selected.as_deref().is_some_and(|view|
+            view.strip_suffix("-day") != Some(name) && (pf != 800 || view.strip_suffix("-night") != Some(name))) {
+            continue;
+        }
         ao_scene::crt_srand(1);
         let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
         let surface = Rc::new(RefCell::new(ao_formats::playfield::collision::Collision::load(&store, pf)?));
@@ -53,8 +61,19 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
         if pf == 800 { views.push((format!("{name}-night"), pf, 0.0, fixed)); }
     }
     views.extend(graphics_fixture_views(&actor));
+    for (name, pos) in [
+        ("icc-coastal1", ao_render::Vec3::new(660.0, 24.3, -714.0)),
+        ("icc-coastal2", ao_render::Vec3::new(700.0, 24.0, -710.0)),
+    ] {
+        views.push((name.into(), 4582, 2648.69, ao_render::Camera { pos, yaw: 0.0, pitch: -0.3, roll: 0.0 }));
+    }
+    views.retain(|(name, _, _, _)| !matches!(name.as_str(), "icc-actor-authored" | "borealis-lightbar-night" | "borealis-lightbar-night-close"));
+    if let Some(name) = &selected {
+        views.retain(|(view, _, _, _)| view == name);
+        ensure!(!views.is_empty(), "unknown AOMAC_GFX_VIEW {name:?}");
+    }
     std::fs::write(out.join("manifest.txt"), &report)?;
-    for (name, pf, time, fixed) in views.into_iter().filter(|(name, _, _, _)| !matches!(name.as_str(), "icc-actor-authored" | "borealis-lightbar-night" | "borealis-lightbar-night-close")) {
+    for (name, pf, time, fixed) in views {
         ao_scene::crt_srand(1);
         let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
         let exposure = super::super::player::grass_exposure_surface(Rc::new(RefCell::new(
@@ -110,7 +129,7 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                 ensure!(variant == 0 || generation_mean <= 0.2, "{name}: amortised grass generation exceeds 0.2 ms: {generation_mean}");
                 if round == 0 {
                     let raw = off.rgba(&shot, &list)?;
-                    std::fs::write(out.join(format!("{name}-{variant}.rgba")), &raw)?;
+                    if !png_only { std::fs::write(out.join(format!("{name}-{variant}.rgba")), &raw)?; }
                     image::save_buffer(out.join(format!("{name}-{variant}.png")), &raw, size.0, size.1, image::ColorType::Rgba8)?;
                     if variant == 0 { baseline_raw = Some(raw); }
                     else {
@@ -119,6 +138,7 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                         writeln!(report, "view={name} neutral_vs_grass_differing_bytes={differing}")?;
                         if differing > 0 { changed_views += 1; }
                         if pf == 127 { ensure!(cells == 0 && differing == 0, "indoor grass changed the image"); }
+                        if name == "icc-coastal2" { ensure!(differing == 0, "icc-coastal2: authored-vegetation ground gained generated grass"); }
                     }
                 }
             }
@@ -129,7 +149,10 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
             std::fs::write(out.join("manifest.txt"), &report)?;
         }
     }
-    ensure!(changed_views > 0, "fixture has no visible grass contribution; do not claim a visual/performance pass");
+    // Authored vegetation excludes the visible coastal2 ground; generated roots lie outside the view.
+    let unchanged_expected = selected.as_deref() == Some("icc-coastal2");
+    writeln!(report, "changed_views={changed_views}\nunchanged_view_expected={unchanged_expected}")?;
+    ensure!(changed_views > 0 || unchanged_expected, "fixture has no visible grass contribution; do not claim a visual/performance pass");
     std::fs::write(out.join("manifest.txt"), &report)?;
     Ok(())
 }
