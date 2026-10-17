@@ -52,10 +52,10 @@ fn grade_chroma(rgb: vec3<f32>, sunlit: f32) -> vec3<f32> {
     let day = params.grade.y;
     let low = params.grade.z;
     let night = params.grade.w;
-    var c = vec3<f32>(y) + (rgb - vec3<f32>(y)) * (1.0 + 0.2 * strength * day);
+    var c = vec3<f32>(y) + (rgb - vec3<f32>(y)) * (1.0 + 0.3 * strength * day);
     let warm = day * mix(0.3, 1.0, low) * sunlit;
-    let cool = day * 0.5 * (1.0 - sunlit) + night * (1.0 - smoothstep(0.0, 0.55, y));
-    c *= vec3<f32>(1.0) + strength * (warm * vec3<f32>(0.10, 0.0, -0.15) + cool * vec3<f32>(-0.09, -0.01, 0.15));
+    let cool = day * 0.7 * (1.0 - sunlit) + night * (1.0 - smoothstep(0.0, 0.55, y));
+    c *= vec3<f32>(1.0) + strength * (warm * vec3<f32>(0.14, 0.0, -0.22) + cool * vec3<f32>(-0.10, -0.01, 0.18));
     c = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
     return c * min(1.0, y / max(luma(c), 1e-5));
 }

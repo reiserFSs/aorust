@@ -33,7 +33,7 @@ impl Default for EnhancedSettings {
         Self {
             sun_shadows: false, ambient_occlusion: false, emissive_bloom: false, ground_grass: false, hdr: false, contact_shadows: false,
             shadow_map_size: 2048, shadow_strength: 0.65, shadow_softness: 1.5, ao_radius: 1.75, ao_strength: 1.5, bloom_strength: 0.6,
-            grass_density: 1.0, grass_distance: 50.0, sun_boost: 0.35, grade_strength: 0.7, contact_strength: 0.4,
+            grass_density: 1.0, grass_distance: 50.0, sun_boost: 0.5, grade_strength: 0.8, contact_strength: 0.4,
         }
     }
 }

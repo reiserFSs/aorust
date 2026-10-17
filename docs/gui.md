@@ -1419,8 +1419,8 @@ bloomed pixels roll into the shoulder instead of clipping at their own old white
 | Sun Shadow Softness / `AomacShadowSoftness` | 1.5 | 0–4 (penumbra growth with blocker distance; 0 = hard 3x3 PCF) |
 | Ambient Occlusion Radius / `AomacAoRadius` | 1 m | 0–5 m |
 | Ambient Occlusion Strength / `AomacAoStrength` | 1 | 0–1 |
-| Sunlight Brightness / `AomacSunBoost` | 0.35 | 0–0.6 (peak lift of fully sunlit daylight surfaces; 0 = faithful) |
-| Colour Grade / `AomacGrade` | 0.7 | 0–1 (HDR present only: saturation, warm sunlit / cool shade / cool night darks; every step renormalised to the input luminance and never above it, so it cannot lift night, shadow or fog luminance; 0 = off) |
+| Sunlight Brightness / `AomacSunBoost` | 0.5 | 0–0.6 (peak lift of fully sunlit daylight surfaces; 0 = faithful) |
+| Colour Grade / `AomacGrade` | 0.8 | 0–1 (HDR present only: saturation, warm sunlit / cool shade / cool night darks; every step renormalised to the input luminance and never above it, so it cannot lift night, shadow or fog luminance; 0 = off) |
 | Contact Shadow Strength / `AomacContactStrength` | 0.4 | 0–1 (share of the direct sun a fully contact-shadowed daylight pixel loses) |
 | Emissive Bloom Strength / `AomacBloomStrength` | 0.6 | 0–1 |
 | Ground Grass Density / `AomacGrassDensity` | 1 | 0–2 |

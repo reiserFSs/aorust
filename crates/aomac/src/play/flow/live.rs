@@ -715,6 +715,21 @@ fn live_walk() {
                     }
                 }
             }
+            // `enh=AomacHdr:1`: set an Enhanced graphics DValue directly (no Options UI/audio needed), then render a frame.
+            "enh" => {
+                use super::super::dvalue::Variant;
+                let (name, value) = v.split_once(':').expect("enh=AomacVariable:value");
+                let value: f64 = value.parse().expect("enh number");
+                let d = &mut l.p.hud.as_mut().expect("HUD").dvalues;
+                let variant = match d.get(name) {
+                    Some(Variant::Bool(_)) => Variant::Bool(value != 0.0),
+                    Some(Variant::Int(_)) => Variant::Int(value as i64),
+                    _ => Variant::Float(value as f32),
+                };
+                d.set(name, variant);
+                l.tick();
+                eprintln!("enh {name}={value} -> {:?}", l.p.hud.as_ref().expect("HUD").dvalues.enhanced_settings());
+            }
             "option" | "optioncheck" => {
                 let (name, value) = v.split_once(':').expect("option=NativeVariable:value");
                 let value: f64 = value.parse().expect("native option number");
