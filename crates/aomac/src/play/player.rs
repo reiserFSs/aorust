@@ -754,7 +754,7 @@ impl Player {
             host.actor_models.push((avatar::MODEL_KEY, self.avatar.model_arc()));
             self.model_sent = true;
         }
-        if host.enhanced_settings.is_some_and(|s| s.ground_grass && s.grass_density > 0.0 && s.grass_distance > 0.0) {
+        if host.enhanced().is_some_and(|s| s.ground_grass && s.grass_density > 0.0 && s.grass_distance > 0.0) {
             host.grass_benders.clear();
             host.grass_benders.push(ao_render::GrassBender { actor: None, position: scene_pos(pos) });
             host.grass_exposure = self.collision.as_ref().map(|surface| {

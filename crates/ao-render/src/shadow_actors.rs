@@ -16,7 +16,7 @@ impl Renderer {
                 let slot = mesh_effect_pipe(if item.faded { faded_pipe(draw.pipe) } else { draw.pipe }, item.rendering_effect, draw.projection_pass);
                 for primary in [true, false] {
                     if !primary && item.faded { continue; }
-                    shadows.ensure_pipeline(self, true, slot, primary, self.actor_pipes.spec(slot));
+                    shadows.ensure_pipeline(self, true, slot, primary, self.world.actor_pipes.spec(slot));
                 }
             }
         }

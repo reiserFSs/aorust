@@ -104,12 +104,12 @@ impl Renderer {
         if !shadows.actor_ids.is_empty() {
             for &(_, _, list, index, _) in &self.sorted {
                 let draw = &[&self.gpu.opaque, &self.gpu.blended, &self.gpu.liquid][list as usize][index];
-                shadows.ensure_pipeline(self, false, draw.pipe, true, self.pipes.spec(draw.pipe));
+                shadows.ensure_pipeline(self, false, draw.pipe, true, self.world.pipes.spec(draw.pipe));
             }
             if let Some(ground) = &self.ground {
                 for draw in &self.gpu.opaque {
                     if ground.materials[draw.mesh].is_some() {
-                        shadows.ensure_pipeline(self, false, draw.pipe, true, self.pipes.spec(draw.pipe));
+                        shadows.ensure_pipeline(self, false, draw.pipe, true, self.world.pipes.spec(draw.pipe));
                     }
                 }
             }
@@ -179,7 +179,7 @@ impl Renderer {
                 }
             }
             if shadows.static_commands.len() != first_command {
-                shadows.ensure_pipeline(self, false, draw.pipe, false, self.pipes.spec(draw.pipe));
+                shadows.ensure_pipeline(self, false, draw.pipe, false, self.world.pipes.spec(draw.pipe));
             }
         }
         if shadows.static_transforms.len() > shadows.static_capacity {

@@ -1382,8 +1382,44 @@ Emissive Bloom (`AomacEmissiveBloom`), Ground Grass (`AomacGroundGrass`) and HDR
 Tonemap (`AomacHdr`) and Contact Shadows (`AomacContactShadows`) checkboxes are
 independent DV Main booleans, all **off** by default, including when an older preferences
 file lacks them. `DValues::enhanced_settings` maps them and the quality controls below to
-`ao_render::EnhancedSettings`; `flow.rs::frame` sends the value through `Host.enhanced_settings`.
-Both windowed and offscreen viewers drain that request into `Renderer::set_enhanced_settings`.
+`ao_render::EnhancedSettings`; `flow.rs::frame` sends live changes through `Host::enhanced_switch`.
+Both viewers request a background world-pipeline variant and keep drawing the previous settings
+until it is ready. Variants are keyed by shadows, AO, bloom, sun-mask and clamped MSAA;
+the active set and three cached sets are retained, so a warm toggle reuses its pipelines.
+`Host::enhanced` supplies the pending frontend settings to grass inputs. Fixtures retain the
+synchronous `Host::enhanced_settings` / `Renderer::set_enhanced_settings` path.
+Viewers settle completed variants before checking render targets, keeping attachment sample
+counts consistent. Repeated unchanged MSAA requests must not cancel a pending live switch.
+Regression: `play::flow::tests::enhanced_option_switch_reuses_compiled_variants` exercises the
+real HUD/offscreen flow and checks frame-thread compile counts and warm-cache reuse.
+
+Headless switch evidence (2026-10-17, 1280×800 captured ICC replay, frozen simulation):
+the same 22-pipeline full-on combination took **904.59 ms** synchronously on a fresh
+renderer. Asynchronously it installed after **994.2 ms**, while **99 frames** continued
+rendering, maximum **38.77 ms**, with **zero frame-thread world/depth-clear compiles**.
+Both warm directions compiled **zero** pipelines (off **15.70 ms**, on **38.36 ms**).
+This cold-compiler diagnostic temporarily renamed an Enhanced WGSL helper and all its
+references uniquely per build, preserving operations while avoiding the already-warm
+Metal source cache; the diagnostic was removed. The ordinary-source run measured
+**24.38 ms** synchronous / **35.04 ms** maximum cold-switch frame with the driver cache
+already warm. Neither timing is a universal frame-latency guarantee.
+
+`sample <pid> 20 -mayDie -file <output>` captured the cold worker inside
+`Request::build -> create_render_pipeline -> Metal newLibraryWithSource ->
+MTLCompilerConnectionManagerPrivate::buildRequest`; rendering continued throughout.
+The wgpu 29.0.4 source trace found no render/submit/poll lock held over the Metal
+pipeline compiler call (wgpu-core `device/resource.rs::create_render_pipeline`,
+`device/queue.rs::submit`; wgpu-hal `metal/device.rs::load_shader`).
+There is therefore no evidence of the proposed one-second shared-device-lock block
+in this controlled run. The historical **1175 ms** frame has no saved stack/stage trace,
+so its exact cause remains unresolved, not attributed to “noise.” Effect-specific
+postprocessing/shadow pipelines still initialize separately from the world-set counter.
+An advancing-time diagnostic independently exposed a newly admitted actor sprite slot
+(AlphaBlend, two-sided, actor=true, sprite=true): **198.57 ms**, of which preparation was
+**184.73 ms**. The switch regression freezes simulation with `dt=0` to test reuse of the
+same scene rather than hide this unrelated lazy first-use compilation behind a tolerance.
+Logs and profiles: `~/aomac-handoff/gfx/v3/ToggleLand-profile-{fixed-time,cold-symbols}/`.
+
 MSAA is independently selectable. HDR is a scene-path switch, not a master switch: with it on the world pass writes
 a fourth attachment: red is the surface's direct-sun share x raw shadow visibility x (1 - native fog);
 the artistic shadow-strength floor affects beauty only and cannot count as surviving direct sunlight.

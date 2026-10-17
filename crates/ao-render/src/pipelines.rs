@@ -41,8 +41,8 @@ impl Pipelines {
         };
         self.0[index].pipeline = Some(pipeline);
     }
-    pub fn invalidate(&mut self) {
-        for slot in &mut self.0 { slot.pipeline = None; }
+    pub(super) fn compiled_slots(&self) -> Vec<usize> {
+        self.0.iter().enumerate().filter_map(|(index, slot)| slot.pipeline.is_some().then_some(index)).collect()
     }
     pub fn invalidate_sky(&mut self) {
         for index in 0..self.0.len() {

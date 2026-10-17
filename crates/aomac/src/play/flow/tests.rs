@@ -2125,3 +2125,130 @@ fn protocol_not_ok_closes_login_progress_and_displays_literal_error() {
     r.click(w, "cancel_btn");
     assert!(r.host.quit && r.p.dialog_w.is_none());
 }
+
+/// Real HUD -> frontend -> offscreen rendering: cold switches compile only on the worker, and both
+/// directions of a warmed switch compile nothing. Run explicitly with client data and a GPU.
+#[test]
+#[ignore = "client data + GPU; Enhanced option switch timing"]
+fn enhanced_option_switch_reuses_compiled_variants() {
+    fn fixture(phase: &str) -> (Rig, ao_render::Offscreen, f64) {
+        let mut r = rig().expect("Enhanced switch regression requires client data");
+        let mut o = ao_render::Offscreen::evidence(&r.p, (1280, 800)).unwrap();
+        let load = Instant::now();
+        r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 25988 });
+        r.burst(&captured(include_str!("../../../../../docs/captures/zone_ithaca.rec")));
+        o.host = std::mem::replace(&mut r.host, Host::headless());
+        loop {
+            o.frame(&mut r.p, 1.0 / 60.0);
+            if r.p.screen == Screen::InWorld && r.p.zone.world.cpu_benchmark_scene().0 { break; }
+            assert!(load.elapsed() < Duration::from_secs(300), "ICC world/models did not load");
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        // The performance replay's documented ICC camera exercises the loaded world's pipeline slots.
+        o.fixed_camera(Some(Camera { pos: Vec3::new(927.02765, 28.060379, -730.7181), yaw: 0.0, pitch: -0.24497865, roll: 0.0 }));
+        o.prepare_frozen_rendering();
+        o.set_cpu_timing(true);
+        let mut worst = 0.0f64;
+        for index in 0..30 {
+            worst = worst.max(frame(&mut o, &mut r.p, phase, index));
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        (r, o, worst)
+    }
+    let switch = |p: &mut Play, on: bool| {
+        let hud = p.hud.as_mut().expect("HUD");
+        for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacHdr"] {
+            hud.dvalues.set(name, super::super::dvalue::Variant::Bool(on));
+        }
+    };
+    fn frame(o: &mut ao_render::Offscreen, p: &mut Play, phase: &str, index: usize) -> f64 {
+        let start = Instant::now();
+        // Hold simulation time fixed: newly spawned animated sprites are separate pipeline admissions,
+        // not work caused by switching the already-visible world's Enhanced combination.
+        o.frame(p, 0.0);
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        if ms > 50.0 {
+            let stages = o.frame_cpu_timings();
+            let render_ms = stages.map_or(0.0, |s| s.prepare_ms + s.encode_ms + s.queue_submit_ms);
+            eprintln!("ENHANCED_SWITCH slow_frame phase={phase} frame={index} wall_ms={ms:.2} outside_render_ms={:.2} frame_cpu_timings={stages:?} total_compiles={} frame_thread_compiles={}",
+                ms - render_ms, o.world_pipeline_compiles(), o.world_frame_thread_compiles());
+        }
+        ms
+    }
+    let (mut r, mut o, faithful_worst) = fixture("faithful_warmup");
+    let off = r.p.hud.as_ref().expect("HUD").dvalues.enhanced_settings();
+    assert!(!off.any_enabled(), "the session starts faithful");
+    let baseline_compiles = o.world_pipeline_compiles();
+    assert!(baseline_compiles > 0, "the fixture must draw real world pipelines");
+    let baseline_frame_compiles = o.world_frame_thread_compiles();
+
+    // An unseen combination stays on the worker, including the first frame that installs it.
+    eprintln!("ENHANCED_SWITCH_BEGIN");
+    let cold = Instant::now();
+    switch(&mut r.p, true);
+    let on = r.p.hud.as_ref().expect("HUD").dvalues.enhanced_settings();
+    assert_ne!(off, on, "the HUD switch must request a different combination");
+    let mut cold_frames = 0;
+    let mut cold_worst = 0.0f64;
+    let mut terrible = Vec::new();
+    while o.enhanced_settings() != on && cold_frames < 600 {
+        let ms = frame(&mut o, &mut r.p, "cold_switch", cold_frames);
+        cold_worst = cold_worst.max(ms);
+        if ms > 50.0 { terrible.push(ms); }
+        cold_frames += 1;
+        assert_eq!(o.world_frame_thread_compiles() - baseline_frame_compiles, 0,
+            "cold switch frame {cold_frames} compiled on the frame thread");
+        assert!(o.enhanced_settings() == off || o.enhanced_settings() == on,
+            "the old variant must remain active until the complete new variant installs");
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    let cold_ms = cold.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(o.enhanced_settings(), on, "the switched combination must be in place");
+    let warmed = o.world_pipeline_compiles() - baseline_compiles;
+    assert!(warmed > 0, "an unseen combination must compile its pipelines once");
+
+    // Both directions must install immediately and remain compile-free over subsequent frames, not
+    // merely defer a missing sky/actor slot until the frame after the assertion.
+    let warm_compiles = o.world_pipeline_compiles();
+    let mut warm_worst = 0.0f64;
+    let mut warm_timings = Vec::new();
+    for (phase, enabled, expected) in [("warm_off", false, off), ("warm_on", true, on)] {
+        let start = Instant::now();
+        switch(&mut r.p, enabled);
+        let first = frame(&mut o, &mut r.p, phase, 0);
+        let toggle_ms = start.elapsed().as_secs_f64() * 1000.0;
+        warm_worst = warm_worst.max(first);
+        assert_eq!(o.enhanced_settings(), expected, "cached {phase} must install in the same frame");
+        assert_eq!(o.world_pipeline_compiles(), warm_compiles, "{phase} must compile absolutely nothing");
+        assert_eq!(o.world_frame_thread_compiles(), baseline_frame_compiles, "{phase} must not compile on the frame thread");
+        for index in 1..60 {
+            warm_worst = warm_worst.max(frame(&mut o, &mut r.p, phase, index));
+            assert_eq!(o.world_pipeline_compiles(), warm_compiles, "{phase} frame {index} must compile absolutely nothing");
+            assert_eq!(o.world_frame_thread_compiles(), baseline_frame_compiles, "{phase} frame {index} must not compile on the frame thread");
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        warm_timings.push((phase, toggle_ms, first));
+    }
+
+    let warm_total_compiles = o.world_pipeline_compiles() - warm_compiles;
+    assert!(o.world_variant_cache_len() <= 3, "compiled combinations stay bounded");
+    drop(o);
+    drop(r);
+
+    // A fresh, sequential replay warms the same faithful scene and camera, then synchronously installs
+    // the exact full-on combination used above. No eviction trick or cheaper shadows-only shader.
+    let (control_r, mut control_o, control_faithful_worst) = fixture("control_faithful_warmup");
+    assert_eq!(control_o.enhanced_settings(), off, "the control must start from the same faithful settings");
+    let sync_before = control_o.world_pipeline_compiles();
+    let sync = Instant::now();
+    control_o.set_enhanced_settings(on);
+    let sync_ms = sync.elapsed().as_secs_f64() * 1000.0;
+    let sync_compiles = control_o.world_pipeline_compiles() - sync_before;
+    let worst = cold_worst.max(warm_worst);
+    eprintln!("ENHANCED_SWITCH faithful_worst_frame_ms={faithful_worst:.2} live_cold_install_ms={cold_ms:.1} frames_kept_rendering={cold_frames} cold_worst_frame_ms={cold_worst:.2} frames_over_50ms={terrible:?} worker_compiled={warmed} cold_frame_thread_compiles=0 warm_toggles={warm_timings:?} warm_total_compiles={warm_total_compiles} control_faithful_worst_frame_ms={control_faithful_worst:.2} sync_unseen_ms={sync_ms:.2} sync_compiled={sync_compiles} worst_switch_frame_ms={worst:.2}");
+    assert_eq!(control_o.enhanced_settings(), on, "synchronous control must install before returning");
+    assert!(sync_compiles > 0, "the synchronous control must compile an unseen set");
+    assert_eq!(sync_compiles, warmed, "cold controls must compile the same full combination and pipeline slots");
+    assert!(worst < 50.0, "no cold or warm switch frame may block: worst {worst:.2} ms");
+    drop(control_r);
+}

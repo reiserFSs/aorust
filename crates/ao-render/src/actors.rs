@@ -609,17 +609,13 @@ impl Renderer {
 
 
     pub(super) fn prepare_actor_pipelines(&mut self) {
-        let shader = self.enhanced_shader.as_ref().unwrap_or(&self.shader);
-        let format = self.world_format();
-        let settings = self.enhanced_settings;
-        let compile = |spec| compile_pipeline(&self.device, shader, format,
-            (&self.pipeline_layout, &self.holo_pipeline_layout), settings, self.msaa_samples, spec);
+        let compile = self.compile_world();
         for it in &self.act.items {
             let model = &self.act.models[&it.model];
             let Some(mesh) = model.meshes[it.mesh].as_ref() else { continue };
             for draw in &mesh.draws {
                 let pipe = if it.faded { faded_pipe(draw.pipe) } else { draw.pipe };
-                self.actor_pipes.ensure(mesh_effect_pipe(pipe, it.rendering_effect, draw.projection_pass), &compile);
+                self.world.actor_pipes.ensure(mesh_effect_pipe(pipe, it.rendering_effect, draw.projection_pass), &|spec| compile.pipeline(spec, false));
             }
         }
     }
@@ -727,7 +723,7 @@ impl Renderer {
         while start<limit {
             let end=(start+1..limit).find(|&i|layer.commands[i].3).unwrap_or(limit);
             if layer.commands[start].3 {
-                pass.set_pipeline(&self.depth_clear_pipe);
+                pass.set_pipeline(&self.world.depth_clear_pipe);
                 pass.draw(0..3,0..1);
             }
             pass.set_bind_group(0,&self.globals_bg,&[]);
@@ -757,7 +753,7 @@ impl Renderer {
                     let pipe = if it.faded { faded_pipe(d.pipe) } else { d.pipe };
                     let pipe = mesh_effect_pipe(pipe, effect, d.projection_pass);
                     if pipe_c.get() != pipe {
-                        pass.set_pipeline(&self.actor_pipes[pipe]);
+                        pass.set_pipeline(&self.world.actor_pipes[pipe]);
                         pipe_c.set(pipe);
                     }
                     if mat_c.get() != (it.model, d.mat) {

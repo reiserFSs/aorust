@@ -1433,7 +1433,8 @@ impl Frontend for Play {
             let msaa = hud.dvalues.get_i64("AomacEdgeSmoothing").unwrap_or(0).clamp(0, 3) as usize;
             host.anisotropy = Some(ANISOTROPY[aniso]);
             host.msaa_samples = Some(MSAA[msaa]);
-            host.enhanced_settings = Some(hud.dvalues.enhanced_settings());
+            // Live switches warm unseen pipeline variants on a worker; fixtures retain the immediate channel.
+            host.enhanced_switch = Some(hud.dvalues.enhanced_settings());
             // live-apply while in game; the initial value (login screen) came from `Play::new`'s startup read.
             self.interface_scale = hud.dvalues.get_i64("AomacInterfaceScale").unwrap_or(0).clamp(0, 3) as u8;
             host.borderless_game = hud.dvalues.flag("AomacBorderlessFullscreen");
@@ -1773,7 +1774,7 @@ impl Frontend for Play {
             self.zone.world.update_with_collision(dt, host.camera.pos.to_array(), host.camera.forward().to_array(), host, query, |id| {
                 player?.effect_anchor(id).map(|matrix| glam::Mat4::from_cols_array_2d(&matrix))
             });
-            if host.enhanced_settings.is_some_and(|s| s.ground_grass && s.grass_density > 0.0 && s.grass_distance > 0.0) {
+            if host.enhanced().is_some_and(|s| s.ground_grass && s.grass_density > 0.0 && s.grass_distance > 0.0) {
                 host.grass_wind = self.world_weather.as_ref().map_or([0.0; 3], |weather| weather.state().wind);
                 host.grass_benders.retain(|bender| bender.actor.is_none());
                 host.grass_benders.extend(self.zone.world.grass_characters()

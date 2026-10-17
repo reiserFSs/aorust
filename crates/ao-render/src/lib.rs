@@ -26,6 +26,7 @@ mod enhanced_settings;
 pub use enhanced_settings::EnhancedSettings;
 mod enhanced;
 mod enhanced_shader;
+mod variant;
 mod shader_source;
 mod ambient_occlusion;
 mod sky_probe;
@@ -655,7 +656,6 @@ pub struct Renderer {
     enhanced_frame: Option<enhanced::EnhancedFrame>,
     bloom: Option<bloom::Bloom>,
     grade: Option<grade::Grade>,
-    enhanced_shader: Option<wgpu::ShaderModule>,
     ambient_occlusion: Option<ambient_occlusion::AmbientOcclusion>,
     contact_shadows: Option<contact_shadows::ContactShadows>,
     gpu_timer: Option<FrameGpuTimer>,
@@ -673,22 +673,23 @@ pub struct Renderer {
     tex_layout: wgpu::BindGroupLayout,
     holo_layout: wgpu::BindGroupLayout,
     shader: wgpu::ShaderModule,
-    pipeline_layout: wgpu::PipelineLayout,
-    holo_pipeline_layout: wgpu::PipelineLayout,
+    world: variant::Pipes,
+    world_variants: Vec<(variant::Key, variant::Pipes)>,
+    world_key: variant::Key,
+    pending_world: Option<variant::Pending>,
+    world_compiles: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    world_frame_compiles: std::sync::Arc<std::sync::atomic::AtomicU64>,
     sampler: wgpu::Sampler,
     clamp_sampler: wgpu::Sampler,
     /// Texture anisotropic filtering clamp ([`Renderer::set_anisotropy`]; audit item 2, default 1x = retail `FUN_10041ede`,
     /// `docs/screens.md` "max anisotropy 1"). The aomac Enhanced options page may raise it.
     anisotropy: u16,
-    /// Colour/depth sample count ([`Renderer::set_msaa_samples`]; MSAA-option decision: not retail, default 1 = off).
-    msaa_samples: u32,
+    /// Unclamped preference, retained while auxiliary attachments temporarily limit MSAA.
+    requested_msaa: u32,
     /// Sample counts the adapter actually supports for both the surface colour format and [`DEPTH`] (always includes 1).
     msaa_supported: Vec<u32>,
     auxiliary_msaa: wgpu::TextureFormatFeatureFlags,
     texture_policy: native_texture::Policy,
-    pipes: Pipelines,
-    actor_pipes: Pipelines,
-    depth_clear_pipe: wgpu::RenderPipeline,
     drawn_visuals: HashMap<VisualKey, i32>,
     pending_visuals: std::cell::RefCell<HashMap<VisualKey, i32>>,
     actor_visual_retirements: Vec<(u32, u32)>,
@@ -721,7 +722,6 @@ pub struct Renderer {
     ground: Option<GroundRun>,
     ground_quality: (i32, i32),
     ground_state: native_ground::NativeGround,
-    ground_pipes: Pipelines,
     /// Light storage buffer plus its pristine contents and the statel zone of each light (distance gating). `cells`/`idx`
     /// are the light-grid index buffers; all three are kept so [`Renderer::set_anisotropy`] can rebuild `globals_bg` with
     /// the current lighting data instead of recomputing the light grid just to change a sampler.
@@ -756,6 +756,9 @@ pub struct Renderer {
     act: actors::ActorLayer,
     screen: screen::ScreenPass,
 }
+
+/// Inactive combinations retained for switching back without recompiling.
+const WORLD_VARIANT_CACHE: usize = 3;
 
 fn default_environment(radius: f32) -> Environment {
     let fog_end = (radius * 2.0).max(300.0);
@@ -1152,16 +1155,15 @@ impl Renderer {
                 count: None,
             }),
         });
-        let holo_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("native Holo"), bind_group_layouts: &[Some(&g_layout), Some(&tex_layout), Some(&holo_layout)], immediate_size: 0,
-        });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[Some(&g_layout), Some(&tex_layout)],
-            immediate_size: 0,
-        });
-        let (pipes, actor_pipes, ground_pipes) = build_pipelines();
-        let depth_clear_pipe = screen::depth_clear_pipeline(&device, format, 1, EnhancedSettings::default());
+        let compiles = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let frame_compiles = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let empty = || Pipelines::from(Vec::new());
+        let none = (empty(), empty(), empty());
+        let world_key = variant::Key::of(EnhancedSettings::default(), 1);
+        let world = variant::Request::new(
+            &device, &shader, format, (&g_layout, &tex_layout, &holo_layout),
+            world_key, EnhancedSettings::default(), false, (&none.0, &none.1, &none.2),
+            &compiles, &frame_compiles).build(false);
         let mut r = Self {
             device,
             queue,
@@ -1170,7 +1172,6 @@ impl Renderer {
             enhanced_frame: None,
             bloom: None,
             grade: None,
-            enhanced_shader: None,
             ambient_occlusion: None,
             contact_shadows: None,
             gpu_timer: None,
@@ -1202,18 +1203,19 @@ impl Renderer {
             tex_layout,
             holo_layout,
             shader,
-            pipeline_layout: layout,
-            holo_pipeline_layout,
+            world,
+            world_variants: Vec::new(),
+            world_key,
+            pending_world: None,
+            world_compiles: compiles,
+            world_frame_compiles: frame_compiles,
             sampler,
             clamp_sampler,
             anisotropy: 1,
-            msaa_samples: 1,
+            requested_msaa: 1,
             msaa_supported,
             auxiliary_msaa,
             texture_policy: Default::default(),
-            pipes,
-            actor_pipes,
-            depth_clear_pipe,
             sky: SkyGpu::default(),
             cloud_preferences: (true, true, false),
             sky_beauty_only: false,
@@ -1230,7 +1232,6 @@ impl Renderer {
             ground: None,
             ground_quality: (200, 44),
             ground_state: Default::default(),
-            ground_pipes,
             light_buf,
             light_cells_buf,
             light_idx_buf,
@@ -1306,76 +1307,130 @@ impl Renderer {
         self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &self.light_buf, &self.light_cells_buf, &self.light_idx_buf, &self.dyn_light_buf, &self.sampler, &self.clamp_sampler);
     }
 
-    /// Colour/depth sample count (MSAA-option decision: not retail, `Renderer::new` already defaults to 1 = off). `requested` is
-    /// downward-clamped to a level the adapter's colour+depth format features actually support ([`clamp_msaa_samples`]); every
-    /// pipeline is then rebuilt at the new [`wgpu::MultisampleState`] (wgpu bakes the sample count into the pipeline, there is no
-    /// live toggle). Callers that keep a [`Targets`] across frames must rebuild it when [`Renderer::msaa_samples`] changes
-    /// (`Targets::sample_count`). The single world pass resolves once and discards its transient MSAA/depth attachments.
+    /// Changes MSAA synchronously, except that an in-flight live switch stays asynchronous.
+    /// Retained targets must be rebuilt when [`Renderer::msaa_samples`] changes.
     pub fn set_msaa_samples(&mut self, requested: u32) {
-        let auxiliary = self.enhanced_settings.ambient_occlusion || self.enhanced_settings.emissive_bloom || self.enhanced_settings.needs_sun_mask();
-        let level = if auxiliary {
+        self.requested_msaa = requested.max(1);
+        let (settings, defer) = self.pending_world.as_ref()
+            .map_or((self.enhanced_settings, false), |pending| (pending.settings, true));
+        let key = variant::Key::of(settings, self.clamp_msaa(self.requested_msaa, settings));
+        self.request_world(key, settings, defer);
+    }
+
+    pub fn msaa_samples(&self) -> u32 { self.world.msaa }
+
+    fn clamp_msaa(&self, requested: u32, settings: EnhancedSettings) -> u32 {
+        let auxiliary = settings.ambient_occlusion || settings.emissive_bloom || settings.needs_sun_mask();
+        if auxiliary {
             self.msaa_supported.iter().copied().filter(|&count| count <= requested && self.auxiliary_msaa.sample_count_supported(count)).max().unwrap_or(1)
-        } else { clamp_msaa_samples(requested.max(1), &self.msaa_supported) };
-        if level == self.msaa_samples { return; }
-        self.msaa_samples = level;
-        self.pipes.invalidate();
-        self.actor_pipes.invalidate();
-        self.ground_pipes.invalidate();
-        self.enhanced_frame = None;
-        self.bloom = None;
-        self.grade = None;
-        self.depth_clear_pipe = screen::depth_clear_pipeline(&self.device, self.world_format(), level, self.enhanced_settings);
+        } else {
+            clamp_msaa_samples(requested.max(1), &self.msaa_supported)
+        }
     }
 
-    pub fn msaa_samples(&self) -> u32 {
-        self.msaa_samples
+    /// Applies one frontend frame's options together, without compiling an intermediate MSAA variant.
+    pub(crate) fn set_world_options(&mut self, samples: Option<u32>, settings: Option<EnhancedSettings>, switch: Option<EnhancedSettings>) {
+        if let Some(samples) = samples { self.requested_msaa = samples.max(1); }
+        if let Some(settings) = switch {
+            self.request_enhanced_settings(settings);
+        } else if let Some(settings) = settings {
+            self.set_enhanced_settings(settings);
+        } else if let Some(samples) = samples {
+            self.set_msaa_samples(samples);
+        }
     }
 
-    /// Optional effects are a clean path switch, not a modification of faithful shader execution.
+    /// Immediate setting for fixtures: compiles an unseen world combination before returning.
     pub fn set_enhanced_settings(&mut self, settings: EnhancedSettings) {
         let settings = settings.clamped();
-        if self.enhanced_settings == settings { return; }
-        let changed_pipeline = self.enhanced_settings.sun_shadows != settings.sun_shadows
-            || self.enhanced_settings.ambient_occlusion != settings.ambient_occlusion
-            || self.enhanced_settings.emissive_bloom != settings.emissive_bloom
-            || self.enhanced_settings.needs_sun_mask() != settings.needs_sun_mask();
-        let changed_frame = self.enhanced_settings.any_enabled() != settings.any_enabled()
-            || self.enhanced_settings.ambient_occlusion != settings.ambient_occlusion
-            || self.enhanced_settings.emissive_bloom != settings.emissive_bloom
-            || self.enhanced_settings.needs_sun_mask() != settings.needs_sun_mask();
+        let key = variant::Key::of(settings, self.clamp_msaa(self.requested_msaa, settings));
+        self.request_world(key, settings, false);
+    }
+
+    /// Keeps drawing the active variant while an unseen combination compiles on a worker.
+    pub fn request_enhanced_settings(&mut self, settings: EnhancedSettings) {
+        let settings = settings.clamped();
+        let key = variant::Key::of(settings, self.clamp_msaa(self.requested_msaa, settings));
+        self.request_world(key, settings, true);
+    }
+
+    fn request_world(&mut self, key: variant::Key, settings: EnhancedSettings, defer: bool) {
+        if key == self.world_key {
+            self.pending_world = None;
+            if self.enhanced_settings != settings { self.apply_enhanced_settings(settings); }
+            return;
+        }
+        if let Some(index) = self.world_variants.iter().position(|(cached, _)| *cached == key) {
+            let world = self.world_variants.remove(index).1;
+            self.install_world(key, world, settings);
+            return;
+        }
+        if let Some(pending) = self.pending_world.as_mut().filter(|pending| pending.key == key) {
+            pending.settings = settings;
+            if !defer { self.await_enhanced_world(); }
+            return;
+        }
+        let request = variant::Request::new(
+            &self.device, &self.shader, self.format, (&self.g_layout, &self.tex_layout, &self.holo_layout),
+            key, settings, self.isolate_sky(), (&self.world.pipes, &self.world.actor_pipes, &self.world.ground_pipes),
+            &self.world_compiles, &self.world_frame_compiles);
+        if defer {
+            self.pending_world = Some(request.spawn(key, settings));
+        } else {
+            let world = request.build(true);
+            self.install_world(key, world, settings);
+        }
+    }
+
+    fn install_world(&mut self, key: variant::Key, world: variant::Pipes, settings: EnhancedSettings) {
+        self.pending_world = None;
+        let previous = std::mem::replace(&mut self.world, world);
+        let previous_key = std::mem::replace(&mut self.world_key, key);
+        if previous.msaa != self.world.msaa {
+            self.enhanced_frame = None;
+            self.bloom = None;
+            self.grade = None;
+        }
+        self.world_variants.push((previous_key, previous));
+        if self.world_variants.len() > WORLD_VARIANT_CACHE { self.world_variants.remove(0); }
+        self.apply_enhanced_settings(settings);
+    }
+
+    fn apply_enhanced_settings(&mut self, settings: EnhancedSettings) {
+        let previous = self.enhanced_settings;
+        let changed_frame = previous.any_enabled() != settings.any_enabled()
+            || previous.ambient_occlusion != settings.ambient_occlusion
+            || previous.emissive_bloom != settings.emissive_bloom
+            || previous.needs_sun_mask() != settings.needs_sun_mask();
         self.enhanced_settings = settings;
         if !settings.ground_grass || settings.grass_density <= 0.0 { self.grass = None; }
         if !settings.ambient_occlusion { self.ambient_occlusion = None; }
         if !settings.contact_shadows { self.contact_shadows = None; }
         if !settings.sun_shadows { self.sun_shadows = None; }
         if changed_frame { self.enhanced_frame = None; self.bloom = None; self.grade = None; }
-        // Grass has its own shader. Keep the native world shader and cached pipelines
-        // unless a world-shading effect actually needs the Enhanced variant.
-        if !(settings.sun_shadows || settings.ambient_occlusion || settings.emissive_bloom || settings.needs_sun_mask()) {
-            self.enhanced_shader = None;
-        } else if self.enhanced_shader.is_none() || changed_pipeline {
-            self.enhanced_shader = Some(self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("Enhanced world"), source: wgpu::ShaderSource::Wgsl(enhanced_shader::source(settings.sun_shadows, settings.ambient_occlusion, settings.emissive_bloom, settings.needs_sun_mask()).into()),
-            }));
-        }
-        if changed_pipeline {
-            let shadow_layout = settings.sun_shadows.then(|| sun_shadows::receiver_layout(&self.device));
-            let mut ordinary = vec![Some(&self.g_layout), Some(&self.tex_layout)];
-            let mut holo = vec![Some(&self.g_layout), Some(&self.tex_layout), Some(&self.holo_layout)];
-            if let Some(shadow_layout) = shadow_layout.as_ref() {
-                ordinary.extend([None, Some(shadow_layout)]);
-                holo.push(Some(shadow_layout));
-            }
-            self.pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("world optional shadow receiver"), bind_group_layouts: &ordinary, immediate_size: 0 });
-            self.holo_pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("holo optional shadow receiver"), bind_group_layouts: &holo, immediate_size: 0 });
-        }
-        if settings.any_enabled() { self.set_msaa_samples(self.msaa_samples); }
-        if changed_pipeline {
-            self.pipes.invalidate();
-            self.actor_pipes.invalidate();
-            self.ground_pipes.invalidate();
-            self.depth_clear_pipe = screen::depth_clear_pipeline(&self.device, self.world_format(), self.msaa_samples, settings);
-        }
+    }
+
+    fn await_enhanced_world(&mut self) {
+        let Some(mut pending) = self.pending_world.take() else { return };
+        let world = pending.wait();
+        self.install_world(pending.key, world, pending.settings);
+    }
+
+    /// Call before checking targets; never install a variant partway through rendering a frame.
+    pub fn settle_enhanced_world(&mut self) {
+        let Some(pending) = self.pending_world.as_mut() else { return };
+        let Some(world) = pending.poll() else { return };
+        let pending = self.pending_world.take().expect("pending variant");
+        self.install_world(pending.key, world, pending.settings);
+    }
+
+    pub fn world_pipeline_compiles(&self) -> u64 { self.world_compiles.load(std::sync::atomic::Ordering::Relaxed) }
+    pub fn world_frame_thread_compiles(&self) -> u64 { self.world_frame_compiles.load(std::sync::atomic::Ordering::Relaxed) }
+    pub fn world_variant_cache_len(&self) -> usize { self.world_variants.len() }
+
+    fn compile_world(&self) -> variant::Compile {
+        self.world.compile(&self.device, &self.shader, self.world_format(), self.enhanced_settings,
+            self.world_compiles.clone(), self.world_frame_compiles.clone())
     }
     pub fn enhanced_settings(&self) -> EnhancedSettings { self.enhanced_settings }
     /// Logical optional attachment bytes, not driver allocation/alignment or total GPU residency.
@@ -2132,7 +2187,7 @@ impl Renderer {
             sun_color: v4(env.sun_color, 0.0),
             ambient: v4(env.ambient, 0.0),
             fog_color: v4(env.fog_color, 1.0),
-            fog: [env.fog_start, env.fog_end, self.time, if self.msaa_samples > 1 { 1.0 } else { 0.0 }],
+            fog: [env.fog_start, env.fog_end, self.time, if self.world.msaa > 1 { 1.0 } else { 0.0 }],
             grid: self.gpu.grid.0,
             dims: self.gpu.grid.1,
             wave: std::array::from_fn(|i| std::array::from_fn(|j| w[i * 4 + j])),
@@ -2179,43 +2234,34 @@ impl Renderer {
         self.prepare_enhanced_grass(cam, vp, env.fog_end.max(env.fog_start + 1e-3), 0.5 * t.size.1 as f32 / (0.5 * self.lens.vertical_fov(aspect)).tan());
         if let Some(start) = grass_start { cpu.grass_prepare_ms = start.elapsed().as_secs_f64() * 1000.0; }
         let isolate_sky = self.isolate_sky();
-        if isolate_sky != self.sky_beauty_only {
-            self.pipes.invalidate_sky();
-            self.sky_beauty_only = isolate_sky;
+        if isolate_sky != self.world.sky_isolation {
+            self.world.pipes.invalidate_sky();
+            self.world.sky_isolation = isolate_sky;
         }
+        self.sky_beauty_only = isolate_sky;
         {
-            let shader = self.enhanced_shader.as_ref().unwrap_or(&self.shader);
-            let format = self.world_format();
-            let settings = self.enhanced_settings;
-            let compile = |spec: PipelineSpec| {
-                // Native sky never seeds auxiliary RGB. Render it with its faithful
-                // shader before the MRT world pass rather than changing its precision.
-                let (shader, settings) = if isolate_sky && spec.sky {
-                    (&self.shader, EnhancedSettings::default())
-                } else { (shader, settings) };
-                compile_pipeline(&self.device, shader, format,
-                    (&self.pipeline_layout, &self.holo_pipeline_layout), settings, self.msaa_samples, spec)
-            };
+            let compile = self.compile_world();
+            let compile = |spec: PipelineSpec| compile.pipeline(spec, isolate_sky && spec.sky);
             if let Some(ground) = &self.ground {
                 for (mesh, material) in ground.materials.iter().enumerate() {
                     if material.is_none() || self.vis_range[mesh].is_empty() { continue; }
                     let path = if ground.has_shadow[mesh] { self.ground_state.path() } else { GroundPath::Simple };
                     let base = match path { GroundPath::Fused => 0, GroundPath::ShadowsTwoPass => 1, GroundPath::Simple => 3 };
-                    self.ground_pipes.ensure(base, &compile);
-                    if path == GroundPath::ShadowsTwoPass { self.ground_pipes.ensure(2, &compile); }
+                    self.world.ground_pipes.ensure(base, &compile);
+                    if path == GroundPath::ShadowsTwoPass { self.world.ground_pipes.ensure(2, &compile); }
                 }
             }
             for d in self.gpu.opaque.iter().chain(&self.gpu.blended).chain(&self.gpu.liquid)
                 .chain(self.sky.draws.iter().map(|(draw, _)| draw)) {
                 if d.count == 0 { continue; }
-                if d.pipe >= 1000 { self.ground_pipes.ensure(d.pipe - 1000, &compile); }
-                else { self.pipes.ensure(d.pipe, &compile); }
+                if d.pipe >= 1000 { self.world.ground_pipes.ensure(d.pipe - 1000, &compile); }
+                else { self.world.pipes.ensure(d.pipe, &compile); }
             }
         }
-        if self.enhanced_settings.any_enabled() && self.enhanced_frame.as_ref().is_none_or(|frame| frame.size != t.size || frame.sample_count != self.msaa_samples) {
+        if self.enhanced_settings.any_enabled() && self.enhanced_frame.as_ref().is_none_or(|frame| frame.size != t.size || frame.sample_count != self.world.msaa) {
             self.bloom = None;
             self.grade = None;
-            self.enhanced_frame = Some(enhanced::EnhancedFrame::new(&self.device, self.format, t.size, self.msaa_samples, self.enhanced_settings));
+            self.enhanced_frame = Some(enhanced::EnhancedFrame::new(&self.device, self.format, t.size, self.world.msaa, self.enhanced_settings));
         }
         self.prepare_enhanced_grade(env.fog_color);
         self.prepare_enhanced_bloom();
@@ -2365,7 +2411,7 @@ impl Renderer {
             let (pipe, mesh, mat) = (std::cell::Cell::new(usize::MAX), std::cell::Cell::new((false, usize::MAX)), std::cell::Cell::new((false, usize::MAX)));
             let draw = |pass: &mut wgpu::RenderPass, d: &Draw, insts: std::ops::Range<u32>, sky: bool| {
                 if pipe.get() != d.pipe {
-                    pass.set_pipeline(if d.pipe >= 1000 { &self.ground_pipes[d.pipe - 1000] } else { &self.pipes[d.pipe] });
+                    pass.set_pipeline(if d.pipe >= 1000 { &self.world.ground_pipes[d.pipe - 1000] } else { &self.world.pipes[d.pipe] });
                     pipe.set(d.pipe);
                 }
                 if mesh.get() != (sky, d.mesh) {

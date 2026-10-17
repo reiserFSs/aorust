@@ -42,8 +42,10 @@ pub struct Host {
     /// downward-clamped to what the adapter supports by [`Renderer::set_msaa_samples`].
     pub msaa_samples: Option<u32>,
     /// Independent opt-in graphics effects and quality knobs; drained by both viewer frontends.
-    /// `None` leaves the renderer unchanged; all-off settings return to faithful rendering.
+    /// Immediate fixture/evidence setting; an unseen combination compiles on the calling thread.
     pub enhanced_settings: Option<crate::EnhancedSettings>,
+    /// Live option request: keep drawing the current variant until the worker finishes.
+    pub enhanced_switch: Option<crate::EnhancedSettings>,
     /// Interface scale (aomac Enhanced option, audit item 2): `None`/`Some(0)` = Auto (today's whole backing-scale
     /// rounding), `Some(1..=3)` = a fixed GUI-pixel scale, honoured regardless of window size ([`gui_scale`]).
     /// Drained every frame by the viewer; the very first frame (before the window exists) reads
@@ -151,6 +153,9 @@ fn present_mode(wait: bool) -> wgpu::PresentMode {
 }
 
 impl Host {
+    /// Latest requested settings, with live options taking precedence over immediate fixture settings.
+    pub fn enhanced(&self) -> Option<crate::EnhancedSettings> { self.enhanced_switch.or(self.enhanced_settings) }
+
     pub fn bind_native_fog(&mut self,state:super::SharedNativeFog) {
         if self.native_fog.as_ref().is_some_and(|old|std::rc::Rc::ptr_eq(old,&state)){return;}
         if let Some(mode)=self.native_fog_preference {let mut fog=state.get();fog.set_mode(mode);state.set(fog);}
@@ -192,7 +197,7 @@ impl Host {
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { enhanced_settings: None, grass_wind: [0.0; 3], grass_exposure: None, grass_benders: vec![], actor_visual_resets: vec![], actor_visual_retirements: vec![], pointer_warp: None, smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
+        Host { enhanced_settings: None, enhanced_switch: None, grass_wind: [0.0; 3], grass_exposure: None, grass_benders: vec![], actor_visual_resets: vec![], actor_visual_retirements: vec![], pointer_warp: None, smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -715,12 +720,7 @@ impl State {
         if let Some(level) = g.host.anisotropy.take() {
             self.renderer.set_anisotropy(level);
         }
-        if let Some(samples) = g.host.msaa_samples.take() {
-            self.renderer.set_msaa_samples(samples);
-        }
-        if let Some(settings) = g.host.enhanced_settings.take() {
-            self.renderer.set_enhanced_settings(settings);
-        }
+        self.renderer.set_world_options(g.host.msaa_samples.take(), g.host.enhanced_settings.take(), g.host.enhanced_switch.take());
         if let Some(scene) = g.host.scene.take() {
             self.renderer.upload(&scene);
             self.speed = (self.renderer.radius() * 0.15).max(5.0);
@@ -830,6 +830,7 @@ impl State {
         }
         self.raw_mouse.set_active(self.looking && self.focused && !self.fly());
         let (gui_out, quit) = self.run_gui(dt);
+        self.renderer.settle_enhanced_world();
         if !self.targets.matches_renderer(&self.renderer) {
             self.targets = Targets::new(&self.renderer, self.config.width, self.config.height);
         }
@@ -1241,6 +1242,10 @@ impl Offscreen {
     pub fn frame_cpu_timings(&self) -> Option<crate::FrameCpuTimings> { self.r.frame_cpu_timings() }
     pub fn read_frame_gpu_ms(&mut self) -> Result<Option<f64>> { self.r.read_frame_gpu_ms() }
     pub fn enhanced_target_bytes(&self) -> u64 { self.r.enhanced_target_bytes() }
+    pub fn enhanced_settings(&self) -> crate::EnhancedSettings { self.r.enhanced_settings() }
+    pub fn world_pipeline_compiles(&self) -> u64 { self.r.world_pipeline_compiles() }
+    pub fn world_frame_thread_compiles(&self) -> u64 { self.r.world_frame_thread_compiles() }
+    pub fn world_variant_cache_len(&self) -> usize { self.r.world_variant_cache_len() }
     pub fn emissive_seed_rgba(&self) -> Result<Option<Vec<u8>>> { self.r.emissive_seed_rgba() }
 
     /// Changes rendering resources while retaining the frozen actors and scene.
@@ -1324,12 +1329,7 @@ impl Offscreen {
         if let Some(samples) = self.perf.as_ref().and_then(|perf| perf.msaa) {
             self.host.msaa_samples = Some(samples);
         }
-        if let Some(samples) = self.host.msaa_samples.take() {
-            self.r.set_msaa_samples(samples);
-        }
-        if let Some(settings) = self.host.enhanced_settings.take() {
-            self.r.set_enhanced_settings(settings);
-        }
+        self.r.set_world_options(self.host.msaa_samples.take(), self.host.enhanced_settings.take(), self.host.enhanced_switch.take());
         if let Some(scene) = self.host.scene.take() {
             self.r.upload(&scene);
         }
@@ -1346,6 +1346,7 @@ impl Offscreen {
         self.r.set_spaceships_shown(self.host.spaceships_shown);
         self.r.set_realistic_water(self.host.realistic_water);
         if let Some((realistic,simple))=self.host.cloud_preferences.take() {self.r.set_cloud_preferences(realistic,simple,false);}
+        self.r.settle_enhanced_world();
         if !self.targets.matches_renderer(&self.r) {
             self.targets = Targets::new(&self.r, self.size.0, self.size.1);
         }

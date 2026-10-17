@@ -168,7 +168,7 @@ impl Renderer {
         self.device.poll(wgpu::PollType::wait_indefinitely())?;
         rx.recv()??;
         let bytes = readback.slice(..).get_mapped_range();
-        let mut report = format!("\nGPU sky pixel probe: layer={layer} policy={:?} anisotropy={} msaa={} time={}\nsource=last-render GPU buffers, material bind groups and globals; independent unblended draws; triangle=-1 means no raster coverage\nfields=x,y,draw,mesh,pipe,triangle,global_triangle,sheet,uv,sampled_alpha,uploaded_base_alpha,diffuse_alpha,source_alpha,depth,isotropic_lod\n", self.texture_policy, self.anisotropy, self.msaa_samples, self.time);
+        let mut report = format!("\nGPU sky pixel probe: layer={layer} policy={:?} anisotropy={} msaa={} time={}\nsource=last-render GPU buffers, material bind groups and globals; independent unblended draws; triangle=-1 means no raster coverage\nfields=x,y,draw,mesh,pipe,triangle,global_triangle,sheet,uv,sampled_alpha,uploaded_base_alpha,diffuse_alpha,source_alpha,depth,isotropic_lod\n", self.texture_policy, self.anisotropy, self.msaa_samples(), self.time);
         writeln!(report, "projection_only_far_override={projection_far:?} near={} geometry=unchanged,last-render-GPU-buffers viewport_xyw=unchanged", self.lens.near)?;
         for (ordinal, (d, _, submesh)) in draws.iter().enumerate() {
             let cloud = self.sky.clouds.iter().find(|run| run.layer.mesh == d.mesh && run.grid > 1);
