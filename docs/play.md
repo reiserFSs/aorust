@@ -569,9 +569,10 @@ workspace/all-target fast clippy, before publication.
 
 ### Runtime shader overrides
 
-All file-backed WGSL/Metal sources use the override, including the world/Enhanced,
-grade, grass (including `grass_shadow.wgsl`), shadow, contact shadow, AO and bloom
-(including `bloom_glare.wgsl`) paths. Shader equations and feature switches are unchanged.
+All file-backed WGSL/Metal sources use the override, including the world/Enhanced
+(receiver helpers and AO sun-share cap in `enhanced_output.wgsl`), grade, grass
+(including `grass_shadow.wgsl`), shadow, contact shadow, AO and bloom
+(including `bloom_glare.wgsl`) paths.
 
 For shader-only iteration, build the fixture test once, then set
 `AOMAC_SHADER_DIR` to the **absolute** `crates/ao-render/src` directory in your
@@ -607,7 +608,9 @@ cargo test --profile fast -p aomac graphics_offline_fixture -j 2 -- \
 ```
 `AOMAC_GFX_SETTINGS` accepts `faithful` (default, all switches off), `neutral`
 (Enhanced boundary with zero-density grass), `shadows`, `ao`, `bloom`, `grass`,
-or `all`. Each effect profile uses its explicit default knobs; the manifest records
+or `all`. `all-no-bloom` differs from `all` only by disabling bloom, for highlight
+washout comparisons without changing shade, AO, grass or exposure. Each effect
+profile uses its explicit default knobs; the manifest records
 the full settings value. Selecting a profile does not change the captured world,
 camera, clock, actor equipment or lights.
 
@@ -615,16 +618,27 @@ camera, clock, actor equipment or lights.
 existing filter renders only that view (including its two independent repeats).
 Within one process, views share immutable scene/collision snapshots keyed by exact
 playfield and time bits, with the fixture's fixed clear weather/day. The current
-14-view matrix loads six snapshots instead of fourteen; renderers, uploads and
+17-view matrix loads nine snapshots instead of seventeen; renderers, uploads and
 independent-repeat checks remain separate. `scene_load_count` and `scene_load_ms`
 in the manifest report loader work (collision loading is not included in the time).
 The destination must not exist. The fixed matrix covers ICC 4582 landmark and
 platform views at its authored frozen time 2648.69; Borealis 800 street and foliage
-with high/low sun and at night; a captured ICC actor at idle time zero; and a
-Condemned Subway 127 corridor (indoor lighting needs no day/night duplicate).
-ICC's authored frozen GAME clock is never overridden. The actor uses
+with high/low sun and at night; a captured ICC actor at idle time zero; Newland 566
+at midday/dusk/night; and a Condemned Subway 127 corridor (indoor lighting needs no
+day/night duplicate). ICC's GAME interface freezes its sky at 2648.69 even when
+the native clock changes: earlier `icc-*-day/dusk/night` captures are **frozen-day**
+evidence, not night proof, and those six redundant variants are no longer captured.
+Actual daylight/night fairness is checked with Borealis and Newland's live native clocks.
+Newland's street eye `[414, h + 2.5, -320]` and target `[440, h + 1, -335]`
+resolve their heights independently through native `Collision::terrain_height`.
+For the installed snapshot this is eye `[414, 27.5, -320]`, target `[440, 26, -335]`.
+The earlier fixed-y treetop view and the grounded x=410 view obscured by a nearby
+tree are iteration evidence only, not camera-matched final comparisons.
+ICC's original `*-authored` views retain their authored frozen GAME clock. The actor uses
 `zone_ithaca.rec` own-character 25988 appearance/position and the existing Avatar
 builder synchronously, without replay worker timing or a synthetic character.
+The manifest records the native authored `GAME.CurrentDayIntensity` as `daylight`;
+Enhanced exposure uses this value directly, never a brightness-based day/night guess.
 Two Borealis night views equip that recorded Testy actor with native Light Bar
 mesh 26163 on attractor 5, place it at the fixed street position, and include the
 mount's real posed lights: `borealis-lightbar-night` and
@@ -640,6 +654,22 @@ The same captured bytes are written as top-down tightly packed `.rgba` and `.png
 alongside `manifest.txt` and `status.txt`. Set `AOMAC_GFX_PNG_ONLY=1` to retain
 only PNG images (including repeat-failure images); byte-exact independent-repeat
 checks still run in memory, and baseline comparison then decodes the baseline PNG.
+For sky precision investigations, `AOMAC_SKY_PIXELS='743,208;779,212'` also
+writes `<view>-sky-first.txt` and `<view>-sky-repeat.txt` from each renderer's
+last uploaded SingleCloud layer17 draws. These opt-in reports include unblended
+source RGBA float bits, sampled alpha, interpolation and runtime cloud vertices;
+they do not alter the strict repeat comparison or retry a capture.
+The ignored renderer test `native_cloud_precision_four_sample_gpu_timing` measures
+faithful ICC platform rendering at **actual 4× MSAA**, rejecting sample-count
+clamping. Run alone with exclusive GPU access and
+`AOMAC_GFX_SKY_TIMING_OUT="$HOME/aomac-handoff/gfx/v3/LookV3/sky-4x-<new-run>"`.
+Its explicit test-only variants compare the old four grouped submissions,
+thirty native submissions in the original pass, and thirty native submissions
+in a beauty-only sky pass before world work. Shader math and scene inputs remain
+identical; only sky output declarations/pass layout differ. It retains all three first-frame
+PNGs, raw CPU/GPU samples, p50/p95/p99 and the GPU median delta against the 0.1 ms
+budget. Each variant receives 120 warmup and 600 measured frames in ABC/CBA order;
+these are timings, not retries or a substitute for independent-repeat acceptance.
 A failed/interrupted run is never a pass. For close-up bloom evidence without raw
 RGBA files, select the view explicitly:
 
@@ -792,7 +822,9 @@ statel floors may overlay a grass cell. An opt-in callback reuses the loaded nat
 `Collision` ground query from terrain height + 0.5 m (the blade-height cap).
 A higher floor at any of five cell samples rejects the whole cell, including
 fully floor-covered cells. Overhead arches and shelters above the blade envelope
-do not exclude green terrain. No collision capability means no grass.
+do not exclude green terrain. This is independent of sky-fill proof: only
+collision-baked terrain vertex alpha can authorize sky fill, and roofs remain
+closed. No collision capability means no grass.
 Exposure is computed only on generation, at most four new cells per frame,
 and retained in a 32768-entry FIFO cache tied to the immutable loaded collision
 source. Door flags affect actor LOS immediately but do not flush static exposure.
@@ -807,8 +839,10 @@ the texel's own, straw in dry patches, each blade a shade off) at the texel's
 luminance, the root growing out of the texel itself and a root-to-tip gradient and
 canopy darkening that average one over the blade, so a field is as bright as the
 ground it stands on. Where the sun lights the ground the blades may rise to a
-meadow luminance of 0.42 if the texel is duller (the daylight policy); shadow, night
-and fog leave them at the texel's brightness and never above it.
+meadow luminance of 0.42 if the texel is duller (the daylight policy). This lift
+requires native `GAME.CurrentDayIntensity` and raw sun visibility before the
+artistic retained-shadow floor; night and roof umbra cannot qualify. Native fog
+still attenuates the resulting surface radiance.
 Far roots also converge on the tile's 8×8 mip, matching native coarse composites
 rather than magnifying one full-resolution dark texel with a derivative-free UV.
 Normals use the native central height differences, cached at tile generation. The

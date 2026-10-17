@@ -404,6 +404,14 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         let baseline = std::env::var_os("AOMAC_GFX_BASELINE").map(PathBuf::from);
         let png_only = std::env::var_os("AOMAC_GFX_PNG_ONLY").is_some();
         writeln!(manifest, "png_only={png_only}")?;
+        let sky_pixels = std::env::var("AOMAC_SKY_PIXELS").ok().map(|value| {
+            value.split(';').map(|pixel| {
+                let (x, y) = pixel.split_once(',').context("AOMAC_SKY_PIXELS must be x,y;x,y")?;
+                let pixel = (x.parse::<u32>()?, y.parse::<u32>()?);
+                ensure!(pixel.0 < size.0 && pixel.1 < size.1, "AOMAC_SKY_PIXELS must be inside the capture");
+                Ok(pixel)
+            }).collect::<anyhow::Result<Vec<_>>>()
+        }).transpose()?.unwrap_or_default();
         let actor = graphics_fixture_actor()?;
         let mut views = graphics_fixture_views(&actor);
         let selected = std::env::var("AOMAC_GFX_VIEW").ok();
@@ -420,22 +428,26 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         let mut scene_load_count = 0;
         let mut scene_load_time = std::time::Duration::ZERO;
         for (name, pf, time, fixed) in views {
-            let (scene, grass_exposure) = match snapshots.entry((pf, time.to_bits())) {
+            let (scene, grass_exposure, grounded_camera) = match snapshots.entry((pf, time.to_bits())) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     // Every unique snapshot starts with the original loader's CRT seed.
                     ao_scene::crt_srand(1);
                     let started = std::time::Instant::now();
-                    let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
+                    let (mut scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
+                    let collision = ao_formats::playfield::collision::Collision::load(&store, pf)?;
+                    super::player::bake_sky_open(&collision, &mut scene);
+                    let grounded_camera = (pf == 566).then(||
+                        graphics_fixture_newland_camera(|point| collision.terrain_height(point))).transpose()?;
                     scene_load_time += started.elapsed();
                     scene_load_count += 1;
                     let grass_exposure = if settings.ground_grass && settings.grass_density > 0.0 {
-                        Some(super::player::grass_exposure_surface(std::rc::Rc::new(std::cell::RefCell::new(
-                            ao_formats::playfield::collision::Collision::load(&store, pf)?))))
+                        Some(super::player::grass_exposure_surface(std::rc::Rc::new(std::cell::RefCell::new(collision))))
                     } else { None };
-                    entry.insert((scene, grass_exposure))
+                    entry.insert((scene, grass_exposure, grounded_camera))
                 }
             };
+            let fixed = grounded_camera.unwrap_or(fixed);
             let capture = |measure: bool| -> anyhow::Result<(Vec<u8>, Lens, usize, usize)> {
                 // Fresh renderers and the original per-capture CRT reset remain independent.
                 // Both consume clones of the same immutable snapshot, including across views.
@@ -454,7 +466,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 off.host.grass_wind = weather.wind;
                 let mut list = off.frame(&mut shot, 0.0);
                 let lightbar = matches!(name.as_str(), "borealis-lightbar-night" | "borealis-lightbar-night-close");
-                if name == "icc-actor-authored" || lightbar {
+                if name.starts_with("icc-actor-") || lightbar {
                     let mut appearance = actor.clone();
                     if lightbar {
                         appearance.attractors.retain(|mount| mount.place != 5);
@@ -475,6 +487,10 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 }
                 if grass_exposure.is_some() { off.warm_grass_tiles(); }
                 let raw = off.rgba(&shot, &list)?;
+                if !sky_pixels.is_empty() {
+                    let report = off.sky_pixel_probe(17, &sky_pixels, scene, None)?;
+                    std::fs::write(out.join(format!("{name}-sky-{}.txt", if measure { "first" } else { "repeat" })), report)?;
+                }
                 if measure && profile == "bloom" && lightbar {
                     let mask = off.emissive_seed_rgba()?.context("Bloom emission mask")?;
                     image::save_buffer(out.join(format!("{name}-emissive-mask.png")),
@@ -504,6 +520,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 }
             }
             writeln!(manifest, "view={name} pf={pf} time={time} camera={fixed:?} lens={lens:?} meshes={meshes} instances={instances} raw_bytes={} repeat_differing_bytes={repeat_differences}", raw.len())?;
+            writeln!(manifest, "{name} environment={:?} ground_light={:?} sun_authored={} daylight={:?}", scene.environment, scene.ground_light, scene.sun_authored, scene.daylight)?;
             std::fs::write(out.join("manifest.txt"), &manifest)?;
             ensure!(repeat_differences == 0, "{name}: independent captures differ in {repeat_differences} bytes");
             if let Some(base) = &baseline {
@@ -516,11 +533,8 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 let count = differing(&previous);
                 let maximum = raw.iter().zip(&previous).map(|(a,b)| a.abs_diff(*b)).max().unwrap_or(0);
                 writeln!(manifest, "{name} baseline_differing_bytes={count} baseline_max_byte_error={maximum}")?;
-                if profile == "neutral" && name == "icc-platform-authored" {
-                    writeln!(manifest, "{name} approved_envelope_max_byte_error=1 approved_envelope_differing_bytes=134")?;
-                }
                 std::fs::write(out.join("manifest.txt"), &manifest)?;
-                ensure!(graphics_fixture_baseline_matches(&profile, &name, count, maximum),
+                ensure!(count == 0 && maximum == 0,
                     "{name}: baseline differs in {count} bytes, maximum byte error {maximum}");
             }
             eprintln!("{name}: {} bytes, independent repeat identical", raw.len());
@@ -537,22 +551,6 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         Err(error) => std::fs::write(status, format!("status=failed\nerror={error:#}\nvisual_acceptance=unexercised\n"))?,
     }
     result
-}
-
-fn graphics_fixture_baseline_matches(profile: &str, view: &str, count: usize, maximum: u8) -> bool {
-    // User-approved known envelope, never a general tolerance or an all-off exception.
-    (count == 0 && maximum == 0)
-        || (profile == "neutral" && view == "icc-platform-authored" && count <= 134 && maximum <= 1)
-}
-
-#[test]
-fn graphics_fixture_baseline_envelope_is_view_specific() {
-    assert!(graphics_fixture_baseline_matches("neutral", "icc-platform-authored", 134, 1));
-    assert!(!graphics_fixture_baseline_matches("neutral", "icc-platform-authored", 135, 1));
-    assert!(!graphics_fixture_baseline_matches("neutral", "icc-platform-authored", 134, 2));
-    assert!(!graphics_fixture_baseline_matches("faithful", "icc-platform-authored", 1, 1));
-    assert!(!graphics_fixture_baseline_matches("neutral", "icc-landmark-authored", 1, 1));
-    assert!(graphics_fixture_baseline_matches("faithful", "icc-platform-authored", 0, 0));
 }
 
 fn graphics_fixture_actor() -> anyhow::Result<ao_net::n3::dynel::SimpleCharFullUpdate> {
@@ -596,11 +594,40 @@ fn graphics_fixture_views(actor: &ao_net::n3::dynel::SimpleCharFullUpdate) -> Ve
     let actor_at = Vec3::new(actor.pos[0], actor.pos[1] + 1.2, -actor.pos[2]);
     views.push(("icc-actor-authored".into(), 4582, 2648.69,
         Camera::look_at(actor_at + Vec3::new(0.0, 1.0, 5.0), actor_at)));
+    // Newland camera heights here are terrain-relative offsets; resolve them
+    // against the snapshot's collision before capture and manifest output.
+    for (light, time) in [("day", 3240.0), ("dusk", 4860.0), ("night", 0.0)] {
+        views.push((format!("newland-{light}"), 566, time,
+            Camera::look_at([414.0, 2.5, -320.0].into(), [440.0, 1.0, -335.0].into())));
+    }
     views.push(("borealis-lightbar-night".into(), 800, 0.0,
         Camera::look_at([679.6, 74.5, -476.7].into(), [679.6, 74.0, -482.7].into())));
     views.push(("borealis-lightbar-night-close".into(), 800, 0.0,
         Camera::look_at([679.6, 74.0, -480.2].into(), [679.6, 74.0, -482.7].into())));
     views
+}
+
+fn graphics_fixture_newland_camera(terrain_height: impl Fn([f32; 3]) -> Option<f32>) -> anyhow::Result<Camera> {
+    use anyhow::Context;
+    let mut eye = [414.0, 2.5, -320.0];
+    let mut at = [440.0, 1.0, -335.0];
+    eye[1] += terrain_height(eye).context("Newland street camera eye has no terrain height")?;
+    at[1] += terrain_height(at).context("Newland street camera target has no terrain height")?;
+    Ok(Camera::look_at(eye.into(), at.into()))
+}
+
+#[test]
+fn graphics_fixture_newland_camera_uses_both_ground_heights() {
+    let camera = graphics_fixture_newland_camera(|point| match (point[0], point[2]) {
+        (414.0, -320.0) => Some(7.0),
+        (440.0, -335.0) => Some(9.0),
+        _ => None,
+    }).unwrap();
+    let expected = Camera::look_at([414.0, 9.5, -320.0].into(), [440.0, 10.0, -335.0].into());
+    assert_eq!(camera.pos, expected.pos);
+    assert_eq!((camera.yaw, camera.pitch, camera.roll), (expected.yaw, expected.pitch, expected.roll));
+    assert!(graphics_fixture_newland_camera(|_| None).is_err());
+    assert!(graphics_fixture_newland_camera(|point| (point[0] == 414.0).then_some(7.0)).is_err());
 }
 
 #[test]
@@ -610,12 +637,15 @@ fn graphics_fixture_snapshot_keys_share_only_matching_playfield_and_time() -> an
     for (_, pf, time, _) in &views {
         *keys.entry((*pf, time.to_bits())).or_default() += 1;
     }
-    assert_eq!(views.len(), 14);
-    assert_eq!(keys.len(), 6);
+    assert_eq!(views.len(), 17);
+    assert_eq!(keys.len(), 9);
     assert_eq!(keys[&(4582, 2648.69_f32.to_bits())], 3);
     assert_eq!(keys[&(800, 0.0_f32.to_bits())], 4);
     assert_eq!(keys[&(800, 3240.0_f32.to_bits())], 2);
     assert_eq!(keys[&(127, 3240.0_f32.to_bits())], 1);
+    for time in [3240.0_f32, 4860.0, 0.0] {
+        assert_eq!(keys[&(566, time.to_bits())], 1);
+    }
     Ok(())
 }
 
@@ -642,15 +672,23 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
         // Isolates the contact pass: shadows + hdr + contact vs `shadows-hdr`.
         "shadows-hdr" => { settings.sun_shadows = true; settings.hdr = true; }
         "shadows-hdr-contact" => { settings.sun_shadows = true; settings.hdr = true; settings.contact_shadows = true; }
-        "all" => {
+        "all" | "all-no-bloom" => {
             settings.sun_shadows = true;
             settings.ambient_occlusion = true;
-            settings.emissive_bloom = true;
+            settings.emissive_bloom = profile == "all";
             settings.ground_grass = true;
             settings.hdr = true;
             settings.contact_shadows = true;
         }
-        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|all"),
+        // 9f78245 all-on defaults, independent of subsequent tuning.
+        "all-before" => settings = ao_render::EnhancedSettings {
+            sun_shadows: true, ambient_occlusion: true, emissive_bloom: true, ground_grass: true,
+            hdr: true, contact_shadows: true,
+            shadow_map_size: 2048, shadow_strength: 0.65, shadow_softness: 1.5,
+            ao_radius: 1.75, ao_strength: 1.5, bloom_strength: 0.6,
+            grass_density: 1.0, grass_distance: 50.0, sun_boost: 0.5, grade_strength: 0.8, contact_strength: 0.4,
+        },
+        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|all|all-no-bloom|all-before"),
     }
     Ok(settings)
 }
@@ -664,11 +702,11 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
         ("neutral", [false, false, false, true]), ("shadows", [true, false, false, false]),
         ("shadows-hard", [true, false, false, false]),
         ("ao", [false, true, false, false]), ("bloom", [false, false, true, false]),
-        ("grass", [false, false, false, true]), ("all", [true; 4]),
+        ("grass", [false, false, false, true]), ("all", [true; 4]), ("all-before", [true; 4]),
     ] {
         let s = graphics_fixture_settings(name).unwrap();
         assert_eq!([s.sun_shadows, s.ambient_occlusion, s.emissive_bloom, s.ground_grass], expected);
-        assert_eq!((s.hdr, s.contact_shadows), (name == "all", name == "all"));
+        assert_eq!((s.hdr, s.contact_shadows), (matches!(name, "all" | "all-before"), matches!(name, "all" | "all-before")));
     }
     assert!(graphics_fixture_settings("contact").unwrap().contact_shadows);
     let isolated = graphics_fixture_settings("shadows-hdr-contact").unwrap();
@@ -680,9 +718,26 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
     let neutral_hdr = graphics_fixture_settings("hdr-neutral").unwrap();
     assert!(neutral_hdr.hdr && neutral_hdr.sun_boost == 0.0);
     assert!(graphics_fixture_settings("unknown").is_err());
+    assert_eq!(graphics_fixture_settings("all-no-bloom").unwrap(),
+        ao_render::EnhancedSettings { emissive_bloom: false, ..graphics_fixture_settings("all").unwrap() });
+    let before = graphics_fixture_settings("all-before").unwrap();
+    assert_eq!((before.shadow_map_size, before.shadow_strength, before.shadow_softness), (2048, 0.65, 1.5));
+    assert_eq!((before.ao_radius, before.ao_strength, before.bloom_strength), (1.75, 1.5, 0.6));
+    assert_eq!((before.grass_density, before.grass_distance), (1.0, 50.0));
+    assert_eq!((before.sun_boost, before.grade_strength, before.contact_strength), (0.5, 0.8, 0.4));
     let actor = graphics_fixture_actor().unwrap();
     assert_eq!(actor.name, "Testy");
     let views = graphics_fixture_views(&actor);
+    assert_eq!(views.iter().map(|view| &view.0).collect::<std::collections::HashSet<_>>().len(), 17);
+    for (light, expected_time) in [("day", 3240.0), ("dusk", 4860.0), ("night", 0.0)] {
+        let newland = views.iter().find(|view| view.0 == format!("newland-{light}")).unwrap();
+        assert_eq!((newland.1, newland.2), (566, expected_time));
+        let city = Camera::look_at([414.0, 2.5, -320.0].into(), [440.0, 1.0, -335.0].into());
+        assert_eq!(newland.3.pos, city.pos);
+        assert_eq!((newland.3.yaw, newland.3.pitch, newland.3.roll), (city.yaw, city.pitch, city.roll));
+    }
+    assert_eq!(views.iter().filter(|view| view.0.starts_with("icc-actor-")).count(), 1);
+    assert!(views.iter().filter(|view| view.1 == 4582).all(|view| view.0.ends_with("-authored") && view.2 == 2648.69));
     for name in ["borealis-street", "borealis-foliage"] {
         for (light, expected_time) in [("sun-low", 4600.0), ("sunset", 4860.0)] {
             let view_name = format!("{name}-{light}");
@@ -754,10 +809,11 @@ fn graphics_enhanced_cpu_timing() -> anyhow::Result<()> {
         let weather = ao_formats::weather::State::clear();
         ao_scene::crt_srand(1);
         // One immutable scene, shared by every ABBA phase, exactly as in graphics_offline_fixture.
-        let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(
+        let (mut scene, _) = ao_formats::playfield::load_playfield_report_with_weather(
             &store, &dir, pf, time, 0, Some(weather))?;
-        let exposure = super::player::grass_exposure_surface(std::rc::Rc::new(std::cell::RefCell::new(
-            ao_formats::playfield::collision::Collision::load(&store, pf)?)));
+        let collision = ao_formats::playfield::collision::Collision::load(&store, pf)?;
+        super::player::bake_sky_open(&collision, &mut scene);
+        let exposure = super::player::grass_exposure_surface(std::rc::Rc::new(std::cell::RefCell::new(collision)));
         let mut lens = camera::lens(scene.lens.unwrap_or_default(), false);
         lens.far = Some(camera::far_plane(camera::VIEW_DISTANCE));
         let mut manifest = format!("fixture=graphics_offline_fixture\nbenchmark=graphics_enhanced_cpu_timing\nview={name}\npf={pf}\ngame_time={time}\ncamera={fixed:?}\nlens={lens:?}\nsize=1920x1200\nrenderer_time=0\ndt=0\ncrt_seed=1\nweather={weather:?}\nmsaa=1\nanisotropy=1\nwarmup=120\nsamples_per_phase=600\norder=all,faithful,faithful,all\npercentile=nearest_rank_ceil_np\nunits=milliseconds\ncpu=wall_not_thread_cpu\npixel_readback=false\npng=false\ngpu_readback=after_cpu_sample_serialized_each_frame\n");

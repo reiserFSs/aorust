@@ -9,9 +9,9 @@ struct Params { strength: f32, hdr: f32, _pad0: f32, _pad1: f32 }
 @group(0) @binding(2) var seed: texture_2d<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
 const THRESHOLD: f32 = 1.0;
-const KNEE: f32 = 0.05;
-// Highlight seeds are tiny (surfaces cross white by only the sun boost), so they are scaled up.
-const HIGHLIGHT_GAIN: f32 = 2.0;
+// One-sided knee: nothing at/below white, with a short smooth onset for exposed highlights.
+const KNEE: f32 = 0.03125;
+const HIGHLIGHT_GAIN: f32 = 3.0;
 // Share of a level's output taken from the coarser, wider level.
 const UP_MIX: f32 = 0.6;
 @vertex fn fullscreen(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
@@ -27,11 +27,14 @@ fn seed_at(q: vec2<i32>) -> vec4<f32> {
     var rgb = min(emission, min(colour, vec3<f32>(1.0)));
     var a = 0.0;
     if params.hdr > 0.5 {
-        let l = min(dot(colour, LUMA), 64.0);
-        let e = l - THRESHOLD;
+        // Peak-channel extraction keeps coloured sky edges/speculars whose luma is still below white.
+        // Native-range night/interior/fog colour cannot cross this threshold; only expose adds HDR light.
+        let peak = min(max(colour.r, max(colour.g, colour.b)), 64.0);
+        let e = peak - THRESHOLD;
         let excess = HIGHLIGHT_GAIN * select(select(e - 0.5 * KNEE, e * e / (2.0 * KNEE), e < KNEE), 0.0, e <= 0.0);
-        rgb += colour * (excess / max(l, 1e-5));
-        a = excess;
+        let highlight = colour * (excess / max(peak, 1e-5));
+        rgb += highlight;
+        a = dot(highlight, LUMA);
     }
     return vec4<f32>(rgb, a);
 }

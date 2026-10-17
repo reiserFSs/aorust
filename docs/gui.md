@@ -1385,27 +1385,56 @@ file lacks them. `DValues::enhanced_settings` maps them and the quality controls
 `ao_render::EnhancedSettings`; `flow.rs::frame` sends the value through `Host.enhanced_settings`.
 Both windowed and offscreen viewers drain that request into `Renderer::set_enhanced_settings`.
 MSAA is independently selectable. HDR is a scene-path switch, not a master switch: with it on the world pass writes
-a fourth attachment (daylight sun weight = luma of the surface's direct-sun share x shadow visibility x (1 - native fog)),
-`grade.wgsl::expose` lifts only pixels whose weight rises through `smoothstep(0.3, 0.7)` by up to `AomacSunBoost` into an
-RGBA16F target, and `present` tonemaps (identity below a knee, cubic to exactly 1.0 at the pixel's own boosted white) and
-dithers the 8-bit write (fixed-pattern noise, +-0.35 level). Night, dusk, shadow, fog, sky, unlit and glow pixels get weight 0
-and keep their native codes (fixture `hdr-neutral`/`boost 0` matches faithful to within 1 code); grass blades are not
-sun-boosted.
+a fourth attachment: red is the surface's direct-sun share x raw shadow visibility x (1 - native fog);
+the artistic shadow-strength floor affects beauty only and cannot count as surviving direct sunlight.
+green is collision-tested terrain sky visibility x (1 - fog); blue is native receiver fog amount. `grade.wgsl::expose` uses a
+`smoothstep(0.12, 0.5)` direct-share ramp, gated separately by native `GAME.CurrentDayIntensity`
+(`Tweak_GAME.txt`'s `DayIntensity` track, retained as `Scene.daylight`; missing authoring stays closed),
+with up to `0.6 * AomacSunBoost` lift into RGBA16F (36% at defaults). This gamma-space
+direct-light factor retains stone detail; it leaves the restored sky-open shade fill unchanged.
+Sky-open terrain can receive the same bounded daylight fill even under a cliff.
+At zone load, terrain's otherwise-unused vertex alpha
+encodes static exposure: all cell corners and centre must have no raised floor or overhead
+collision; coarse vertices require every adjacent cell open. Unbaked/roofed terrain is closed.
+Meshes, actors, interiors and night receive no sky-fill lift. Both direct daylight and sky fill are added only to
+surface colour after subtracting native fog radiance, preserving fog extinction and fully fogged colours.
+Material-local custom fog cannot use the frame's fog colour and therefore receives no added daylight. Terrain's native
+ZERO/SRCCOLOR multiplier attenuates only the mask's direct-sun red by raw sun visibility;
+sky openness, fog amount and alpha use identity factors, preserving the independently baked base-pass mask.
+`present` tonemaps (identity below a knee, cubic to the pixel's boosted white) and dithers
+the 8-bit write (fixed-pattern noise, +-0.35 level). Zero exposure boost and zero grade
+retain native codes. Grass carries the same baked fine-cell terrain sky proof in spare normal.w,
+so near blades and the far substrate receive matching fill. Floor-only grass occupancy is not
+sky proof: roofed or unbaked cells stay closed, and the same authored-night and fog gates apply.
+Grass's meadow-albedo lift also requires raw visible sun and the same native daylight
+weight carried in previously-unused `Globals.ambient_g.w`; retained shade illumination is not direct light.
 Contact Shadows (port of ao-vk `contact.frag`) march 12 jittered steps (0.6 m, fixed-pattern interleaved gradient noise) from each
 surface point towards the sun through the current frame's resolved primary-view depth at half resolution, with a normal-facing
 gate, a thickness gate and a distance fade, then depth-aware blur/upsample and darken the native colour (after AO, before
-bloom/expose) by `1 - contact x AomacContactStrength x daylight ramp(sun weight)`, the same `smoothstep(0.3, 0.7)` ramp as the HDR
-lift. It reads the same sun mask as HDR (the fourth world-pass attachment exists when either switch is on) but works with or
-without HDR. Night (moonlight weight is about 0.26), dusk, shadowed, fogged, sky, unlit and glow pixels fall below the ramp and
-are untouched, and no actor list or history is read, so hidden actors cannot change a pixel.
+bloom/expose) by `1 - contact x AomacContactStrength x direct-light weight`.
+It reads only the red channel of the same sun mask as HDR (the fourth world-pass attachment exists when either switch
+is on) but works with or without HDR. Weak moonlight and dusk are no longer discarded by a daylight threshold:
+they can receive proportional darkening. Sky, unlit and glow pixels remain excluded; fog attenuates the mask.
+No actor list or history is read, so hidden actors cannot change a pixel.
+The AO receiver uses a 1.25 sky-fill occlusion multiplier (formerly 2, which muddied broad shade)
+and a bounded 60% direct-diffuse occlusion budget (formerly 25%) so sunlit creases remain visible.
+Specular, emission, sky and fog remain excluded.
+World and grass receivers share the runtime-loaded `enhanced_output.wgsl` AO budget.
+Ambient-attachment alpha follows the resolved depth owner: depth-writing pipelines replace
+it, while non-depth-writing blends preserve it; RGB blending is unchanged.
 
 Bloom (`emissive_bloom`) is a 7-level pyramid (`bloom.wgsl`, structure from ao-vk `bloom_down/up.frag`, see THIRD_PARTY):
 a 13-tap Karis-weighted first downsample, `[1,3,3,1]` downsamples and a 3x3-tent upsample that mixes each level's own
 light with the wider level (60 % wider, energy-preserving, so halos are round and wide rather than nearest-neighbour
 blocks). Seeds are the world pass's depth-tested authored emission mask (clipped to the visible colour) and, only with
-HDR on, `2 x max(luma - 1.0, 0)` (0.05 soft knee) of the exposed scene: only pixels the expose pass pushed above native
-white (sunlit daylight surfaces) glow; night, shadow and fog have no highlight seeds, and no history is used. The halo is
-added with `strength x 4`. Without HDR it is the UNORM-range composite capped at 64 display codes luma. With HDR the
+HDR on, above-white peak-RGB highlights with gain 3 and a one-sided 1/32 knee. Hue is preserved and the pyramid
+alpha tracks actual highlight luminance. Only exposed colours above native white seed highlight glow; native-range
+night and interior colours cannot seed it. No history is used.
+The halo is an optical exception: source-gated, uniform lens veiling rather than
+surface radiance or a change to native fog extinction. Only depth-visible, already
+fog-attenuated sources seed it. Receivers are never classified or masked, which
+would silhouette hidden or fully fogged actors; night adds no new highlight seeds.
+The halo is added with `strength x 4`. Without HDR it is the UNORM-range composite capped at 64 display codes luma. With HDR the
 frame order is world -> AO -> (contact insertion point) -> `expose` -> bloom pyramid -> `present`, where `present` adds the
 halo in float, still capping the *authored* share of the halo at 64 codes (a night lamp keeps a modest halo; the share
 is tracked in the pyramid's alpha as the highlight luma) while the highlight share is uncapped (bounded by its seed). Tonemap
@@ -1415,16 +1444,16 @@ bloomed pixels roll into the shoulder instead of clipping at their own old white
 | Quality control / DV Main key | Default | Bounds |
 |---|---|---|
 | Shadow Map Size / `AomacShadowMapSize` | 2048 | 256–4096 (UI choices 256/512/1024/2048/4096) |
-| Sun Shadow Strength / `AomacShadowStrength` | 0.65 | 0–1 (share of the sun removed in full shadow) |
+| Sun Shadow Strength / `AomacShadowStrength` | 0.45 | 0–1 (share of the sun removed in full shadow; 55% remains as shade illumination) |
 | Sun Shadow Softness / `AomacShadowSoftness` | 1.5 | 0–4 (penumbra growth with blocker distance; 0 = hard 3x3 PCF) |
-| Ambient Occlusion Radius / `AomacAoRadius` | 1 m | 0–5 m |
-| Ambient Occlusion Strength / `AomacAoStrength` | 1 | 0–1 |
-| Sunlight Brightness / `AomacSunBoost` | 0.5 | 0–0.6 (peak lift of fully sunlit daylight surfaces; 0 = faithful) |
-| Colour Grade / `AomacGrade` | 0.8 | 0–1 (HDR present only: saturation, warm sunlit / cool shade / cool night darks; every step renormalised to the input luminance and never above it, so it cannot lift night, shadow or fog luminance; 0 = off) |
-| Contact Shadow Strength / `AomacContactStrength` | 0.4 | 0–1 (share of the direct sun a fully contact-shadowed daylight pixel loses) |
+| Ambient Occlusion Radius / `AomacAoRadius` | 1.75 m | 0–5 m |
+| Ambient Occlusion Strength / `AomacAoStrength` | 1.5 | 0–2 |
+| Sunlight Brightness / `AomacSunBoost` | 0.6 | 0–0.6 (daylight exposure control; peak lift is 60% of this gamma-space control, 36% at defaults; 0 = faithful) |
+| Colour Grade / `AomacGrade` | 0.8 | 0–1 (HDR present only; luminance-preserving warm daylight / cool night chroma, with gamut compression toward equal-luminance grey rather than lossy clipping; 0 = off) |
+| Contact Shadow Strength / `AomacContactStrength` | 0.8 | 0–1 (share of directional light removed at full contact) |
 | Emissive Bloom Strength / `AomacBloomStrength` | 0.6 | 0–1 |
 | Ground Grass Density / `AomacGrassDensity` | 1 | 0–2 |
-| Ground Grass Distance / `AomacGrassDistance` | 50 m | 0–60 m |
+| Ground Grass Distance / `AomacGrassDistance` | 160 m | 0–180 m |
 
 These are aomac-only artistic controls, not reconstructed retail settings. Values are bounded
 at the renderer settings boundary; non-finite floats use the documented defaults.
@@ -1468,15 +1497,14 @@ not the whole image. Bloom seeds are authored emission only (never inferred from
 All four flags off select the original shader/attachments and world pass with no optional
 textures, composite, depth resolve or timer buffers; switching off releases the Enhanced frame.
 The offline neutral profile is explicitly `ground_grass=true, grass_density=0`, not all-off.
-Neutral execution preserves native blend semantics. The approved eleven-view comparison has
-ten byte-exact views and one explicitly bounded exception: `icc-platform-authored`, 134 bytes
-in 129 pixels, maximum one 8-bit level, mean absolute byte error 0.00001453993.
-The fixture asserts only this named neutral view may differ by at most one level in at most
-134 bytes; faithful and every other view still require exact equality. Independent repeats
-are exact. The cause remains unresolved: sampled colour/stored depth differ from faithful
-attachment usage; attributing the difference to those properties is an inference.
-Grass has its own shader, so grass-only execution reuses the original world shader and cached
-one-colour pipelines; this removes unnecessary variant work but did not change the known envelope.
+Neutral execution preserves native blend semantics. The older eleven-view evidence
+had a 134-byte, one-level exception in `icc-platform-authored`; that is historical
+evidence only, not a current tolerance. V3's separate native beauty-only sky pass
+produces byte-exact faithful/neutral images in all seventeen frozen views, with
+zero independent-repeat differences (`~/aomac-handoff/gfx/v3/LookV3/final-faithful`
+and `final-neutral`). The obsolete exception and its compatibility test are removed;
+every baseline now requires exact equality. Grass-only execution still reuses the
+original world shader and cached one-colour pipelines.
 `Renderer::set_gpu_timing(true)` explicitly allocates `FrameGpuTimer` only when timestamp queries
 are supported; descriptor timestamps span the first actual skin/world pass through the last
 presentation/heat-haze/viewport pass. Encoder timestamp writes can reorder on Metal and are not

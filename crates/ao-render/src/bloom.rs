@@ -404,6 +404,30 @@ pub(crate) mod tests {
         pixels[center] = [3.0, 3.0, 3.0, 1.0];
         let brighter = a_total(&rig.run(&pixels, &none, 0.6));
         assert!(brighter > a_total(&lit), "more excess seeds more energy");
+        // The one-sided 1/32 knee is quadratic below its join, then linear. Binary-exact inputs
+        // avoid half-float upload rounding; small seeds keep Karis reweighting below this tolerance.
+        let mut knee_energy = Vec::new();
+        for excess in [0.015625, 0.03125, 0.0625] {
+            pixels[center] = [1.0 + excess, 1.0 + excess, 1.0 + excess, 1.0];
+            knee_energy.push(a_total(&rig.run(&pixels, &none, 0.6)));
+        }
+        assert!((knee_energy[1] / knee_energy[0] - 4.0).abs() < 0.15,
+            "smooth quadratic onset above white: {knee_energy:?}");
+        assert!((knee_energy[2] / knee_energy[1] - 3.0).abs() < 0.15,
+            "knee joins the linear excess without suppressing modest highlights: {knee_energy:?}");
+        // Saturated daylight can exceed white in blue while remaining below white in luma.
+        // Extraction preserves hue, and alpha must tag actual luma rather than peak-channel energy.
+        pixels[center] = [0.25, 0.5, 1.25, 1.0];
+        let coloured = rig.run(&pixels, &none, 0.6);
+        assert!(a_total(&coloured) > 0.0, "above-white blue sky edge seeds a halo");
+        for p in &coloured {
+            let luma = p[0] * 0.2126 + p[1] * 0.7152 + p[2] * 0.0722;
+            assert!((p[3] - luma).abs() <= luma * 0.005 + 1e-6, "highlight alpha is luma: {p:?}");
+            assert!((p[0] - p[2] * 0.2).abs() <= p[2] * 0.005 + 1e-6, "red/blue hue preserved: {p:?}");
+            assert!((p[1] - p[2] * 0.4).abs() <= p[2] * 0.005 + 1e-6, "green/blue hue preserved: {p:?}");
+        }
+        pixels[center] = [0.25, 0.5, 1.0, 1.0];
+        assert_eq!(total(&rig.run(&pixels, &none, 0.6)), 0.0, "native-range saturated colour seeds nothing");
         // Authored seeds stay untagged (capped) and are clipped to the displayed colour, never inferred from brightness.
         pixels[center] = [0.8, 0.8, 0.8, 1.0];
         let mut sources = none.clone();
