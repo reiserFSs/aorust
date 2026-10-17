@@ -84,15 +84,18 @@ impl Renderer {
             return;
         }
         let aspect = size.0 as f32 / size.1.max(1) as f32;
-        // Receivers never extend beyond the faithful camera/fog envelope.
-        let useful_far = far.min(env.fog_end).min(180.0).max(self.lens.near + 0.01);
+        // Local fog changes with the eye; using it to fit cascades rescales the
+        // entire texel grid while walking. Keep the fit/splits camera-independent.
+        let shadow_far = self.lens.far.unwrap_or(180.0).min(180.0).max(self.lens.near + 0.01);
+        let receiver_far = far.min(env.fog_end).min(shadow_far);
         let Some(mut frame) = CascadeFrame::new(cam.pos, cam.forward(), cam.up(), self.lens.vertical_fov(aspect),
-            aspect, self.lens.near, useful_far, sun.expect("positive authored sun strength"), resolution) else {
+            aspect, self.lens.near, shadow_far, sun.expect("positive authored sun strength"), resolution) else {
             shadows.update(&self.queue, &CascadeFrame { uniform: bytemuck::Zeroable::zeroed() });
             self.sun_shadows = Some(shadows);
             return;
         };
         frame.uniform.forward[3] = strength;
+        frame.uniform.eye[3] = receiver_far;
         shadows.update(&self.queue, &frame);
         // The primary pass uses only the native visible list. Cascades also
         // admit loaded static geometry in their bounded light volumes.

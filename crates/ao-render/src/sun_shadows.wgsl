@@ -84,13 +84,20 @@ fn cascade_visibility(world: vec3<f32>, normal: vec3<f32>, layer: u32) -> f32 {
         dot(normal, row_y) / dot(row_y, row_y), dot(normal, row_z) / dot(row_z, row_z));
     var gradient = vec2<f32>(0.0);
     if abs(plane.z) > 0.000001 { gradient = vec2<f32>(-2.0 * plane.x, 2.0 * plane.y) / plane.z; }
-    let center = floor(uv * dimensions) + vec2<f32>(0.5);
+    let texel_position = uv * dimensions - vec2<f32>(0.5);
+    let center = floor(texel_position) + vec2<f32>(0.5);
+    let fraction = fract(texel_position);
     var visibility = 0.0;
-    for (var y = -1; y <= 1; y++) {
-        for (var x = -1; x <= 1; x++) {
+    // Bilinearly slide the 3x3 box instead of jumping its centre by a texel.
+    // Compare the underlying texel centres separately: hardware bilinear PCF
+    // would use one depth for four different points on a sloped receiver plane.
+    for (var y = -1; y <= 2; y++) {
+        let wy = select(select(1.0, fraction.y, y == 2), 1.0 - fraction.y, y == -1);
+        for (var x = -1; x <= 2; x++) {
+            let wx = select(select(1.0, fraction.x, x == 2), 1.0 - fraction.x, x == -1);
             let sample_uv = (center + vec2<f32>(f32(x), f32(y))) / dimensions;
             let receiver_depth = p.z + dot(gradient, sample_uv - uv) - 0.00002;
-            visibility += textureSampleCompareLevel(shadow_maps, shadow_sampler,
+            visibility += wx * wy * textureSampleCompareLevel(shadow_maps, shadow_sampler,
                 sample_uv, i32(layer), receiver_depth);
         }
     }
@@ -99,7 +106,7 @@ fn cascade_visibility(world: vec3<f32>, normal: vec3<f32>, layer: u32) -> f32 {
 fn sun_visibility(world: vec3<f32>, normal: vec3<f32>) -> f32 {
     if shadow_frame.forward.w <= 0.0 { return 1.0; }
     let depth = dot(world - shadow_frame.eye.xyz, shadow_frame.forward.xyz);
-    if depth < shadow_frame.splits.w || depth >= shadow_frame.splits.z { return 1.0; }
+    if depth < shadow_frame.splits.w || depth >= min(shadow_frame.splits.z, shadow_frame.eye.w) { return 1.0; }
     var layer = 0u;
     if depth > shadow_frame.splits.x { layer = 1u; }
     if depth > shadow_frame.splits.y { layer = 2u; }

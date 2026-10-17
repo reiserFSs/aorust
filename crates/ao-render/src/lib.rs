@@ -30,6 +30,8 @@ mod sun_shadows;
 mod shadow_pass;
 #[cfg(test)]
 mod shadow_tests;
+#[cfg(test)]
+mod shadow_temporal_tests;
 use gpu_stats::{GpuStatsExt, TextureViewStatsExt};
 pub use native_ground::GroundPath;
 

@@ -57,13 +57,22 @@ impl CascadeFrame {
             || near <= 0.0 || useful_far <= near || aspect <= 0.0 || fovy <= 0.0
             || fovy >= std::f32::consts::PI || !toward_sun.is_finite()
             || toward_sun.length_squared() < 1e-8 || resolution == 0 { return None; }
-        let sun = toward_sun.normalize();
+        let authored_sun = toward_sun.normalize();
+        // Only the shadow raster grid is quantized; sky/direct light stay smooth.
+        let angle_step = std::f32::consts::TAU / 16384.0;
+        let azimuth = (authored_sun.x.atan2(authored_sun.z) / angle_step).round() * angle_step;
+        let elevation = (authored_sun.y.clamp(-1.0, 1.0).asin() / angle_step).round() * angle_step;
+        let (sin_azimuth, cos_azimuth) = azimuth.sin_cos();
+        let (sin_elevation, cos_elevation) = elevation.sin_cos();
+        let sun = Vec3::new(sin_azimuth * cos_elevation, sin_elevation, cos_azimuth * cos_elevation);
         let forward = forward.try_normalize()?;
         forward.cross(up).try_normalize()?;
         let splits = [near + (useful_far - near) / 9.0, near + (useful_far - near) / 3.0, useful_far];
-        let light_up = if sun.y.abs() > 0.95 { Vec3::Z } else { Vec3::Y };
-        // World-origin light basis: camera translation never perturbs its rotation.
-        let basis = Mat4::look_to_rh(Vec3::ZERO, -sun, light_up);
+        // Analytic azimuth basis has no up-axis switch as the sun crosses 0.95Y.
+        // World-origin rotation is independent of camera position and orientation.
+        let right = Vec3::new(cos_azimuth, 0.0, -sin_azimuth);
+        let basis = Mat4::from_cols(right.extend(0.0), sun.cross(right).extend(0.0),
+            sun.extend(0.0), glam::Vec4::W).transpose();
         let mut start = near;
         let matrices = splits.map(|end| {
             let center = eye + forward * ((start + end) * 0.5);
@@ -78,16 +87,19 @@ impl CascadeFrame {
             let light_center = basis.transform_point3(center);
             let x = (light_center.x / texel).round() * texel;
             let y = (light_center.y / texel).round() * texel;
-            // Include loaded upstream casters, but never extend receiver visibility.
-            let z = useful_far + radius;
+            // Snap depth too: continuously shifting the depth origin perturbs
+            // caster/receiver float comparisons even when XY stays in one texel.
+            let depth_center = (light_center.z / texel).round() * texel;
+            // Include upstream casters and the depth-snapping half-texel guard.
+            let z = useful_far + radius + texel;
             let projection = Mat4::orthographic_rh(x - radius, x + radius, y - radius, y + radius,
-                -light_center.z - z, -light_center.z + z);
+                -depth_center - z, -depth_center + z);
             start = end - (end - start) * 0.1;
             (projection * basis).to_cols_array_2d()
         });
         Some(Self { uniform: ShadowUniform { matrices,
-            splits: [splits[0], splits[1], splits[2], near], eye: eye.extend(1.0).to_array(),
-            forward: forward.extend(horizon_fade(sun.y)).to_array(), control: [0; 4] } })
+            splits: [splits[0], splits[1], splits[2], near], eye: eye.extend(useful_far).to_array(),
+            forward: forward.extend(horizon_fade(authored_sun.y)).to_array(), control: [0; 4] } })
     }
 }
 
@@ -384,6 +396,23 @@ mod tests {
         assert_ne!(a.uniform.matrices, frame(Vec3::ZERO, Vec3::X).uniform.matrices);
         assert!(CascadeFrame::new(Vec3::ZERO, -Vec3::Z, Vec3::Y,
             1.0, 1.5, 0.1, 90.0, Vec3::ZERO, RESOLUTION).is_none());
+    }
+    #[test]
+    fn subtexel_depth_and_sun_motion_do_not_rerasterize_cascades() {
+        let sun = Vec3::new(0.0, 0.5, 0.75_f32.sqrt());
+        let a = frame(Vec3::ZERO, sun);
+        for tick in 0..90 {
+            let eye = Vec3::splat(tick as f32 * 1e-8);
+            let moving_sun = Mat4::from_rotation_y(tick as f32 * 1e-6).transform_vector3(sun);
+            assert_eq!(a.uniform.matrices, frame(eye, moving_sun).uniform.matrices);
+        }
+        // The former look-at up-vector switch rotated the grid abruptly at .95Y.
+        let below = frame(Vec3::ZERO, Vec3::new(0.0, 0.95 - 1e-6, (1.0_f32 - 0.95_f32.powi(2)).sqrt()));
+        let above = frame(Vec3::ZERO, Vec3::new(0.0, 0.95 + 1e-6, (1.0_f32 - 0.95_f32.powi(2)).sqrt()));
+        for (a, b) in below.uniform.matrices.iter().flatten().flatten()
+            .zip(above.uniform.matrices.iter().flatten().flatten()) {
+            assert!((a - b).abs() < 0.001, "sun basis flipped at the former up-axis threshold");
+        }
     }
     #[test]
     fn horizon_fades_without_night_or_extra_energy() {
