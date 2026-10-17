@@ -21,6 +21,7 @@ mod enhanced_settings;
 pub use enhanced_settings::EnhancedSettings;
 mod enhanced;
 mod enhanced_shader;
+mod ambient_occlusion;
 mod sky_probe;
 use gpu_stats::{GpuStatsExt, TextureViewStatsExt};
 pub use native_ground::GroundPath;
@@ -603,6 +604,7 @@ pub struct Renderer {
     enhanced_settings: EnhancedSettings,
     enhanced_frame: Option<enhanced::EnhancedFrame>,
     enhanced_shader: Option<wgpu::ShaderModule>,
+    ambient_occlusion: Option<ambient_occlusion::AmbientOcclusion>,
     gpu_timer: Option<FrameGpuTimer>,
     pub stats: FrameStats,
     /// Seconds driving `Submesh::uv_scroll` (the viewer advances it; screenshots leave it at 0).
@@ -1096,6 +1098,7 @@ impl Renderer {
             enhanced_settings: EnhancedSettings::default(),
             enhanced_frame: None,
             enhanced_shader: None,
+            ambient_occlusion: None,
             gpu_timer: None,
             stats: FrameStats::default(),
             time: 0.0,
@@ -1251,6 +1254,7 @@ impl Renderer {
             || self.enhanced_settings.ambient_occlusion != settings.ambient_occlusion
             || self.enhanced_settings.emissive_bloom != settings.emissive_bloom;
         self.enhanced_settings = settings;
+        if !settings.ambient_occlusion { self.ambient_occlusion = None; }
         if changed_path { self.enhanced_frame = None; }
         if !settings.any_enabled() {
             self.enhanced_frame = None;
@@ -1276,7 +1280,7 @@ impl Renderer {
             let colour = 4 + 8 * (u64::from(frame.ambient.is_some()) + u64::from(frame.emissive.is_some()));
             let samples = u64::from(frame.sample_count);
             pixels * (colour + 4 * samples + if samples > 1 { colour * samples + 4 } else { 0 })
-        })
+        }) + self.ambient_occlusion.as_ref().map_or(0, ambient_occlusion::AmbientOcclusion::target_bytes)
     }
     fn world_format(&self) -> wgpu::TextureFormat { self.format }
     /// Explicit offline instrumentation; disabled by default and owns no resources then.
@@ -2264,8 +2268,13 @@ impl Renderer {
         }
         if let Some(frame) = enhanced_frame {
             frame.resolve_depth(&mut enc);
+        }
+        if self.enhanced_settings.ambient_occlusion {
+            self.encode_enhanced_ao(&mut enc, vp, ambient_occlusion::fog_depth_limit(self.lens.near, far, env.fog_end));
+        }
+        if let Some(frame) = self.enhanced_frame.as_ref() {
             let timestamps = if self.heat_haze.source().is_none() && self.screen.layers.is_empty() { self.gpu_timer.as_mut().map(FrameGpuTimer::end_pass) } else { None };
-            frame.composite(&mut enc, world_resolve, None, timestamps);
+            frame.composite(&mut enc, self.heat_haze.source().unwrap_or(resolve), None, timestamps);
         }
         let timestamps = if self.heat_haze.source().is_some() && self.screen.layers.is_empty() { self.gpu_timer.as_mut().map(FrameGpuTimer::end_pass) } else { None };
         self.heat_haze.draw(&mut enc, resolve, timestamps);

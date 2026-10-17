@@ -36,7 +36,7 @@ pub(super) fn source(shadows: bool, ao: bool, bloom: bool) -> String {
     for name in names {
         let ambient = match name.as_str() {
             "fs_opaque" | "fs_fade_opaque" | "fs_fade_test" | "fs_test" | "fs_blend" => "enhanced_ambient(i, beauty)",
-            "fs_ground_simple" => "vec4<f32>(min(beauty.rgb, ground_tile(i) * i.ambient_share.xyz * (1.0 - i.fog)), beauty.a)",
+            "fs_ground_simple" => "vec4<f32>(min(beauty.rgb, sample_clamped(tex, i.uv).rgb * i.ambient_share.xyz * (1.0 - i.fog)), beauty.a)",
             "fs_ground_shadow" => "vec4<f32>(1.0)",
             _ => "vec4<f32>(0.0, 0.0, 0.0, beauty.a)",
         };
