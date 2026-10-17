@@ -1131,13 +1131,18 @@ The design follows ao-vk's procedural grass (MIT, attribution in `THIRD_PARTY`):
   dark tuft speckles and the carpet-to-terrain seam. Subpixel blades widen to 0.8 px and blend towards the
   ground rather than flickering. Cells outside the view frustum are culled on the CPU.
   The two nearest bands retain curved six-vertex blades. More distant bands use
-  root/tip triangles; geometry morphs to this straight profile and head colour
-  fades out from 22–27 m, before the instancing switch, so neither can pop.
-- *Wind*: waves running through the field along the native weather wind, a cross
-  wave, each blade's flutter, and gust bands sweeping over it (the bent blades lighter).
-  The native wind scales the lean; a light base breeze (the strength of a 0.35 bend)
-  keeps calm weather from freezing a field (a deliberate Enhanced addition).
-  Wind direction is the native wind's, or a fixed one when calm.
+  root/tip triangles. From 22–27 m the shoulder slides into the tip while the
+  profile straightens and head colour fades. The completed six-vertex strip is
+  exactly its first root/tip triangle, including nonlinear shading, so the later
+  three-vertex instancing switch cannot introduce a brightness ring.
+- *Wind*: gentle, coherent world-anchored waves and gust bands, with slower cross-wave
+  motion and small per-blade flutter. The grass-only bend vector follows native
+  weather through a two-second low-pass filter; a light base breeze (strength 0.35)
+  keeps calm weather moving. Native weather and its render-count random walk are unchanged.
+  A separate bounded double-precision phase advances once per frontend frame in real
+  seconds, with stalled increments limited to 0.1 s. Integer harmonics make wrapping
+  continuous; neither native game-day time nor the large native f32 animation clock
+  drives this effect.
 
 Slope uses actual triangle gradients, not the direction-dependent corner height
 range; a cell is rejected only where both triangles exceed about 75°. The default
@@ -1232,6 +1237,85 @@ porous for AO only. No new render targets are allocated, and
 grass-off AO does not load porosity metadata. This is an Enhanced treatment,
 not retail behaviour.
 Wind uses the current native weather wind plus the light base breeze above.
+
+The idle ICC twitch was not a camera-selection problem: `weather::Wind::walk`
+(`weather.rs`, native GC100bf729/100bf699) changes the raw wind vector every frame.
+The old grass shader projected absolute world roots onto that changing direction,
+so milliradian heading changes at ICC's roughly 900 m coordinates jumped the wind
+pattern's spatial phase. The upstream [ao-vk wind shader](https://github.com/wannabuh/ao-vk/blob/main/rvk/shaders/wind.glsl)
+explicitly documents the same world-origin rotation failure and stabilizes its wind
+frame. Here the procedural waves remain in fixed world axes while only their bend
+direction follows the filtered weather. This also removes the old non-periodic
+`time % 3600` discontinuity. Stable cell/blade hashes, continuous rank shrink and
+the complementary day/night partition are retained. Native terrain cell crossings
+still reproject roots onto the current ROAM triangles; holding stale roots instead
+would make blades float or sink. No static-camera regeneration or day/night
+population re-seeding was found.
+
+`grass_offline_temporal_stability` reproduces the idle problem headlessly with
+the real native ICC weather random walk, not a constant clear-weather vector.
+It renders 120 consecutive 1/60 s frames at 960×600 with actual 4× MSAA for static
+wind, a 0.25 mm/frame camera drift, and a 0.25 m/s walk, plus a frozen-clock/constant-wind
+static control. Paired density-zero frames isolate grass from native animation.
+Each CSV records native wind, camera, encoded-RGB changes, >40-code pixel events,
+consecutive temporal sign reversals, and whole-frame GPU timestamps. Contact sheets
+contain paired grass-OFF/ON frames 0, 60 and 119. Frozen wind requires exactly zero
+grass-contribution change. The original predeclared 1% raw-pop bound remains enforced
+at 4× and reported diagnostically at 1×: moving blade edges legitimately cross
+high-contrast pixels. Static/micro-moving acceptance also requires significant
+consecutive channel reversals in at most 1% of **all** blade-ROI RGB opportunities,
+with reversal RMS at most one encoded code. Both consecutive deltas must exceed
+two codes; shared energy is `min(abs(previous_delta), abs(delta))²`.
+The amplitude-normalized reversal fraction among active changes is retained as a
+diagnostic, not acceptance: it misleadingly normalizes away the reduction in motion.
+The two-second weather response is retained, not overdamped to make moving edges
+disappear. `AOMAC_GFX_TEMPORAL_MSAA=1` retains the single-sample diagnostic;
+`AOMAC_GFX_TEMPORAL_BASELINE=1` records the original failure without asserting corrected
+bounds. Run with a new output directory:
+
+```sh
+AOMAC_GFX_OUT="$HOME/aomac-handoff/gfx/v3/GrassTwitch/after4x" \
+CARGO_TARGET_DIR=/tmp/GrassTwitch/target \
+  cargo test --profile fast -j 2 -p aomac grass_offline_temporal_stability -- \
+  --ignored --nocapture --test-threads=1
+```
+
+Measured at the fixed ICC camera above, original `3f82a93` versus the wind/shoulder
+fix (120 frames, actual 4× MSAA, grass-only isolation; same native weather sequence):
+
+| Case | Mean RGB change, before → after | Max >40-code events/frame | Significant reversals/all opportunities | Reversal RMS, codes |
+|---|---:|---:|---:|---:|
+| Static wind | 6.649596 → 0.581760 | 46,216 → 323 | 21.26950% → 0.35640% | 9.308843 → 0.635255 |
+| Frozen wind, static | 0 → 0 | 0 → 0 | 0 → 0 | 0 → 0 |
+| Micro camera | 6.637183 → 0.716631 | 46,365 → 343 | 21.13386% → 0.32755% | 9.279291 → 0.597132 |
+| Slow walk | 6.778199 → 2.884580 | 45,663 → 4,526 | 20.51815% → 4.62022% | 8.968194 → 2.056302 |
+
+Static and micro cases pass both frequency bounds and the unchanged 1% raw-pop bound.
+Slow walking legitimately moves blades across pixels and is measured, not constrained
+by the stationary jitter gate. Whole-frame grass-ON GPU medians for those four cases
+were 1.528 → 1.826, 1.580 → 1.558, 1.589 → 1.527 and 1.603 → 1.503 ms respectively.
+PNG sheets, per-frame CSVs, the original single-sample diagnostics and analytic
+tip-displacement evidence are under `~/aomac-handoff/gfx/v3/GrassTwitch/`;
+the accepted final capture is `after-accepted4x`, paired with `before4x`.
+Analytic tip-displacement evidence uses the same native-decay walk for old and new
+wind, with per-frame world-space values retained in the handoff. This is a labeled
+shader model, not a GPU vertex readback.
+At 1920×1200, actual 4× MSAA, HDR and all five effects, grass-ON minus grass-OFF
+whole-frame GPU p50 contributions (off/on, on/off; paired mean) were:
+
+| View | Original, ms | Final, ms | Final paired mean, ms |
+|---|---:|---:|---:|
+| Newland ground | 1.017417 / incomplete | 1.452417 / 2.018333 | 1.735375 |
+| ICC mid ground | 1.219250 / 1.333207 | 1.322959 / 1.628834 | 1.475897 |
+| Borealis far hillside | 0.435459 / incomplete | 0.514000 / 0.913834 | 0.713917 |
+
+Original Newland/Borealis runs stopped on the unchanged 0.2 ms CPU prepare-p95
+assertion (0.215541/0.220833 ms); their measured first-order GPU pairs remain reported,
+not called complete passes. All three final matrices passed their existing checks.
+Newland's paired mean stays below the 2 ms grass budget; the reverse-order sample
+is honestly retained at 2.018333 ms. No tolerance was widened. Fixed world wave axes
+retain the original calm-wind basis `(0.8, 0.6)` and original amplitudes, preserving
+calm geometry while only temporal frequencies/filtering change the wind character.
 
 Interaction follows the approved conservative rule: own-character feet always
 bend grass, including first person. Other sources must be currently drawn opaque

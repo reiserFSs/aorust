@@ -19,6 +19,28 @@ const EXPOSURE_CELLS_PER_FRAME: usize = 4;
 /// Narrowest drawn blade width in pixels; thinner blades are widened and tinted towards the ground.
 const MIN_BLADE_PIXELS: f32 = 0.8;
 
+/// Effect-local radians, never derived from the native f32 animation clock.
+/// Integer shader harmonics make every component continuous across TAU.
+fn advance_wind_phase(phase: f64, dt: f32) -> f64 {
+    let dt = if dt.is_finite() { dt.clamp(0.0, 0.1) } else { 0.0 };
+    (phase + f64::from(dt) * 0.05).rem_euclid(std::f64::consts::TAU)
+}
+
+fn wind_target(wind: [f32; 3]) -> [f32; 3] {
+    let speed = wind[0].hypot(wind[2]);
+    let direction = if speed > 0.05 { [wind[0] / speed, wind[2] / speed] } else { [0.8, 0.6] };
+    [direction[0], direction[1], (0.35 + 0.1 * speed).min(2.5)]
+}
+
+/// Smooth the effect's bend vector, not native weather. Do not renormalize the
+/// filtered direction: reversals should pass gently through stillness.
+fn smooth_wind(filtered: [f32; 3], wind: [f32; 3], dt: f32) -> [f32; 3] {
+    let target = wind_target(wind);
+    let dt = if dt.is_finite() { dt.clamp(0.0, 0.1) } else { 0.0 };
+    let share = -(-dt * 0.5).exp_m1();
+    std::array::from_fn(|i| filtered[i] + (target[i] - filtered[i]) * share)
+}
+
 /// Opt-in native collision capability; unknown tiles fail closed.
 #[derive(Clone)]
 pub struct GrassExposure {
@@ -99,11 +121,16 @@ pub(super) struct Grass {
     draws: Vec<Draw>,
     stride: u32,
     band_strides: [u32; BANDS],
+    #[cfg(test)]
+    forced_band: Option<usize>,
     surface_heights: Vec<f32>,
     surface_parities: Vec<u32>,
     samples: u32,
     channels: (bool, bool, bool),
     wind: [f32; 3],
+    wind_phase: f64,
+    filtered_wind: [f32; 3],
+    wind_seeded: bool,
     benders: [[f32; 3]; MAX_BENDERS],
     bender_count: usize,
     inputs: Vec<GrassBender>,
@@ -187,10 +214,14 @@ impl Grass {
             wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&noise_sampler) },
             wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&mask_view) },
         ] }));
-        Self { pipeline, bind, layout, shadows, cells_buffer, params_buffer, visible_buffer, noise_view, noise_sampler, mask_view, green_bytes: green.layers.len(), cells: Vec::with_capacity(MAX_CELLS), batches: Vec::with_capacity(MAX_CELLS), visible: std::array::from_fn(|_| Vec::with_capacity(MAX_CELLS)), draws: Vec::new(), stride: 0, band_strides: [0; BANDS], surface_heights: Vec::new(), surface_parities: Vec::new(), samples, channels, wind: [0.0; 3], benders: [[0.0; 3]; MAX_BENDERS], bender_count: 0, inputs: Vec::with_capacity(MAX_BENDERS), prepare_cpu_ns: 0, exposure: None, exposure_cache: std::collections::HashMap::with_capacity(MAX_EXPOSURE_CELLS * 2), exposure_order: std::collections::VecDeque::with_capacity(MAX_EXPOSURE_CELLS), candidates: Vec::with_capacity(MAX_CELLS), order: Vec::with_capacity(MAX_CELLS), last_selection: None, last_radius: 0, last_path: super::GroundPath::Simple, pending: false }
+        let filtered_wind = wind_target([0.0; 3]);
+        Self {
+            #[cfg(test)]
+            forced_band: None,
+            pipeline, bind, layout, shadows, cells_buffer, params_buffer, visible_buffer, noise_view, noise_sampler, mask_view, green_bytes: green.layers.len(), cells: Vec::with_capacity(MAX_CELLS), batches: Vec::with_capacity(MAX_CELLS), visible: std::array::from_fn(|_| Vec::with_capacity(MAX_CELLS)), draws: Vec::new(), stride: 0, band_strides: [0; BANDS], surface_heights: Vec::new(), surface_parities: Vec::new(), samples, channels, wind: [0.0; 3], wind_phase: 0.0, filtered_wind, wind_seeded: false, benders: [[0.0; 3]; MAX_BENDERS], bender_count: 0, inputs: Vec::with_capacity(MAX_BENDERS), prepare_cpu_ns: 0, exposure: None, exposure_cache: std::collections::HashMap::with_capacity(MAX_EXPOSURE_CELLS * 2), exposure_order: std::collections::VecDeque::with_capacity(MAX_EXPOSURE_CELLS), candidates: Vec::with_capacity(MAX_CELLS), order: Vec::with_capacity(MAX_CELLS), last_selection: None, last_radius: 0, last_path: super::GroundPath::Simple, pending: false }
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn prepare(&mut self, queue: &wgpu::Queue, ground: &GroundRun, liquids: &[super::native_liquid::LiquidRun], camera: Vec3, settings: super::EnhancedSettings, time: f32, path: super::GroundPath, view: Option<(super::Mat4, f32)>) {
+    pub fn prepare(&mut self, queue: &wgpu::Queue, ground: &GroundRun, liquids: &[super::native_liquid::LiquidRun], camera: Vec3, settings: super::EnhancedSettings, path: super::GroundPath, view: Option<(super::Mat4, f32)>) {
         let size = ground.detail.patches().first().map_or(1.0, |patch| patch.cell_size);
         let radius = settings.grass_distance.clamp(0.0, MAX_RADIUS)
             .min(((MAX_CELLS as f32).sqrt() * 0.5 - 3.5).max(0.0) * size);
@@ -296,6 +327,8 @@ impl Grass {
                     // Instance only ranks that can survive at the cell's nearest point.
                     let keep = thinning_keep((distance - half * std::f32::consts::SQRT_2).max(0.0));
                     let band = (0..BANDS - 1).find(|&band| keep > 0.5 / (1 << band) as f32).unwrap_or(BANDS - 1);
+                    #[cfg(test)]
+                    let band = self.forced_band.unwrap_or(band);
                     self.visible[band].push(cell_index);
                 }
                 for (band, &start) in starts.iter().enumerate() {
@@ -310,12 +343,11 @@ impl Grass {
         for (band, cells) in self.visible.iter().enumerate().filter(|(_, cells)| !cells.is_empty()) {
             queue.write_buffer(&self.visible_buffer, (band * MAX_CELLS * 4) as u64, bytemuck::cast_slice(cells));
         }
-        // Wind: the zone's weather wind, or a light breeze where the zone has none.
-        let speed = self.wind[0].hypot(self.wind[2]);
-        let direction = if speed > 0.05 { [self.wind[0] / speed, self.wind[2] / speed] } else { [0.8, 0.6] };
+        // Spatial waves stay world-anchored; only the filtered bend follows weather.
+        let [wind_x, wind_z, strength] = self.filtered_wind;
         let pixels = view.map_or(0.0, |(_, pixels)| pixels);
-        let mut params = Params { wind_time: [direction[0], direction[1], time % 3600.0, radius], limits: [self.stride as f32, pixels, MIN_BLADE_PIXELS, self.bender_count as f32],
-            wind: [(0.35 + 0.1 * speed).min(2.5), 1.0, 0.0, 0.0], bands: std::array::from_fn(|row| std::array::from_fn(|col| self.band_strides[row * 4 + col] as f32)), benders: [[0.0; 4]; MAX_BENDERS] };
+        let mut params = Params { wind_time: [wind_x, wind_z, (self.wind_phase / 0.05) as f32, radius], limits: [self.stride as f32, pixels, MIN_BLADE_PIXELS, self.bender_count as f32],
+            wind: [strength, 1.0, 0.0, 0.0], bands: std::array::from_fn(|row| std::array::from_fn(|col| self.band_strides[row * 4 + col] as f32)), benders: [[0.0; 4]; MAX_BENDERS] };
         for (slot, position) in params.benders.iter_mut().zip(&self.benders[..self.bender_count]) { *slot = [position[0], position[1], position[2], 1.0]; }
         self.bender_count = 0;
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
@@ -367,7 +399,7 @@ impl Grass {
                 let Some(gpu_draw) = gpu.opaque.get(ground.draws[batch.patch][batch.submesh]) else { continue; };
                 pass.set_bind_group(1, &gpu.mats[gpu_draw.mat], &[]);
                 pass.set_bind_group(2, palette, &[]);
-                // Near blades have three cross sections; distant blades need only root and tip.
+                // The shoulder has collapsed into the tip before distant bands omit it.
                 // The instance index retains the distance band in its top four bits.
                 let (band, stride) = ((draw.band as u32) << 28, self.band_strides[draw.band]);
                 pass.draw(0..if draw.band >= 2 { 3 } else { 6 }, band + draw.slots.start * stride..band + draw.slots.end * stride);
@@ -576,6 +608,15 @@ fn select_benders(
 }
 
 impl super::Renderer {
+    /// Advance only Enhanced grass with real frame seconds, once per frontend frame.
+    /// Stalls are bounded independently of native animation and game-day clocks.
+    pub fn advance_grass_wind(&mut self, dt: f32) {
+        self.ensure_grass();
+        if let Some(grass) = &mut self.grass {
+            grass.wind_phase = advance_wind_phase(grass.wind_phase, dt);
+            grass.filtered_wind = smooth_wind(grass.filtered_wind, grass.wind, dt);
+        }
+    }
     fn ensure_grass(&mut self) {
         let settings = self.enhanced_settings();
         let enabled = settings.ground_grass && settings.grass_density > 0.0 && settings.grass_distance > 0.0;
@@ -585,7 +626,14 @@ impl super::Renderer {
             return;
         };
         if self.grass.as_ref().is_none_or(|grass| grass.samples != self.msaa_samples() || grass.channels != (settings.ambient_occlusion, settings.emissive_bloom, settings.needs_sun_mask()) || grass.shadows != settings.sun_shadows) {
-            self.grass = Some(Grass::new(&self.device, &self.queue, &ground.green, &self.world.grass));
+            let mut grass = Grass::new(&self.device, &self.queue, &ground.green, &self.world.grass);
+            if let Some(previous) = &self.grass {
+                grass.wind = previous.wind;
+                grass.wind_phase = previous.wind_phase;
+                grass.filtered_wind = previous.filtered_wind;
+                grass.wind_seeded = previous.wind_seeded;
+            }
+            self.grass = Some(grass);
             if let Some(shadows) = &mut self.sun_shadows { shadows.grass_receiver = None; }
         }
     }
@@ -612,6 +660,12 @@ impl super::Renderer {
             grass.inputs.retain(|b| b.position.iter().all(|v| v.is_finite()));
             benders.clear();
             grass.wind = wind.map(|v| if v.is_finite() { v } else { 0.0 });
+            // A still render has no dt to converge through: start at the first
+            // supplied weather vector, then smooth subsequent weather frames.
+            if !grass.wind_seeded {
+                grass.filtered_wind = wind_target(grass.wind);
+                grass.wind_seeded = true;
+            }
         } else {
             *benders = Vec::new();
         }
@@ -640,7 +694,7 @@ impl super::Renderer {
             );
             grass.benders = selected.map(|bender| bender.position);
             grass.bender_count = count;
-            grass.prepare(&self.queue, ground, &self.liquids, cam.pos, settings, self.time, self.ground_state.path(), Some((vp, pixels_per_unit)));
+            grass.prepare(&self.queue, ground, &self.liquids, cam.pos, settings, self.ground_state.path(), Some((vp, pixels_per_unit)));
             grass.prepare_cpu_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         }
     }
@@ -661,7 +715,7 @@ impl super::Renderer {
         let settings = self.enhanced_settings();
         if let (Some(grass), Some(ground)) = (&mut self.grass, &self.ground) {
             for _ in 0..=MAX_CELLS.div_ceil(EXPOSURE_CELLS_PER_FRAME) {
-                grass.prepare(&self.queue, ground, &self.liquids, camera.pos, settings, self.time, self.ground_state.path(), None);
+                grass.prepare(&self.queue, ground, &self.liquids, camera.pos, settings, self.ground_state.path(), None);
                 self.queue.submit([]);
                 if !grass.pending { break; }
             }
@@ -728,6 +782,113 @@ impl super::Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn first_weather_target_is_correct_without_advancing_time() {
+        let raw = [3.0, 0.0, 4.0];
+        let seeded = wind_target(raw);
+        assert_eq!(seeded, [0.6, 0.8, 0.85]);
+        assert_eq!(smooth_wind(seeded, raw, 0.0), seeded);
+        assert_eq!(wind_target([0.0; 3]), [0.8, 0.6, 0.35]);
+    }
+    #[test]
+    fn grass_wind_is_smooth_across_wrap_and_large_native_times() {
+        let tau = std::f64::consts::TAU;
+        let dt = 1.0_f32 / 60.0;
+        let step = f64::from(dt) * 0.05;
+        let before = tau - step * 0.5;
+        let after = advance_wind_phase(before, dt);
+        assert!((after - step * 0.5).abs() < 1e-12);
+        // All temporal harmonics used by the wind shader, evaluated through
+        // the actual f32 upload boundary on both sides of the wrap.
+        for harmonic in [1.0_f32, 2.0, 8.0, 12.0, 14.0, 24.0] {
+            let previous = (((before / 0.05) as f32 * 0.05) * harmonic + 0.7).sin();
+            let next = (((after / 0.05) as f32 * 0.05) * harmonic + 0.7).sin();
+            assert!((next - previous).abs() < harmonic * step as f32 + 0.00002);
+        }
+        let mut phase = 0.7;
+        // At this native clock magnitude f32 loses a whole frame. Grass must
+        // still advance, without consulting or changing that clock.
+        let native_time = 16_777_216.0_f32;
+        assert_eq!(native_time + dt, native_time);
+        for _ in 0..600 {
+            let previous = phase;
+            phase = advance_wind_phase(phase, dt);
+            assert!((phase - previous - step).abs() < 1e-12);
+        }
+        assert_eq!(advance_wind_phase(phase, 100.0), advance_wind_phase(phase, 0.1));
+        for invalid in [f32::NAN, f32::INFINITY, -1.0] {
+            assert_eq!(advance_wind_phase(phase, invalid), phase);
+        }
+    }
+    #[test]
+    fn grass_weather_random_walk_cannot_rephase_the_icc_field() {
+        // Native weather changes its vector every frame. Evaluate tip motion
+        // at ICC-scale coordinates, where rotating those coordinates by the
+        // raw wind direction used to jump several wave cycles while idle.
+        let root = [900.0_f32, 900.0_f32];
+        let dt = 1.0 / 60.0;
+        let mut filtered = [0.8, 0.6, 0.35];
+        let mut raw = [0.0; 3];
+        let mut phase = 0.0;
+        // Analytical shader model, not GPU readback. Deterministic native-sized
+        // kicks use the native 1/1.02 decay (weather.rs Wind::walk), with zero
+        // base wind as at ICC; the old and new paths share this same sequence.
+        let tip = |wind: [f32; 3], phase: f64, old: bool| {
+            let time = (phase / 0.05) as f32;
+            let p = time * 0.05;
+            let [x, z] = if old {
+                [root[0] * wind[0] + root[1] * wind[1], -root[0] * wind[1] + root[1] * wind[0]]
+            } else { [root[0] * 0.8 + root[1] * 0.6, -root[0] * 0.6 + root[1] * 0.8] };
+            let s = x * 0.39 - if old { time * 2.3 } else { p * 14.0 }
+                + 1.6 * (z * 0.07 + if old { time * 0.11 } else { p }).sin()
+                + 0.9 * (z * 0.21 - x * 0.05).sin();
+            let gust = (0.5 + 0.5 * s.sin()).powi(4)
+                * (0.55 + 0.45 * (z * 0.043 + x * 0.021 - if old { time * 0.21 } else { p * 2.0 }).sin());
+            let blade_phase = root[0] * 0.3 + root[1] * 0.25;
+            let sway = 0.45 + 0.35 * (x * 0.55 - if old { time * 2.4 } else { p * 12.0 } + 0.7 * blade_phase.sin()).sin()
+                + 0.15 * (z * 0.23 + x * 0.31 - if old { time * 1.7 } else { p * 8.0 } + 1.3).sin()
+                + (0.12 + 0.35 * gust) * (if old { time * 5.3 } else { p * 24.0 } + blade_phase * 1.7).sin();
+            let strength = wind[2];
+            let lean = if strength <= 1.0 { strength }
+                else { 1.0 + 1.3 * (1.0 - (-(strength - 1.0) / 1.2).exp()) };
+            let bend = 0.5 * lean * (0.16 * sway + 0.7 * gust);
+            let mut x = wind[0] * bend;
+            let mut z = wind[1] * bend;
+            let length = x.hypot(z);
+            if length > 0.45 { x *= 0.45 / length; z *= 0.45 / length; }
+            [x, (0.25 - x * x - z * z).max(0.0).sqrt() - 0.5, z]
+        };
+        let displacement = |a: [f32; 3], b: [f32; 3]| {
+            ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+        };
+        let mut previous = tip(filtered, phase, false);
+        let mut previous_old = tip(wind_target(raw), phase, true);
+        let mut sums = [0.0_f32; 2];
+        let mut maxima = [0.0_f32; 2];
+        println!("analytical_native_like_wind_csv,frame,old_tip_displacement_m,new_tip_displacement_m");
+        for frame in 0..3600_u32 {
+            raw[0] = raw[0] / 1.02 + (hash(frame * 2) as f32 / u32::MAX as f32 - 0.5) * 3.4;
+            raw[2] = raw[2] / 1.02 + (hash(frame * 2 + 1) as f32 / u32::MAX as f32 - 0.5) * 3.4;
+            filtered = smooth_wind(filtered, raw, dt);
+            phase = advance_wind_phase(phase, dt);
+            let next = tip(filtered, phase, false);
+            let step = displacement(next, previous);
+            assert!(step < 0.01, "frame {frame}: tip moved {step} world units");
+            previous = next;
+            if frame < 120 {
+                let next_old = tip(wind_target(raw), phase, true);
+                let old_step = displacement(next_old, previous_old);
+                previous_old = next_old;
+                for (i, value) in [old_step, step].into_iter().enumerate() {
+                    sums[i] += value;
+                    maxima[i] = maxima[i].max(value);
+                }
+                println!("analytical_native_like_wind_csv,{frame},{old_step:.9},{step:.9}");
+            }
+        }
+        println!("analytical_native_like_wind_summary,frames=120,old_max_m={:.9},old_mean_m={:.9},new_max_m={:.9},new_mean_m={:.9},hard_bound_m=0.01",
+            maxima[0], sums[0] / 120.0, maxima[1], sums[1] / 120.0);
+    }
     #[test]
     fn grass_hidden_or_non_admitted_character_cannot_bend_evict_or_leave_a_trail() {
         use ao_scene::{Instance, Mesh, Scene, Submesh, Vertex, IDENTITY};
@@ -843,7 +1004,7 @@ mod tests {
         assert_eq!(thinning_keep(12.0), 1.0);
         assert_eq!(thinning_keep(22.0), 0.5);
         assert_eq!(thinning_keep(42.0), 0.1);
-        assert!(thinning_keep(27.0) > 0.25, "geometry morph must finish before a cell can use three vertices");
+        assert!(thinning_keep(27.0) > 0.25, "geometry morph must finish before the next thinning band");
         let shader = include_str!("grass.wgsl");
         assert!(shader.contains("max(dist - 12.0, 0.0) / 10.0"), "CPU and GPU thinning must agree");
         assert!(shader.contains("smoothstep(22.0, 27.0, dist)"));
@@ -864,10 +1025,8 @@ mod tests {
 
 #[cfg(test)]
 mod blade_appearance_tests {
-    #[test]
-    fn night_blades_remain_visible_without_outshining_native_ground() {
+    fn night_grass_scene() -> ao_scene::Scene {
         use ao_scene::{ground_detail::{GroundCell, GroundPatch}, Environment, Instance, Mesh, Scene, Submesh, Texture, TextureKey, TextureSource, Vertex, IDENTITY};
-        use crate::{Camera, EnhancedSettings, GroundPath, Renderer, Targets, Vec3};
 
         let tile = TextureKey { rdb_type: 1_010_006, id: 1 };
         let palette = TextureKey { rdb_type: 1_000_007, id: 2 };
@@ -904,6 +1063,13 @@ mod blade_appearance_tests {
                 width: 8, height: 8, rgba: [rgb[0], rgb[1], rgb[2], 255].repeat(64), source,
             });
         }
+        scene
+    }
+
+    #[test]
+    fn night_blades_remain_visible_without_outshining_native_ground() {
+        use crate::{Camera, EnhancedSettings, GroundPath, Renderer, Targets, Vec3};
+        let scene = night_grass_scene();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let mut renderer = Renderer::new(&instance, None).expect("night grass requires an offscreen GPU");
         renderer.set_msaa_samples(1);
@@ -953,6 +1119,50 @@ mod blade_appearance_tests {
             }
             assert!(darker_visible > 0, "{expected:?}: night blades must be visibly darker, not culled or blacked out");
         }
+    }
+
+    #[test]
+    fn completed_grass_morph_has_identical_pixels_across_distance_bands() {
+        use crate::{Camera, EnhancedSettings, Renderer, Targets, Vec3};
+        let mut scene = night_grass_scene();
+        scene.daylight = Some(1.0);
+        let environment = scene.environment.as_mut().unwrap();
+        environment.ambient = [0.3; 3];
+        environment.sun_color = [0.7; 3];
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = Renderer::new(&instance, None).expect("grass topology requires an offscreen GPU");
+        renderer.set_msaa_samples(1);
+        renderer.upload(&scene);
+        renderer.set_enhanced_settings(EnhancedSettings {
+            ground_grass: true, grass_density: 2.0, grass_distance: 60.0, ..Default::default()
+        });
+        renderer.set_enhanced_grass_exposure(Some(super::GrassExposure {
+            generation: 1, query: std::rc::Rc::new(|_| true), line_of_sight: std::rc::Rc::new(|_, _| true),
+        }));
+        // Every root is beyond the completed morph; keep the camera and all uniforms frozen.
+        let camera = Camera::look_at(Vec3::new(4.0, 3.0, 30.0), Vec3::new(4.0, 0.0, -4.0));
+        renderer.warm_grass_tiles(&camera);
+        let out = renderer.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("grass topology regression"), size: wgpu::Extent3d { width: 256, height: 256, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: renderer.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+        });
+        let view = out.create_view(&Default::default());
+        let targets = Targets::new(&renderer, 256, 256);
+        let mut images = Vec::new();
+        for band in [1, 2] {
+            renderer.grass.as_mut().expect("enabled grass").forced_band = Some(band);
+            renderer.render(&view, &targets, &camera);
+            let grass = renderer.grass.as_ref().unwrap();
+            assert!(!grass.visible[band].is_empty(), "fixture must submit grass in forced band {band}");
+            images.push(crate::texture_to_rgba(&renderer, &out, 256, 256).unwrap());
+        }
+        renderer.set_enhanced_settings(EnhancedSettings::default());
+        renderer.render(&view, &targets, &camera);
+        let ground = crate::texture_to_rgba(&renderer, &out, 256, 256).unwrap();
+        assert!(images[0] != ground, "fixture must produce visible grass, not two bare-ground images");
+        let mismatch = images[0].iter().zip(&images[1]).position(|(a, b)| a != b);
+        assert_eq!(mismatch, None, "changing only the distance band must not change grass pixels");
     }
 
     #[test]

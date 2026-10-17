@@ -799,6 +799,7 @@ impl State {
         self.last = now;
         self.clock += dt;
         self.renderer.time = self.clock;
+        self.renderer.advance_grass_wind(dt);
         if let Some(sun) = LiveRun::advance(&mut self.live, &mut self.renderer, dt) {
             if let Some(gui) = &mut self.gui { gui.host.effect_sun_direction = Some(sun); }
         }
@@ -1315,6 +1316,7 @@ impl Offscreen {
         let start = self.perf.as_ref().map(|_| Instant::now());
         let cpu_start = start.map(|_| perf_thread_cpu());
         self.r.time += dt;
+        self.r.advance_grass_wind(dt);
         if let Some(sun) = LiveRun::advance(&mut self.live, &mut self.r, dt) { self.host.effect_sun_direction = Some(sun); }
         self.r.visible_actor_ids(&mut self.host.previous_visible_actors);
         let update_end = start.map(|_| Instant::now());

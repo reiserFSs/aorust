@@ -7,7 +7,7 @@
 // terrain tile colour, native palette and lighting.
 struct GrassCell { origin: vec4<f32>, heights: vec4<f32>, identity: vec4<u32>, normals: array<vec4<f32>, 4> }
 struct GrassParams {
-    wind_time: vec4<f32>, // x, y: unit wind direction; z: wind clock (s); w: grass radius
+    wind_time: vec4<f32>, // x, y: filtered bend direction (not normalized); z: bounded wind seconds; w: grass radius
     limits: vec4<f32>,    // x: blades per cell; y: pixels per unit at depth 1; z: least blade width (px); w: bender count
     wind: vec4<f32>,      // x: wind strength (1 = a fresh breeze); y: gust share
     bands: array<vec4<f32>, 2>, // blades instanced per cell in eight distance bands
@@ -78,19 +78,22 @@ var<private> SECTION_W = array<vec4<f32>, 4>(vec4<f32>(1.0, 0.6667, 0.3333, 0.0)
 var<private> FLOWERS = array<vec3<f32>, 6>(vec3<f32>(0.84, 0.84, 0.78), vec3<f32>(0.86, 0.74, 0.24), vec3<f32>(0.56, 0.42, 0.72),
     vec3<f32>(0.44, 0.52, 0.80), vec3<f32>(0.82, 0.56, 0.64), vec3<f32>(0.84, 0.60, 0.30));
 
-// Waves of wind running through the field, bands of stronger wind sweeping over it (ao-vk wind.glsl).
+// Gentle traveling wind. Every temporal frequency is an integer harmonic of
+// the same wrapped phase (grass.rs); nested gust modulation wraps with it.
 fn grass_gust(aa: vec2<f32>, time: f32) -> f32 {
-    let s = aa.x * 0.39 - time * 2.3 + 1.6 * sin(aa.y * 0.07 + time * 0.11) + 0.9 * sin(aa.y * 0.21 - aa.x * 0.05);
+    let wind_phase = time * 0.05;
+    let s = aa.x * 0.39 - wind_phase * 14.0 + 1.6 * sin(aa.y * 0.07 + wind_phase) + 0.9 * sin(aa.y * 0.21 - aa.x * 0.05);
     var g = 0.5 + 0.5 * sin(s);
-    let strength = 0.55 + 0.45 * sin(aa.y * 0.043 + aa.x * 0.021 - time * 0.21);
+    let strength = 0.55 + 0.45 * sin(aa.y * 0.043 + aa.x * 0.021 - wind_phase * 2.0);
     g *= g;
     return g * g * strength;
 }
 const GUST_MEAN: f32 = 0.15;
 fn grass_sway(aa: vec2<f32>, time: f32, phase: f32, gust: f32) -> f32 {
-    let rows = sin(aa.x * 0.55 - time * 2.4 + 0.7 * sin(phase));
-    let cross = sin(aa.y * 0.23 + aa.x * 0.31 - time * 1.7 + 1.3);
-    let flutter = sin(time * 5.3 + phase * 1.7);
+    let wind_phase = time * 0.05;
+    let rows = sin(aa.x * 0.55 - wind_phase * 12.0 + 0.7 * sin(phase));
+    let cross = sin(aa.y * 0.23 + aa.x * 0.31 - wind_phase * 8.0 + 1.3);
+    let flutter = sin(wind_phase * 24.0 + phase * 1.7);
     return 0.45 + 0.35 * rows + 0.15 * cross + (0.12 + 0.35 * gust) * flutter;
 }
 // A sideways bend b of a point `above` units up its blade, keeping the blade's length.
@@ -262,12 +265,14 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     height = select(height, 0.4 + (height - 0.4) * 0.3, height > 0.4);
     height = min(height, GRASS_MAX_HEIGHT);
 
-    // Curved near blades retain root, shoulder and tip; distant tufts need only root and tip.
+    // Use the same first triangle in every band; collapse the shoulder onto its tip before dropping the rest.
     let step = vertex >> 1u;
-    let section = select(select(0u, step + 1u, step > 0u), step * 3u, band >= 2u);
-    let t = SECTION_T[kind][section];
-    // Complete the geometric morph before the CPU can select band 2 (~29 m nearest cell edge).
+    let section = select(0u, step + 1u, step > 0u);
+    let t0 = SECTION_T[kind][section];
+    // Finish collapsing the shoulder before band 2 (~29 m nearest cell edge).
+    // Evaluating all geometry and shading at the tip also makes the remaining triangles degenerate.
     let simple_tuft = smoothstep(22.0, 27.0, dist);
+    let t = select(t0, mix(t0, 1.0, simple_tuft), section == 2u);
     // Half-resolution AO cannot resolve root/tip tufts: fade their receiving share with the geometry.
     o.coverage.y = 1.0 - simple_tuft;
     let profile = mix(SECTION_W[kind][section], 1.0 - t, simple_tuft);
@@ -296,7 +301,9 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     // Wind: waves running through the field (the upper blade bending most) with gusts on top.
     let wd = grass_params.wind_time.xy;
     let time = grass_params.wind_time.z;
-    let aa = vec2<f32>(dot(root.xz, wd), dot(root.xz, vec2<f32>(-wd.y, wd.x)));
+    // Never rotate world position with weather: even a tiny direction change
+    // becomes a large phase jump at distant world coordinates (e.g. ICC).
+    let aa = vec2<f32>(dot(root.xz, vec2<f32>(0.8, 0.6)), dot(root.xz, vec2<f32>(-0.6, 0.8)));
     let gust = grass_gust(aa, time) * grass_params.wind.y;
     let strength = grass_params.wind.x;
     let lean_level = select(1.0 + 1.3 * (1.0 - exp(-(strength - 1.0) / 1.2)), strength, strength <= 1.0);
@@ -332,7 +339,7 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
         if hb(hj, 3u) < 0.15 { colour = hj % 6u; }
         head = FLOWERS[colour] * (0.85 + 0.15 * v2);
     }
-    // Fade the flat head-colour flag too: the three-vertex tuft must not change colour at the band switch.
+    // Fade the flat head-colour flag with the geometric morph.
     o.head = vec4<f32>(head, select(0.0, 1.0 - simple_tuft, is_head));
     let canopy = clamp(0.55 * (1.0 - rim) * (0.5 + vigour) + 0.6 * clump - 0.05, 0.0, 1.0);
     let grad = mix(0.9, 1.2, t);
