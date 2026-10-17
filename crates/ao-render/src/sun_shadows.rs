@@ -24,7 +24,9 @@ pub(crate) fn receiver_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 }
 
 pub(super) fn horizon_fade(elevation: f32) -> f32 {
-    let t = ((elevation - 0.02) / 0.15).clamp(0.0, 1.0);
+    // Input is normalized toward-sun Y: full strength at 4°, fading to zero
+    // only at the actual horizon (sin(4°) = 0.06975647).
+    let t = (elevation / 0.06975647).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 
@@ -365,8 +367,10 @@ mod tests {
     fn horizon_fades_without_night_or_extra_energy() {
         assert_eq!(horizon_fade(-1.0), 0.0);
         assert_eq!(horizon_fade(0.0), 0.0);
-        assert_eq!(horizon_fade(0.02), 0.0);
-        assert!(horizon_fade(0.08) > 0.0 && horizon_fade(0.08) < 1.0);
+        let near_horizon = horizon_fade(0.5_f32.to_radians().sin());
+        assert!(near_horizon > 0.0 && near_horizon < 0.1);
+        assert!(horizon_fade(3.0_f32.to_radians().sin()) > 0.8);
+        assert_eq!(horizon_fade(4.0_f32.to_radians().sin()), 1.0);
         assert_eq!(horizon_fade(0.5), 1.0);
         for elevation in -100..=100 {
             assert!((0.0..=1.0).contains(&horizon_fade(elevation as f32 / 100.0)));

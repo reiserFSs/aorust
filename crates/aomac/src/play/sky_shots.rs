@@ -545,7 +545,7 @@ fn graphics_fixture_views(actor: &ao_net::n3::dynel::SimpleCharFullUpdate) -> Ve
         ("borealis-street", [679.6, 74.5, -476.7], [679.6, 74.5, -477.7]),
         ("borealis-foliage", [652.0, 65.3, -420.0], [651.8296, 73.42179, -428.4731]),
     ] {
-        for (light, time) in [("sun-high", 3240.0), ("sun-low", 4860.0), ("night", 0.0)] {
+        for (light, time) in [("sun-high", 3240.0), ("sun-low", 4600.0), ("sunset", 4860.0), ("night", 0.0)] {
             views.push((format!("{name}-{light}"), 800, time, Camera::look_at(eye.into(), at.into())));
         }
     }
@@ -593,7 +593,17 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
         assert_eq!([s.sun_shadows, s.ambient_occlusion, s.emissive_bloom, s.ground_grass], expected);
     }
     assert!(graphics_fixture_settings("unknown").is_err());
-    assert_eq!(graphics_fixture_actor().unwrap().name, "Testy");
+    let actor = graphics_fixture_actor().unwrap();
+    assert_eq!(actor.name, "Testy");
+    let views = graphics_fixture_views(&actor);
+    for name in ["borealis-street", "borealis-foliage"] {
+        for (light, expected_time) in [("sun-low", 4600.0), ("sunset", 4860.0)] {
+            let view_name = format!("{name}-{light}");
+            let view = views.iter().find(|view| view.0 == view_name).unwrap();
+            assert_eq!(view.1, 800);
+            assert_eq!(view.2, expected_time);
+        }
+    }
 }
 
 fn graphics_shadow_timing(off: &mut Offscreen, directory: &std::path::Path, name: &str) -> anyhow::Result<()> {

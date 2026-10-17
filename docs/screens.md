@@ -760,6 +760,8 @@ Loaded opaque/cutout static geometry inside the cascade light volumes and admitt
 
 Fully fogged actor pixels do not seed admission, so an actor hidden by the original fog cannot disclose itself through a nearer ground shadow. Native material/mode-2 no-fog authoring is preserved. At night or without an authored sun budget, neither caster passes nor PCF lookups run.
 
+Horizon fading uses the normalized authored sun elevation: full shadow strength at 4°, smoothly decreasing to zero at 0°. A low but still positive sun keeps casting while its authored directional-light share is nonzero; no positive-elevation cutoff suppresses long sunset shadows.
+
 The nine PCF taps compare exact texel centers against the geometric receiver plane (normal derived before fragment discard). This removes planar self-shadow moiré without a large slope bias that detaches feet or objects from their shadows.
 
 Cascade casters are two-sided even when their native camera material is culled: thin one-sided statel walls must block light from behind, otherwise roof shadows detach from building bases. The primary actor-admission image retains native culling. The GPU regression includes a back-lit one-sided wall, base-contact coverage and preservation of its ambient-only lighting floor.
