@@ -93,8 +93,14 @@ pub(super) fn append_shader(source: &mut String, translucency: bool, lod: bool) 
     if !translucency && !lod { return; }
     source.push_str(&crate::shader_source::load("foliage_detail.wgsl", include_str!("foliage_detail.wgsl")));
     if lod {
-        *source = source.replace("    let dl = vertex_lights(p, n, power);", "    var dl = array<vec3<f32>, 2>(vec3<f32>(0.0), vec3<f32>(0.0));\n    if !foliage_detail_distant(p) { dl = vertex_lights(p, n, power); }");
-        *source = source.replace("if sn > 0.0 && power > 0.0 {", "if sn > 0.0 && power > 0.0 && !foliage_detail_distant(p) {");
+        // rvk F_SHADOWCHEAP: distant foliage keeps real lighting but replaces
+        // soft-shadow blocker search/PCSS with one hardware-filtered comparison.
+        // Bounds, receiver projection/bias, cascade selection and blending stay
+        // in the shared receiver. Near foliage and non-plants stay byte-identical.
+        *source = source.replace(
+            "    // Wide taps must not slope-extrapolate past ~76 degrees of receiver tilt.",
+            "    if foliage_detail_distant(world) {\n        return textureSampleCompareLevel(shadow_maps, shadow_sampler, uv, i32(layer), p.z - 0.00002);\n    }\n    // Wide taps must not slope-extrapolate past ~76 degrees of receiver tilt.",
+        );
     }
     if translucency {
         *source = source.replace("    let lit = min(texture_color + spec, vec3<f32>(1.0));", "    let foliage_transfer = foliage_detail_transmission(i.wpos, i.n, i.clip.xy);\n    texture_color = min(texture_color + foliage_transfer * clamp(t.rgb * i.tint, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0));\n    let lit = min(texture_color + spec, vec3<f32>(1.0));");
@@ -152,9 +158,10 @@ mod tests {
             assert!(state.get(0,0).is_none(), "cache uses native first-index keys");
         }
         for (transmission,lod) in [(true,false),(false,true),(true,true)] {
-            let mut source = base.clone(); append_shader(&mut source,transmission,lod);
+            let mut source = crate::enhanced_shader::source(crate::EnhancedSettings { sun_shadows: true, ..Default::default() });
+            append_shader(&mut source,transmission,lod);
             assert_eq!(source.contains("let foliage_transfer ="),transmission);
-            assert_eq!(source.contains("if !foliage_detail_distant(p)"),lod);
+            assert_eq!(source.contains("if foliage_detail_distant(world) {"),lod);
             let errors = renderer.device.push_error_scope(wgpu::ErrorFilter::Validation);
             let _shader = renderer.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("foliage detail regression"), source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -169,7 +176,7 @@ mod tests {
         append_shader(&mut source,true,false);
         let fog = "let rgb = select(mix(lit, authored_fog, f), lit, add);";
         assert!(source.contains(fog) && original.contains(fog));
-        assert!(source.contains("sun_visibility(world, n, pixel)"));
+        assert!(source.contains("sun_visibility(world, lit_side, pixel)"));
         assert!(source.contains("max(g.sun_g.rgb, vec3<f32>(0.0))"));
         assert!(!source.contains("foliage_pushers"));
         for sun in [0.0f32, 0.5, 1.0] { for visible in [0.0f32, 0.5, 1.0] { for fog in [0.0f32, 0.5, 1.0] {
@@ -178,5 +185,45 @@ mod tests {
             assert!(transmitted <= unfogged);
             if sun == 0.0 || visible == 0.0 || fog == 1.0 { assert_eq!(transmitted,0.0); }
         } } }
+    }
+    #[test]
+    fn backlight_is_two_sided_and_strongest_toward_sun() {
+        let transfer = |normal: Vec3, view: Vec3, sun: Vec3| {
+            let facing = if normal.dot(view) >= 0.0 { normal } else { -normal };
+            0.5 * (-facing.dot(sun)).max(0.0) + 0.7 * (-view.dot(sun)).max(0.0).powi(4)
+        };
+        let normal = Vec3::Z;
+        let sun = -Vec3::Z;
+        assert_eq!(transfer(normal, Vec3::Z, sun), 1.2);
+        assert_eq!(transfer(-normal, Vec3::Z, sun), 1.2);
+        assert_eq!(transfer(normal, -Vec3::Z, sun), 0.0);
+        assert!(transfer(Vec3::X, Vec3::Z, sun) >= 0.7, "grazing cards still forward-scatter");
+        let shader = include_str!("foliage_detail.wgsl");
+        assert!(shader.contains("select(-n, n, dot(n, view) >= 0.0)"));
+        assert!(shader.contains("0.5 * through_leaf + 0.7 * toward_eye"));
+    }
+    #[test]
+    fn lod_cheap_shadow_preserves_lamps_near_plants_and_receiver_bounds() {
+        let original = crate::enhanced_shader::source(crate::EnhancedSettings { sun_shadows: true, ..Default::default() });
+        let mut source = original.clone();
+        append_shader(&mut source, false, true);
+        let lighting = |text: &str| text.split("fn light_vertex_sun(").nth(1).unwrap().split("\n}").next().unwrap().to_owned();
+        assert_eq!(lighting(&source), lighting(&original), "LOD must not discard local lamps or specular");
+        let cascade = source.split("fn cascade_visibility(").nth(1).unwrap().split("\n}").next().unwrap();
+        let branch = cascade.find("if foliage_detail_distant(world) {").unwrap();
+        assert!(cascade.find("if any(uv <= guard)").unwrap() < branch);
+        assert!(cascade.find("if softness <= 0.0").unwrap() < branch, "hard-shadow receiver plane filter is unchanged");
+        assert!(branch < cascade.find("var blocker_sum").unwrap());
+        let single_tap = cascade[branch..].split("\n    }").next().unwrap();
+        assert_eq!(single_tap.matches("textureSampleCompareLevel(").count(), 1);
+        assert!(single_tap.contains("uv, i32(layer), p.z - 0.00002"));
+        assert_eq!(source.split("fn sun_visibility(").nth(1).unwrap().split("\n}").next(),
+            original.split("fn sun_visibility(").nth(1).unwrap().split("\n}").next(), "cascade selection, blend and fog envelope stay native");
+        for plant in [false, true] { for distance in [0.0f32, 48.0, 48.1] {
+            let cheap = plant && distance * distance > 2304.0;
+            assert_eq!(cheap, plant && distance > 48.0);
+        } }
+        let helper = include_str!("foliage_detail.wgsl");
+        assert!(helper.contains("(u32(mat.native.z) & 64u) != 0u && dot(delta, delta) > 2304.0"));
     }
 }

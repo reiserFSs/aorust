@@ -2613,19 +2613,27 @@ impl Renderer {
                             draw(pass, d, vi..vi + 1, false);
                         }
                     }
-                    if split_foliage {
-                        // Replay only the complementary soft coverage, preserving
-                        // native relative order and never crossing a priority.
-                        for &(_, _, list, di, vi) in &self.sorted[first..last] {
-                            let d = &[&self.gpu.opaque, &self.gpu.blended, &self.gpu.liquid][list as usize][di];
-                            if !d.vegetation { continue; }
-                            if let Some(pipe) = foliage_edges::pipeline(&self.world.pipes, d.pipe, true) {
-                                draw(pass, &Draw { pipe, ..*d }, vi..vi + 1, false);
-                            }
+                }
+                calls.set(calls.get() + self.draw_actors(pass, priority));
+                if let Some(inst) = inst_buf.filter(|_| split_foliage) {
+                    pass.set_bind_group(0, &self.globals_bg, &[]);
+                    if self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows || self.enhanced_settings.night_mode == NightMode::Moonlit {
+                        pass.set_bind_group(3, &self.sun_shadows.as_ref().expect("shadow maps prepared before world").receiver, &[]);
+                    }
+                    pass.set_vertex_buffer(1, inst.slice(..));
+                    pipe.set(usize::MAX); mesh.set((false, usize::MAX, false)); mat.set((false, usize::MAX));
+                    let first = self.sorted.partition_point(|command| command.0 < priority);
+                    let last = self.sorted.partition_point(|command| command.0 <= priority);
+                    // Replay only the complementary soft coverage, preserving
+                    // native relative order and never crossing a priority.
+                    for &(_, _, list, di, vi) in &self.sorted[first..last] {
+                        let d = &[&self.gpu.opaque, &self.gpu.blended, &self.gpu.liquid][list as usize][di];
+                        if !d.vegetation { continue; }
+                        if let Some(pipe) = foliage_edges::pipeline(&self.world.pipes, d.pipe, true) {
+                            draw(pass, &Draw { pipe, ..*d }, vi..vi + 1, false);
                         }
                     }
                 }
-                calls.set(calls.get() + self.draw_actors(pass, priority));
             };
             if let Some(sky) = sky_buf {
                 pass.set_vertex_buffer(1, sky.slice(..));

@@ -86,9 +86,9 @@ impl Spec {
                 };
                 (if effect == 17 { "fs_lava_crust" } else { "fs_lava" }, Some(wgpu::BlendState { color: component, alpha: component }), true)
             },
-            18 => ("fs_foliage_blend_core", None, true),
+            18 => ("fs_foliage_blend_core", Some(wgpu::BlendState::ALPHA_BLENDING), true),
             19 => ("fs_foliage_blend_soft", Some(wgpu::BlendState::ALPHA_BLENDING), false),
-            20 => ("fs_foliage_sprite_core", None, true),
+            20 => ("fs_foliage_sprite_core", Some(wgpu::BlendState::ALPHA_BLENDING), true),
             21 => ("fs_foliage_sprite_soft", Some(wgpu::BlendState::ALPHA_BLENDING), false),
             _ => (fs, state, depth_write),
         };
@@ -169,6 +169,17 @@ impl Index<usize> for Pipelines {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn foliage_core_keeps_blended_coverage_and_soft_edges_do_not_write_depth() {
+        let base = Spec { blend: Blend::AlphaBlend, two_sided: true, sky: false, env: false,
+            fade: false, sprite: false, actor: false, flip_depth: false, effect: 18, compare: None };
+        for effect in 18..=21 {
+            let descriptor = Spec { effect, ..base }.descriptor();
+            assert_eq!(descriptor.state, Some(wgpu::BlendState::ALPHA_BLENDING));
+            assert_eq!(descriptor.depth_write, effect % 2 == 0);
+        }
+    }
 
     #[test]
     fn descriptor_duplicates_reuse_keys_without_merging_distinct_state() {
