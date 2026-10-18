@@ -12,6 +12,8 @@ struct GrassParams {
     wind: vec4<f32>,      // x: wind strength (1 = a fresh breeze); y: gust share
     bands: array<vec4<f32>, 2>, // blades instanced per cell in eight distance bands
     benders: array<vec4<f32>, 16>,
+    trail_origin: vec4<f32>, // world grid minimum x/z, cell size, enabled
+    trails: array<vec4<f32>, 1024>, // lean x/z, foot height, compression
 }
 @group(3) @binding(0) var<storage, read> grass_cells: array<GrassCell>;
 @group(3) @binding(1) var<uniform> grass_params: GrassParams;
@@ -102,7 +104,29 @@ fn bend_keeping_length(b_in: vec3<f32>, above: f32) -> vec3<f32> {
     if l > most { b *= most / l; }
     return vec3<f32>(b.x, -(above - sqrt(max(above * above - dot(b, b), 0.0))), b.z);
 }
-// Current frame only: an admitted visible actor's feet spring the grass out of the way. No state survives.
+
+// World-anchored samples, not a camera-scrolling texture. CPU ownership revokes
+// every sample from a source as soon as final-camera admission is lost.
+fn grass_trail(pos: vec3<f32>) -> vec2<f32> {
+    let coordinate = pos.xz / grass_params.trail_origin.z - vec2<f32>(0.5);
+    let base = vec2<i32>(floor(coordinate));
+    let fraction = fract(coordinate);
+    let origin = vec2<i32>(grass_params.trail_origin.xy);
+    var bend = vec2<f32>(0.0);
+    for (var z = 0; z < 2; z += 1) {
+        for (var x = 0; x < 2; x += 1) {
+            let cell = base + vec2<i32>(x, z);
+            if any(cell < origin) || any(cell >= origin + vec2<i32>(32)) { continue; }
+            let wrapped = ((cell % vec2<i32>(32)) + vec2<i32>(32)) % vec2<i32>(32);
+            let sample = grass_params.trails[u32(wrapped.y * 32 + wrapped.x)];
+            if abs(sample.z - pos.y) > 1.5 { continue; }
+            let weight = select(1.0 - fraction.x, fraction.x, x == 1) * select(1.0 - fraction.y, fraction.y, z == 1);
+            bend += sample.xy * sample.w * weight;
+        }
+    }
+    return bend;
+}
+// Instant admitted-character push plus independently enabled recovering trails.
 fn grass_push(pos: vec3<f32>, h: f32, plant_height: f32) -> vec3<f32> {
     var push = vec2<f32>(0.0);
     for (var index = 0u; index < min(u32(grass_params.limits.w), 16u); index += 1u) {
@@ -114,6 +138,7 @@ fn grass_push(pos: vec3<f32>, h: f32, plant_height: f32) -> vec3<f32> {
         let near = 1.0 - smoothstep(0.12, 0.8, dist);
         push += select(vec2<f32>(0.7071), d / dist, dist > 1e-3) * near;
     }
+    if grass_params.trail_origin.w > 0.0 { push += grass_trail(pos); }
     let len = length(push);
     if len <= 1e-4 { return vec3<f32>(0.0); }
     let above = h * plant_height;

@@ -885,6 +885,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
         "foliage-leaves" => settings.foliage_leaves = true,
         "foliage-flutter" => settings.foliage_flutter = true,
         "foliage-falling" => settings.foliage_falling = true,
+        "grass-trails" => { settings.grass_trails = true; settings.ground_grass = true; }
         "foliage-subdivision" => settings.foliage_subdivision = true,
         "foliage-translucency" => settings.foliage_translucency = true,
         "foliage-lod" => settings.foliage_lod = true,
@@ -897,6 +898,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             settings.foliage_leaves = true;
             settings.foliage_flutter = true;
             settings.foliage_falling = true;
+            settings.grass_trails = true;
             settings.foliage_subdivision = true;
             settings.foliage_translucency = true;
             settings.foliage_lod = true;
@@ -953,7 +955,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             grass_density: 1.0, grass_distance: 50.0, sun_boost: 0.5, grade_strength: 0.8, contact_strength: 0.4,
             ..Default::default()
         },
-        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before|foliage-edges|foliage-sway|foliage-push|foliage-leaves|foliage-flutter|foliage-falling|foliage-subdivision|foliage-translucency|foliage-lod|all-foliage|all-foliage-shadows"),
+        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before|foliage-edges|foliage-sway|foliage-push|foliage-leaves|foliage-flutter|foliage-falling|grass-trails|foliage-subdivision|foliage-translucency|foliage-lod|all-foliage|all-foliage-shadows"),
     }
     Ok(settings)
 }
@@ -1029,6 +1031,9 @@ fn graphics_fixture_foliage_profiles_are_independent() {
         "foliage-subdivision" => foliage_subdivision,
         "foliage-translucency" => foliage_translucency, "foliage-lod" => foliage_lod,
     );
+    assert_eq!(graphics_fixture_settings("grass-trails").unwrap(),
+        ao_render::EnhancedSettings { grass_trails: true, ground_grass: true, ..defaults });
+    assert!(all.grass_trails && all.ground_grass);
     assert_eq!(graphics_fixture_settings("all-foliage-shadows").unwrap(),
         ao_render::EnhancedSettings { sun_shadows: true, ..all });
     assert!(!all.sun_shadows && !all.hdr

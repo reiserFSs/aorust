@@ -857,7 +857,7 @@ the fixture rejects adapter clamping rather than mislabel a 4× benchmark.
 Atmosphere budget captures use `AOMAC_GFX_MSAA=4` at 1920×1200.
 Within one process, views share immutable scene/collision snapshots keyed by exact
 playfield and time bits, with the fixture's fixed clear weather/day. The current
-17-view matrix loads nine snapshots instead of seventeen; renderers, uploads and
+18-view matrix loads nine snapshots instead of eighteen; renderers, uploads and
 independent-repeat checks remain separate. `scene_load_count` and `scene_load_ms`
 in the manifest report loader work (collision loading is not included in the time).
 The destination must not exist. The fixed matrix covers ICC 4582 landmark and
@@ -886,7 +886,18 @@ mount's real posed lights: `borealis-lightbar-night` and
 These fixture equipment/placement overrides are explicit in the manifest;
 no emissive or other material is replaced.
 Every view uses a fixed 1920×1200 camera/lens, day zero, clear weather,
-CRT/cloud seed one, zero renderer/effect time, MSAA one and anisotropy one.
+CRT/cloud seed one, zero renderer/effect time, MSAA one by default and anisotropy one.
+Set `AOMAC_GFX_MSAA=4` for four-sample foliage/edge evidence and timing;
+`1`, `2`, `4` and `8` are accepted, subject to adapter support. The selected sample count is written to the manifest
+and frame timing report. Omit the override to retain the faithful fixture default.
+Set `AOMAC_GFX_FOLIAGE_INTERACTION=1` for interaction evidence: every selected
+profile, including the faithful baseline, receives the same captured own-avatar
+model and idle pose. Sixteen deterministic zero-delta render steps move it one
+metre along scene X, ending three metres ahead of the camera and one metre below
+its eye. Each step supplies the matching own-avatar bender; the final pose and
+interaction state are frozen for capture/timing. The manifest records the mode,
+step count, delta and per-view scene-space endpoints. Omit this mode to preserve
+the original fixture placement and captures; pair baselines with the same mode.
 Each immutable scene snapshot is rendered by two independently initialized
 renderers; raw RGBA8 must match exactly before the run reports success.
 The same captured bytes are written as top-down tightly packed `.rgba` and `.png`,
@@ -1155,7 +1166,7 @@ extinction or signals from hidden/non-admitted actors.
 The ignored headless regression
 `graphics_offline_night_preserves_fog_and_hidden_actor_isolation` uses
 `borealis-foliage-night` and `newland-night`, at 1920×1200 and MSAA one, with
-`faithful`, `grass` and `all-no-bloom`. A zero-alpha captured
+`faithful`, `grass`, `all-no-bloom` and `all-foliage`. A zero-alpha captured
 character and its actor-tagged bender must produce exactly the absent image.
 Two saturated, untextured captured-body colour probes must differ without fog
 (the non-vacuous control), then become byte-identical with full native fog.
@@ -1302,6 +1313,46 @@ after grass uses its own receiver layout.
 
 ## Optional material-ground grass
 
+The Enhanced page also exposes ten independent, default-off foliage controls:
+`AomacFoliageEdges`, `AomacFoliageSway`, `AomacFoliagePush`,
+`AomacFoliageLeaves`, `AomacFoliageFlutter`, `AomacFoliageFalling`,
+`AomacGrassTrails`, `AomacFoliageSubdivision`, `AomacFoliageTranslucency`
+and `AomacFoliageLod`. They use the same account-independent root `Prefs.xml`
+storage as Ground Grass. Restore Original resets the selected Enhanced page;
+Restore All resets every registered Enhanced control, including quality sliders.
+Native-foliage effects do not require Ground Grass:
+weather wind, terrain exposure and admitted character interaction inputs are
+supplied independently. Grass Trails requires Ground Grass to provide the
+generated blade geometry affected by trails.
+
+The offline fixture accepts `foliage-edges`, `foliage-sway`, `foliage-push`,
+`foliage-leaves`, `foliage-flutter`, `foliage-falling`, `grass-trails`,
+`foliage-subdivision`, `foliage-translucency` and `foliage-lod` to isolate
+each switch. The `grass-trails` profile also enables its underlying Ground
+Grass geometry; `all-foliage` enables all ten switches plus Ground Grass,
+without unrelated enhancements. `all-foliage-shadows` additionally enables only
+Sun Shadows, for canopy cascade-draw evidence. Existing profiles, including `all` and `all-before`,
+retain their previous switch selections.
+
+Static foliage admission uses the native texture creator identity and exact
+embedded FAFTexture names (`docs/formats.md`), not an alpha-only classifier.
+Opaque trunks, actors, signs and unknown textures stay unchanged. Sway shares
+GrassTwitch's stabilized, fixed-world-axis low-frequency wind; spring contacts
+are source-owned and disappear immediately when their character loses final-camera
+body admission or terrain LOS. Near-character topology refinement preserves
+triangle area, UVs and original distant geometry. Two-pass foliage keeps the native
+alpha test, partitions alpha at 0.95, and defers the complementary soft range
+within the same native priority. A frame containing any native depth clear uses
+the original unsplit foliage path rather than replaying across that clear.
+
+Additional sprigs reuse the original canopy texture and never thin the original
+cards. Flutter and gust-falling copies use the same branch motion in beauty and
+sun-shadow passes. Their GPU resources allocate only while a leaf switch is on.
+Grass trails use a 32×32 world-anchored grid of 1.25 m cells, recover over six
+seconds and revoke each source's contribution before upload when it is no longer
+admitted. Backlit foliage transmission retains the native fog operation; the
+separate distant-plant shading switch omits local/specular evaluation beyond 48 m.
+
 `AomacGroundGrass` is an off-by-default enhancement, not a reproduction of native
 vegetation geometry. Every green part of the terrain's original tile pictures
 admits blades, including grass/soil transition tiles; the per-texel green mask
@@ -1398,10 +1449,11 @@ ao-vk-like night lighting direction. Native palette/gamma composition and the
 root fog floor remain relevant; a raised blade tip must not reduce extinction.
 Regression:
 `AOMAC_GFX_OUT=<new dir> cargo test --profile fast -p aomac
-graphics_offline_night_is_never_brighter_than_faithful -- --ignored --nocapture --test-threads=1`
-requires every aligned 16×16 block's mean Rec.709 sRGB-code luminance to exceed
-faithful by at most one code for the `grass` and `all-no-bloom` profiles at
-`newland-night` and `borealis-foliage-night`; no additional tolerance is allowed.
+graphics_offline_night_preserves_fog_and_hidden_actor_isolation -- --ignored --nocapture --test-threads=1`
+checks non-admitted actor/bender isolation and fully fogged body-colour
+extinction, with a visible unfogged colour control, for the two night views.
+The synthetic native-ground lighting regression remains separate to detect
+unlit or self-glowing blades; no global faithful-night brightness cap applies.
 Far roots also converge on the tile's 8×8 mip, matching native coarse composites
 rather than magnifying one full-resolution dark texel with a derivative-free UV.
 Normals use the native central height differences, cached at tile generation. The
@@ -1694,9 +1746,3 @@ screenshot readback. It warms 120 frames, records 600 samples, and writes
 milliseconds. Acquire the shared GPU timing lock before timing; do not run
 concurrent captures or GPU tests.
 
-
-Native foliage sway, admitted-character push and near-character subdivision are independent default-off controls on Enhanced/Grass & Plants. Their fixture profiles are `foliage-sway`, `foliage-push` and `foliage-subdivision`; `all-foliage` combines the available foliage switches plus Ground Grass. Source identity is documented in `docs/formats.md`; native trunks, actors and unknown textures remain rigid. Wind shares stabilized grass weather; source-owned spring contacts revoke on lost final-camera admission or terrain LOS.
-
-Foliage Edges, Foliage Translucency and Foliage LOD add independent default-off controls and matching `foliage-edges`, `foliage-translucency` and `foliage-lod` fixture profiles. Core/soft coverage splits at alpha 0.95 within each native priority, preserving authored alpha testing; native viewport depth clears retain the unsplit path. Backlit transmission retains native fog; LOD omits local/specular evaluation beyond 48 m.
-
-Canopy Leaves, Leaf Flutter and Falling Leaves are independent default-off controls with matching `foliage-leaves`, `foliage-flutter` and `foliage-falling` profiles. Extra sprigs reuse native canopy textures without thinning original cards. Beauty and sun-shadow passes share branch motion; optional leaf GPU allocations exist only while a leaf switch is enabled. `all-foliage-shadows` adds Sun Shadows to the combined foliage fixture.

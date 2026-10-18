@@ -112,6 +112,7 @@ pub(super) fn controls() -> Vec<Control> {
         Control::check(Foliage, "Native Foliage", "AomacFoliageLeaves", "Canopy Leaves"),
         Control::check(Foliage, "Native Foliage", "AomacFoliageFlutter", "Leaf Flutter"),
         Control::check(Foliage, "Native Foliage", "AomacFoliageFalling", "Falling Leaves"),
+        Control::check(Foliage, "Native Foliage", "AomacGrassTrails", "Grass Trails"),
         Control::check(Foliage, "Native Foliage", "AomacFoliageSubdivision", "Foliage Subdivision"),
         Control::check(Foliage, "Native Foliage", "AomacFoliageTranslucency", "Foliage Translucency"),
         Control::check(Foliage, "Native Foliage", "AomacFoliageLod", "Foliage LOD"),

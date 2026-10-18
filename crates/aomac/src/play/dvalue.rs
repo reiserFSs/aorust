@@ -209,6 +209,7 @@ impl DValues {
             foliage_leaves: self.flag("AomacFoliageLeaves"),
             foliage_flutter: self.flag("AomacFoliageFlutter"),
             foliage_falling: self.flag("AomacFoliageFalling"),
+            grass_trails: self.flag("AomacGrassTrails"),
             foliage_subdivision: self.flag("AomacFoliageSubdivision"),
             foliage_translucency: self.flag("AomacFoliageTranslucency"),
             foliage_lod: self.flag("AomacFoliageLod"),

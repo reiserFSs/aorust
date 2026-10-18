@@ -19,6 +19,92 @@ const EXPOSURE_CELLS_PER_FRAME: usize = 4;
 /// Narrowest drawn blade width in pixels; thinner blades are widened and tinted towards the ground.
 const MIN_BLADE_PIXELS: f32 = 0.8;
 
+const TRAIL_SIDE: usize = 32;
+const TRAIL_CELLS: usize = TRAIL_SIDE * TRAIL_SIDE;
+const TRAIL_CELL_SIZE: f32 = 1.25;
+const TRAIL_RECOVERY_SECONDS: f32 = 6.0;
+
+#[derive(Clone, Copy, Default)]
+struct TrailSample {
+    grid: [i32; 2],
+    /// Horizontal lean, foot height, and remaining compression.
+    bend: [f32; 4],
+}
+struct TrailSource {
+    previous: GrassBender,
+    cells: Vec<TrailSample>,
+}
+#[derive(Default)]
+struct TrailGrid {
+    sources: Vec<TrailSource>,
+    origin: [i32; 2],
+}
+impl TrailGrid {
+    fn index(grid: [i32; 2]) -> usize {
+        grid[1].rem_euclid(TRAIL_SIDE as i32) as usize * TRAIL_SIDE
+            + grid[0].rem_euclid(TRAIL_SIDE as i32) as usize
+    }
+    fn recover(&mut self, dt: f32) {
+        if !dt.is_finite() || dt <= 0.0 { return; }
+        for source in &mut self.sources {
+            for cell in &mut source.cells {
+                cell.bend[3] = (cell.bend[3] - dt / TRAIL_RECOVERY_SECONDS).max(0.0);
+            }
+        }
+    }
+    fn update(&mut self, admitted: &[GrassBender], camera: Vec3) {
+        self.origin = [camera.x, camera.z].map(|v| (v / TRAIL_CELL_SIZE).floor() as i32 - TRAIL_SIDE as i32 / 2);
+        let admitted = &admitted[..admitted.len().min(MAX_BENDERS)];
+        // Keep ownership until recovery completes, but never after admission loss.
+        self.sources.retain(|source| admitted.iter().any(|b| b.actor == source.previous.actor));
+        for bender in admitted {
+            let Some(source) = self.sources.iter_mut().find(|source| source.previous.actor == bender.actor) else {
+                self.sources.push(TrailSource { previous: *bender, cells: vec![TrailSample::default(); TRAIL_CELLS] });
+                continue;
+            };
+            for cell in &mut source.cells {
+                if (0..2).any(|axis| cell.grid[axis] < self.origin[axis] || cell.grid[axis] >= self.origin[axis] + TRAIL_SIDE as i32) {
+                    cell.bend[3] = 0.0;
+                }
+            }
+            let start = Vec3::from_array(source.previous.position);
+            let end = Vec3::from_array(bender.position);
+            source.previous = *bender;
+            let movement = end - start;
+            let distance = movement.x.hypot(movement.z);
+            // Teleports never draw a line through unobserved ground.
+            if !(0.001..=6.0).contains(&distance) || movement.y.abs() > 1.5 { continue; }
+            let direction = [movement.x / distance, movement.z / distance];
+            let steps = (distance / 0.3).ceil() as usize;
+            for step in 0..=steps {
+                let position = start.lerp(end, step as f32 / steps as f32);
+                let center = [position.x, position.z].map(|v| (v / TRAIL_CELL_SIZE).floor() as i32);
+                for z in center[1] - 1..=center[1] + 1 {
+                    for x in center[0] - 1..=center[0] + 1 {
+                        let grid = [x, z];
+                        if (0..2).any(|axis| grid[axis] < self.origin[axis] || grid[axis] >= self.origin[axis] + TRAIL_SIDE as i32) { continue; }
+                        let dx = (x as f32 + 0.5) * TRAIL_CELL_SIZE - position.x;
+                        let dz = (z as f32 + 0.5) * TRAIL_CELL_SIZE - position.z;
+                        let strength = (1.0 - dx.hypot(dz) / 1.15).max(0.0);
+                        let cell = &mut source.cells[Self::index(grid)];
+                        if cell.grid != grid || strength >= cell.bend[3] {
+                            *cell = TrailSample { grid, bend: [direction[0], direction[1], position.y, strength] };
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fn write(&self, output: &mut [[f32; 4]; TRAIL_CELLS]) {
+        for source in &self.sources {
+            for cell in &source.cells {
+                let index = Self::index(cell.grid);
+                if cell.bend[3] > output[index][3] { output[index] = cell.bend; }
+            }
+        }
+    }
+}
+
 /// Effect-local radians, never derived from the native f32 animation clock.
 /// Integer shader harmonics make every component continuous across TAU.
 pub(super) fn advance_wind_phase(phase: f64, dt: f32) -> f64 {
@@ -74,6 +160,8 @@ struct Params {
     /// Blades instanced per cell in each distance band.
     bands: [[f32; 4]; 2],
     benders: [[f32; 4]; MAX_BENDERS],
+    trail_origin: [f32; 4],
+    trails: [[f32; 4]; TRAIL_CELLS],
 }
 struct Batch {
     patch: usize,
@@ -109,6 +197,7 @@ pub(super) struct Grass {
     shadows: bool,
     cells_buffer: wgpu::Buffer,
     params_buffer: wgpu::Buffer,
+    params: Params,
     visible_buffer: wgpu::Buffer,
     noise_view: wgpu::TextureView,
     noise_sampler: wgpu::Sampler,
@@ -132,6 +221,7 @@ pub(super) struct Grass {
     benders: [[f32; 3]; MAX_BENDERS],
     bender_count: usize,
     inputs: Vec<GrassBender>,
+    trails: TrailGrid,
     prepare_cpu_ns: u64,
     exposure: Option<GrassExposure>,
     exposure_cache: std::collections::HashMap<[u32; 4], Option<[[f32; 4]; 4]>>,
@@ -210,6 +300,8 @@ impl Grass {
         Self {
             #[cfg(test)]
             forced_band: None,
+            trails: TrailGrid::default(),
+            params: bytemuck::Zeroable::zeroed(),
             pipeline, bind, layout, shadows, cells_buffer, params_buffer, visible_buffer, noise_view, noise_sampler, mask_view, green_bytes: green.layers.len(), cells: Vec::with_capacity(MAX_CELLS), batches: Vec::with_capacity(MAX_CELLS), visible: std::array::from_fn(|_| Vec::with_capacity(MAX_CELLS)), draws: Vec::new(), stride: 0, band_strides: [0; BANDS], surface_heights: Vec::new(), surface_parities: Vec::new(), samples, channels, wind_phase: 0.0, filtered_wind, benders: [[0.0; 3]; MAX_BENDERS], bender_count: 0, inputs: Vec::with_capacity(MAX_BENDERS), prepare_cpu_ns: 0, exposure: None, exposure_cache: std::collections::HashMap::with_capacity(MAX_EXPOSURE_CELLS * 2), exposure_order: std::collections::VecDeque::with_capacity(MAX_EXPOSURE_CELLS), candidates: Vec::with_capacity(MAX_CELLS), order: Vec::with_capacity(MAX_CELLS), last_selection: None, last_radius: 0, last_path: super::GroundPath::Simple, pending: false }
     }
     #[allow(clippy::too_many_arguments)]
@@ -338,11 +430,23 @@ impl Grass {
         // Spatial waves stay world-anchored; only the filtered bend follows weather.
         let [wind_x, wind_z, strength] = self.filtered_wind;
         let pixels = view.map_or(0.0, |(_, pixels)| pixels);
-        let mut params = Params { wind_time: [wind_x, wind_z, (self.wind_phase / 0.05) as f32, radius], limits: [self.stride as f32, pixels, MIN_BLADE_PIXELS, self.bender_count as f32],
-            wind: [strength, 1.0, 0.0, 0.0], bands: std::array::from_fn(|row| std::array::from_fn(|col| self.band_strides[row * 4 + col] as f32)), benders: [[0.0; 4]; MAX_BENDERS] };
+        let params = &mut self.params;
+        params.wind_time = [wind_x, wind_z, (self.wind_phase / 0.05) as f32, radius];
+        params.limits = [self.stride as f32, pixels, MIN_BLADE_PIXELS, self.bender_count as f32];
+        params.wind = [strength, 1.0, 0.0, 0.0];
+        params.bands = std::array::from_fn(|row| std::array::from_fn(|col| self.band_strides[row * 4 + col] as f32));
+        params.benders.fill([0.0; 4]);
+        params.trail_origin = [self.trails.origin[0] as f32, self.trails.origin[1] as f32, TRAIL_CELL_SIZE, f32::from(u8::from(settings.grass_trails))];
+        if settings.grass_trails {
+            params.trails.fill([0.0; 4]);
+            self.trails.write(&mut params.trails);
+        }
         for (slot, position) in params.benders.iter_mut().zip(&self.benders[..self.bender_count]) { *slot = [position[0], position[1], position[2], 1.0]; }
         self.bender_count = 0;
-        queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
+        // Disabled trails neither clear nor upload the persistent 16KiB grid.
+        let bytes = bytemuck::bytes_of(params);
+        let size = if settings.grass_trails { bytes.len() } else { std::mem::offset_of!(Params, trails) };
+        queue.write_buffer(&self.params_buffer, 0, &bytes[..size]);
     }
     fn cell_exposed(&mut self, cell: &mut Cell, budget: &mut usize, liquids: &[super::native_liquid::LiquidRun], ground: &GroundRun, grid: [i32; 2]) -> bool {
         let key = [cell.origin[0].to_bits(), cell.origin[1].to_bits(), cell.origin[2].to_bits(), cell.identity[0]];
@@ -606,6 +710,7 @@ impl super::Renderer {
         if let Some(grass) = &mut self.grass {
             grass.wind_phase = phase;
             grass.filtered_wind = wind;
+            grass.trails.recover(dt);
         }
     }
     fn ensure_grass(&mut self) {
@@ -636,7 +741,7 @@ impl super::Renderer {
     }
     /// Current-frame opaque character candidates. Admission, LOS and nearest-source
     /// capping use the renderer's final camera, after body preparation.
-    /// Reuse the caller's allocation; no candidate copies or persistent trail state.
+    /// Reuse the caller's candidate allocation; trails retain only admitted sources.
     /// Set after `set_actors`, which invalidates the previous batch's snapshot.
     /// The snapshot remains valid for repeated draws/screenshots until the next
     /// actor batch replaces it; visibility is still checked again on every render.
@@ -663,6 +768,7 @@ impl super::Renderer {
                 grass.exposure_order.clear();
                 grass.last_selection = None;
                 grass.pending = true;
+                grass.trails.sources.clear();
             }
             grass.exposure = exposure;
         }
@@ -679,6 +785,11 @@ impl super::Renderer {
             );
             grass.benders = selected.map(|bender| bender.position);
             grass.bender_count = count;
+            if settings.grass_trails {
+                grass.trails.update(&selected[..count], cam.pos);
+            } else {
+                grass.trails.sources.clear();
+            }
             grass.prepare(&self.queue, ground, &self.liquids, cam.pos, settings, self.ground_state.path(), Some((vp, pixels_per_unit)));
             grass.prepare_cpu_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         }
@@ -767,6 +878,56 @@ impl super::Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn grass_trails_recover_without_stationary_repainting() {
+        let mut grid = TrailGrid::default();
+        let mut actor = GrassBender { actor: Some(7), position: [0.0; 3] };
+        grid.update(&[actor], Vec3::ZERO);
+        assert!(grid.sources[0].cells.iter().all(|cell| cell.bend[3] == 0.0));
+        actor.position[0] = 2.0;
+        grid.update(&[actor], Vec3::ZERO);
+        let strongest = grid.sources[0].cells.iter().map(|cell| cell.bend[3]).fold(0.0_f32, f32::max);
+        assert!(strongest > 0.0);
+        grid.recover(1.0);
+        grid.update(&[actor], Vec3::ZERO);
+        let recovered = grid.sources[0].cells.iter().map(|cell| cell.bend[3]).fold(0.0_f32, f32::max);
+        assert!((recovered - (strongest - 1.0 / TRAIL_RECOVERY_SECONDS).max(0.0)).abs() < 1e-6);
+        grid.recover(TRAIL_RECOVERY_SECONDS);
+        let mut output = [[0.0; 4]; TRAIL_CELLS];
+        grid.write(&mut output);
+        assert!(output.iter().all(|cell| cell[3] == 0.0));
+    }
+
+    #[test]
+    fn grass_trails_revoke_only_the_lost_source_and_stay_world_anchored() {
+        let mut grid = TrailGrid::default();
+        let mut actors = [
+            GrassBender { actor: None, position: [-2.0, 0.0, -1.0] },
+            GrassBender { actor: Some(7), position: [-2.0, 0.0, -1.0] },
+        ];
+        grid.update(&actors, Vec3::ZERO);
+        for actor in &mut actors { actor.position[0] = 1.0; }
+        grid.update(&actors, Vec3::ZERO);
+        let mut before = [[0.0; 4]; TRAIL_CELLS];
+        grid.write(&mut before);
+        assert!(before.iter().any(|cell| cell[3] > 0.0));
+        grid.update(&actors[..1], Vec3::new(2.0, 0.0, 2.0));
+        let mut after = [[0.0; 4]; TRAIL_CELLS];
+        grid.write(&mut after);
+        assert_eq!(before, after, "camera movement never relocates world cells; overlapping admitted contribution survives");
+        assert_eq!(grid.sources.len(), 1);
+        grid.update(&[], Vec3::ZERO);
+        assert!(grid.sources.is_empty(), "admission loss removes history immediately");
+        let mut revoked = [[0.0; 4]; TRAIL_CELLS];
+        grid.write(&mut revoked);
+        assert!(revoked.iter().all(|cell| cell[3] == 0.0));
+        // Readmission cannot resurrect a trail or bridge an unobserved movement.
+        grid.update(&actors, Vec3::ZERO);
+        for actor in &mut actors { actor.position[0] += 20.0; }
+        grid.update(&actors, Vec3::ZERO);
+        assert!(grid.sources.iter().flat_map(|source| &source.cells).all(|cell| cell.bend[3] == 0.0));
+        assert!(grid.sources.iter().all(|source| source.cells.len() == TRAIL_CELLS));
+    }
     #[test]
     fn first_weather_target_is_correct_without_advancing_time() {
         let raw = [3.0, 0.0, 4.0];
