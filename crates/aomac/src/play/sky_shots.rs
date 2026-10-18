@@ -467,7 +467,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         let mut scene_load_count = 0;
         let mut scene_load_time = std::time::Duration::ZERO;
         for (name, pf, time, fixed) in views {
-            let (scene, grass_exposure, grounded_camera) = match snapshots.entry((pf, time.to_bits())) {
+            let (scene, grass_exposure, grounded_camera, collision) = match snapshots.entry((pf, time.to_bits())) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     // Every unique snapshot starts with the original loader's CRT seed.
@@ -480,18 +480,23 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                         graphics_fixture_newland_camera(|point| collision.terrain_height(point))).transpose()?;
                     scene_load_time += started.elapsed();
                     scene_load_count += 1;
+                    let collision = std::rc::Rc::new(std::cell::RefCell::new(collision));
                     let grass_exposure = if settings.foliage_enabled() || settings.interaction_enabled() {
-                        Some(super::player::grass_exposure_surface(std::rc::Rc::new(std::cell::RefCell::new(collision))))
+                        Some(super::player::grass_exposure_surface(collision.clone()))
                     } else { None };
-                    entry.insert((scene, grass_exposure, grounded_camera))
+                    entry.insert((scene, grass_exposure, grounded_camera, collision))
                 }
             };
             let fixed = grounded_camera.unwrap_or(fixed);
-            let interaction_end = fixed.pos + fixed.forward() * 3.0 - Vec3::Y;
-            let interaction_start = interaction_end - Vec3::X;
-            if interaction {
-                writeln!(manifest, "{name} interaction_start_scene={interaction_start:?} interaction_end_scene={interaction_end:?}")?;
-            }
+            let interaction_path = if interaction {
+                // Newland pf566 statel+0x4076, mesh95575 dry_edge_grass_small:
+                // native scene root, not a camera-derived or guessed plant position.
+                let endpoint = (pf == 566).then_some(Vec3::new(427.2627258, 25.0000992, -332.0443726));
+                let path = graphics_fixture_interaction_path(fixed, endpoint,
+                    |point| collision.borrow().terrain_height(point))?;
+                writeln!(manifest, "{name} interaction_start_scene={:?} interaction_end_scene={:?}", path.0, path.1)?;
+                Some(path)
+            } else { None };
             let capture = |measure: bool| -> anyhow::Result<(Vec<u8>, Lens, usize, usize)> {
                 // Fresh renderers and the original per-capture CRT reset remain independent.
                 // Both consume clones of the same immutable snapshot, including across views.
@@ -514,7 +519,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 if measure { std::fs::write(out.join(format!("{name}-msaa.txt")), format!("requested={msaa}\nactual={actual_msaa}\n"))?; }
                 let lightbar = matches!(name.as_str(), "borealis-lightbar-night" | "borealis-lightbar-night-close");
                 let authored_actor = name.starts_with("icc-actor-") || lightbar;
-                if interaction {
+                if let Some((interaction_start, interaction_end)) = interaction_path {
                     let mut avatar = super::avatar::Avatar::new(&store, &dir, 25988, &actor,
                         ao_formats::character::actor::ActorAssets::new(&store)?)?;
                     off.host.actor_models.push((super::avatar::MODEL_KEY, std::sync::Arc::new(avatar.model().clone())));
@@ -716,6 +721,39 @@ fn graphics_fixture_newland_camera(terrain_height: impl Fn([f32; 3]) -> Option<f
     eye[1] += terrain_height(eye).context("Newland street camera eye has no terrain height")?;
     at[1] += terrain_height(at).context("Newland street camera target has no terrain height")?;
     Ok(Camera::look_at(eye.into(), at.into()))
+}
+
+fn graphics_fixture_interaction_path(
+    camera: Camera,
+    endpoint: Option<Vec3>,
+    terrain_height: impl Fn([f32; 3]) -> Option<f32>,
+) -> anyhow::Result<(Vec3, Vec3)> {
+    use anyhow::Context;
+    let mut end = endpoint.unwrap_or_else(|| camera.pos + camera.forward() * 3.0 - Vec3::Y);
+    let mut start = end - Vec3::X;
+    start.y = terrain_height(start.to_array()).context("interaction start has no terrain height")?;
+    end.y = terrain_height(end.to_array()).context("interaction end has no terrain height")?;
+    Ok((start, end))
+}
+
+#[test]
+fn graphics_fixture_interaction_path_grounds_each_endpoint() {
+    let camera = Camera::look_at([10.0, 80.0, -20.0].into(), [10.0, 80.0, -30.0].into());
+    let (start, end) = graphics_fixture_interaction_path(camera, None, |point| match (point[0], point[2]) {
+        (9.0, -23.0) => Some(4.0),
+        (10.0, -23.0) => Some(6.0),
+        _ => None,
+    }).unwrap();
+    assert_eq!(start, Vec3::new(9.0, 4.0, -23.0));
+    assert_eq!(end, Vec3::new(10.0, 6.0, -23.0));
+    let endpoint = Vec3::new(427.2627258, 25.0000992, -332.0443726);
+    let (start, end) = graphics_fixture_interaction_path(camera, Some(endpoint),
+        |point| (point[2] == endpoint.z).then_some(point[0])).unwrap();
+    assert_eq!(start, Vec3::new(endpoint.x - 1.0, endpoint.x - 1.0, endpoint.z));
+    assert_eq!(end, Vec3::new(endpoint.x, endpoint.x, endpoint.z));
+    assert!(graphics_fixture_interaction_path(camera, None, |_| None).is_err());
+    assert!(graphics_fixture_interaction_path(camera, None,
+        |point| (point[0] == 9.0).then_some(4.0)).is_err());
 }
 
 #[test]

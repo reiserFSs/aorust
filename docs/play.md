@@ -893,11 +893,18 @@ and frame timing report. Omit the override to retain the faithful fixture defaul
 Set `AOMAC_GFX_FOLIAGE_INTERACTION=1` for interaction evidence: every selected
 profile, including the faithful baseline, receives the same captured own-avatar
 model and idle pose. Sixteen deterministic zero-delta render steps move it one
-metre along scene X, ending three metres ahead of the camera and one metre below
-its eye. Each step supplies the matching own-avatar bender; the final pose and
-interaction state are frozen for capture/timing. The manifest records the mode,
-step count, delta and per-view scene-space endpoints. Omit this mode to preserve
-the original fixture placement and captures; pair baselines with the same mode.
+metre along scene X. Start and end Y are sampled independently from the snapshot's
+actual `Collision::terrain_height`, using scene coordinates without Z inversion.
+The default endpoint is three metres ahead of the frozen camera in XZ; Newland
+instead ends at native pf566 statel+0x4076, mesh95575 `dry_edge_grass_small`,
+scene root `(427.2627258, 25.0000992, -332.0443726)` (endpoint Y is terrain-grounded).
+The camera and native scene remain unchanged. Each step supplies the matching
+own-avatar bender; the final pose and interaction state are frozen for
+capture/timing. The manifest records the mode, step count, delta and per-view
+terrain-grounded scene-space endpoints. Missing endpoint terrain fails only this
+opt-in mode. Omit it to preserve the original fixture placement and captures;
+pair baselines with the same mode. The separate night-fog positive control
+retains its intentionally camera-near actor placement.
 Each immutable scene snapshot is rendered by two independently initialized
 renderers; raw RGBA8 must match exactly before the run reports success.
 The same captured bytes are written as top-down tightly packed `.rgba` and `.png`,
