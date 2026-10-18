@@ -157,7 +157,7 @@ impl Compiled {
             wgpu::BindGroupLayoutEntry { binding: 8, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }, count: None },
         ];
         if shadows {
-            entries.extend(crate::sun_shadows::receiver_entries().map(|mut entry| { entry.binding += 2; entry }));
+            entries.extend(crate::sun_shadows::receiver_entries().into_iter().filter(|entry| entry.binding != 7).map(|mut entry| { entry.binding += 2; entry }));
         }
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("grass cells, benders and shared sun receiver"), entries: &entries,

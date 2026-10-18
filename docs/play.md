@@ -1455,6 +1455,7 @@ behind a synthetic wall producing exactly the same bender list as its absence.
 native-cell regression: density-zero/one renders identify actual blade pixels
 before asserting shadow and AO darkening, neutral zero-AO/no-sun paths, and zero
 emission. It is not retail-image or native-collision visual acceptance.
+Grass remaps only shared shadow bindings 0–2 to 2–4, excluding global exposure binding 7 because native root openness already travels in its cell data.
 
 The ignored `grass_offline_capture_and_timing` fixture compares density-zero
 neutral frames with grass using `FrameGpuTimer`, in both orderings. Alongside the
