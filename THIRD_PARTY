@@ -5,12 +5,26 @@ The optional Enhanced ground-grass renderer (crates/ao-render/src/grass.rs,
 grass.wgsl, grass_noise.rs) ports algorithms and shader code from ao-vk's
 procedural grass (rvk/grass.cpp, rvk/shaders/grass.vert, grass_common.glsl,
 wind.glsl): the camera-facing four-section blade strips and their kinds (blade,
-broad blade, seed stalk, flower), tuft clumping and fan-out, wildflower patches,
-slope and path-edge thinning, root-to-tip shading with canopy darkening, light
-through the blade, wind waves and gusts, the character push, the minimum
+broad blade, seed stalk, flower), tuft clumping and fan-out, dry/tall patches,
+wildflower patches, slope and path-edge thinning, root-to-tip shading with canopy
+darkening, light through the blade, rounded-edge shading and tangent/half-vector
+physical sheen, wind waves and lighter gust bands, the character push, the minimum
 drawn blade width and the smooth distance thinning. Placement and colour are
-driven by this project's own terrain data instead. No ao-vk artwork or binary
-asset is used; the blades are generated procedurally at draw time.
+driven by this project's own terrain data instead. Tufts, species, native-mask
+path thinning, gust light bands and sunlight shading are independently opt-in.
+No ao-vk artwork or binary asset is used; the blade/species shapes and colours are
+generated procedurally at draw time, only in the optional Enhanced grass path.
+
+The optional grass sun-shadow caster adapts ao-vk's separate nearest-cascade
+grass depth layer (rvk/shadow.cpp, grass.cpp and shaders/grass_shadow.vert).
+Keeping grass depth separate lets receivers soften its contribution instead of
+darkening the whole field: ao-vk's grass.vert uses 0.4, and its
+ffp_main.glsl GrassShadowVisibility uses the 0.45 weight used by this renderer.
+This renderer reuses the visible blade geometry, including its wind and
+admitted-character deformation, rather than maintaining a second blade generator.
+The upstream grass_shadow.vert also documents the corresponding point-light
+cube-face casting algorithm; the MIT notice below covers adaptations of that
+algorithm as well.
 
 ao-vk is distributed under the MIT License:
 

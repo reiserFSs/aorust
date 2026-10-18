@@ -24,14 +24,18 @@ fn grass_sun_visibility(world: vec3<f32>, normal: vec3<f32>) -> f32 {
     if shadow_frame.forward.w <= 0.0 { return 1.0; }
     let depth = dot(world - shadow_frame.eye.xyz, shadow_frame.forward.xyz);
     if depth < shadow_frame.splits.w || depth >= shadow_frame.splits.z { return 1.0; }
-    var layer = 0u;
-    if depth > shadow_frame.splits.x { layer = 1u; }
-    if depth > shadow_frame.splits.y { layer = 2u; }
-    var visible = grass_cascade_visibility(world, normal, layer);
-    let start = select(shadow_frame.splits.w, shadow_frame.splits[layer - min(layer, 1u)], layer > 0u);
-    let end = shadow_frame.splits[layer];
-    let blend = smoothstep(end - (end - start) * 0.1, end, depth);
-    if layer < 2u { visible = mix(visible, grass_cascade_visibility(world, normal, layer + 1u), blend); }
-    else { visible = mix(visible, 1.0, blend); }
+    var visible = 1.0;
+    if shadow_frame.control.w != 0u {
+        var layer = 0u;
+        if depth > shadow_frame.splits.x { layer = 1u; }
+        if depth > shadow_frame.splits.y { layer = 2u; }
+        visible = grass_cascade_visibility(world, normal, layer);
+        let start = select(shadow_frame.splits.w, shadow_frame.splits[layer - min(layer, 1u)], layer > 0u);
+        let end = shadow_frame.splits[layer];
+        let blend = smoothstep(end - (end - start) * 0.1, end, depth);
+        if layer < 2u { visible = mix(visible, grass_cascade_visibility(world, normal, layer + 1u), blend); }
+        else { visible = mix(visible, 1.0, blend); }
+    }
+    visible *= grass_blade_visibility(world);
     return mix(1.0, visible, clamp(shadow_frame.forward.w, 0.0, 1.0));
 }

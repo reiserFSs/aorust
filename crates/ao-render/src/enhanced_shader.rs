@@ -1,7 +1,8 @@
 //! Enhanced-only shader generation; the faithful WGSL is never modified.
 
 pub(super) fn source(settings: crate::EnhancedSettings) -> String {
-    let shadows = settings.sun_shadows || settings.moon_shadows;
+    let sun_shadows = settings.sun_shadows || (settings.ground_grass && settings.grass_sun_shadows);
+    let shadows = sun_shadows || settings.moon_shadows;
     let ao = settings.ambient_occlusion;
     let bloom = settings.emissive_bloom;
     let hdr = settings.needs_sun_mask();
@@ -29,7 +30,7 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
     source = source.replace("    o.light = min(to_g(emissive) + g.ambient_g.rgb + sun_diffuse * max(sn, 0.0) + dl[0], vec3<f32>(1.0));", "    let native_raw = to_g(emissive) + g.ambient_g.rgb + sun_diffuse * max(sn, 0.0) + dl[0];\n    o.light = min(native_raw, vec3<f32>(1.0));");
     source = source.replace("    o.spec = min(to_g(specular) * (dl[1] + sun_spec), vec3<f32>(1.0));", "    let native_spec = to_g(specular) * (dl[1] + sun_spec);\n    o.spec = min(native_spec, vec3<f32>(1.0));");
     source = source.replace("    return o;\n}\n\n// mode:", "    let excess = max(native_raw - vec3<f32>(1.0), vec3<f32>(0.0));\n    o.ao_info = vec3<f32>(select(0.0, 1.0, all(emissive <= vec3<f32>(0.0))), 0.0, 0.0);\n    o.sun_share = max(sun_diffuse * max(sn, 0.0) - excess, vec3<f32>(0.0));\n    o.sun_spec_share = max(to_g(specular) * sun_spec - max(native_spec - vec3<f32>(1.0), vec3<f32>(0.0)), vec3<f32>(0.0));\n    return o;\n}\n\n// mode:");
-    if settings.sun_shadows {
+    if sun_shadows {
         source = source.replace("    var light = i.light;\n    var spec = i.spec;", "    var shadow = 0.0;\n    if any(i.sun_share > vec3<f32>(0.0)) || any(i.sun_spec_share > vec3<f32>(0.0)) { shadow = 1.0 - sun_visibility(i.wpos); }\n    var light = max(i.light - i.sun_share * shadow, vec3<f32>(0.0));\n    var spec = max(i.spec - i.sun_spec_share * shadow, vec3<f32>(0.0));");
     }
     source = source.replace("    o.light = clamp(g.sun_g.rgb * max(dot(n, g.sun_dir.xyz), 0.0) + vertex_lights(o.wpos, n, 0.0)[0],", "    let ground_local = vertex_lights(o.wpos, n, 0.0)[0];\n    o.light = clamp(g.sun_g.rgb * max(dot(n, g.sun_dir.xyz), 0.0) + ground_local,");
@@ -38,7 +39,7 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
         source = source.replace("all(emissive <= vec3<f32>(0.0))), 0.0, 0.0)", "all(emissive <= vec3<f32>(0.0))), select(0.0, 1.0, any(dl[0] > vec3<f32>(0.0)) || any(dl[1] > vec3<f32>(0.0))), 0.0)");
         source = source.replace("    let ground_local = vertex_lights(o.wpos, n, 0.0)[0];", "    let ground_local = vertex_lights(o.wpos, n, 0.0)[0];\n    o.ao_info.y = select(0.0, 1.0, any(ground_local > vec3<f32>(0.0)));");
     }
-    if settings.sun_shadows {
+    if sun_shadows {
         source = source.replace("clamp(i.light + ground_palette(i),", "clamp(i.light - i.sun_share * (1.0 - sun_visibility(i.wpos)) + ground_palette(i),");
         source = source.replace("ground_tile(i) * i.dlight", "ground_tile(i) * max(i.dlight - i.sun_spec_share * (1.0 - sun_visibility(i.wpos)), vec3<f32>(0.0))");
     }

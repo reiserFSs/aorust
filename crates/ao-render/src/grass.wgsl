@@ -10,6 +10,8 @@ struct GrassParams {
     wind_time: vec4<f32>, // x, y: filtered bend direction (not normalized); z: bounded wind seconds; w: grass radius
     limits: vec4<f32>,    // x: blades per cell; y: pixels per unit at depth 1; z: least blade width (px); w: bender count
     wind: vec4<f32>,      // x: wind strength (1 = a fresh breeze); y: gust share
+    features: vec4<f32>,  // tufts/dry/tall, species, path thinning, gust light bands
+    lighting: vec4<f32>,  // sunlight, grass sun shadows, grass point shadows, reserved
     bands: array<vec4<f32>, 2>, // blades instanced per cell in eight distance bands
     benders: array<vec4<f32>, 16>,
     trail_origin: vec4<f32>, // world grid minimum x/z, cell size, enabled
@@ -154,7 +156,7 @@ struct GOut {
     @location(2) light: vec3<f32>,
     @location(3) dlight: vec3<f32>,
     @location(4) spec: vec3<f32>,
-    @location(5) shape: vec4<f32>,    // x: up the blade; y: across it (-1..1); z: gradient x canopy; w: rounded-edge light
+    @location(5) shape: vec4<f32>,    // x: up the blade; y: across it (-1..1); z: gradient x canopy; w: gust light
     @location(6) @interpolate(flat) hue: vec4<f32>,    // rgb: per-blade colour jitter; w: dry-patch share
     @location(7) @interpolate(flat) head: vec4<f32>,   // rgb: seed head / flower colour; w: 1 on a head
     @location(8) mixes: vec4<f32>,    // x: root goes to ground; y: whole blade goes to ground; z: light through it; w: brightness scale
@@ -162,13 +164,14 @@ struct GOut {
     @location(10) @interpolate(flat) path: u32,
     @location(11) @interpolate(flat) normal: vec4<f32>, // xyz: normal; w: same baked sky openness as terrain
     @location(12) @interpolate(flat) coverage: vec2<f32>, // field coverage, then geometry-LOD AO share
+    @location(13) sunlight: vec2<f32>, // rounded-edge delta, physical blade sheen (before sun visibility)
+    @location(14) world: vec3<f32>, // shared visible/caster geometry, including wind and admitted pushes
 }
 
 // Raw light visibility, before the artistic shadow-strength floor used by beauty.
 var<private> grass_direct_visibility: f32 = 1.0;
 
-@vertex
-fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance: u32) -> GOut {
+fn grass_vertex(vertex: u32, instance: u32) -> GOut {
     var o: GOut;
     o.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
     // The instance index carries its distance band in the top bits, then runs over the band's visible cells' blades.
@@ -214,57 +217,64 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     // Grass grows where the ground's own picture is green, texel by texel: a transition tile's soil stays bare.
     let tile_uv = grass_uv(c.identity.y & 255u, uv);
     let layer = i32(c.identity.y >> 8u);
-    let reach = 0.5 / size;
+    // The root texel mask is always authoritative, independently of optional path thinning.
     let m0 = textureSampleLevel(grass_mask, grass_noise_sampler, tile_uv, layer, 0.0).r;
     if m0 < 0.15 { return o; }
-    let around = (m0 + textureSampleLevel(grass_mask, grass_noise_sampler, clamp(tile_uv + vec2<f32>(reach, 0.0), vec2<f32>(0.0), vec2<f32>(1.0)), layer, 0.0).r
-        + textureSampleLevel(grass_mask, grass_noise_sampler, clamp(tile_uv - vec2<f32>(reach, 0.0), vec2<f32>(0.0), vec2<f32>(1.0)), layer, 0.0).r
-        + textureSampleLevel(grass_mask, grass_noise_sampler, clamp(tile_uv + vec2<f32>(0.0, reach), vec2<f32>(0.0), vec2<f32>(1.0)), layer, 0.0).r
-        + textureSampleLevel(grass_mask, grass_noise_sampler, clamp(tile_uv - vec2<f32>(0.0, reach), vec2<f32>(0.0), vec2<f32>(1.0)), layer, 0.0).r) * 0.2;
-    let out_mask = c.identity.w >> 8u;
-    var edge_distance = 1.0e3;
-    let to_edge = vec4<f32>(uv.x, 1.0 - uv.x, uv.y, 1.0 - uv.y) * size;
-    for (var s = 0u; s < 4u; s += 1u) { if ((out_mask >> s) & 1u) != 0u { edge_distance = min(edge_distance, to_edge[s]); } }
-    for (var s = 0u; s < 4u; s += 1u) {
-        if ((out_mask >> (4u + s)) & 1u) != 0u {
-            edge_distance = min(edge_distance, length(vec2<f32>(select(to_edge.x, to_edge.y, (s & 1u) != 0u), select(to_edge.z, to_edge.w, (s & 2u) != 0u))));
+    var edge = 1.0;
+    if grass_params.features.z > 0.5 {
+        let reach = 0.5 / size;
+        let around = (m0 + textureSampleLevel(grass_mask, grass_noise_sampler, clamp(tile_uv + vec2<f32>(reach, 0.0), vec2<f32>(0.0), vec2<f32>(1.0)), layer, 0.0).r
+            + textureSampleLevel(grass_mask, grass_noise_sampler, clamp(tile_uv - vec2<f32>(reach, 0.0), vec2<f32>(0.0), vec2<f32>(1.0)), layer, 0.0).r
+            + textureSampleLevel(grass_mask, grass_noise_sampler, clamp(tile_uv + vec2<f32>(0.0, reach), vec2<f32>(0.0), vec2<f32>(1.0)), layer, 0.0).r
+            + textureSampleLevel(grass_mask, grass_noise_sampler, clamp(tile_uv - vec2<f32>(0.0, reach), vec2<f32>(0.0), vec2<f32>(1.0)), layer, 0.0).r) * 0.2;
+        let out_mask = c.identity.w >> 8u;
+        var edge_distance = 1.0e3;
+        let to_edge = vec4<f32>(uv.x, 1.0 - uv.x, uv.y, 1.0 - uv.y) * size;
+        for (var s = 0u; s < 4u; s += 1u) { if ((out_mask >> s) & 1u) != 0u { edge_distance = min(edge_distance, to_edge[s]); } }
+        for (var s = 0u; s < 4u; s += 1u) {
+            if ((out_mask >> (4u + s)) & 1u) != 0u {
+                edge_distance = min(edge_distance, length(vec2<f32>(select(to_edge.x, to_edge.y, (s & 1u) != 0u), select(to_edge.z, to_edge.w, (s & 2u) != 0u))));
+            }
         }
+        edge = min(clamp(edge_distance / 1.2, 0.0, 1.0), smoothstep(0.1, 0.6, around));
+        if hb(hw, 1u) > smoothstep(0.15, 0.45, m0) * (0.3 + 0.7 * edge) { return o; }
     }
-    // How far inside the grass this is: the neighbouring cells' green, and the green around the root in its own tile.
-    let edge = min(clamp(edge_distance / 1.2, 0.0, 1.0), smoothstep(0.1, 0.6, around));
-    if hb(hw, 1u) > smoothstep(0.15, 0.45, m0) * (0.3 + 0.7 * edge) { return o; }
 
     // The slow fields at the root (grass_noise.rs): two fetches.
     let noise_uv = root.xz / NOISE_PERIOD;
     let field0 = textureSampleLevel(grass_noise, grass_noise_sampler, noise_uv, 0, 0.0);
     let field1 = textureSampleLevel(grass_noise, grass_noise_sampler, noise_uv, 1, 0.0);
-    let clump = field0.x;
-    if hb(hv, 0u) > 0.72 + 0.28 * clump { return o; }
-
-    // Tufts: a world-anchored jittered lattice of centres; blades thin out between them and fan out from the centre.
-    // The nearest of the four lattice points around the root's quadrant.
-    let tuft_cell = 0.5;
-    let base = vec2<i32>(floor(root.xz / tuft_cell - 0.5));
-    var nearest = 1.0e9; var out_dir = vec2<f32>(0.0); var vigour = 0.5;
-    for (var dj = 0; dj <= 1; dj += 1) {
-        for (var di = 0; di <= 1; di += 1) {
-            let cell = base + vec2<i32>(di, dj);
-            let h = lattice(cell.x, cell.y);
-            let centre = (vec2<f32>(cell) + 0.15 + 0.7 * vec2<f32>(hb(h, 0u), hb(h, 1u))) * tuft_cell;
-            let d = root.xz - centre;
-            let d2 = dot(d, d);
-            if d2 < nearest { nearest = d2; out_dir = d; vigour = hb(h, 2u); }
+    let tufts = grass_params.features.x;
+    let clump = field0.x * tufts;
+    var out_dir = vec2<f32>(0.0);
+    var vigour = 0.5;
+    var rim = 1.0;
+    if tufts > 0.5 {
+        if hb(hv, 0u) > 0.72 + 0.28 * clump { return o; }
+        // The nearest of four jittered lattice centres: thinning between tufts and fan-out within them.
+        let tuft_cell = 0.5;
+        let base = vec2<i32>(floor(root.xz / tuft_cell - 0.5));
+        var nearest = 1.0e9;
+        for (var dj = 0; dj <= 1; dj += 1) {
+            for (var di = 0; di <= 1; di += 1) {
+                let cell = base + vec2<i32>(di, dj);
+                let h = lattice(cell.x, cell.y);
+                let centre = (vec2<f32>(cell) + 0.15 + 0.7 * vec2<f32>(hb(h, 0u), hb(h, 1u))) * tuft_cell;
+                let d = root.xz - centre;
+                let d2 = dot(d, d);
+                if d2 < nearest { nearest = d2; out_dir = d; vigour = hb(h, 2u); }
+            }
         }
+        let tuft_d = sqrt(nearest);
+        rim = min(tuft_d / (0.75 * tuft_cell), 1.0);
+        out_dir = select(vec2<f32>(0.0), out_dir / tuft_d, tuft_d > 1e-4);
+        if hb(hv, 1u) > 1.0 - 0.45 * rim * rim { return o; }
     }
-    let tuft_d = sqrt(nearest);
-    let rim = min(tuft_d / (0.75 * tuft_cell), 1.0);
-    out_dir = select(vec2<f32>(0.0), out_dir / tuft_d, tuft_d > 1e-4);
-    if hb(hv, 1u) > 1.0 - 0.45 * rim * rim { return o; }
 
     // What it is: mostly blades; a few broad blades, seed stalks and flowers (in patches of one colour).
     var kind = 0u;
     let pick = hb(hw, 2u);
-    if pick < 0.124 {
+    if grass_params.features.y > 0.5 && pick < 0.124 {
         let flower = 0.024 * clamp((field0.w - 0.45) / 0.3, 0.0, 1.0);
         if pick < flower { kind = 3u; }
         else if pick < flower + 0.04 { kind = 2u; }
@@ -272,7 +282,7 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     }
     let v0 = hb(hk, 0u); let v2 = hb(hk, 3u); let v4 = hb(hv, 2u);
     let yaw = f32((hk >> 8u) & 0xffffu) * (6.2831853 / 65536.0);
-    let tall = 1.0 + 0.5 * (field0.z - 0.5);
+    let tall = 1.0 + 0.5 * (field0.z - 0.5) * tufts;
     var height = GRASS_HEIGHT * (0.45 + 1.2 * v0) * tall * (1.0 + 0.35 * (1.0 - rim) * vigour) * (0.65 + 0.35 * edge);
     var half_width = 0.5 * (0.03 + 0.03 * v2) * 0.9;
     var droop = 0.06 + 0.18 * v4;
@@ -305,7 +315,7 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     let lean_field = field1.xy - 0.5;
     let lean_dir = lean_field / (length(lean_field) + 1e-6) * (0.05 + 0.22 * field1.z);
     let scatter = (v2 - 0.5) * 0.18;
-    let fan = 0.3 * min(rim * 1.5, 1.0);
+    let fan = 0.3 * min(rim * 1.5, 1.0) * tufts;
     // Growth tends upwards on steep hills, rather than turning a green cliff into horizontal fur.
     let growth_n = normalize(mix(ground_n, vec3<f32>(0.0, 1.0, 0.0), 1.0 - smoothstep(0.5, 0.85, ground_n.y)));
     var up = normalize(vec3<f32>(growth_n.x + lean_dir.x + rr.x * scatter + out_dir.x * fan, growth_n.y,
@@ -348,9 +358,10 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     let widen_px = max(grass_params.limits.z / max(pixels, 1e-4), 1.0);
     let p = axis + right * (side * half_width * profile * fade * widen * (1.0 + 0.3 * steep) * widen_px);
     o.clip = g.vp * vec4<f32>(p, 1.0);
+    o.world = p;
 
     // Colour inputs; the terrain sample itself is taken per fragment at the root.
-    let dry = clamp((field0.y - 0.56) / 0.16, 0.0, 1.0) * 0.55 * (0.6 + 0.4 * hb(hv, 3u));
+    let dry = clamp((field0.y - 0.56) / 0.16, 0.0, 1.0) * 0.55 * (0.6 + 0.4 * hb(hv, 3u)) * tufts;
     let hj = grass_hash(hw);
     o.hue = vec4<f32>(1.0 + 0.12 * (vec3<f32>(hb(hj, 0u), hb(hj, 1u), hb(hj, 2u)) - 0.5), dry);
     var head = vec3<f32>(0.0);
@@ -370,13 +381,19 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     let sun = normalize(g.sun_dir.xyz + vec3<f32>(0.0, 1e-6, 0.0));
     let sun_on = clamp(dot(g.sun_g.rgb, LUMA) * 2.5, 0.0, 1.0) * smoothstep(0.0, 0.1, sun.y);
     let canopy_shade = mix(1.0, smoothstep(0.0, 0.75, t), canopy * 0.7 * (1.0 - sun.y));
-    let sunlit = sun_on * canopy_shade;
+    let sunlit = sun_on * canopy_shade * grass_params.lighting.x;
     let face = vec3<f32>(vh.x, 0.0, vh.y) / max(vl, 1e-3);
-    let behind = max(dot(face, sun), 0.0);
+    let behind = max(-dot(face, sun), 0.0);
     let towards = max(dot(view_dir, sun), 0.0);
     let through = (0.5 * behind + 0.5 * towards * towards * towards) * pow(t, 1.3);
+    let tangent = normalize(up_view + rr * (2.0 * droop * t));
+    let half_vector = sun - view_dir;
+    let half_dir = half_vector / max(length(half_vector), 1e-6);
+    let th = dot(tangent, half_dir);
+    let sheen = pow(max(1.0 - th * th, 0.0), 20.0) * t;
+    o.sunlight = vec2<f32>(sunlit * 0.3 * side * dot(right, sun), 0.07 * sheen * sunlit);
     o.shape = vec4<f32>(t, side, grad * ao,
-        (1.0 + sunlit * 0.3 * side * dot(right, sun)) * (1.0 + 0.45 * (gust - GUST_MEAN * grass_params.wind.y) * t));
+        1.0 + grass_params.features.w * 0.45 * (gust - GUST_MEAN * grass_params.wind.y) * t);
     o.mixes = vec4<f32>(0.55 * (1.0 - smoothstep(0.0, 0.4, t)),
         max(0.95 * smoothstep(24.0, 80.0, dist), min(0.7 * smoothstep(0.55 * radius, radius, dist) + 0.5 * (1.0 - 1.0 / widen_px), 0.85)),
         0.4 * through * sunlit, 0.94 + 0.12 * v0);
@@ -443,6 +460,11 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     return o;
 }
 
+@vertex
+fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance: u32) -> GOut {
+    return grass_vertex(vertex, instance);
+}
+
 struct GrassOutput {
     @location(0) color: vec4<f32>,
     //__AMBIENT_FIELD__
@@ -488,14 +510,21 @@ fn fs_grass(i: GOut) -> GrassOutput {
     let body = hue * (target_luma / max(dot(hue, LUMA), 1e-3)) * i.mixes.w;
     let vein = 1.04 - 0.14 * exp(-i.shape.y * i.shape.y * 12.0);
     var albedo = mix(mix(body, ground, i.mixes.x) * i.shape.z, i.head.rgb, i.head.w) * vein;
-    var colour = albedo * light * i.shape.w + albedo * vec3<f32>(1.2, 1.25, 0.7) * g.sun_g.rgb * (i.mixes.z * visibility) * (1.0 - g.moon_g.w);
+    // Raw visibility (not the beauty shadow floor) gates every extra direct-sun term.
+    let direct = grass_direct_visibility * (1.0 - g.moon_g.w);
+    let sunlight_extra = (albedo * light * (i.sunlight.x * i.shape.w)
+        + albedo * vec3<f32>(1.2, 1.25, 0.7) * g.sun_g.rgb * i.mixes.z
+        + g.sun_g.rgb * i.sunlight.y) * direct;
+    let gust_extra = albedo * light * (i.shape.w - 1.0);
+    var colour = albedo * light * i.shape.w + sunlight_extra;
     colour = mix(colour, ground * light, i.mixes.y);
     albedo = mix(albedo, ground, i.mixes.y);
     let fog = i.fog;
     var color = mix(colour, g.fog_g.rgb, fog);
     if i.path > 1u {
         // Preserve native two-pass fog multiplication, not the fused approximation.
-        color = mix(albedo, g.fog_g.rgb, fog) * mix(light, vec3<f32>(1.0), fog);
+        color = mix(albedo, g.fog_g.rgb, fog) * mix(light, vec3<f32>(1.0), fog)
+            + (sunlight_extra + gust_extra) * ((1.0 - fog) * (1.0 - i.mixes.y));
     }
     var output: GrassOutput;
     // Hardware alpha-to-coverage dithers the outer field without fragment discard.

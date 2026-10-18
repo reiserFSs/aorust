@@ -1510,6 +1510,44 @@ counts consistent. Repeated unchanged MSAA requests must not cancel a pending li
 Regression: `play::flow::tests::enhanced_option_switch_reuses_compiled_variants` exercises the
 real HUD/offscreen flow and checks frame-thread compile counts and warm-cache reuse.
 
+The **Grass & Plants / Ground Grass** section also exposes six independent
+Enhanced modifiers, each defaulting **off** and persisted/reset through the same
+DV Main registry:
+
+| Checkbox | DV Main key |
+|---|---|
+| Grass Tufts | `AomacGrassTufts` |
+| Grass Species | `AomacGrassSpecies` |
+| Grass Path Thinning | `AomacGrassPathThinning` |
+| Grass Gust Bands | `AomacGrassGustBands` |
+| Grass Sunlight | `AomacGrassSunlight` |
+| Grass Sun Shadows | `AomacGrassSunShadows` |
+
+These modifiers do not enable Ground Grass or change the world Sun Shadows
+preference. Ground Grass remains the carpet's master switch; density and distance
+remain independent. Missing keys in older preferences retain false. The CPU uploads
+`GrassParams.features = [tufts, species, path_thinning, gust_bands]` and
+`lighting = [sunlight, sun_shadows, 0, 0]` before the distance bands
+every prepared frame, without per-blade allocations.
+Grass Sun Shadows adds blade casters independently of world Sun Shadows;
+the modifier neither requires nor enables that preference.
+The artistic reference is ao-vk `rvk/grass.cpp` and
+`rvk/shaders/grass_common.glsl`, `grass.vert`, `grass.frag` (MIT; see `THIRD_PARTY`);
+these controls are not reconstructed retail settings. Native fog extinction and
+actor admission remain unchanged.
+
+Headless fixture settings (`AOMAC_GFX_SETTINGS`) include `grass-tufts`,
+`grass-species`, `grass-path-thinning`, `grass-gust-bands`, `grass-sunlight`,
+and `grass-sun-shadows`, each enabling only its modifier
+plus Ground Grass. `grass-all` leaves world Sun Shadows off for isolation;
+`grass-all`, `all`, and `all-no-bloom` enable all six modifiers.
+`grass` and the historical `all-before` retain the modifiers off.
+Runnable CPU checks (not evidence of an executed gate):
+`cargo test --release -p ao-render grass_params_match_uniform_layout`,
+`cargo test --release -p ao-render grass_switches_are_independent_and_default_off`,
+`cargo test --release -p aomac foliage_graphics_switches_roundtrip_independently_and_restore`,
+and `cargo test --release -p aomac graphics_fixture_grass_profiles_are_independent`.
+
 Headless switch evidence (2026-10-17, 1280×800 captured ICC replay, frozen simulation):
 the same 22-pipeline full-on combination took **904.59 ms** synchronously on a fresh
 renderer. Asynchronously it installed after **994.2 ms**, while **99 frames** continued

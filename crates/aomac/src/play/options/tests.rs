@@ -972,6 +972,9 @@ fn foliage_graphics_switches_roundtrip_independently_and_restore() {
         )+};
     }
     check!(
+        "AomacGrassTufts" => grass_tufts, "AomacGrassSpecies" => grass_species,
+        "AomacGrassPathThinning" => grass_path_thinning, "AomacGrassGustBands" => grass_gust_bands,
+        "AomacGrassSunlight" => grass_sunlight, "AomacGrassSunShadows" => grass_sun_shadows,
         "AomacFoliageEdges" => foliage_edges, "AomacFoliageSway" => foliage_sway,
         "AomacFoliagePush" => foliage_push, "AomacFoliageLeaves" => foliage_leaves,
         "AomacFoliageFlutter" => foliage_flutter, "AomacFoliageFalling" => foliage_falling,
@@ -1201,6 +1204,8 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
     let Some(mut r) = Rig::new() else { return };
     for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows",
         "AomacMaterialSpecular", "AomacClusteredLighting", "AomacMoonShadows", "AomacLocalLightShadows",
+        "AomacGrassTufts", "AomacGrassSpecies", "AomacGrassPathThinning", "AomacGrassGustBands",
+        "AomacGrassSunlight", "AomacGrassSunShadows",
         "AomacHeightHaze", "AomacLandHaze", "AomacValleyMist", "AomacVolumetricShafts",
         "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs",
         "AomacFoliageEdges", "AomacFoliageSway", "AomacFoliagePush", "AomacFoliageLeaves", "AomacFoliageFlutter",
@@ -1253,6 +1258,8 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
     }
     for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows",
         "AomacMaterialSpecular", "AomacClusteredLighting", "AomacMoonShadows", "AomacLocalLightShadows",
+        "AomacGrassTufts", "AomacGrassSpecies", "AomacGrassPathThinning", "AomacGrassGustBands",
+        "AomacGrassSunlight", "AomacGrassSunShadows",
         "AomacHeightHaze", "AomacLandHaze", "AomacValleyMist", "AomacVolumetricShafts",
         "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs",
         "AomacFoliageEdges", "AomacFoliageSway", "AomacFoliagePush", "AomacFoliageLeaves", "AomacFoliageFlutter",

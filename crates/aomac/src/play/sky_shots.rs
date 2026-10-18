@@ -1736,6 +1736,21 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
         "ao" => settings.ambient_occlusion = true,
         "bloom" => settings.emissive_bloom = true,
         "grass" => settings.ground_grass = true,
+        "grass-tufts" => { settings.ground_grass = true; settings.grass_tufts = true; }
+        "grass-species" => { settings.ground_grass = true; settings.grass_species = true; }
+        "grass-path-thinning" => { settings.ground_grass = true; settings.grass_path_thinning = true; }
+        "grass-gust-bands" => { settings.ground_grass = true; settings.grass_gust_bands = true; }
+        "grass-sunlight" => { settings.ground_grass = true; settings.grass_sunlight = true; }
+        "grass-sun-shadows" => { settings.ground_grass = true; settings.grass_sun_shadows = true; }
+        "grass-all" => {
+            settings.ground_grass = true;
+            settings.grass_tufts = true;
+            settings.grass_species = true;
+            settings.grass_path_thinning = true;
+            settings.grass_gust_bands = true;
+            settings.grass_sunlight = true;
+            settings.grass_sun_shadows = true;
+        }
         "foliage-edges" => settings.foliage_edges = true,
         "foliage-sway" => settings.foliage_sway = true,
         "foliage-push" => settings.foliage_push = true,
@@ -1814,6 +1829,12 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             settings.ambient_occlusion = true;
             settings.emissive_bloom = profile == "all";
             settings.ground_grass = true;
+            settings.grass_tufts = true;
+            settings.grass_species = true;
+            settings.grass_path_thinning = true;
+            settings.grass_gust_bands = true;
+            settings.grass_sunlight = true;
+            settings.grass_sun_shadows = true;
             settings.hdr = true;
             settings.contact_shadows = true;
             settings.height_haze = true;
@@ -1844,7 +1865,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             grass_density: 1.0, grass_distance: 50.0, sun_boost: 0.5, grade_strength: 0.8, contact_strength: 0.4,
             ..Default::default()
         },
-        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|clustered|local-shadows|local-shadows-one|local-shadows-clustered|moonlit|moon-shadows|moon-volumetric-shafts|moon-cloud-gap-shafts|dark-night|specular|lighting|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before|foliage-edges|foliage-sway|foliage-push|foliage-leaves|foliage-flutter|foliage-falling|grass-trails|foliage-subdivision|foliage-translucency|foliage-lod|all-foliage|all-foliage-shadows|water|water-waves|water-ripples|water-refraction|water-reflections|water-foam|water-wakes|waterfalls|underwater|water-caustics|water-sun-glint"),
+        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|rain|wet-surfaces|weather-particles|spell-particles|fluid-smoke|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|clustered|local-shadows|local-shadows-one|local-shadows-clustered|moonlit|moon-shadows|moon-volumetric-shafts|moon-cloud-gap-shafts|dark-night|specular|generated-normals|material-maps|material-pbr|material-reflections|environment-probe|materials|wet-reflections|lighting|ao|bloom|grass|grass-tufts|grass-species|grass-path-thinning|grass-gust-bands|grass-sunlight|grass-sun-shadows|grass-all|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before|foliage-edges|foliage-sway|foliage-push|foliage-leaves|foliage-flutter|foliage-falling|grass-trails|foliage-subdivision|foliage-translucency|foliage-lod|all-foliage|all-foliage-shadows|water|water-waves|water-ripples|water-refraction|water-reflections|water-foam|water-wakes|waterfalls|underwater|water-caustics|water-sun-glint"),
     }
     Ok(settings)
 }
@@ -1962,6 +1983,30 @@ fn graphics_fixture_foliage_profiles_are_independent() {
         && !all.ambient_occlusion && !all.emissive_bloom && !all.contact_shadows);
     for old in ["faithful", "neutral", "grass", "all", "all-no-bloom", "all-before"] {
         assert!(!graphics_fixture_settings(old).unwrap().foliage_enabled());
+    }
+}
+
+#[test]
+fn graphics_fixture_grass_profiles_are_independent() {
+    let flags = |s: ao_render::EnhancedSettings| [
+        s.grass_tufts, s.grass_species, s.grass_path_thinning, s.grass_gust_bands,
+        s.grass_sunlight, s.grass_sun_shadows,
+    ];
+    for (index, profile) in ["grass-tufts", "grass-species", "grass-path-thinning",
+        "grass-gust-bands", "grass-sunlight", "grass-sun-shadows"].iter().enumerate() {
+        let settings = graphics_fixture_settings(profile).unwrap();
+        let mut expected = [false; 6];
+        expected[index] = true;
+        assert_eq!(flags(settings), expected);
+        assert!(settings.ground_grass);
+        assert!(!settings.sun_shadows);
+        assert!(!settings.hdr && !settings.foliage_enabled());
+    }
+    for profile in ["grass-all", "all", "all-no-bloom"] {
+        assert_eq!(flags(graphics_fixture_settings(profile).unwrap()), [true; 6]);
+    }
+    for profile in ["faithful", "neutral", "grass", "all-before"] {
+        assert_eq!(flags(graphics_fixture_settings(profile).unwrap()), [false; 6]);
     }
 }
 

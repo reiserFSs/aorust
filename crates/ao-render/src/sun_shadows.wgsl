@@ -31,14 +31,20 @@ fn shadow_vertex(v: VIn, uv: vec2<f32>, id: u32, matrix: mat4x4<f32>, fogged: bo
     o.clip = matrix * wp;
     return o;
 }
+// Directional control.y is positive softness bits, z/w are grass/receiver
+// switches. Point faces explicitly tag their different z/w empty/owner flags.
+fn point_face_caster_clipped(character: bool) -> bool {
+    return (shadow_frame.control.y & 0x80000000u) != 0u
+        && (shadow_frame.control.z != 0u || (shadow_frame.control.w != 0u && character));
+}
 @vertex fn vs_shadow_static(v: VIn) -> ShadowVertex {
     var o = shadow_vertex(v, v.uv, 0u, shadow_frame.matrices[shadow_frame.control.x], false);
-    if shadow_frame.control.z != 0u { o.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0); }
+    if point_face_caster_clipped(false) { o.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0); }
     return o;
 }
 @vertex fn vs_shadow_actor(v: VIn, @location(11) uv: vec4<f32>, @location(12) id: u32, @location(13) character: u32) -> ShadowVertex {
     var o = shadow_vertex(v, v.uv * uv.xy + uv.zw, id, shadow_frame.matrices[shadow_frame.control.x], false);
-    if shadow_frame.control.z != 0u || (shadow_frame.control.w != 0u && character != 0u) { o.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0); }
+    if point_face_caster_clipped(character != 0u) { o.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0); }
     return o;
 }
 @vertex fn vs_shadow_primary_static(v: VIn, @builtin(instance_index) id: u32) -> ShadowVertex {
@@ -176,24 +182,50 @@ fn cascade_visibility(world: vec3<f32>, normal: vec3<f32>, layer: u32, pixel: ve
     }
     return visibility / 12.0;
 }
+// ao-vk ffp_main.glsl GrassShadowVisibility: keep blade occlusion apart
+// from solid casters, so a carpet never extinguishes the native ambient budget.
+fn grass_blade_visibility(world: vec3<f32>) -> f32 {
+    if shadow_frame.control.z == 0u { return 1.0; }
+    let clip = shadow_frame.matrices[0] * vec4<f32>(world, 1.0);
+    let p = clip.xyz / clip.w;
+    let uv = p.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    let dimensions = vec2<f32>(textureDimensions(shadow_maps));
+    let guard = vec2<f32>(2.0) / dimensions;
+    if any(uv <= guard) || any(uv >= vec2<f32>(1.0) - guard) || p.z <= 0.0 || p.z >= 1.0 { return 1.0; }
+    var visible = 0.0;
+    // A four-tap footprint softens the narrow real silhouettes without an
+    // expensive blocker search per blade. Fade at the nearest map's boundary.
+    for (var y = 0u; y < 2u; y += 1u) {
+        for (var x = 0u; x < 2u; x += 1u) {
+            let offset = (vec2<f32>(f32(x), f32(y)) - 0.5) / dimensions;
+            visible += textureSampleCompareLevel(shadow_maps, shadow_sampler, uv + offset, 3, p.z - 0.00002);
+        }
+    }
+    let edge = smoothstep(0.75, 0.95, max(abs(p.x), abs(p.y)));
+    return mix(1.0, visible * 0.25, 0.45 * (1.0 - edge));
+}
 fn sun_visibility(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>) -> f32 {
     if shadow_frame.forward.w <= 0.0 { return 1.0; }
     let depth = dot(world - shadow_frame.eye.xyz, shadow_frame.forward.xyz);
     if depth < shadow_frame.splits.w || depth >= min(shadow_frame.splits.z, shadow_frame.eye.w) { return 1.0; }
-    var layer = 0u;
-    if depth > shadow_frame.splits.x { layer = 1u; }
-    if depth > shadow_frame.splits.y { layer = 2u; }
-    var visible = cascade_visibility(world, normal, layer, pixel);
-    let start = select(shadow_frame.splits.w, shadow_frame.splits[layer - min(layer, 1u)], layer > 0u);
-    let end = shadow_frame.splits[layer];
-    let blend = smoothstep(end - (end - start) * 0.1, end, depth);
-    if layer < 2u { visible = mix(visible, cascade_visibility(world, normal, layer + 1u, pixel), blend); }
-    else { visible = mix(visible, 1.0, blend); }
+    var visible = 1.0;
+    if shadow_frame.control.w != 0u {
+        var layer = 0u;
+        if depth > shadow_frame.splits.x { layer = 1u; }
+        if depth > shadow_frame.splits.y { layer = 2u; }
+        visible = cascade_visibility(world, normal, layer, pixel);
+        let start = select(shadow_frame.splits.w, shadow_frame.splits[layer - min(layer, 1u)], layer > 0u);
+        let end = shadow_frame.splits[layer];
+        let blend = smoothstep(end - (end - start) * 0.1, end, depth);
+        if layer < 2u { visible = mix(visible, cascade_visibility(world, normal, layer + 1u, pixel), blend); }
+        else { visible = mix(visible, 1.0, blend); }
+    }
     // Camera-local fog may end before the stable cascade envelope. Retain a
     // smooth receiver fade there, including native materials that disable fog.
     if shadow_frame.eye.w < shadow_frame.splits.z {
         let fade_start = max(shadow_frame.splits.w, shadow_frame.eye.w * 0.9);
         visible = mix(visible, 1.0, smoothstep(fade_start, shadow_frame.eye.w, depth));
     }
+    visible *= grass_blade_visibility(world);
     return mix(1.0, visible, clamp(shadow_frame.forward.w, 0.0, 1.0));
 }

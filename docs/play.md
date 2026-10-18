@@ -2109,6 +2109,80 @@ Newland day captures use time 3240 (midday), while preserving the original
 4700-derived camera selection. `AOMAC_GFX_DAY_TIME` overrides Newland's daytime
 only; `AOMAC_GFX_DISTANCE` overrides the grass radius without changing density.
 
+The same harness accepts `AOMAC_GFX_GRASS_FEATURE=none` (default), `all`,
+`tufts`, `species`, `path_thinning`, `gust_bands`, `sunlight`, or `sun_shadows`.
+Selections are exact, not comma-separated; invalid values fail.
+Only variant 1 enables the selected grass switches. Selecting `sun_shadows` or
+`all` enables the shared sun maps in **both** variants; other native/Enhanced
+effects remain identical across the pair. The default
+`AOMAC_GFX_GRASS_COMPARE=density` retains density-zero versus selected grass,
+so its ABBA timestamps include the entire selected grass contribution.
+`AOMAC_GFX_GRASS_COMPARE=features` instead keeps the same nonzero density in
+both variants and compares plain grass against the selected switches. It requires
+a selection other than `none`, and skips the far-speck regression because that
+regression requires a grass-free terrain control. It still requires visible change
+in a positive view. Variant 0/1 PNGs are baseline/selected respectively.
+
+Build and run the CPU-only selector check before acquiring the GPU lock:
+
+```sh
+CARGO_TARGET_DIR=/tmp/GrassPlus/target cargo test --profile fast -j 2 -p aomac grass_feature_selection_is_explicit
+CARGO_TARGET_DIR=/tmp/GrassPlus/target cargo test --profile fast -j 2 -p aomac grass_offline --no-run
+```
+
+Run each following chunk separately under the GPU timing lock described above;
+hold it for less than five minutes and release before the next chunk. Use a new
+`AOMAC_GFX_OUT` for every invocation. Full-grass cost at Newland, 1920×1200,
+4× MSAA, HDR and all shared effects (320 warmup + 600 measured frames per
+variant, density-zero/selected/selected/density-zero order):
+
+```sh
+AOMAC_GFX_OUT=/tmp/GrassPlus/evidence-all-cost \
+AOMAC_GFX_VIEW=newland-grass-ground-day AOMAC_GFX_GRASS_FEATURE=all \
+AOMAC_GFX_GRASS_COMPARE=density AOMAC_GFX_MSAA=4 AOMAC_GFX_EFFECTS=1 \
+AOMAC_GFX_HDR=1 AOMAC_GFX_PNG_ONLY=1 CARGO_TARGET_DIR=/tmp/GrassPlus/target \
+  cargo test --profile fast -j 2 -p aomac grass_offline_capture_and_timing -- \
+  --ignored --nocapture --test-threads=1
+```
+
+For a single switch's paired visual evidence, this example uses `tufts`; replace
+it with any selection above and use a distinct output directory. Capture-only
+retains explicit grass warmup but omits GPU timing and the reverse order:
+
+```sh
+AOMAC_GFX_OUT=/tmp/GrassPlus/evidence-tufts \
+AOMAC_GFX_VIEW=newland-grass-ground-day AOMAC_GFX_GRASS_FEATURE=tufts \
+AOMAC_GFX_GRASS_COMPARE=features AOMAC_GFX_CAPTURE_ONLY=1 \
+AOMAC_GFX_MSAA=4 AOMAC_GFX_EFFECTS=1 AOMAC_GFX_HDR=1 AOMAC_GFX_PNG_ONLY=1 \
+CARGO_TARGET_DIR=/tmp/GrassPlus/target \
+  cargo test --profile fast -j 2 -p aomac grass_offline_capture_and_timing -- \
+  --ignored --nocapture --test-threads=1
+```
+
+Temporal captures also honor both grass selectors. `AOMAC_GFX_TEMPORAL_STRIP=1`
+uses only the fixed ICC wind-on scenario, with 120 deterministic 0.1-second
+updates and paired contact-sheet columns at 0.1, 6.1 and 12.0 seconds. This is
+a finite gust-motion diagnostic, not the 60 Hz stability acceptance: it records
+metrics but explicitly disables behavioral assertions (`baseline=true`).
+No full frame sequence or image-processing dependency is added.
+
+```sh
+AOMAC_GFX_OUT=/tmp/GrassPlus/evidence-gust-strip \
+AOMAC_GFX_GRASS_FEATURE=gust_bands AOMAC_GFX_GRASS_COMPARE=features \
+AOMAC_GFX_TEMPORAL_STRIP=1 AOMAC_GFX_TEMPORAL_MSAA=4 \
+CARGO_TARGET_DIR=/tmp/GrassPlus/target \
+  cargo test --profile fast -j 2 -p aomac grass_offline_temporal_stability -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The temporal camera remains ICC tile 258/grid `[234,189]`, not Newland;
+`AOMAC_GFX_VIEW` applies only to the static capture/timing fixture. Inspect the
+actual paired PNGs: close ground selection guarantees neither a visible path
+edge nor a sun blocker. Use the recorded camera/tile and an appropriate existing
+day/dusk view for lighting evidence; a no-change positive comparison is a failed/vacuous fixture,
+not proof that a feature works. Keep only manifests, CSVs and selected paired
+PNGs/contact sheets under the 100 MB retained-evidence cap, not full matrices.
+
 Measured on Apple M4 Pro at code revision `afb37e44`: 1920×1200, actual 4× MSAA,
 all five effects enabled, density 1, distance 160 m, sun boost 0.5 and grade 0.8.
 Values below are grass-on minus grass-off whole-frame GPU p50, in milliseconds;

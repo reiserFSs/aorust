@@ -12,6 +12,102 @@ fn static_shadow_ranges_preserve_draw_order_and_instance_holes() {
     let expanded: Vec<_> = batches.iter().flat_map(|(draw, range)| range.clone().map(|instance| (*draw, instance))).collect();
     assert_eq!(expanded, commands);
 }
+#[test]
+fn grass_shadow_receiver_preserves_ambient_and_disables_without_caster_layer() {
+    let source = include_str!("sun_shadows.wgsl");
+    assert!(source.contains("if shadow_frame.control.z == 0u { return 1.0; }"));
+    assert!(source.contains("0.45 * (1.0 - edge)"));
+    assert!(source.contains("visible *= grass_blade_visibility(world);"));
+    assert!(include_str!("grass_shadow.wgsl").contains("visible *= grass_blade_visibility(world);"));
+    assert!(source.contains("if shadow_frame.control.w != 0u {"));
+    assert!(include_str!("grass_shadow.wgsl").contains("if shadow_frame.control.w != 0u {"));
+    assert!(!include_str!("volumetric_shafts.wgsl").contains("shadow_frame.control.w"),
+        "shaft ray marching must retain raw solid depths independently of surface receiver permission");
+    // Only the directional share is attenuated; the receiver's existing artistic
+    // strength remains the final operation, never the ambient or fog budget.
+    assert!(source.contains("return mix(1.0, visible, clamp(shadow_frame.forward.w, 0.0, 1.0));"));
+}
+
+#[test]
+fn standalone_grass_sun_shadows_compile_receivers_without_world_shadow_preference() {
+    let baseline = EnhancedSettings { ground_grass: true, ..Default::default() };
+    let grass = EnhancedSettings { grass_sun_shadows: true, ..baseline };
+    assert!(!grass.sun_shadows);
+    assert_ne!(variant::Key::of(baseline, 1), variant::Key::of(grass, 1),
+        "standalone grass receivers need their own cached world variant");
+    let source = enhanced_shader::source(grass);
+    assert!(source.contains("fn grass_blade_visibility("));
+    assert!(source.contains("i.sun_share.xyz * (1.0 - sun_visibility("),
+        "ground must receive real blade depths without world sun shadows");
+    let disabled = EnhancedSettings { ground_grass: false, ..grass };
+    assert_eq!(variant::Key::of(disabled, 1), variant::Key::of(EnhancedSettings::default(), 1),
+        "disabled grass must not change the faithful world pipeline");
+}
+
+#[test]
+fn real_grass_shadow_pipeline_is_opt_in_and_reuses_visible_geometry() {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let mut renderer = Renderer::new(&instance, None).expect("headless grass caster GPU");
+    let baseline = sun_shadows::SunShadows::new(&renderer, (32, 32), 256);
+    assert!(baseline.grass_layer.is_none());
+    assert!(baseline.grass_caster.is_none());
+    renderer.enhanced_settings.ground_grass = true;
+    renderer.enhanced_settings.grass_sun_shadows = true;
+    let blades = sun_shadows::SunShadows::new(&renderer, (32, 32), 256);
+    blades.grass_caster.as_ref().expect("enabled blade caster").pipeline.get();
+    assert!(blades.grass_layer.is_some());
+    assert_eq!(blades.resident_bytes() - baseline.resident_bytes(), 256 * 256 * 4);
+}
+
+#[test]
+fn grass_and_shafts_do_not_enable_world_solid_shadow_receivers() {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let mut renderer = Renderer::new(&instance, None).expect("headless grass/shaft independence GPU");
+    let scene = Scene {
+        meshes: vec![
+            quad([[-8.0, 0.0, -8.0], [8.0, 0.0, -8.0], [8.0, 0.0, 8.0], [-8.0, 0.0, 8.0]], [0.0, 1.0, 0.0]),
+            quad([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 3.0, 0.0], [-1.0, 3.0, 0.0]], [0.0, 0.0, 1.0]),
+        ],
+        instances: (0..2).map(|mesh| ao_scene::Instance { mesh, transform: ao_scene::IDENTITY }).collect(),
+        ..Default::default()
+    };
+    renderer.upload(&scene);
+    renderer.shadow_sun = Some([-0.8, 0.5, -0.3]);
+    renderer.env.sun_dir = [-0.8, 0.5, -0.3];
+    renderer.env.sun_color = [0.6; 3];
+    renderer.env.ambient = [0.2; 3];
+    renderer.env.fog_start = 100.0;
+    renderer.env.fog_end = 120.0;
+    let settings = EnhancedSettings { ground_grass: true, volumetric_shafts: true, ..Default::default() };
+    renderer.set_enhanced_settings(settings);
+    let (width, height) = (256, 192);
+    let targets = Targets::new(&renderer, width, height);
+    let output = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("grass/shaft surface independence"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: renderer.format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+    });
+    let view = output.create_view(&Default::default());
+    let camera = Camera::look_at(Vec3::new(0.0, 3.0, 8.0), Vec3::ZERO);
+    let capture = |renderer: &mut Renderer| {
+        renderer.render(&view, &targets, &camera);
+        texture_to_rgba(renderer, &output, width, height).unwrap()
+    };
+    let shafts_only = capture(&mut renderer);
+    renderer.set_enhanced_settings(EnhancedSettings { grass_sun_shadows: true, ..settings });
+    let grass_and_shafts = capture(&mut renderer);
+    let shadows = renderer.sun_shadows.as_ref().expect("shafts retain real maps");
+    assert!(!shadows.static_commands.is_empty(), "control must populate solid maps for shafts");
+    assert_eq!(shadows.coverage_uniform.control[3], 0, "solid surface reception must remain disabled");
+    // No grass terrain exists in this scene: enabling its receiver must not
+    // reveal the solid silhouettes that only the shaft ray march requested.
+    assert_eq!(shafts_only, grass_and_shafts);
+    renderer.set_enhanced_settings(EnhancedSettings { sun_shadows: true, grass_sun_shadows: true, ..settings });
+    let world_shadows = capture(&mut renderer);
+    assert_eq!(renderer.sun_shadows.as_ref().unwrap().coverage_uniform.control[3], 1);
+    assert_ne!(grass_and_shafts, world_shadows, "control must visibly receive the wall's solid shadow");
+}
 
 fn quad(points: [[f32; 3]; 4], normal: [f32; 3]) -> ao_scene::Mesh {
     ao_scene::Mesh {

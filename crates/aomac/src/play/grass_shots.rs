@@ -11,6 +11,44 @@ use ao_render::{EnhancedSettings, Offscreen};
 use anyhow::{Context, ensure};
 use std::{cell::RefCell, fmt::Write, path::PathBuf, rc::Rc};
 
+fn grass_feature_settings(value: &str) -> anyhow::Result<EnhancedSettings> {
+    ensure!(matches!(value, "none" | "all" | "tufts" | "species" | "path_thinning" | "gust_bands" | "sunlight" | "sun_shadows"),
+        "unknown AOMAC_GFX_GRASS_FEATURE {value:?}; expected none, all, tufts, species, path_thinning, gust_bands, sunlight or sun_shadows");
+    Ok(EnhancedSettings {
+        grass_tufts: matches!(value, "all" | "tufts"),
+        grass_species: matches!(value, "all" | "species"),
+        grass_path_thinning: matches!(value, "all" | "path_thinning"),
+        grass_gust_bands: matches!(value, "all" | "gust_bands"),
+        grass_sunlight: matches!(value, "all" | "sunlight"),
+        grass_sun_shadows: matches!(value, "all" | "sun_shadows"),
+        ..Default::default()
+    })
+}
+
+#[test]
+fn grass_feature_selection_is_explicit() -> anyhow::Result<()> {
+    let flags = |s: EnhancedSettings| [s.grass_tufts, s.grass_species, s.grass_path_thinning,
+        s.grass_gust_bands, s.grass_sunlight, s.grass_sun_shadows];
+    assert_eq!(flags(grass_feature_settings("none")?), [false; 6]);
+    assert_eq!(flags(grass_feature_settings("all")?), [true; 6]);
+    for (index, name) in ["tufts", "species", "path_thinning", "gust_bands", "sunlight", "sun_shadows"].into_iter().enumerate() {
+        let mut expected = [false; 6];
+        expected[index] = true;
+        assert_eq!(flags(grass_feature_settings(name)?), expected, "{name}");
+    }
+    for invalid in ["", "All", "tufts,species", "unknown"] {
+        assert!(grass_feature_settings(invalid).is_err(), "{invalid:?}");
+    }
+    Ok(())
+}
+
+fn compare_grass_features(feature: &str) -> anyhow::Result<bool> {
+    let value = std::env::var("AOMAC_GFX_GRASS_COMPARE").unwrap_or_else(|_| "density".into());
+    ensure!(matches!(value.as_str(), "density" | "features"), "AOMAC_GFX_GRASS_COMPARE must be density or features");
+    ensure!(value != "features" || feature != "none", "features comparison requires AOMAC_GFX_GRASS_FEATURE other than none");
+    Ok(value == "features")
+}
+
 #[test]
 #[ignore = "offline grass capture/timing matrix; requires assets and a new AOMAC_GFX_OUT"]
 fn grass_offline_capture_and_timing() -> anyhow::Result<()> {
@@ -44,8 +82,12 @@ fn grass_offline_temporal_stability() -> anyhow::Result<()> {
 fn run_temporal(out: &std::path::Path) -> anyhow::Result<()> {
     use ao_render::{Camera, Vec3};
     const FRAMES: usize = 120;
-    const DT: f32 = 1.0 / 60.0;
-    let baseline = std::env::var("AOMAC_GFX_TEMPORAL_BASELINE").is_ok_and(|value| value == "1");
+    let strip = std::env::var("AOMAC_GFX_TEMPORAL_STRIP").is_ok_and(|value| value == "1");
+    let dt_step = if strip { 0.1 } else { 1.0 / 60.0 };
+    let baseline = strip || std::env::var("AOMAC_GFX_TEMPORAL_BASELINE").is_ok_and(|value| value == "1");
+    let feature = std::env::var("AOMAC_GFX_GRASS_FEATURE").unwrap_or_else(|_| "none".into());
+    let feature_settings = grass_feature_settings(&feature)?;
+    let compare_features = compare_grass_features(&feature)?;
     let msaa = std::env::var("AOMAC_GFX_TEMPORAL_MSAA").ok().map(|value| value.parse::<u32>()).transpose()?.unwrap_or(4);
     ensure!(matches!(msaa, 1 | 4), "AOMAC_GFX_TEMPORAL_MSAA must be 1 (diagnostic) or 4");
     let dir = ao_gui::client_dir();
@@ -63,14 +105,16 @@ fn run_temporal(out: &std::path::Path) -> anyhow::Result<()> {
     let mut lens = camera::lens(scene.lens.unwrap_or_default(), false);
     lens.far = Some(camera::far_plane(camera::VIEW_DISTANCE));
     let mut manifest = format!(
-        "fixture=grass_offline_temporal_stability\nbaseline={baseline}\nsize={}x{}\nframes={FRAMES}\nfixed_dt={DT}\nplayfield=4582\nnative_tile=258\ngrid=[234,189]\ncamera={fixed:?}\nlens={lens:?}\nday={day}\nday_time={day_time}\nscene_weather=clear_fixed\nwind=live_native_Weather_open_weather_update_fixed_day_time_seed1\nwarmup_frames=320\nwarmup_dt=0\nrenderer_initial_time=0\nmsaa={msaa}\nanisotropy=1\nhdr=false\nao=false\nshadows=false\nbloom=false\ntiming=FrameGpuTimer_whole_frame_not_isolated_grass\nwind_off_static=frozen_clock_dt0_constant_zero_wind_unchanged_static_deformation_not_zero_bend\nroi=union_of_paired_on_off_RGB_difference_gt8_on_green_OFF_terrain_lower_two_thirds\nrgb_delta=absolute_encoded_RGB_codes_no_alpha\npop=any_RGB_channel_delta_gt40\nresidual_delta=delta_of_signed_ON_minus_OFF_RGB\nraw_pop_bound=1_percent_blade_ROI_per_frame_static_micro_enforced_at_MSAA4_only\noscillation=consecutive_residual_channel_deltas_both_abs_gt2_sign_reversal\noscillation_weight=min_abs_consecutive_delta_squared\nactive_energy_fraction=reversal_weight_sum_over_qualifying_pair_weight_sum_diagnostic_only_amplitude_normalized_not_acceptance\nopportunities=all_ROI_RGB_channels_each_frame_index_ge2_including_inactive_channels\nstatic_micro_reversal_opportunity_fraction_bound=0.01\nstatic_micro_reversal_RMS_codes_bound=1.0\nreversal_RMS=sqrt_weighted_reversal_energy_over_all_channel_opportunities\nbound_rationale=at_most_1_percent_of_all_blade_channel_opportunities_reverse_and_RMS_reversal_energy_at_most_one_encoded_code\nmicro_camera=0.25mm_lateral_per_frame\nslow_walk=0.25m_per_second_forward\ncontact_sheet=columns_frames_0_60_119_rows_OFF_ON\nvisual_acceptance=unexercised\n",
+        "fixture=grass_offline_temporal_stability\nbaseline={baseline}\nsize={}x{}\nframes={FRAMES}\nfixed_dt={dt_step}\nplayfield=4582\nnative_tile=258\ngrid=[234,189]\ncamera={fixed:?}\nlens={lens:?}\nday={day}\nday_time={day_time}\nscene_weather=clear_fixed\nwind=live_native_Weather_open_weather_update_fixed_day_time_seed1\nwarmup_frames=320\nwarmup_dt=0\nrenderer_initial_time=0\nmsaa={msaa}\nanisotropy=1\nhdr=false\nao=false\nbloom=false\ntiming=FrameGpuTimer_whole_frame_not_isolated_grass\nwind_off_static=frozen_clock_dt0_constant_zero_wind_unchanged_static_deformation_not_zero_bend\nroi=union_of_paired_on_off_RGB_difference_gt8_on_green_OFF_terrain_lower_two_thirds\nrgb_delta=absolute_encoded_RGB_codes_no_alpha\npop=any_RGB_channel_delta_gt40\nresidual_delta=delta_of_signed_ON_minus_OFF_RGB\nraw_pop_bound=1_percent_blade_ROI_per_frame_static_micro_enforced_at_MSAA4_only\noscillation=consecutive_residual_channel_deltas_both_abs_gt2_sign_reversal\noscillation_weight=min_abs_consecutive_delta_squared\nactive_energy_fraction=reversal_weight_sum_over_qualifying_pair_weight_sum_diagnostic_only_amplitude_normalized_not_acceptance\nopportunities=all_ROI_RGB_channels_each_frame_index_ge2_including_inactive_channels\nstatic_micro_reversal_opportunity_fraction_bound=0.01\nstatic_micro_reversal_RMS_codes_bound=1.0\nreversal_RMS=sqrt_weighted_reversal_energy_over_all_channel_opportunities\nbound_rationale=at_most_1_percent_of_all_blade_channel_opportunities_reverse_and_RMS_reversal_energy_at_most_one_encoded_code\nmicro_camera=0.25mm_lateral_per_frame\nslow_walk=0.25m_per_second_forward\ncontact_sheet=columns_frames_0_60_119_rows_baseline_selected\nvisual_acceptance=unexercised\n",
         size.0, size.1);
+    writeln!(manifest, "grass_feature={feature}\ncompare_features={compare_features}\nstrip={strip}\ncontact_sheet_times_seconds={:?}\nsun_shadows={}", [dt_step, 61.0 * dt_step, 120.0 * dt_step], feature_settings.grass_sun_shadows)?;
     if let Some(shader_dir) = std::env::var_os("AOMAC_SHADER_DIR") {
         writeln!(manifest, "shader_dir={}", PathBuf::from(shader_dir).display())?;
     }
     std::fs::write(out.join("manifest.txt"), &manifest)?;
     let mut failures = Vec::new();
-    for name in ["static-wind-on", "wind-off-static", "micro-camera", "slow-walk"] {
+    let scenarios: &[&str] = if strip { &["static-wind-on"] } else { &["static-wind-on", "wind-off-static", "micro-camera", "slow-walk"] };
+    for &name in scenarios {
         let mut weather = ao_formats::playfield::open_weather(&store, 4582)?;
         let mut pair = Vec::with_capacity(2);
         for grass in [false, true] {
@@ -84,7 +128,9 @@ fn run_temporal(out: &std::path::Path) -> anyhow::Result<()> {
             off.host.grass_exposure = Some(exposure.clone());
             off.host.grass_wind = [0.0; 3];
             off.host.enhanced_settings = Some(EnhancedSettings {
-                ground_grass: true, grass_density: if grass { 1.0 } else { 0.0 }, ..Default::default()
+                ground_grass: true, grass_density: if grass || compare_features { 1.0 } else { 0.0 },
+                sun_shadows: feature_settings.grass_sun_shadows,
+                ..if grass { feature_settings } else { EnhancedSettings::default() }
             });
             off.frame(&mut shot, 0.0);
             off.warm_grass_tiles();
@@ -102,15 +148,15 @@ fn run_temporal(out: &std::path::Path) -> anyhow::Result<()> {
         let mut rows = Vec::with_capacity(FRAMES);
         let mut sheet = image::RgbaImage::new(size.0 * 3, size.1 * 2);
         for frame in 0..FRAMES {
-            let dt = if name == "wind-off-static" { 0.0 } else { DT };
-            weather.update(day, f64::from(day_time), DT);
+            let dt = if name == "wind-off-static" { 0.0 } else { dt_step };
+            weather.update(day, f64::from(day_time), dt_step);
             let wind = if name == "wind-off-static" { [0.0; 3] } else { weather.state().wind };
             let mut view = fixed;
             if name == "micro-camera" {
                 view.pos.x += frame as f32 * 0.00025;
             } else if name == "slow-walk" {
                 let forward = fixed.forward();
-                view.pos += Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero() * (frame as f32 * DT * 0.25);
+                view.pos += Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero() * (frame as f32 * dt_step * 0.25);
             }
             let mut captures = Vec::with_capacity(2);
             let mut gpu = [0.0; 2];
@@ -262,9 +308,12 @@ fn grass_temporal_oscillation_distinguishes_ramp_from_alternation() {
 
 fn run(out: &std::path::Path) -> anyhow::Result<()> {
     let selected = std::env::var("AOMAC_GFX_VIEW").ok();
+    let feature = std::env::var("AOMAC_GFX_GRASS_FEATURE").unwrap_or_else(|_| "none".into());
+    let feature_settings = grass_feature_settings(&feature)?;
+    let compare_features = compare_grass_features(&feature)?;
     let png_only = std::env::var("AOMAC_GFX_PNG_ONLY").is_ok_and(|value| value == "1");
     let capture_only = std::env::var("AOMAC_GFX_CAPTURE_ONLY").is_ok_and(|value| value == "1");
-    let assert_specks = !std::env::var("AOMAC_GFX_ASSERT_SPECKS").is_ok_and(|value| value == "0");
+    let assert_specks = !compare_features && !std::env::var("AOMAC_GFX_ASSERT_SPECKS").is_ok_and(|value| value == "0");
     // AOMAC_GFX_DENSITY: grass density (default 1); AOMAC_GFX_EFFECTS=1: sun/contact shadows, AO and bloom in both variants.
     // AOMAC_GFX_HDR=1: the HDR present; AOMAC_GFX_MSAA: requested samples (default 1).
     // AOMAC_GFX_DISTANCE: grass distance (settings default); AOMAC_GFX_DAY_TIME: Newland day time only (default 3240).
@@ -272,7 +321,7 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
     let effects = std::env::var("AOMAC_GFX_EFFECTS").is_ok_and(|value| value == "1");
     let effect_override = |key| std::env::var(key).map_or(effects, |value| value != "0");
     let ao = effect_override("AOMAC_GFX_AO");
-    let shadows = effect_override("AOMAC_GFX_SHADOWS");
+    let shadows = effect_override("AOMAC_GFX_SHADOWS") || feature_settings.grass_sun_shadows;
     let contact = effect_override("AOMAC_GFX_CONTACT");
     let hdr = std::env::var("AOMAC_GFX_HDR").is_ok_and(|value| value == "1");
     let msaa = std::env::var("AOMAC_GFX_MSAA").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1);
@@ -287,9 +336,10 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
     let mut negative_views = 0;
     let mut positive_views = 0;
     let measured_frames = if capture_only { 0 } else { 600 };
-    let timing = if capture_only { "unexercised (capture only)" } else { "FrameGpuTimer whole-frame neutral Enhanced UNORM versus grass incremental contribution, not isolated draw timestamp" };
+    let timing = if capture_only { "unexercised (capture only)" } else { "FrameGpuTimer whole-frame paired selected-minus-baseline incremental contribution, not isolated draw timestamp" };
     let mut report = format!("fixture=graphics_offline_fixture\nsize=1920x1200\nrenderer_time=0\ndt=0\ncrt_seed=1\nweather=clear\nmsaa_requested={msaa}\nanisotropy=1\nwarmup_frames=320\nmeasured_frames={measured_frames}\ntiming={timing}\nvisual_acceptance=unexercised\n");
     writeln!(report, "selected_view={selected:?}\npng_only={png_only}\ncapture_only={capture_only}\nassert_specks={assert_specks}\nao={ao}\nsun_shadows={shadows}\ncontact_shadows={contact}")?;
+    writeln!(report, "grass_feature={feature}\ncompare_features={compare_features}\ncomparison={}\nvariant_order=off_on_on_off", if compare_features { "plain_grass_vs_selected_grass_features" } else { "density_zero_vs_selected_grass" })?;
     for (key, program, args) in [
         ("revision", "git", vec!["rev-parse".into(), "HEAD".into()]),
         ("resource_sha256", "shasum", vec!["-a".into(), "256".into(), dir.join("cd_image/rdb.db").into_os_string()]),
@@ -381,7 +431,12 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                 off.host.fog_density_scale = Some(1.0);
                 off.host.grass_exposure = Some(exposure.clone());
                 off.host.grass_wind = weather.wind;
-                let settings = EnhancedSettings { sun_shadows: shadows, contact_shadows: contact, ambient_occlusion: ao, emissive_bloom: effects, hdr, ground_grass: true, grass_distance, grass_density: if variant == 0 { 0.0 } else { density }, ..Default::default() };
+                let settings = EnhancedSettings {
+                    sun_shadows: shadows, contact_shadows: contact, ambient_occlusion: ao,
+                    emissive_bloom: effects, hdr, ground_grass: true, grass_distance,
+                    grass_density: if variant == 0 && !compare_features { 0.0 } else { density },
+                    ..if variant == 1 { feature_settings } else { EnhancedSettings::default() }
+                };
                 off.host.enhanced_settings = Some(settings);
                 // The extended field can need more than 320 streamed exposure frames.
                 // Record its up-front cost separately; the paired GPU measurement is stationary/warmed.
@@ -415,7 +470,7 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                     Some((gpu_stats, prepare_stats))
                 };
                 allocated[variant] = off.gpu_allocated_bytes();
-                let max_blade_candidates = cells * (1536.0 * settings.clamped().grass_density / 2.0).round().max(1.0) as usize * variant;
+                let max_blade_candidates = cells * (1536.0 * settings.clamped().grass_density / 2.0).round().max(1.0) as usize * usize::from(variant == 1 || compare_features);
                 writeln!(report, "view={name} pf={pf} time={time} camera={fixed:?} lens={lens:?} settings={settings:?} round={round} variant={variant} effect_gpu_payload_bytes={bytes} cells={cells} max_blade_candidates={max_blade_candidates}")?;
                 if let Some((gpu_stats, prepare_stats)) = timing_stats {
                     writeln!(report, "gpu_ms_p50_p95_p99={gpu_stats:?} prepare_wall_ms_p50_p95_p99={prepare_stats:?}")?;
@@ -438,8 +493,8 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                     else {
                         let baseline = baseline_raw.as_ref().context("neutral capture missing")?;
                         let differing = raw.iter().zip(baseline).filter(|(a, b)| a != b).count();
-                        writeln!(report, "view={name} neutral_vs_grass_differing_bytes={differing}")?;
-                        if name == "borealis-grass-ground-far-day" {
+                        writeln!(report, "view={name} neutral_vs_grass_differing_bytes={differing} comparison_features={compare_features}")?;
+                        if name == "borealis-grass-ground-far-day" && !compare_features {
                             // The retained AFTER detail places this rectangle on the far green hills.
                             // Allow new isolated dark pixels in at most 0.05% of this run's green area.
                             // This permits real blade edges, not the old carpet's 3.4% pepper noise.

@@ -3,9 +3,10 @@ use super::*;
 use crate::sun_shadows::{CascadeFrame, SunShadows, CASCADES};
 
 fn cascade_resolution(settings: EnhancedSettings) -> u32 {
-    if !settings.sun_shadows && !settings.moon_shadows && !settings.volumetric_shafts { return 1; }
+    let grass = settings.ground_grass && settings.grass_sun_shadows;
+    if !settings.sun_shadows && !settings.moon_shadows && !settings.volumetric_shafts && !grass { return 1; }
     let resolution = settings.shadow_map_size.clamp(256, 4096);
-    if settings.volumetric_shafts && !settings.sun_shadows && !settings.moon_shadows {
+    if settings.volumetric_shafts && !settings.sun_shadows && !settings.moon_shadows && !grass {
         (resolution / 2).max(256)
     } else { resolution }
 }
@@ -18,6 +19,10 @@ fn shaft_only_maps_match_half_resolution_integration_without_lowering_surface_sh
     assert_eq!(cascade_resolution(EnhancedSettings { sun_shadows:true, ..shafts }), 2048);
     assert_eq!(cascade_resolution(EnhancedSettings { moon_shadows:true, ..shafts }), 2048);
     assert_eq!(cascade_resolution(EnhancedSettings { shadow_map_size:256, ..shafts }), 256);
+    let grass = EnhancedSettings { ground_grass:true, grass_sun_shadows:true, ..Default::default() };
+    assert_eq!(cascade_resolution(grass), 2048);
+    assert_eq!(cascade_resolution(EnhancedSettings { volumetric_shafts:true, ..grass }), 2048);
+    assert_eq!(cascade_resolution(EnhancedSettings { ground_grass:false, ..grass }), 1);
 }
 
 pub(super) fn authored_sun(scene: &Scene) -> Option<[f32; 3]> {
@@ -87,23 +92,24 @@ impl Renderer {
 
     pub(crate) fn encode_enhanced_shadows(&mut self, encoder: &mut wgpu::CommandEncoder, cam: &Camera, size: (u32, u32), env: Environment, far: f32) {
         self.shadow_timer_pending = false;
-        if !self.enhanced_settings.sun_shadows && !self.enhanced_settings.moon_shadows
+        let grass_enabled = self.enhanced_settings.ground_grass && self.enhanced_settings.grass_sun_shadows;
+        if !self.enhanced_settings.sun_shadows && !self.enhanced_settings.moon_shadows && !grass_enabled
             && !self.enhanced_settings.volumetric_shafts && !self.enhanced_settings.needs_admitted_lights()
             && self.enhanced_settings.night_mode != NightMode::Moonlit {
             self.sun_shadows = None;
             self.point_shadows = None;
             return;
         }
-        let directional = self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows || self.enhanced_settings.volumetric_shafts;
-        let admission = directional || self.enhanced_settings.needs_admitted_lights();
+        let admission = self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows
+            || self.enhanced_settings.volumetric_shafts || self.enhanced_settings.needs_admitted_lights();
         // Moon illumination alone needs only the openness binding, not maps or a primary prepass.
         let resource_size = if admission { size } else { (1, 1) };
         let resolution = cascade_resolution(self.enhanced_settings);
-        let mut shadows = self.sun_shadows.take().filter(|s| s.size == resource_size && s.resolution == resolution)
+        let mut shadows = self.sun_shadows.take().filter(|s| s.size == resource_size && s.resolution == resolution && s.grass_layer.is_some() == grass_enabled)
             .unwrap_or_else(|| SunShadows::new(self, resource_size, resolution));
         shadows.sun_replacement_active = false;
         shadows.native_fog_end = env.fog_end;
-        let sun = (self.enhanced_settings.sun_shadows || self.enhanced_settings.volumetric_shafts)
+        let sun = (self.enhanced_settings.sun_shadows || self.enhanced_settings.volumetric_shafts || grass_enabled)
             .then_some(self.shadow_sun).flatten().map(Vec3::from);
         let mut strength = sun.map_or(0.0, |direction| crate::sun_shadows::horizon_fade(direction.normalize().y))
             .min(Vec3::from(env.sun_dir).try_normalize().map_or(0.0, |direction| crate::sun_shadows::horizon_fade(direction.y)));
@@ -116,6 +122,8 @@ impl Renderer {
         // Fit is independent of local eye fog: only receiver reach changes.
         let shadow_far = self.lens.far.unwrap_or(180.0).min(180.0).max(self.lens.near + 0.01);
         let receiver_far = far.min(env.fog_end).min(shadow_far);
+        let solid_casters = self.enhanced_settings.volumetric_shafts
+            || if moon.is_some() { self.enhanced_settings.moon_shadows } else { self.enhanced_settings.sun_shadows };
         let mut frame = direction.filter(|_| strength > 0.0).and_then(|direction|
             CascadeFrame::new(cam.pos, cam.forward(), cam.up(), self.lens.vertical_fov(aspect),
                 aspect, self.lens.near, shadow_far, direction, resolution));
@@ -123,6 +131,10 @@ impl Renderer {
             frame.uniform.forward[3] = strength * self.enhanced_settings.shadow_strength.clamp(0.0, 1.0);
             frame.uniform.eye[3] = receiver_far;
             frame.uniform.control[1] = self.enhanced_settings.shadow_softness.clamp(0.0, 4.0).to_bits();
+            frame.uniform.control[2] = u32::from(grass_enabled && moon.is_none());
+            // Shafts need solid depth maps even when beauty's world shadows are off.
+            // Keep their raw map population separate from surface receiver permission.
+            frame.uniform.control[3] = u32::from(if moon.is_some() { self.enhanced_settings.moon_shadows } else { self.enhanced_settings.sun_shadows });
             if let Some((direction, budget)) = moon {
                 frame.uniform.moon_direction = Vec3::from(direction).normalize().extend(1.0).to_array();
                 frame.uniform.moon_budget = [budget[0], budget[1], budget[2], 0.0];
@@ -155,9 +167,13 @@ impl Renderer {
         };
         frame.include_caster_depth(self.gpu.insts.iter().filter(|instance| !instance.hidden).map(|instance| (instance.center, instance.radius)));
         shadows.update(&self.queue, &frame);
-        self.prepare_static_shadow_casters(&mut shadows, &frame);
+        if solid_casters {
+            self.prepare_static_shadow_casters(&mut shadows, &frame);
+        } else {
+            shadows.static_commands.clear();
+        }
         for layer in 0..CASCADES {
-            let timestamp_writes = self.shadow_timestamp(layer == CASCADES - 1);
+            let timestamp_writes = self.shadow_timestamp(layer == CASCADES - 1 && shadows.grass_layer.is_none());
             let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("current-frame sun cascade"), color_attachments: &[],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -169,9 +185,26 @@ impl Renderer {
             pass.set_bind_group(3, &shadows.cascade_groups[layer], &[]);
             // Static geometry does not need primary visibility admission. Dynamic
             // actors require at least one current-frame depth-tested visible pixel.
-            self.draw_static_shadows(&mut pass, &shadows, false);
-            self.draw_actor_shadows(&mut pass, &shadows, false);
-            self.draw_canopy_leaf_shadows(&mut pass, &shadows);
+            if solid_casters {
+                self.draw_static_shadows(&mut pass, &shadows, false);
+                self.draw_actor_shadows(&mut pass, &shadows, false);
+                self.draw_canopy_leaf_shadows(&mut pass, &shadows);
+            }
+        }
+        let grass_bind = self.grass.as_ref().and_then(|grass| shadows.grass_caster_bind(&self.device, grass));
+        let grass_timestamp = if shadows.grass_layer.is_some() { self.shadow_timestamp(true) } else { None };
+        if let Some(layer) = &shadows.grass_layer {
+            let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("nearest real grass blade shadows"), color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: layer, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None,
+                }), timestamp_writes: grass_timestamp, occlusion_query_set: None, multiview_mask: None,
+            });
+            if moon.is_none() {
+                if let (Some(grass), Some(ground), Some(caster), Some(bind)) = (&self.grass, &self.ground, &shadows.grass_caster, &grass_bind) {
+                    grass.draw_shadow(&mut pass, &self.globals_bg, ground, &self.gpu, caster.pipeline.get(), bind);
+                }
+            }
         }
         shadows.sun_replacement_active = self.enhanced_settings.sun_shadows && moon.is_none() && frame.uniform.forward[3] > 0.0;
         self.sun_shadows = Some(shadows);

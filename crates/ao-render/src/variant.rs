@@ -7,6 +7,7 @@ use super::{EnhancedSettings, Pipelines, PipelineSpec, build_pipelines, compile_
 pub(super) struct Key {
     shadows: bool,
     moon_shadows: bool,
+    grass_shadows: bool,
     night_mode: super::NightMode,
     ao: bool,
     bloom: bool,
@@ -27,6 +28,7 @@ impl Key {
             material_specular: settings.material_specular, clustered_lighting: settings.clustered_lighting,
             materials: [settings.generated_normals, settings.material_maps, settings.material_pbr, settings.material_reflections, settings.environment_probe],
             local_light_shadows: settings.local_light_shadows,
+            grass_shadows: settings.ground_grass && settings.grass_sun_shadows,
             bloom: settings.emissive_bloom, sun_mask: settings.needs_sun_mask(), water_cloud: false, msaa,
             foliage: [settings.foliage_edges, settings.foliage_sway, settings.foliage_push, settings.foliage_subdivision, settings.foliage_translucency, settings.foliage_lod] }
     }
@@ -34,7 +36,7 @@ impl Key {
         self.water_cloud = visible;
         self
     }
-    fn enhanced(self) -> bool { self.shadows || self.moon_shadows || self.ao || self.bloom || self.sun_mask || self.material_specular || self.materials.iter().any(|&v| v) || self.clustered_lighting || self.local_light_shadows || self.night_mode != super::NightMode::AsGame || self.foliage.iter().any(|&v| v) }
+    fn enhanced(self) -> bool { self.shadows || self.moon_shadows || self.grass_shadows || self.ao || self.bloom || self.sun_mask || self.material_specular || self.materials.iter().any(|&v| v) || self.clustered_lighting || self.local_light_shadows || self.night_mode != super::NightMode::AsGame || self.foliage.iter().any(|&v| v) }
 }
 
 pub(super) struct Pipes {
@@ -198,7 +200,7 @@ impl Request {
         let shadow_layout = if self.settings.needs_admitted_lights() {
             Some(super::point_shadows::receiver_layout(&self.device))
         } else {
-            (self.key.shadows || self.key.moon_shadows || self.settings.night_mode == super::NightMode::Moonlit).then(|| super::sun_shadows::receiver_layout(&self.device))
+            (self.key.shadows || self.key.moon_shadows || self.key.grass_shadows || self.settings.night_mode == super::NightMode::Moonlit).then(|| super::sun_shadows::receiver_layout(&self.device))
         };
         let mut ordinary = vec![Some(&self.g_layout), Some(&self.tex_layout)];
         let mut holo = vec![Some(&self.g_layout), Some(&self.tex_layout), Some(&self.holo_layout)];
@@ -243,7 +245,7 @@ impl Request {
         let grass = super::grass::Compiled::new(
             &self.device, &self.g_layout, &self.tex_layout, &self.holo_layout, self.key.msaa,
             (settings.ambient_occlusion, settings.emissive_bloom, settings.needs_sun_mask(), self.key.water_cloud, settings.material_reflections || settings.environment_probe),
-            self.settings.sun_shadows || self.settings.moon_shadows, self.format);
+            self.settings.sun_shadows || self.settings.moon_shadows || self.key.grass_shadows, self.format);
         Pipes { #[cfg(test)] shader, msaa: self.key.msaa, native_sky_pipes,
             pipes, actor_pipes, ground_pipes, depth_clear_pipe, grass }
     }

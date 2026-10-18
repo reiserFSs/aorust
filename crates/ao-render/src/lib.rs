@@ -1895,7 +1895,8 @@ impl Renderer {
         if !settings.contact_shadows {
             self.contact_shadows.as_mut().expect("startup contact pipelines").release_targets();
         }
-        if !settings.sun_shadows && !settings.moon_shadows && !settings.volumetric_shafts && !settings.needs_admitted_lights()
+        if !settings.sun_shadows && !settings.moon_shadows && !(settings.ground_grass && settings.grass_sun_shadows)
+            && !settings.volumetric_shafts && !settings.needs_admitted_lights()
             && settings.night_mode != NightMode::Moonlit { self.sun_shadows = None; }
         if !settings.needs_admitted_lights() { self.point_shadows = None; }
         self.release_disabled_atmosphere(settings);
@@ -3079,6 +3080,7 @@ impl Renderer {
             pass.set_bind_group(0, &self.globals_bg, &[]);
             // Sky, ground and actors retain this receiver across pipeline changes.
             if self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows || self.enhanced_settings.needs_admitted_lights()
+                || (self.enhanced_settings.ground_grass && self.enhanced_settings.grass_sun_shadows)
                 || self.enhanced_settings.night_mode == NightMode::Moonlit {
                 pass.set_bind_group(3, self.shadow_receiver(), &[]);
             }
@@ -3130,6 +3132,7 @@ impl Renderer {
                 pass.set_bind_group(0, &self.globals_bg, &[]);
                 // Grass replaces group 3; restore the shared receiver at phase entry.
                 if self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows || self.enhanced_settings.needs_admitted_lights()
+                    || (self.enhanced_settings.ground_grass && self.enhanced_settings.grass_sun_shadows)
                     || self.enhanced_settings.night_mode == NightMode::Moonlit {
                     pass.set_bind_group(3, self.shadow_receiver(), &[]);
                 }
