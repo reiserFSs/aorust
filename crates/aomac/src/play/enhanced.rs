@@ -114,6 +114,7 @@ pub(super) fn controls() -> Vec<Control> {
         Control::check(Camera, "Antialiasing", "AomacFxaa", "FXAA (when TAA is off)"),
         Control::check(Camera, "Sharpening", "AomacCas", "Contrast Adaptive Sharpening"),
         Control::slider(Camera, "Sharpening", "AomacCasStrength", "Sharpening Strength", "%.2f", 0.5, 0.0, 1.0),
+        Control::slider(Camera, "Motion Blur", "AomacMotionBlur", "Motion Blur", "%.2f", 0.0, 0.0, 1.0),
         Control::radio(Performance, "Interface", "AomacInterfaceScale", "Interface Scale", &[("Auto (retail-equivalent)", 0), ("1x", 1), ("2x", 2), ("3x", 3)], 0, 0, 3),
         Control::check(Performance, "Interface", "AomacBorderlessFullscreen", "Instant Fullscreen (skip animation, hide menu bar/dock)"),
         Control { page: Performance, section: "Text", name: "ChatFontSize", label: "Chat Font Size", kind: ControlKind::Slider { format: "%.0f pt", scale: 0.1 }, default: Variant::Int(140), min: Some(Variant::Int(50)), max: Some(Variant::Int(480)) },
