@@ -128,6 +128,11 @@ of ao-vk's rvk/draw.cpp, leaves.cpp, grass.cpp and shaders/ffp.vert,
 ffp_main.glsl, sway.glsl, wind.glsl and grass.vert.
 Source: https://github.com/wannabuh/ao-vk (MIT, Copyright (c) 2026 wannabuh).
 The MIT permission and warranty notice above applies to these adaptations.
+Visible-sprig density, two-sided transmission/forward scattering, branch-scale
+wind, tumbling descent and ground-rest/shrink motion were revisited against
+revision 53b6881eccd80b6d5887826106644ae7e7de3a44, including the changed-course
+canopy-plan.md notes. Native textures remain runtime-only; no upstream artwork
+or proprietary client asset is redistributed.
 Native resource-name classification, current-frame source admission/revocation,
 world-anchored stabilized wind, unchanged original canopy coverage and bounded
 native topology refinement are specific to this renderer. No client assets are

@@ -906,6 +906,34 @@ all no-interaction views, the clock and the native scene remain unchanged.
 Each step supplies the matching own-avatar bender and calls `render_frozen`:
 frontend/upload steps alone do not advance renderer-owned trail history.
 The final pose and interaction state are frozen for capture/timing.
+
+For actual motion evidence, set `AOMAC_GFX_SEQUENCE=stationary` or `interaction`.
+`AOMAC_GFX_SEQUENCE_START` selects the initial elapsed seconds (default 2),
+`AOMAC_GFX_SEQUENCE_DT` the seconds between captures (default 0.5), and
+`AOMAC_GFX_SEQUENCE_COUNT` the strip length (5–8, default 6). The fixture advances
+and renders real substeps no larger than 1/60 s rather than seeking the clock.
+The interaction sequence selects a real native leafy shrub, excluding grass and
+flowers, crosses it and leaves it while the actor remains admitted, so the later
+frames show spring recovery rather than a frozen contact. Selection uses
+transformed plant bounds, collision-grounded positions, a clear camera line and
+an unobstructed path; the manifest identifies the native instance and submesh.
+Missing candidates fail with a native-vegetation inventory instead of substituting
+a grass tuft. Sequence controls are opt-in; ordinary frozen captures remain unchanged.
+Do not combine sequence mode with timing flags. Use the same sequence controls,
+view and sample count for OFF/ON comparisons, and assemble its PNGs into a frame
+strip. A shader-only iteration may rerun the compiled test with
+`AOMAC_SHADER_DIR=/absolute/worktree/crates/ao-render/src`; unset the override for
+the final embedded-shader gate.
+`newland-backlit-day` selects an existing tall native canopy with a terrain-grounded,
+unobstructed camera looking toward its authored sun, and records that alignment.
+Use it for transmission evidence: an ordinary street view looking away from the
+sun is not a positive control for backlighting.
+`borealis-foliage-ground-sun-high` and `newland-foliage-ground-day` frame a native
+canopy together with its collision-terrain landing footprint, rather than looking
+straight up from under the tree. Use `START=0 DT=2 COUNT=8` for a 0–14 s fall/rest
+strip. The grounded eye, full crown/ground fit and clear sight lines are recorded;
+no substitute plane is introduced when terrain or a clear view is missing.
+
 The manifest records the mode, step count, delta and per-view
 terrain-grounded scene-space endpoints. Missing endpoint terrain fails only this
 opt-in mode. Omit it to preserve the original fixture placement and captures;
@@ -1364,21 +1392,40 @@ retain their previous switch selections.
 Static foliage admission uses the native texture creator identity and exact
 embedded FAFTexture names (`docs/formats.md`), not an alpha-only classifier.
 Opaque trunks, actors, signs and unknown textures stay unchanged. Sway shares
-GrassTwitch's stabilized, fixed-world-axis low-frequency wind; spring contacts
+GrassTwitch's stabilized, fixed-world-axis wind, with branch-scale oscillation,
+crosswind flex and bounded gust lean. Tall crowns flex about a stationary centre;
+small plants remain base-rooted. Spring contacts have a readable damped rebound,
 are source-owned and disappear immediately when their character loses final-camera
 body admission or terrain LOS. Near-character topology refinement preserves
 triangle area, UVs and original distant geometry. Two-pass foliage keeps the native
-alpha test, partitions alpha at 0.95, and defers the complementary soft range
-within the same native priority. A frame containing any native depth clear uses
-the original unsplit foliage path rather than replaying across that clear.
+alpha comparison, partitions alpha at 0.95, and replays the complementary soft range
+after same-priority actors, with blending and without depth writes. Both passes
+retain fractional coverage, avoiding an opaque fringe at the core boundary.
+A frame containing any native depth clear uses the original unsplit foliage path
+rather than replaying across that clear.
 
-Additional sprigs reuse the original canopy texture and never thin the original
-cards. Flutter and gust-falling copies use the same branch motion in beauty and
-sun-shadow passes. Their GPU resources allocate only while a leaf switch is on.
+Additional sprigs reuse eighth-texture windows from the original canopy texture,
+with UV-area density and bounded, fair per-material allocation; the original
+cards remain intact. Sprigs lift and tilt out from the cards, have outward crown
+normals, and share anchored branch flutter and alpha rims in beauty/sun-shadow
+passes. They receive native sunlight and sun shadows.
+At most five detached slots per material drift and tumble during gusts, land on
+the native terrain height and normal at their actual endpoint, rest for five
+seconds, then shrink over one second. Missing terrain suppresses the detached
+slot. Stateless trajectories use a fixed-world drift heading, not stored weather
+history, and do not collide with trunks or other objects during descent.
+Actor push is excluded from detached trajectories to avoid retaining a hidden
+actor's influence. Their GPU resources allocate only while a leaf switch is on.
 Grass trails use a 32×32 world-anchored grid of 1.25 m cells, recover over six
 seconds and revoke each source's contribution before upload when it is no longer
-admitted. Backlit foliage transmission retains the native fog operation; the
-separate distant-plant shading switch omits local/specular evaluation beyond 48 m.
+admitted. Backlit foliage transmission uses two-sided sun scattering and forward
+glare before the unchanged native fog operation; it requires a sunward view and
+does not add sunlight at night. Beyond 48 m, the distant-plant shading switch
+replaces soft sun-shadow blocker/PCSS searches with one filtered comparison.
+Native cascade selection/blending, receiver bounds, bias and fog are retained;
+near plants, non-plants, hard shadows, lamps and specular remain unchanged.
+Layer `AOMAC_GFX_FEATURE=sun_shadows` on an isolated foliage profile to measure
+this path or verify sprig receiving/casting without enabling every foliage effect.
 
 World variants retain independent moon/night settings alongside the foliage key.
 Shader generation uses the complete `EnhancedSettings` API, applies the moon
