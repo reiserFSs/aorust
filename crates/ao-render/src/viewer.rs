@@ -1443,6 +1443,10 @@ impl Offscreen {
     pub fn point_shadow_owner_is_selected(&mut self, owner: u32) -> Result<bool> {
         self.r.point_shadow_owner_is_selected(owner)
     }
+    /// Current point-cache CPU dispatch inputs; no allocation or GPU readback.
+    pub fn point_shadow_dispatch_work(&self) -> Option<(usize, usize, u32, u32, u64)> {
+        self.r.point_shadow_dispatch_work()
+    }
     pub fn gpu_allocated_bytes(&self) -> Option<usize> { native_gpu_allocated_bytes(&self.r) }
 
     /// Starts a fresh measured interval without rebuilding the renderer or its resources.

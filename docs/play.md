@@ -2332,6 +2332,12 @@ actor poses. Setting `AOMAC_GFX_TIMING_PAN` or `AOMAC_GFX_OWN_AVATAR` (including
 controls, so post feature-on/off matrices have matched frozen inputs.
 The manifest and timing reports record the chosen effect-time mode and delta.
 After 120 warmup frames it records 600 samples in `<view>-frame-gpu.txt`.
+When a point cache exists, `<view>-point-dispatch.txt` records its current static
+and dynamic caster counts, CPU static/actor face masks, and retained CPU static-input
+signature (`cpu_static_input_signature_u64`) immediately after that 720-frame pass,
+before any supplemental camera-pan pass. It records the
+effect-time mode/delta and source explicitly; these are existing runtime CPU
+dispatch inputs, not GPU executed-draw counts or another admission readback.
 The manifest records native cloud-layer winds; stationary zero-wind fixtures can
 reuse the 256² field and are not evidence of wind-driven map-rebuild cost.
 Faithful, cloud-shadow and cloud-gap profiles also write

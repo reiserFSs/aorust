@@ -1111,3 +1111,130 @@ fn carried_far_primary_animation_omits_world_passes_but_capsule_entry_revokes_an
         < patch_light(&renderer, &unshadowed, Vec3::new(-2.0, -2.0, -8.0)),
         "far-animation/capsule regression never preserved positive world-shadow geometry");
 }
+
+#[test]
+fn static_input_reuse_keeps_gpu_source_hash_exact_across_real_geometry_and_alpha_changes() {
+    let mut scene = scene();
+    let mut lamp = scene.lights.remove(0);
+    let key = ao_scene::TextureKey { rdb_type: 0, id: 721 };
+    scene.meshes[1].submeshes[0].texture = Some(key);
+    scene.meshes[1].submeshes[0].blend = ao_scene::Blend::AlphaTest;
+    scene.meshes[1].submeshes[0].uv_scroll = [0.5, 0.0];
+    for vertex in &mut scene.meshes[1].vertices { vertex.uv = [0.25, 0.5]; }
+    scene.meshes.push(quad(0.0, 0.0, -5.5, 0.5, 0.5));
+    scene.instances.push(Instance {
+        mesh: 2, transform: Mat4::from_translation(Vec3::new(100.0, 0.0, 0.0)).to_cols_array_2d(),
+    });
+    scene.textures.insert(key, ao_scene::Texture {
+        width: 2, height: 1, rgba: vec![255, 255, 255, 255, 255, 255, 255, 0],
+        source: ao_scene::TextureSource::Generated,
+    });
+    let mut renderer = renderer(&scene);
+    renderer.set_dynamic_lights(&[lamp]);
+    renderer.time = 2.0; // Mature native birth and opaque wrapped scrolling texels.
+    let capture = Capture::new(&renderer);
+    let before = capture.frame(&mut renderer);
+    let initial = words(&renderer, &renderer.point_shadows.as_ref().unwrap().state);
+    // CubeState.cached_input follows the original 24 words: signature lo/hi,
+    // CPU descriptor count, and the GPU's exact selected-sphere caster count.
+    let signature = u64::from(initial[24]) | (u64::from(initial[25]) << 32);
+    assert_eq!(signature, renderer.point_shadows.as_ref().unwrap().static_input_signature);
+    assert!(initial[27] > 0, "cache-reuse fixture did not hash actual in-range world geometry");
+    for _ in 0..4 {
+        assert_eq!(before, capture.frame(&mut renderer));
+        let reused = words(&renderer, &renderer.point_shadows.as_ref().unwrap().state);
+        assert_eq!(initial[24..28], reused[24..28],
+            "stable CPU descriptors failed to retain the natural GPU input snapshot and exact caster count");
+        assert_eq!(initial[12], reused[12], "stable descriptor inputs changed the GPU-selected source's world hash");
+        assert_eq!(scheduled(&renderer, false), [false; 6]);
+        assert_eq!(caster_instances(&renderer, false), 0);
+    }
+    // A hidden owner's potential volume admits the far descriptor to the CPU
+    // superset, but current GPU proof must preserve the visible cube exactly.
+    add_actors(&mut renderer, vec![actor(99, 100.0)]);
+    let hidden = Light { pos: [100.0, 2.0, -3.0], owner: Some(99), ..lamp };
+    renderer.set_dynamic_lights(&[lamp, hidden]);
+    assert_eq!(before, capture.frame(&mut renderer),
+        "hidden-owned potential-union expansion changed visible illumination or shadow history");
+    let expanded = words(&renderer, &renderer.point_shadows.as_ref().unwrap().state);
+    assert_ne!(initial[24..26], expanded[24..26],
+        "hidden-owned union positive control did not change the actual CPU descriptor snapshot");
+    assert!(expanded[26] > initial[26],
+        "hidden-owned union positive control did not add the far world descriptor");
+    assert_eq!(initial[27], expanded[27],
+        "hidden-owned potential casters changed the GPU's exact visible-source caster count");
+    assert_eq!(initial[12], expanded[12], "CPU potential-union expansion polluted the actual selected-source hash");
+    assert_eq!(scheduled(&renderer, false), [false; 6]);
+    assert_eq!(caster_instances(&renderer, false), 0);
+
+    let mut posed = Scene {
+        meshes: vec![Mesh::default(), scene.meshes[1].clone(), Mesh::default()],
+        instances: scene.instances.clone(), ..Default::default()
+    };
+    for vertex in &mut posed.meshes[1].vertices { vertex.pos[0] += 1.0; }
+    renderer.repose(&posed);
+    for _ in 0..3 {
+        capture.frame(&mut renderer);
+        assert_eq!(scheduled(&renderer, false).into_iter().filter(|&updated| updated).count(), 2,
+            "near mesh revision failed to recompute and drain the normal static face budget");
+    }
+    let moved = capture.frame(&mut renderer);
+    let reposed = words(&renderer, &renderer.point_shadows.as_ref().unwrap().state);
+    assert_ne!(expanded[24..26], reposed[24..26],
+        "real near-mesh revision failed to update the natural descriptor-input snapshot");
+    assert_ne!(expanded[12], reposed[12], "near static geometry revision reused a stale source hash");
+    assert_eq!(scheduled(&renderer, false), [false; 6]);
+    let old_shadow = Vec3::new(-2.0, -2.0, -8.0);
+    let new_shadow = Vec3::new(0.0, -2.0, -8.0);
+    assert!(patch_light(&renderer, &before, old_shadow) + 9 * 3 * 8 < patch_light(&renderer, &moved, old_shadow),
+        "near geometry recomputation retained the old positive shadow");
+    assert!(patch_light(&renderer, &moved, new_shadow) + 9 * 3 * 8 < patch_light(&renderer, &before, new_shadow),
+        "near geometry recomputation failed to rasterize its new positive shadow");
+
+    // At u=.25 the first texel is opaque; one second of authored drift moves
+    // every vertex to u=.75, the fully transparent second texel.
+    renderer.time = 3.0;
+    for _ in 0..3 { capture.frame(&mut renderer); }
+    let transparent = capture.frame(&mut renderer);
+    let alpha_changed = words(&renderer, &renderer.point_shadows.as_ref().unwrap().state);
+    assert_ne!(reposed[24..26], alpha_changed[24..26],
+        "real alpha-scroll clock delta failed to update the natural descriptor-input snapshot");
+    assert_ne!(reposed[12], alpha_changed[12], "near alpha-scroll time reused the previous static-input hash");
+    assert!(patch_light(&renderer, &moved, new_shadow) + 9 * 3 * 8
+        < patch_light(&renderer, &transparent, new_shadow),
+        "alpha-scroll recomputation retained an occluder whose actual texels became transparent");
+    renderer.time = 4.0;
+    for _ in 0..3 { capture.frame(&mut renderer); }
+    let opaque_again = capture.frame(&mut renderer);
+    assert!(patch_light(&renderer, &opaque_again, new_shadow) + 9 * 3 * 8
+        < patch_light(&renderer, &transparent, new_shadow),
+        "alpha-scroll recomputation failed to restore actual opaque depth");
+
+    let previous = metadata(&renderer);
+    lamp.pos[0] += 0.25;
+    renderer.set_dynamic_lights(&[lamp, hidden]);
+    let mut visited = [false; 6];
+    let mut moved_light = Vec::new();
+    for _ in 0..3 {
+        moved_light = capture.frame(&mut renderer);
+        let updates = scheduled(&renderer, false);
+        assert_eq!(updates.into_iter().filter(|&updated| updated).count(), 2,
+            "source-sphere delta reused cached projections instead of refreshing two faces");
+        for (face, updated) in updates.into_iter().enumerate() {
+            if updated { assert!(!visited[face]); visited[face] = true; }
+        }
+    }
+    assert_eq!(visited, [true; 6]);
+    let current = metadata(&renderer);
+    for face in 0..6 {
+        let start = 128 + face * 36;
+        assert_ne!(previous[start..start + 16], current[start..start + 16],
+            "source-sphere mutation left a stale light-space projection");
+    }
+    assert_ne!(opaque_again, moved_light, "source-sphere mutation did not change actual receiver geometry/lighting");
+    let sphere_changed = words(&renderer, &renderer.point_shadows.as_ref().unwrap().state);
+    assert_ne!(alpha_changed[8..12], sphere_changed[8..12],
+        "source-sphere delta failed to update the cached hash sphere");
+    assert_eq!(initial[27], sphere_changed[27],
+        "source-sphere refresh lost real in-range world descriptors");
+}

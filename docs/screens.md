@@ -817,9 +817,13 @@ and three face-drain frames (frozen time never expires the fade). All owned
 candidate volumes remain possible before GPU proof. CPU face-frustum/radius
 tests further omit impossible draw commands without omitting dirty clears.
 GPU admission still exclusively determines actual lights and geometry.
-Static per-mesh geometry/material revisions and pose/time keys are hashed again
-for each currently selected GPU source, so hidden-owned CPU supersets cannot
-change a visible cube's dirty schedule.
+Static per-mesh geometry/material revisions and pose/time keys are hashed for
+each currently selected GPU source, so hidden-owned CPU supersets cannot change
+a visible cube's dirty schedule. The GPU retains that source-specific hash and
+eligible-caster count until the complete CPU static-descriptor signature or
+cached light sphere changes; steady hits do not rescan the caster union in a
+single GPU lane. Current source admission still runs before this reuse.
+An exactly empty GPU-selected static volume disables static-depth sampling.
 Owned-light admission dependencies are restricted conservatively to capsules
 from the camera to the owner's current primary geometry bounds: only world or
 actor occluders intersecting those capsules contribute pose, alpha-scroll, and

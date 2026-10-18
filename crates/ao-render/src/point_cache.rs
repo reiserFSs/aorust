@@ -10,6 +10,15 @@ pub(crate) struct CacheCaster {
     pub spare: [u32; 4],
 }
 
+#[repr(C, align(16))]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(super) struct Params {
+    pub(super) eye: [f32; 4],
+    pub(super) timing: [f32; 4],
+    pub(super) cache: [u32; 4],
+    pub(super) schedule: [f32; 4],
+}
+
 /// The view cone to an owner sphere lies inside this eye-to-centre capsule.
 /// This is only a conservative dependency test, never actor admission.
 pub(crate) fn capsule_relevant(eye: Vec3, sphere: [f32; 4], capsules: &[[f32; 4]]) -> bool {
@@ -60,12 +69,16 @@ fn face_possible(sphere: [f32; 4], face: usize, lights: &[PossibleLight]) -> boo
     })
 }
 
-pub(super) fn world_fingerprint(mut hash: u64, casters: &[CacheCaster], time: f32) -> u64 {
-    for caster in casters {
-        for word in [caster.key[0], caster.key[1], caster.draw[0], caster.draw[1], caster.draw[2]] {
-            hash_word(&mut hash, word);
-        }
-    }
+pub(super) fn static_input_signature(casters: &[CacheCaster]) -> u64 {
+    let mut hash = 14695981039346656037u64;
+    hash_word(&mut hash, casters.len() as u32);
+    for word in bytemuck::cast_slice::<CacheCaster, u32>(casters) { hash_word(&mut hash, *word); }
+    hash
+}
+
+pub(super) fn world_fingerprint(mut hash: u64, signature: u64, time: f32) -> u64 {
+    hash_word(&mut hash, signature as u32);
+    hash_word(&mut hash, (signature >> 32) as u32);
     hash_word(&mut hash, (time.max(0.0) / 120.0).floor() as u32);
     hash
 }

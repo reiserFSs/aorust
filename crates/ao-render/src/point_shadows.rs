@@ -8,6 +8,8 @@ pub(crate) use point_cache::{CacheCaster, capsule_relevant};
 
 const CUBES: usize = 16;
 const RESOLUTION: u32 = 256;
+const STATE_WORDS: usize = 28;
+const STATE_BYTES: u64 = (STATE_WORDS * 4) as u64;
 #[cfg(test)]
 const NEAR: f32 = 0.1;
 const FADE_SECONDS: f32 = 0.25;
@@ -108,6 +110,7 @@ pub(crate) struct PointShadows {
     casters: Vec<CacheCaster>,
     dynamic_world: Vec<CacheCaster>,
     static_caster_count: usize,
+    static_input_signature: u64,
     caster_buffer: wgpu::Buffer,
     caster_capacity: usize,
     indirect: wgpu::Buffer,
@@ -162,7 +165,7 @@ impl PointShadows {
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::STORAGE);
         let metadata = buffer("cached point face receiver metadata", 14336,
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
-        let state = buffer("persistent cube cache state", (CUBES * 96) as u64,
+        let state = buffer("persistent cube cache state", CUBES as u64 * STATE_BYTES,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
         let params = buffer("point shadow simulation clock and encoded schedule", 64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         let caster_buffer = buffer("point caster descriptors", 64, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
@@ -173,6 +176,7 @@ impl PointShadows {
             min_filter: wgpu::FilterMode::Linear, ..Default::default() });
         Self { receiver: None, array, actor_array, _actor_maps: actor_maps, actor_faces,
             casters: Vec::new(), dynamic_world: Vec::new(), static_caster_count: 0,
+            static_input_signature: 0,
             caster_buffer, caster_capacity: 1, indirect, indirect_stride: 40,
             dispatch: point_cache::Dispatch::default(), static_face_mask: 0,
             actor_face_mask: 0, had_dynamic_casters: false,
@@ -191,7 +195,7 @@ impl Renderer {
     /// Explicit fixture diagnostic; never consulted by rendering or admission.
     pub fn point_shadow_owner_is_selected(&self, owner: u32) -> anyhow::Result<bool> {
         let Some(points) = self.point_shadows.as_ref().filter(|points| points.local_resources) else { return Ok(false); };
-        let size = (CUBES * 96) as u64;
+        let size = CUBES as u64 * STATE_BYTES;
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("explicit selected point-owner proof"), size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
@@ -208,11 +212,20 @@ impl Renderer {
         // select_cubes first resolves every incumbent against THIS frame's GPU
         // primary-owner-admitted pool, clearing identity immediately if absent.
         // Thus an owned selected identity also proves current primary admission.
-        let selected = bytemuck::cast_slice::<u8, u32>(&mapped).as_chunks::<24>().0.iter().take(points.count)
+        let selected = bytemuck::cast_slice::<u8, u32>(&mapped).as_chunks::<STATE_WORDS>().0.iter().take(points.count)
             .any(|state| state[0] != 0 && state[1] == u32::MAX && state[2] == owner);
         drop(mapped);
         readback.unmap();
         Ok(selected)
+    }
+
+    /// Explicit CPU dispatch diagnostics; these are the actual submitted masks,
+    /// conservative descriptor counts and the GPU's static-input memoization key.
+    pub fn point_shadow_dispatch_work(&self) -> Option<(usize, usize, u32, u32, u64)> {
+        self.point_shadows.as_ref().map(|points| (
+            points.static_caster_count, points.casters.len() - points.static_caster_count,
+            points.static_face_mask, points.actor_face_mask, points.static_input_signature,
+        ))
     }
     pub(crate) fn encode_point_shadows(&mut self, encoder: &mut wgpu::CommandEncoder, cam: &Camera, shadows: &mut SunShadows, admission_planes: [f32; 3]) {
         if !self.enhanced_settings.needs_admitted_lights() { self.point_shadows = None; return; }
@@ -261,7 +274,8 @@ impl Renderer {
                     false
                 });
             }
-            let fingerprint = point_cache::world_fingerprint(selection_inputs, &points.casters, self.time);
+            points.static_input_signature = point_cache::static_input_signature(&points.casters);
+            let fingerprint = point_cache::world_fingerprint(selection_inputs, points.static_input_signature, self.time);
             points.static_face_mask = points.dispatch.mask(fingerprint, self.time);
             points.static_caster_count = points.casters.len();
             self.point_actor_casters(shadows, &mut points.casters);
@@ -294,12 +308,15 @@ impl Renderer {
             if !points.casters.is_empty() {
                 self.queue.write_buffer(&points.caster_buffer, 0, bytemuck::cast_slice(&points.casters));
             }
-            let params = [cam.pos.extend(points.static_face_mask as f32).to_array(),
-                [elapsed / FADE_SECONDS, count as f32, (points.face_stride / 16) as f32, points.static_caster_count as f32],
-                [points.casters.len() as f32, 0.0, self.time, 0.0],
-                [points.dispatch.normal_mask as f32, u8::from(points.dispatch.restoration_possible) as f32,
-                    u8::from(points.dispatch.allocation_cold) as f32, points.actor_face_mask as f32]];
-            self.queue.write_buffer(&points.params, 0, bytemuck::cast_slice(&params));
+            let params = point_cache::Params {
+                eye: cam.pos.extend(points.static_face_mask as f32).to_array(),
+                timing: [elapsed / FADE_SECONDS, count as f32, (points.face_stride / 16) as f32, points.static_caster_count as f32],
+                cache: [points.casters.len() as u32, points.static_input_signature as u32,
+                    (points.static_input_signature >> 32) as u32, (self.time.max(0.0) / 120.0).floor() as u32],
+                schedule: [points.dispatch.normal_mask as f32, u8::from(points.dispatch.restoration_possible) as f32,
+                    u8::from(points.dispatch.allocation_cold) as f32, points.actor_face_mask as f32],
+            };
+            self.queue.write_buffer(&points.params, 0, bytemuck::bytes_of(&params));
             if points.selection.is_none() || points.input_buffer.as_ref() != Some(&self.dyn_light_buf) {
                 points.input_buffer = Some(self.dyn_light_buf.clone());
                 points.selection = Some(self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
@@ -475,7 +492,7 @@ mod tests {
         }
     }
     fn cube_states(renderer: &Renderer) -> Vec<[u32; 8]> {
-        let size = (CUBES * 96) as u64;
+        let size = CUBES as u64 * STATE_BYTES;
         let readback = renderer.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("test-only cube identity readback"), size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
@@ -488,7 +505,7 @@ mod tests {
         renderer.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         receiver.recv().unwrap().unwrap();
         let mapped = readback.slice(..).get_mapped_range();
-        bytemuck::cast_slice::<u8, u32>(&mapped).as_chunks::<24>().0.iter()
+        bytemuck::cast_slice::<u8, u32>(&mapped).as_chunks::<STATE_WORDS>().0.iter()
             .map(|state| state[..8].try_into().unwrap()).collect()
     }
     #[test]

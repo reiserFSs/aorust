@@ -25,12 +25,12 @@ fn cull_casters(@builtin(global_invocation_id) id: vec3<u32>) {
 @compute @workgroup_size(64)
 fn cull_actor_casters(@builtin(global_invocation_id) id: vec3<u32>) {
     let static_count=u32(params.timing.w);
-    if id.x > u32(params.cache.x)-static_count { return; }
+    if id.x > params.cache.x-static_count { return; }
     let item=select(static_count+id.x,0u,id.x==0u);
     cull_command(item,id.y+u32(params.timing.y)*6u);
 }
 fn cull_command(item:u32,layer:u32) {
-    let n = u32(params.cache.x);
+    let n = params.cache.x;
     let face_count = u32(params.timing.y)*6u;
     let actor = layer >= face_count;
     let face = layer % face_count;

@@ -3,8 +3,9 @@
 struct CubeState {
     identity: vec4<u32>, fade: vec4<f32>, light: vec4<f32>,
     cache: vec4<u32>, progress: vec4<u32>, clock: vec4<f32>,
+    cached_input: vec4<u32>,
 }
-struct PointParams { eye: vec4<f32>, timing: vec4<f32>, cache: vec4<f32>, schedule: vec4<f32>, }
+struct PointParams { eye: vec4<f32>, timing: vec4<f32>, cache: vec4<u32>, schedule: vec4<f32>, }
 struct PointFaceMetadata { static_matrix: mat4x4<f32>, dynamic_matrix: mat4x4<f32>, params: vec4<f32>, }
 struct PointMetadata { slots: array<vec4<f32>,16>, lights: array<vec4<f32>,16>, faces: array<PointFaceMetadata,96>, }
 @group(0) @binding(0) var<storage, read_write> pool: array<vec4<f32>>;
@@ -128,7 +129,7 @@ fn select_cubes() {
         var membership_second = 0u;
         var dynamic_world = false;
         var has_actor_depth = false;
-        for (var i=u32(params.timing.w); i<u32(params.cache.x); i++) {
+        for (var i=u32(params.timing.w); i<params.cache.x; i++) {
             let c = casters[i];
             // Hidden owners must not affect even a radius test or cache schedule.
             if c.key.w == 0u || !caster_admitted(c) { continue; }
@@ -154,22 +155,32 @@ fn select_cubes() {
         let cache_trigger = cold || changed_light || changed_size;
         let cache_light = select(states[slot].light,light,cache_trigger);
         let motion_margin = select(0.0,0.2,owned);
-        var world_hash = 2166136261u;
-        // Only this currently admitted source's possible casters affect its cache.
-        // CPU hidden-owner supersets can add work, never change visible schedules.
-        for (var i=0u;i<u32(params.timing.w);i++) {
-            let c=casters[i];
-            if distance(c.sphere.xyz,cache_light.xyz)>cache_light.w+c.sphere.w+motion_margin { continue; }
-            world_hash=(world_hash^c.key.x)*16777619u;
-            world_hash=(world_hash^c.key.y)*16777619u;
-            world_hash=(world_hash^c.draw.x)*16777619u;
-            world_hash=(world_hash^c.draw.y)*16777619u;
-            world_hash=(world_hash^c.draw.z)*16777619u;
+        let input_key = vec3<u32>(params.cache.y,params.cache.z,u32(params.timing.w));
+        var world_hash = states[slot].cache.x;
+        var world_count = states[slot].cached_input.w;
+        let previous_world_count = world_count;
+        if cache_trigger || any(states[slot].cached_input.xyz != input_key) {
+            world_hash = 2166136261u;
+            world_count = 0u;
+            // Only current GPU-selected source geometry affects the result.
+            // Hidden-owner CPU supersets may force recomputation, never dirtiness.
+            for (var i=0u;i<u32(params.timing.w);i++) {
+                let c=casters[i];
+                if distance(c.sphere.xyz,cache_light.xyz)>cache_light.w+c.sphere.w+motion_margin { continue; }
+                world_count++;
+                world_hash=(world_hash^c.key.x)*16777619u;
+                world_hash=(world_hash^c.key.y)*16777619u;
+                world_hash=(world_hash^c.draw.x)*16777619u;
+                world_hash=(world_hash^c.draw.y)*16777619u;
+                world_hash=(world_hash^c.draw.z)*16777619u;
+            }
+            states[slot].cached_input=vec4<u32>(input_key,world_count);
         }
         let previous_membership_second = u32(states[slot].clock.y) | (u32(states[slot].clock.z) << 16u);
         let membership_changed = states[slot].cache.z != membership || previous_membership_second != membership_second;
-        let refresh_epoch=floor(max(params.cache.z,0.0)/120.0);
-        if changed_light || changed_size || states[slot].cache.x != world_hash || states[slot].clock.x != refresh_epoch {
+        let refresh_epoch=f32(params.cache.w);
+        if changed_light || changed_size || states[slot].cache.x != world_hash
+            || previous_world_count != world_count || states[slot].clock.x != refresh_epoch {
             states[slot].progress.x = 63u;
             states[slot].clock.x = refresh_epoch;
         }
@@ -213,6 +224,7 @@ fn select_cubes() {
                 metadata.faces[face_index].params.x=0.0;
                 metadata.faces[face_index].params.w=0.0;
             }
+            if world_count == 0u { metadata.faces[face_index].params.x=0.0; }
             if !has_actor_depth { metadata.faces[face_index].params.w=0.0; }
             let matrix=face_matrix(face,light.xyz,light.w);
             for (var kind=0u;kind<2u;kind++) {
@@ -223,7 +235,7 @@ fn select_cubes() {
                 if update {
                     if kind==0u {
                         metadata.faces[face_index].static_matrix=matrix;
-                        metadata.faces[face_index].params.x=1.0; metadata.faces[face_index].params.y=ratio;
+                        metadata.faces[face_index].params.x=select(0.0,1.0,world_count>0u); metadata.faces[face_index].params.y=ratio;
                     } else {
                         metadata.faces[face_index].dynamic_matrix=matrix;
                         metadata.faces[face_index].params.z=ratio;

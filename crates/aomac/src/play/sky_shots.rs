@@ -790,6 +790,10 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                         format!("profile={profile}\npost_features={features:?}\nmsaa_requested={msaa}\nmsaa_actual={actual_msaa}\ncamera_pan={camera_pan}\nresolution=1920x1200\nwarmup=120\nsamples=600\nunits=milliseconds\neffect_time_mode={effect_time_mode}\neffect_dt_seconds={effect_dt:?}\ncamera_motion={}\nnative_cloud_wind={:?}\ncloud_field_cache=native_layer_and_eye_key;zero_wind_may_reuse\nframe_p50_p95_p99={percentiles:?}\n",
                             if camera_pan { "authored_yaw_sweep" } else { "stationary" },
                             scene.single_clouds.iter().map(|layer| layer.wind).collect::<Vec<_>>()))?;
+                    if let Some((static_casters, dynamic_casters, static_face_mask, actor_face_mask, static_input_signature)) = off.point_shadow_dispatch_work() {
+                        std::fs::write(out.join(format!("{name}-point-dispatch.txt")),
+                            format!("profile={profile}\nsource=current_runtime_cpu_dispatch_inputs\nphase=after_primary_frame_timing_before_camera_pan\ncompleted_timing_frames=720\nwarmup=120\nsamples=600\neffect_time_mode={effect_time_mode}\neffect_dt_seconds={effect_dt:?}\nstatic_casters={static_casters}\ndynamic_casters={dynamic_casters}\ncpu_static_face_mask={static_face_mask}\ncpu_actor_face_mask={actor_face_mask}\ncpu_static_input_signature_u64={static_input_signature}\ngpu_readback=false\n"))?;
+                    }
                     // A clear-weather fixture has zero native high-altitude wind.
                     // Measure a separate, explicit lateral-camera pass to include
                     // real field rebuilds without inventing weather or changing PNG poses.
