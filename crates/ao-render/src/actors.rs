@@ -838,6 +838,7 @@ pub(crate) fn same_material(a: &ao_scene::Submesh, b: &ao_scene::Submesh) -> boo
         shininess,
         env_texture,
         liquid,
+        vegetation,
     } = a;
     *texture == b.texture
         && *texture_clamp == b.texture_clamp
@@ -866,6 +867,7 @@ pub(crate) fn same_material(a: &ao_scene::Submesh, b: &ao_scene::Submesh) -> boo
         && *shininess == b.shininess
         && *env_texture == b.env_texture
         && *liquid == b.liquid
+        && *vegetation == b.vegetation
 }
 
 /// Material-and-shape summary of a mesh's submeshes for [`Model::topology`]: every field `same_material` compares,
@@ -908,6 +910,7 @@ fn submesh_shape(submeshes: &[ao_scene::Submesh]) -> Vec<ao_scene::Submesh> {
             shininess: s.shininess,
             env_texture: s.env_texture,
             liquid: s.liquid,
+            vegetation: s.vegetation,
         })
         .collect()
 }
@@ -1226,6 +1229,7 @@ mod tests {
             |s| s.shininess = 10.0,
             |s| s.env_texture = Some(TextureKey { rdb_type: 1, id: 3 }),
             |s| s.liquid = true,
+            |s| s.vegetation = true,
         ];
         for change in &variants {
             let mut other = base.clone();

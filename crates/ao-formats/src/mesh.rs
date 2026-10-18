@@ -45,6 +45,46 @@ const D3DBLEND_SRCALPHA: i32 = 5;
 const D3DCULL_NONE: i32 = 1;
 const MAX_DEPTH: usize = 64;
 
+/// Exact FAFTexture_t names observed in native plant archives and resolved against
+/// NameTable 1000010/1 (1010004 textures). No filename substring/alpha-only inference:
+/// clothing such as body_leaves, signs, bark and terrain grass are not foliage.
+/// ponytail: unknown plant textures stay rigid; extend this evidence-backed list when surveyed.
+fn foliage_texture_name(name: &str, key: TextureKey) -> bool {
+    // 21025's op2_canopy / large leaf uses this autumn-leaf atlas, not woody branches.
+    (name == "branch" && key == TextureKey { rdb_type: OVERRIDE_TEXTURES, id: 257704 })
+        || matches!(name,
+        "leaves" | "leaves_hires" | "jungleleaves" | "leaf_opac" | "bigplantleaf"
+        | "greenleaves_opac" | "yellowstarflower_opac" | "spikyshrub_opac"
+        | "jungle_plantleaf2_opac" | "jungle_plantleaf_opac" | "jungle_bigfern_opac"
+        | "jungle_readleafymultiple" | "pink_jungleleaf_opac" | "jungle_featheryflower_opac"
+        | "applestyletrees_leaves_opac" | "applestyletrees_leaves2_opac"
+        | "applestyletrees_leaves3_opac" | "applestyletrees_leaves4_opac"
+        | "applestyletrees_newleaves" | "frazettatreeleaves" | "enigmatreeleaves"
+        | "enigmatreeleaves2" | "enigmatreeleaves3" | "mcclean_leaves" | "dryleaves"
+        | "deserttree_smallleaves_greenhue" | "deserttree_smallestleaves"
+        | "big_smooth_leaf_dark" | "big_leaf_redrange_no_opac" | "blue_leaf" | "leaf"
+        | "leaf_normal_64x256" | "palmeblad" | "hanging_ivy-flower_white"
+        | "shrub-lightgreen-plain1" | "shrub-round1b" | "shrub-green-plain1"
+        | "shrub-round1" | "shrub-yellowish-plain" | "shrub-round-green"
+        | "yellow-flowers" | "red-flowers" | "yellowflower" | "flower2_128x128"
+        | "plant_bigpink2_centerflower" | "plant_bigpinkpetals2" | "plant_bigpinkpetals1"
+        | "plant_bigpink_centerflower" | "plant_bigbluepetals1" | "plant_bigblue_centerflower"
+        | "rootplant_hair_lightgreen" | "athens_redcircleflower1" | "athens_roofgrass1"
+        | "alien_leaves" | "grass_medium_high" | "grass_small" | "extra_tall_grass"
+        | "extra_tall_grass_dry" | "grass_medium_high_dry" | "grass_small_dry"
+        | "megatall swamptree_leaves" | "megatall swamptree_leaves2" | "shadowfern"
+        | "shadowgrass001_statelversion" | "shadowgrass-light001a_statelversion"
+        | "shadowgrass-light001a_statelversion_lars" | "shadowgrassgreen001_statelversion"
+        | "plant_billboards_1024" | "plant_billboards_1024_lars"
+        | "plant_billboards_1024_lars2" | "plant_billboards_512_lars"
+        | "plant_billboards_1024_lars2_inferno" | "plant_billboards_512_lars_inferno"
+        | "shrubrubbish_opacity_01" | "shrubrubbish_opacity_green01"
+        | "shrubrubbish_opacity_inferno01" | "new_leaves_cluster" | "new_leaves_cluster2"
+        | "new_leaves_wine-red-cluster" | "penumbra_frozen_jungletrees_leaves"
+        | "nascense_plants02" | "topflowers" | "wierdwodner_leaves_opacity"
+        | "notum_leaves" | "blueflower" | "pinkflower" | "creme_leaf")
+}
+
 /// Decodes static mesh record `id` (with its textures) into a scene with one instance at the origin.
 pub fn load_mesh(store: &RecordStore, id: u32) -> Result<Scene> {
     let mut scene = Scene::default();
@@ -311,19 +351,20 @@ struct MatKey {
     color: [f32; 4],
     emissive: [f32; 3],
     glow_mask: bool,
+    vegetation: bool,
     specular: [f32; 3],
     shininess: f32,
 }
 
 type MatId = (Option<TextureKey>, u8, bool, [u32; 4], [u32; 3], bool, [u32; 3], u32,
-    (Option<TextureKey>, bool, Option<i32>, Option<i32>, i32, bool, bool),
+    (Option<TextureKey>, bool, Option<i32>, Option<i32>, i32, bool, bool, bool),
     (Option<i32>, Option<(u32, i32)>, [u32; 3]));
 
 impl MatKey {
     /// Hashable identity (`Blend` and `f32` are not `Hash`).
     fn id(&self) -> MatId {
         (self.texture, self.blend as u8, self.two_sided, self.color.map(f32::to_bits), self.emissive.map(f32::to_bits), self.glow_mask, self.specular.map(f32::to_bits), self.shininess.to_bits(),
-            (self.stage1_env_texture, self.depth_write, self.depth_func, self.alpha_test, self.alpha_func, self.fog_enabled, self.lighting_enabled),
+            (self.stage1_env_texture, self.depth_write, self.depth_func, self.alpha_test, self.alpha_func, self.fog_enabled, self.lighting_enabled, self.vegetation),
             (self.render_priority, self.render_node, self.render_origin.map(f32::to_bits)))
     }
 }
@@ -431,12 +472,20 @@ impl Builder<'_, '_> {
             }).or_else(|| self.object_states.iter().rev().find(|&&(t, _)| t == ty).map(|&(_, v)| v))
         };
         let mut tex = None;
+        let mut foliage_texture = None;
         for ds in [node_ds, mat_ds].into_iter().flatten() {
             // channel 0 = diffuse; fall back to the first bound channel
             let chans: Vec<_> = ds.all("tch_type").map(le).zip(ds.refs("tch_text")).collect();
             let found = chans.iter().find(|(t, _)| *t == Some(0)).or(chans.first()).and_then(|&(_, t)| {
-                let creator = objs.get(t)?.ref1("creator").and_then(|c| objs.get(c))?;
-                Some(TextureKey { rdb_type: creator.i32("type")? as u32, id: creator.i32("inst")? as u32 })
+                let texture = objs.get(t)?;
+                let creator = texture.ref1("creator").and_then(|c| objs.get(c))?;
+                let key = TextureKey { rdb_type: creator.i32("type")? as u32, id: creator.i32("inst")? as u32 };
+                if tex.is_none() && key.rdb_type == OVERRIDE_TEXTURES
+                    && texture.blob("name").and_then(|b| std::str::from_utf8(b).ok()).is_some_and(|name| foliage_texture_name(name, key))
+                {
+                    foliage_texture = Some(key);
+                }
+                Some(key)
             });
             if tex.is_none() {
                 tex = found;
@@ -497,6 +546,7 @@ impl Builder<'_, '_> {
         let (specular, shininess) = if !generic && state(D3DRS_SPECULARENABLE) == Some(1) { (spec.map(|c| lin(c * strength)), shininess) } else { ([0.0; 3], 0.0) };
         MatKey { texture: tex, stage1_env_texture, blend, depth_write, depth_func, alpha_test, alpha_func, fog_enabled, lighting_enabled,
             render_priority: None, render_node: None, render_origin: [0.0; 3],
+            vegetation: tex.is_some() && tex == foliage_texture && matches!(blend, Blend::AlphaTest | Blend::AlphaBlend),
             two_sided: state(D3DRS_CULLMODE) == Some(D3DCULL_NONE), color: [1.0, 1.0, 1.0, a], emissive, glow_mask, specular, shininess }
     }
 
@@ -539,6 +589,7 @@ impl Builder<'_, '_> {
         if let Some(&(_, id)) = self.overrides.iter().find(|o| o.0 as usize == slot) {
             let tex = TextureKey { rdb_type: OVERRIDE_TEXTURES, id };
             if (self.have_texture)(tex) {
+                key.vegetation &= key.texture == Some(tex);
                 key.texture = Some(tex);
                 self.last_tex = key.texture;
             }
@@ -552,6 +603,7 @@ impl Builder<'_, '_> {
                 alpha_test: key.alpha_test.map(|v| v as u8), alpha_func: key.alpha_func as u8,
                 fog_enabled: key.fog_enabled, lighting_enabled: key.lighting_enabled,
                 render_priority: key.render_priority, render_node: key.render_node, render_origin: key.render_origin,
+                vegetation: key.vegetation,
                 stage1_env_texture: key.stage1_env_texture, projection_pass: true, two_sided: key.two_sided, base_color: key.color, emissive: key.emissive,
                 glow_mask: key.glow_mask, specular: key.specular, shininess: key.shininess, ..Submesh::new(vec![], key.texture) });
             let sub = self.mesh.submeshes.len() - 1;
@@ -682,6 +734,82 @@ pub fn decode_mesh_connectors(store: &RecordStore, rdb_type: u32, id: u32) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vegetation_requires_native_named_foliage_and_nonopaque_material() {
+        fn classify(name: &str, texture_type: u32, alpha: bool, loaded: bool) -> bool {
+            use crate::archive::Member;
+            fn m<'a>(name: &'a str, data: &'a [u8]) -> Member<'a> { Member { name, data } }
+            let one = 1u32.to_le_bytes();
+            let two = 2u32.to_le_bytes();
+            let three = 3u32.to_le_bytes();
+            let four = 4u32.to_le_bytes();
+            let zero = 0u32.to_le_bytes();
+            let texture_type = texture_type.to_le_bytes();
+            let alpha_state = D3DRS_ALPHATESTENABLE.to_le_bytes();
+            let alpha_value = u32::from(alpha).to_le_bytes();
+            let name = blob(name.as_bytes());
+            let ar = Archive { root: 0, animation_ranges: vec![], objects: vec![
+                Object { members: vec![m("material", &one)] },
+                Object { members: vec![m("delta_state", &two)] },
+                Object { members: vec![m("tch_type", &zero), m("tch_text", &three),
+                    m("rst_type", &alpha_state), m("rst_value", &alpha_value)] },
+                Object { members: vec![m("name", &name), m("creator", &four)] },
+                Object { members: vec![m("type", &texture_type), m("inst", &one)] },
+            ] };
+            let mut have_texture = |_| loaded;
+            let mut builder = Builder { ar: &ar, mesh: Mesh::default(), groups: HashMap::new(),
+                have_texture: &mut have_texture, visited: vec![], object_space: false,
+                overrides: &[], slot: 0, last_tex: None, generic_materials: &[], object_states: &[] };
+            builder.material(None, &ar.objects[0]).vegetation
+        }
+        for name in ["leaves_hires", "applestyletrees_newleaves", "grass_medium_high",
+            "plant_billboards_1024_lars2", "palmeblad"] {
+            assert!(classify(name, OVERRIDE_TEXTURES, true, true), "{name}");
+            assert!(!classify(name, OVERRIDE_TEXTURES, false, true), "opaque {name}");
+            assert!(!classify(name, OVERRIDE_TEXTURES, true, false), "missing {name}");
+            assert!(!classify(name, 1_010_011, true, true), "CAT texture {name}");
+        }
+        for name in ["bark", "plant_trunk_001", "inferno_frozen_jungletrees_trunk",
+            "barkgrasspart", "grass_texture_tiles256", "body_leaves", "arms_fern_tshirt",
+            "bannerwork_unredeemed_inferno2", "hq_implant_sign", "cloak", "unknown"] {
+            assert!(!classify(name, OVERRIDE_TEXTURES, true, true), "{name}");
+        }
+        assert!(!Submesh::new(vec![], None).vegetation);
+        assert!(foliage_texture_name("branch", TextureKey { rdb_type: OVERRIDE_TEXTURES, id: 257704 }));
+        assert!(!foliage_texture_name("branch", TextureKey { rdb_type: OVERRIDE_TEXTURES, id: 1 }));
+    }
+
+    #[test]
+    fn installed_borealis_brown_canopy_retains_foliage_but_not_overridden_trunk() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        let Ok(store) = RecordStore::open(&dir) else { return };
+        let names = crate::character::NameTable::load(&store).unwrap();
+        let mesh = names.id(MESH_TYPE, "large-brown-tree1.abiff").unwrap();
+        let canopy = TextureKey { rdb_type: OVERRIDE_TEXTURES, id: names.id(OVERRIDE_TEXTURES, "branch.png").unwrap() };
+        let bark = TextureKey { rdb_type: OVERRIDE_TEXTURES, id: names.id(OVERRIDE_TEXTURES, "spookybark.png").unwrap() };
+        // Actual camera-target placement: rdb1000003/800 +0x267a, AO(651.82959,65.42179,428.47311).
+        let placement = store.get(1_000_003, 800).unwrap().unwrap();
+        assert_eq!(u32::from_le_bytes(placement[0x268a..0x268e].try_into().unwrap()), mesh);
+        assert_eq!(u32::from_le_bytes(placement[0x2694..0x2698].try_into().unwrap()), bark.id);
+        for ty in [MESH_TYPE, MESH_LOW_TYPE] {
+            let mut scene = Scene::default();
+            let index = decode_statel_mesh(&store, ty, mesh, &[(0, bark.id)], None, &mut scene).unwrap().unwrap();
+            let mesh = &scene.meshes[index];
+            let leaves: Vec<_> = mesh.submeshes.iter().filter(|s| s.texture == Some(canopy)).collect();
+            assert!(!leaves.is_empty(), "native canopy missing in family {ty}");
+            for s in leaves {
+                assert!(s.vegetation && !s.indices.is_empty(), "native autumn canopy family {ty}");
+                // Classification must retain the native blend/test/culling, not rewrite it for sway.
+                assert_eq!(s.blend, Blend::AlphaBlend);
+                assert_eq!((s.alpha_test, s.alpha_func, s.two_sided), (Some(128), 5, true));
+            }
+            let trunks: Vec<_> = mesh.submeshes.iter().filter(|s| s.texture == Some(bark)).collect();
+            assert!(!trunks.is_empty(), "placement bark override missing in family {ty}");
+            assert!(trunks.iter().all(|s| !s.vegetation));
+        }
+    }
 
     #[test]
     fn generic_visual_uses_factory_frame_or_selected_mesh_frame() {

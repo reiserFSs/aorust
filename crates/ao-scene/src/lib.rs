@@ -192,6 +192,10 @@ pub struct Submesh {
     /// Ordinary RTriMesh provenance: its native draw invokes the statel projection pass.
     /// CAT, terrain and procedural visuals do not.
     pub projection_pass: bool,
+    /// Source-identified deformable static foliage (native leaf/grass/plant texture identity).
+    /// False for opaque/trunk materials, CAT actors and unknown/procedural geometry.
+    /// Metadata only: faithful rendering never changes material state or geometry from this flag.
+    pub vegetation: bool,
     /// Liquid surface (`VisualLiquid_t`, render list 4): drawn after the opaque phase **including the actors' opaque parts** and
     /// before the blended world (list 5) and the actors' blended parts (list 6), `DisplaySystem_t::Render` @0x100793b8.
     pub liquid: bool,
@@ -203,6 +207,7 @@ impl Submesh {
             indices,
             texture,
             texture_clamp: false,
+            vegetation: false,
             blend: Blend::Opaque,
             sprite_alpha_test: false,
             depth_write: None,
