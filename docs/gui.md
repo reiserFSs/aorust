@@ -1429,6 +1429,12 @@ Tonemap (`AomacHdr`) and Contact Shadows (`AomacContactShadows`) checkboxes are
 independent DV Main booleans, all **off** by default, including when an older preferences
 file lacks them. `DValues::enhanced_settings` maps them and the quality controls below to
 `ao_render::EnhancedSettings`; `flow.rs::frame` sends live changes through `Host::enhanced_switch`.
+**Lighting / Characters** adds **Round Character Silhouettes (nearby)**
+(`AomacCharacterSmoothing`), an independent default-off DV Main checkbox.
+It uses cached CAT body/head subdivision only within 15 m of the camera.
+Weapons, original hit-test triangles and shadow caster geometry are unchanged;
+see `docs/zone/avatar.md` for the subdivision and skinning contract.
+
 The **Sky & Weather** page also registers five independent default-off booleans:
 Enhanced Rain (`AomacEnhancedRain`), Wet Surfaces (`AomacWetSurfaces`), Storm Particles
 (`AomacWeatherParticles`), GPU Spell Particles (`AomacGpuSpellParticles`), and Fluid Smoke

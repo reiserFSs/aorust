@@ -9,6 +9,10 @@ use std::sync::{Arc, Weak};
 
 #[path = "skinning.rs"]
 mod skinning;
+#[path = "character_smoothing.rs"]
+mod character_smoothing;
+#[path = "smoothing_gpu.rs"]
+mod smoothing_gpu;
 #[path = "shadow_actors.rs"]
 mod shadow_actors;
 #[path = "motion_vectors.rs"]
@@ -100,6 +104,7 @@ struct ModelMesh {
     /// Bind-pose bounding sphere.
     sphere: (Vec3, f32),
     bounds: (Vec3, Vec3),
+    smoothing: Option<smoothing_gpu::MeshGpu>,
 }
 
 struct Model {
@@ -127,6 +132,7 @@ struct ActorGpu {
     skin: Option<std::sync::Arc<Vec<ao_scene::Vertex>>>,
     skin_bounds: Option<(Vec3, Vec3)>,
     pose: Option<skinning::PoseGpu>,
+    smoothing: Option<smoothing_gpu::ActorGpu>,
 }
 
 /// One visible (actor, model mesh) with its slot in the instance buffer.
@@ -147,6 +153,7 @@ struct Item {
     water_body: Option<[f32; 3]>,
     swimming: bool,
     water_surface: Option<f32>,
+    smoothing: bool,
 }
 
 fn bounds_depth((center, half): (Vec3, Vec3), transform: Mat4, eye: Vec3, forward: Vec3) -> f32 {
@@ -199,6 +206,7 @@ pub(crate) struct ActorLayer {
     /// frame has been seen; a model whose geometry size never exceeds its first frame never grows at all.
     pub(crate) mesh_buffer_grows: u64,
     skin_pipeline: Option<(crate::pipeline_creation::ComputePipeline, wgpu::BindGroupLayout)>,
+    smoothing_pipeline: Option<(crate::pipeline_creation::ComputePipeline, wgpu::BindGroupLayout)>,
     pub(super) native_metal: bool,
 }
 
@@ -448,7 +456,7 @@ impl Renderer {
             let vbytes = mesh.vertices.len() * 12;
             let vertex_capacity = ((vbytes * 4) as u64).next_power_of_two().max(1);
             let vb = self.device.create_buffer_tracked(&wgpu::BufferDescriptor {
-                label: None, size: vertex_capacity, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false,
+                label: None, size: vertex_capacity, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC | if scene.native_skin.is_some() { wgpu::BufferUsages::STORAGE } else { wgpu::BufferUsages::empty() }, mapped_at_creation: false,
             });
             self.queue.write_buffer(&vb, 0, bytemuck::cast_slice(&mesh.vertices));
             let (mut indices, mut draws, mut submesh_mats) = (Vec::with_capacity(idx_total), vec![], Vec::with_capacity(mesh.submeshes.len()));
@@ -505,7 +513,11 @@ impl Renderer {
             let (lo, hi) = mesh.vertices.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(l, h), v| (l.min(Vec3::from(v.pos)), h.max(Vec3::from(v.pos))));
             let c = (lo + hi) * 0.5;
             let r = mesh.vertices.iter().map(|v| (Vec3::from(v.pos) - c).length()).fold(0.0, f32::max);
-            meshes.push(Some(ModelMesh { vb, ib, vertex_capacity, index_capacity, nverts: mesh.vertices.len(), draws, submesh_mats, sphere: (c, r), bounds: (c, (hi - lo) * 0.5) }));
+            // ponytail: attractor identities arrive with frames, so CAT rigid parts cache topology
+            // once too; carry model-time attractor metadata if unused weapon allocations matter.
+            let smoothing = scene.native_skin.as_ref().filter(|skin| !skin.is_empty())
+                .and_then(|_| smoothing_gpu::MeshGpu::new(&self.device, mesh, &draws));
+            meshes.push(Some(ModelMesh { vb, ib, vertex_capacity, index_capacity, nverts: mesh.vertices.len(), draws, submesh_mats, sphere: (c, r), bounds: (c, (hi - lo) * 0.5), smoothing }));
         }
         let topology = scene.meshes.iter().map(|mesh| (mesh.vertices.len(), submesh_shape(&mesh.submeshes))).collect();
         let native_skin = scene.native_skin.as_ref().filter(|s| !s.is_empty()).map(|s| (
@@ -534,6 +546,7 @@ impl Renderer {
             a.vb = None;
             a.skin = None;
             a.pose = None;
+            a.smoothing = None;
         }
     }
 
@@ -609,11 +622,11 @@ impl Renderer {
                     entry.into_mut()
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => entry.insert(ActorGpu {
-                    vb: None, seen: tick, model: f.model, skin: None, skin_bounds: None, pose: None,
+                    vb: None, seen: tick, model: f.model, skin: None, skin_bounds: None, pose: None, smoothing: None,
                 }),
             };
             a.seen = tick;
-            if a.model != f.model { if let Some(vb) = a.vb.take() { self.act.vb_pool.entry(a.model).or_default().push(vb); } a.skin = None; a.pose = None; }
+            if a.model != f.model { if let Some(vb) = a.vb.take() { self.act.vb_pool.entry(a.model).or_default().push(vb); } a.skin = None; a.pose = None; a.smoothing = None; }
             a.model = f.model;
             if f.skin.as_ref().is_none_or(|skin| skin.len() != body.nverts) && f.skin_pose.is_some() && self.act.models.get(&f.model).is_some_and(|m| m.native_skin.is_some()) {
                 continue;
@@ -747,6 +760,7 @@ impl Renderer {
     pub(crate) fn prepare_actors(&mut self, cam: Vec3, forward: Vec3, planes: &[Vec4; 6]) {
         let body_fog_enabled = self.enhanced_settings().ground_grass || self.enhanced_settings().water_wakes || self.enhanced_settings().fluid_smoke;
         let sun_enabled = self.enhanced_settings().sun_shadows;
+        let smoothing_enabled = self.enhanced_settings().character_smoothing;
         let layer = &mut self.act;
         layer.items.clear();
         let mut xf: Vec<ActorInstance> = vec![];
@@ -797,7 +811,10 @@ impl Renderer {
                 });
                 layer.items.push(Item { actor: f.id, model: f.model, mesh: mi, fog_depth, bucket, faded: alpha < 1.0, rendering_effect: f.rendering_effect, priority,
                     native_shadow_source: f.native_shadow_source, native_shadow_receiver,
-                    water_body: (mi == 0 && f.water_admitted).then_some([f.transform[3][0], f.transform[3][1], f.transform[3][2]]), swimming: f.swimming, water_surface: f.water_surface });
+                    water_body: (mi == 0 && f.water_admitted).then_some([f.transform[3][0], f.transform[3][1], f.transform[3][2]]), swimming: f.swimming, water_surface: f.water_surface,
+                    smoothing: smoothing_enabled && f.character && model.native_skin.is_some()
+                        && base.w_axis.truncate().distance_squared(cam) <= 225.0
+                        && (mi == 0 || f.part_attractors.get(mi) == Some(&Some(0))) && mesh.smoothing.is_some() });
                 // m0.w carries `alpha - 1` to the shader (the affine matrix' unused column element)
                 let mut a = m.to_cols_array_2d();
                 a[0][3] = alpha.min(1.0) - 1.0;
@@ -851,6 +868,7 @@ impl Renderer {
         }
         // AddToRenderList prepends: later submitted visuals lead equal-distance buckets.
         layer.commands.sort_unstable_by(|a, b| bucket_order(a.0, a.2, b.0, b.2).then_with(|| b.4.cmp(&a.4)));
+        if smoothing_enabled { self.prepare_actor_smoothing(); }
     }
 
     /// Draws a native render list without changing its material pipelines.
@@ -878,9 +896,14 @@ impl Renderer {
                 if it.native_shadow_source.is_some_and(|source| self.replaces_native_shadow(source, it.native_shadow_receiver)) { return; }
                 let model = &layer.models[&it.model];
                 let Some(mesh) = model.meshes[it.mesh].as_ref() else { return };
+                let smooth = it.smoothing.then_some(mesh.smoothing.as_ref()).flatten();
                 let own = (it.mesh == 0).then(|| layer.actors.get(&it.actor)?.vb.as_ref()).flatten();
-                let vb = own.unwrap_or(&mesh.vb);
-                for d in &mesh.draws {
+                let vb = if let Some(smooth) = smooth {
+                    if it.mesh == 0 { &layer.actors[&it.actor].smoothing.as_ref().unwrap().vertices } else { &smooth.vertices }
+                } else { own.unwrap_or(&mesh.vb) };
+                let draws = smooth.map_or(mesh.draws.as_slice(), |smooth| smooth.draws.as_slice());
+                let ib = smooth.map_or(&mesh.ib, |smooth| &smooth.indices);
+                for d in draws {
                     let effect = it.rendering_effect;
                     if effect == 1 && model.holo.is_none() { continue; }
                     if actor_priority(it.priority.or(visual_priority(d, actor_visual_key(it, d), &self.drawn_visuals)), it.faded, effect, blended_pipe(d.pipe)) != priority {
@@ -889,7 +912,7 @@ impl Renderer {
                     let vb_ptr = vb as *const wgpu::Buffer as usize;
                     if vb_c.get() != vb_ptr {
                         pass.set_vertex_buffer(0, vb.slice(..));
-                        pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                         vb_c.set(vb_ptr);
                     }
                     let pipe = if it.faded { faded_pipe(d.pipe) } else { d.pipe };
@@ -1212,7 +1235,7 @@ mod tests {
         assert_eq!(ActorFrame::default().water_surface, None);
         let feet = [1.0, 2.0, 3.0];
         layer.items.push(Item { actor: 7, model: 1, mesh: 0, fog_depth: 9.0, bucket: 0,
-            faded: false, rendering_effect: 0, priority: None, native_shadow_source: None, native_shadow_receiver: None, water_body: Some(feet), swimming: false, water_surface: None });
+            faded: false, rendering_effect: 0, priority: None, native_shadow_source: None, native_shadow_receiver: None, water_body: Some(feet), swimming: false, water_surface: None, smoothing: false });
         let mut positions = vec![];
         layer.enhanced_water_body_positions(20.0, &mut positions);
         assert_eq!(positions, [(7, feet)], "dry admitted bodies seed first-entry velocity history");
@@ -1248,7 +1271,7 @@ mod tests {
             view_of: HashMap::new(), textures: vec![], identities: HashMap::new(),
             topology: vec![(0, vec![ao_scene::Submesh::new(vec![], None)])], native_skin: None, point_cache_revision: 0 });
         layer.items.push(Item { actor: 7, model: 1, mesh: 0, fog_depth: 9.0,
-            bucket: 0, faded: false, rendering_effect: 0, priority: None, native_shadow_source: None, native_shadow_receiver: None, water_body: None, swimming: false, water_surface: None });
+            bucket: 0, faded: false, rendering_effect: 0, priority: None, native_shadow_source: None, native_shadow_receiver: None, water_body: None, swimming: false, water_surface: None, smoothing: false });
         let camera = Camera::look_at(Vec3::ZERO, -Vec3::Z);
         let ids = |layer: &ActorLayer, end| layer.enhanced_grass_actor_ids(end).collect::<Vec<_>>();
         assert_eq!(ids(&layer, 20.0), [7], "positive control: a drawn opaque body bends");
@@ -1683,9 +1706,9 @@ mod tests {
         let mut layer = ActorLayer::default();
         for (id, model) in [(1, 7), (2, 8), (3, 7)] {
             layer.models.entry(model).or_insert_with(|| Model { meshes: vec![], mats: vec![], material_bindings: vec![], holo: None, views: vec![], view_of: HashMap::new(), textures: vec![], identities: HashMap::new(), topology: vec![], native_skin: None, point_cache_revision: 0 });
-            layer.actors.insert(id, ActorGpu { vb: None, seen: 1, model, skin: None, skin_bounds: None, pose: None });
+            layer.actors.insert(id, ActorGpu { vb: None, seen: 1, model, skin: None, skin_bounds: None, pose: None, smoothing: None });
             layer.frames.push(ActorFrame { id, model, skin: Some(std::sync::Arc::new(vec![ao_scene::Vertex::default()])), ..Default::default() });
-            layer.items.push(Item { actor: id, model, mesh: 0, fog_depth: 0.0, bucket: 0, faded: false, rendering_effect: 0, priority: None, native_shadow_source: None, native_shadow_receiver: None, water_body: None, swimming: false, water_surface: None });
+            layer.items.push(Item { actor: id, model, mesh: 0, fog_depth: 0.0, bucket: 0, faded: false, rendering_effect: 0, priority: None, native_shadow_source: None, native_shadow_receiver: None, water_body: None, swimming: false, water_surface: None, smoothing: false });
         }
         for key in [7, 7, 99] {
             layer.remove_model(key);

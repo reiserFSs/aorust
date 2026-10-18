@@ -264,3 +264,15 @@ timestamps, nonblocking readback and a live GUI-font overlay rather than
 changing effects during a profiling sweep. No upstream artwork or binaries
 are included. Copyright (c) 2026 wannabuh; the full MIT permission and warranty
 notice reproduced above applies to these adaptations.
+
+Enhanced character silhouettes: ao-vk
+====================================
+
+The Phong tangent-plane projection follows Boubekeur & Alexa (2008), also
+used in ao-vk rvk/shaders/ffp.tese and ffp.tesc, inspected at revision
+47fceedf61d375947be20b78d97238cb9c971ca9:
+https://github.com/wannabuh/ao-vk
+The implementation here is independent Rust/WGSL: cached CAT edge topology,
+post-skin midpoint interpolation and a fixed nearby-only subdivision level.
+Copyright (c) 2026 wannabuh; the full MIT permission and warranty notice
+reproduced above applies to these adaptations. No artwork is copied.

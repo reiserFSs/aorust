@@ -12,6 +12,8 @@ pub enum NightMode {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EnhancedSettings {
     pub sun_shadows: bool,
+    /// Cached Phong subdivision of nearby CAT bodies and mounted heads.
+    pub character_smoothing: bool,
     pub ambient_occlusion: bool,
     pub emissive_bloom: bool,
     pub ground_grass: bool,
@@ -121,6 +123,7 @@ impl Default for EnhancedSettings {
             sun_shadows: false, ambient_occlusion: false, emissive_bloom: false, ground_grass: false, hdr: false, contact_shadows: false,
             grass_tufts: false, grass_species: false, grass_path_thinning: false, grass_gust_bands: false,
             grass_sunlight: false, grass_sun_shadows: false, grass_point_shadows: false,
+            character_smoothing: false,
             height_haze: false, land_haze: false, valley_mist: false, volumetric_shafts: false,
             cloud_gap_shafts: false, volumetric_clouds: false, cloud_shadows: false, sky_discs: false,
             material_specular: false, clustered_lighting: false, moon_shadows: false, local_light_shadows: false,
@@ -151,6 +154,7 @@ impl Default for EnhancedSettings {
 impl EnhancedSettings {
     pub fn any_enabled(self) -> bool {
         self.sun_shadows || self.ambient_occlusion || self.emissive_bloom || self.ground_grass || self.needs_grade() || self.contact_shadows
+            || self.character_smoothing
             || self.height_haze || self.land_haze || self.valley_mist || self.volumetric_shafts
             || self.cloud_gap_shafts || self.volumetric_clouds || self.cloud_shadows || self.sky_discs
             || self.material_specular || self.clustered_lighting || self.moon_shadows || self.local_light_shadows

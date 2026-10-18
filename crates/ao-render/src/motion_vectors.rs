@@ -23,6 +23,7 @@ struct Pose {
     transform: [[f32; 4]; 4],
     vertices: Option<wgpu::Buffer>,
     bytes: u64,
+    smoothing: bool,
     room: Option<usize>,
     ready: bool,
     cut: bool,
@@ -194,8 +195,8 @@ impl Programs {
     }
 }
 impl MotionVectors {
-    fn admit(&mut self, device: &wgpu::Device, key: PoseKey, bytes: u64, room: Option<usize>) {
-        if self.poses.get(&key).is_some_and(|pose| pose.bytes == bytes && pose.room == room) { return; }
+    fn admit(&mut self, device: &wgpu::Device, key: PoseKey, bytes: u64, room: Option<usize>, smoothing: bool) {
+        if self.poses.get(&key).is_some_and(|pose| pose.bytes == bytes && pose.room == room && pose.smoothing == smoothing) { return; }
         if let Some(previous) = self.poses.remove(&key) {
             if let Some(slot) = previous.visibility_slot { self.visibility.release(slot); }
         }
@@ -206,7 +207,7 @@ impl MotionVectors {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let group = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("exact motion pose"), layout: &self.programs.layout,
             entries: &[wgpu::BindGroupEntry { binding: 2, resource: uniform.as_entire_binding() }] });
-        self.poses.insert(key, Pose { id, transform: Mat4::IDENTITY.to_cols_array_2d(), bytes, room, ready: false, cut: false, visibility_slot, uniform, group: Some(group),
+        self.poses.insert(key, Pose { id, transform: Mat4::IDENTITY.to_cols_array_2d(), bytes, room, smoothing, ready: false, cut: false, visibility_slot, uniform, group: Some(group),
             vertices: (bytes > 0).then(|| device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("previous displayed vertices"), size: bytes,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })) });
     }
@@ -278,7 +279,7 @@ impl Renderer {
         for (index, &source) in self.vis_src.iter().enumerate() {
             let position = self.vis[index][3];
             let room = self.fog.as_ref().and_then(|fog| fog.camera_room([position[0], position[1], position[2]]));
-            let key = PoseKey::World(source); motion.admit(&self.device, key, 0, room);
+            let key = PoseKey::World(source); motion.admit(&self.device, key, 0, room, false);
             let pose = motion.poses.get_mut(&key).unwrap();
             pose.cut = pose.ready && transform_cut(pose.transform, self.vis[index]);
         }
@@ -288,7 +289,8 @@ impl Renderer {
             let position = self.act.motion_instances[index].transform[3];
             let room = self.fog.as_ref().and_then(|fog| fog.camera_room([position[0], position[1], position[2]]));
             let deforming = item.mesh == 0 && self.act.actors.get(&item.actor).is_some_and(|actor| actor.vb.is_some());
-            motion.admit(&self.device, key, if deforming { mesh.nverts as u64 * 48 } else { 0 }, room);
+            let (_, _, _, nverts) = displayed_actor_geometry(&self.act, item, mesh);
+            motion.admit(&self.device, key, if deforming || item.smoothing { nverts as u64 * 48 } else { 0 }, room, item.smoothing);
             let pose = motion.poses.get_mut(&key).unwrap();
             pose.cut = pose.ready && transform_cut(pose.transform, self.act.motion_instances[index].transform);
         }
@@ -367,13 +369,12 @@ impl Renderer {
                     let item = &self.act.items[index]; let model = &self.act.models[&item.model];
                     let Some(mesh) = &model.meshes[item.mesh] else { continue; };
                     let pose = &motion.poses[&PoseKey::Actor(item.actor, item.model, item.mesh)];
-                    let own = (item.mesh == 0).then(|| self.act.actors.get(&item.actor)?.vb.as_ref()).flatten();
-                    let vb = own.unwrap_or(&mesh.vb);
+                    let (vb, ib, draws, _) = displayed_actor_geometry(&self.act, item, mesh);
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_vertex_buffer(2, pose.vertices.as_ref().filter(|_| pose.ready).unwrap_or(vb).slice(..));
-                    pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                     pass.set_bind_group(2, pose.group.as_ref().unwrap(), &[]);
-                    for draw in &mesh.draws {
+                    for draw in draws {
                         if item.rendering_effect == 1 && model.holo.is_none() { continue; }
                         if actor_priority(item.priority.or(visual_priority(draw, actor_visual_key(item, draw), &self.drawn_visuals)), item.faded, item.rendering_effect, blended_pipe(draw.pipe)) != priority { continue; }
                         let slot = mesh_effect_pipe(if item.faded { faded_pipe(draw.pipe) } else { draw.pipe }, item.rendering_effect, draw.projection_pass);
@@ -409,15 +410,27 @@ impl Renderer {
         }
         for (index, item) in self.act.items.iter().enumerate() {
             let Some(mesh) = &self.act.models[&item.model].meshes[item.mesh] else { continue; };
-            let own = (item.mesh == 0).then(|| self.act.actors.get(&item.actor)?.vb.as_ref()).flatten();
+            let (vb, _, _, _) = displayed_actor_geometry(&self.act, item, mesh);
             let Some(pose) = motion.poses.get_mut(&PoseKey::Actor(item.actor, item.model, item.mesh)) else { continue; };
-            if pose.bytes > 0 { encoder.copy_buffer_to_buffer(own.unwrap_or(&mesh.vb), 0, pose.vertices.as_ref().unwrap(), 0, pose.bytes); }
+            if pose.bytes > 0 { encoder.copy_buffer_to_buffer(vb, 0, pose.vertices.as_ref().unwrap(), 0, pose.bytes); }
             pose.transform = self.act.motion_instances[index].transform;
             pose.transform[0][3] = 0.0;
             pose.ready = true;
         }
         motion.reset = false;
     }
+}
+
+/// Match the primary actor raster exactly; shadow passes intentionally retain native geometry.
+fn displayed_actor_geometry<'a>(layer: &'a ActorLayer, item: &Item, mesh: &'a ModelMesh)
+    -> (&'a wgpu::Buffer, &'a wgpu::Buffer, &'a [Draw], usize)
+{
+    if let Some(smooth) = mesh.smoothing.as_ref().filter(|_| item.smoothing) {
+        let vb = if item.mesh == 0 { &layer.actors[&item.actor].smoothing.as_ref().unwrap().vertices } else { &smooth.vertices };
+        return (vb, &smooth.indices, &smooth.draws, smooth.vertex_count as usize);
+    }
+    let own = (item.mesh == 0).then(|| layer.actors.get(&item.actor)?.vb.as_ref()).flatten();
+    (own.unwrap_or(&mesh.vb), &mesh.ib, &mesh.draws, mesh.nverts)
 }
 
 #[cfg(test)]
@@ -474,5 +487,64 @@ mod tests {
         assert!(source.contains("motion.retain_poses(|key| admitted.contains(key))"));
         assert!(source.contains("motion.retain_poses(|_| false)"));
         assert!(source.contains("pose.bytes == bytes && pose.room == room"));
+    }
+
+    #[test]
+    fn smoothing_history_tracks_displayed_body_head_and_lod_topology() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = Renderer::new(&instance, None).expect("smoothing motion regression requires headless GPU");
+        let vertices: Vec<_> = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]].into_iter()
+            .map(|pos| ao_scene::Vertex { pos, normal: [0.0, 0.0, 1.0], ..Default::default() }).collect();
+        let native = vertices.iter().map(|vertex| ao_scene::NativeSkinVertex {
+            local0: vertex.pos, local1: vertex.pos, weight: 1.0, bone0: 0, bone1: 0, normal: vertex.normal,
+        }).collect();
+        let mesh = ao_scene::Mesh { vertices, submeshes: vec![ao_scene::Submesh::new(vec![0, 1, 2], None)] };
+        renderer.add_actor_model(1, &Scene { meshes: vec![mesh.clone(), mesh], native_skin: Some(Arc::new(native)), ..Default::default() });
+        renderer.set_actors(vec![ActorFrame { id: 7, model: 1, character: true, always: true,
+            part_attractors: vec![None, Some(0)], ..Default::default() }]);
+        renderer.enhanced_settings.taa = true;
+        renderer.warm_motion_vectors();
+        let mut previous = None;
+        for (enabled, distance, smooth) in [(false, 0.0, false), (true, 0.0, true),
+            (true, 0.0, true), (true, 15.001, false), (true, 0.0, true), (false, 0.0, false)] {
+            renderer.enhanced_settings.character_smoothing = enabled;
+            renderer.prepare_actors(Vec3::new(distance, 0.0, 0.0), -Vec3::Z, &[Vec4::ZERO; 6]);
+            renderer.prepare_motion_vectors((16, 16), Mat4::IDENTITY, Mat4::IDENTITY);
+            let motion = renderer.motion_vectors.as_ref().unwrap();
+            let mut ids = Vec::new();
+            for item in &renderer.act.items {
+                let mesh = renderer.act.models[&item.model].meshes[item.mesh].as_ref().unwrap();
+                let (vb, ib, draws, count) = displayed_actor_geometry(&renderer.act, item, mesh);
+                let pose = &motion.poses[&PoseKey::Actor(7, 1, item.mesh)];
+                assert_eq!(item.smoothing, smooth);
+                assert_eq!(count, if smooth { 6 } else { 3 });
+                assert_eq!(draws[0].count, if smooth { 12 } else { 3 });
+                assert_eq!(pose.bytes, if smooth { 6 * 48 } else { 0 });
+                if smooth {
+                    let topology = mesh.smoothing.as_ref().unwrap();
+                    assert!(std::ptr::eq(ib, &topology.indices));
+                    let expected = if item.mesh == 0 { &renderer.act.actors[&7].smoothing.as_ref().unwrap().vertices } else { &topology.vertices };
+                    assert!(std::ptr::eq(vb, expected));
+                } else {
+                    assert!(std::ptr::eq(vb, &mesh.vb));
+                    assert!(std::ptr::eq(ib, &mesh.ib));
+                }
+                ids.push(pose.id);
+            }
+            if let Some((was_smooth, old_ids)) = &previous {
+                if *was_smooth == smooth { assert_eq!(&ids, old_ids); }
+                else {
+                    assert_ne!(&ids, old_ids, "topology changes must invalidate temporal identity, including rigid heads");
+                    assert!(motion.poses.values().all(|pose| !pose.ready));
+                }
+            }
+            previous = Some((smooth, ids));
+            let mut encoder = renderer.device.create_command_encoder(&Default::default());
+            renderer.encode_actor_skins(&mut encoder);
+            renderer.finish_motion_frame(&mut encoder);
+            renderer.queue.submit([encoder.finish()]);
+            renderer.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            assert!(renderer.motion_vectors.as_ref().unwrap().poses.values().all(|pose| pose.ready));
+        }
     }
 }

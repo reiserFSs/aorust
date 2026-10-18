@@ -100,6 +100,7 @@ pub(super) fn controls() -> Vec<Control> {
         Control::slider(Lighting, "Local Lights", "AomacLampIntensity", "Lamp Intensity", "%.2fx", 1.0, 0.0, 4.0),
         Control::slider(Lighting, "Local Lights", "AomacCarriedLightIntensity", "Carried Light Intensity", "%.2fx", 1.0, 0.0, 4.0),
         Control::check(Lighting, "Material Highlights", "AomacMaterialSpecular", "Authored Material Specular (GGX + AA)"),
+        Control::check(Lighting, "Characters", "AomacCharacterSmoothing", "Round Character Silhouettes (nearby)"),
         Control::check(Lighting, "Materials & Reflections", "AomacGeneratedNormals", "Generated Texture Bump Maps"),
         Control::check(Lighting, "Materials & Reflections", "AomacMaterialMaps", "Side-loaded Material Maps"),
         Control::check(Lighting, "Materials & Reflections", "AomacMaterialPbr", "Texture Material GGX"),
@@ -265,6 +266,19 @@ mod tests {
             reset(&mut d, Some(PageId::Lighting));
             assert_eq!(flags(d.enhanced_settings()), [false; 5]);
         }
+    }
+
+    #[test]
+    fn character_smoothing_is_default_off_persistent_and_resettable() {
+        let mut d = values();
+        assert!(!d.enhanced_settings().character_smoothing);
+        assert!(d.set("AomacCharacterSmoothing", Variant::Bool(true)));
+        assert!(d.enhanced_settings().character_smoothing);
+        let mut loaded = values();
+        assert!(loaded.load_config(&d.save_config(CAT_MAIN), CAT_MAIN, false));
+        assert!(loaded.enhanced_settings().character_smoothing);
+        reset(&mut loaded, Some(PageId::Lighting));
+        assert!(!loaded.enhanced_settings().character_smoothing);
     }
 
 

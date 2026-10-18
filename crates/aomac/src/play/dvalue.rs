@@ -201,6 +201,7 @@ impl DValues {
         let defaults = ao_render::EnhancedSettings::default();
         ao_render::EnhancedSettings {
             sun_shadows: self.flag("AomacSunShadows"),
+            character_smoothing: self.flag("AomacCharacterSmoothing"),
             ambient_occlusion: self.flag("AomacAmbientOcclusion"),
             emissive_bloom: self.flag("AomacEmissiveBloom"),
             ground_grass: self.flag("AomacGroundGrass"),

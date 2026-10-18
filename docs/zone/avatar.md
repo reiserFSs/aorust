@@ -9,6 +9,35 @@ Cloth selection is resolved: Gamecode `0x1004b521` examines pages 2, 1, 0 for ea
 
 Render submissions normally retain only the CAT bone palette; CPU skinning stays lazy for exact picks and source-mesh effects. Deformer (`3001`, vertex callback GC `0x100d7217`, process `0x100d7752`; `combat-anim.md` native-class census) edits the submitted body's CPU vertices. While such an effect needs source geometry, both `Player::frame` and remote `Dynels::update_with_collision` therefore submit the CPU source frame itself, not a palette-only sibling. The renderer keeps CPU skin authoritative when both skin and palette are present. Installed-asset headless regressions `own_deformer_submits_cpu_skin_only_while_needed` and `remote_deformer_submits_cpu_skin_only_while_needed` cover that exception without requiring a GPU or live session.
 
+### Optional round character silhouettes (non-retail)
+
+**Enhanced → Lighting → Characters → Round Character Silhouettes (nearby)**
+(`AomacCharacterSmoothing`, default off) caches one level of edge subdivision
+for CAT model geometry when uploaded. Only the body and the mounted head
+(`ActorFrame::part_attractors == Some(0)`) draw subdivided triangles, and only
+for submitted character actors within 15 m of the final camera. Weapons and
+other attachments retain their authored geometry.
+
+Each triangle becomes four, with shared edge midpoints. Smooth midpoints use
+Phong tangent-plane projection; material boundaries, open boundaries and
+normal/face discontinuities keep their edge midpoint linear. UVs, colours and
+normals interpolate at the same edge coordinates. For animated bodies the
+cached endpoint mapping is evaluated **after** the original native GPU/CPU
+skin, preserving every original bone contribution rather than truncating
+the midpoint's interpolated weights to CAT's two-influence format. Bind pose
+and CPU-deformed bodies follow the same geometry path. No per-frame CPU
+subdivision is performed.
+
+The original model, CPU picks (`Avatar::pick_hit`,
+`Dynels::pick_character_hit`) and shadow caster topology remain unchanged.
+The all-off draw path binds the original buffers. Admission and native fog
+extinction are unchanged.
+
+Algorithm reference: [ao-vk `ffp.tese`](https://github.com/wannabuh/ao-vk/blob/47fceedf61d375947be20b78d97238cb9c971ca9/rvk/shaders/ffp.tese)
+and [`ffp.tesc`](https://github.com/wannabuh/ao-vk/blob/47fceedf61d375947be20b78d97238cb9c971ca9/rvk/shaders/ffp.tesc),
+which implement Boubekeur & Alexa's Phong projection. This implementation
+uses bounded cached subdivision instead of a hardware tessellation stage.
+
 ## 1. Heading handedness (resolved)
 
 **Server/engine space is the client's left-handed D3D space; a model's rest forward axis is +Z; a dynel's rotation is a unit

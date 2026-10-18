@@ -103,6 +103,11 @@ impl Renderer {
 
     /// Encoded before the world render pass; unchanged render shaders consume the output as vertices.
     pub(crate) fn encode_actor_skins(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        self.encode_native_actor_skins(encoder);
+        self.encode_actor_smoothing(encoder);
+    }
+
+    fn encode_native_actor_skins(&mut self, encoder: &mut wgpu::CommandEncoder) {
         let Some((pipeline, _)) = &self.act.skin_pipeline else { return };
         for actor in self.act.actors.values_mut() {
             let Some(pose) = actor.pose.as_mut().filter(|p| p.pending) else { continue };

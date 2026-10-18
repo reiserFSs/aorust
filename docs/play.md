@@ -2782,3 +2782,65 @@ ground are rejected). Drying must visibly evolve after rain removal.
 These assertions do not certify aesthetics: status
 keeps `visual_acceptance=unexercised` until the parent inspects the native-asset
 sheets. Retain compact sheets, CSVs and metadata only in the final ≤100 MB handoff.
+
+### Headless character silhouette crowd acceptance
+
+`character_smoothing_crowd_evidence` replays the real ICC
+`docs/captures/zone_ithaca.rec` character crowd through `Play` and the renderer
+at 1920×1200, requesting and checking actual 4× MSAA. It toggles
+`AomacCharacterSmoothing` through the shared registry for frozen-camera
+OFF/ON/ON/OFF GPU timing and captures paired animated poses separately.
+Run alone under the GPU timing lock:
+
+```sh
+AOMAC_CHAR_SMOOTH_OUT="$HOME/aomac-handoff/gfx/parity/CharSmooth" \
+CARGO_TARGET_DIR=/tmp/CharSmooth/target \
+cargo test --release -p aomac -j 2 character_smoothing_crowd_evidence -- \
+  --ignored --nocapture --test-threads=1
+```
+Animation strips drive native walking with W and require the actual own
+head anchor to move; merely ticking time on a static idle is not motion proof.
+
+
+The report records actual crowd population and current-camera near geometry;
+it is a captured ICC crowd, not a live Newland measurement or a synthetic
+sixty-copy stress test. Readbacks and animation captures stay outside timed
+intervals. The fixture checks unchanged original CPU picking and exact
+all-off repeat pixels; the saved sheets still require visual inspection.
+
+The real sparse capture measured 65 remote characters, 30 visible pick bodies
+and only two remote origins inside the 15 m LOD radius: whole-world GPU means
+were OFF **1.13247 ms**, ON **1.23412 ms**, an ABBA delta of **+0.10166 ms**
+(240 samples per state, 60 warmup + 120 measured frames per leg).
+This is not a sixty-nearby-avatar crowd cost. Evidence:
+`~/aomac-handoff/gfx/parity/CharSmooth/real-icc/`.
+
+The separate `character_smoothing_synthetic_crowd_evidence` is explicitly a
+**synthetic 60-humanoid stress crowd made from real assets**, not a live or
+captured population. It decodes native humanoid appearances from
+`zone_ithaca.rec` and `zone_newchar_ithaca.rec`, preserving their breed, sex,
+head, cloth/armour and attachments. Sixty fixture-only actors reuse these
+native rigs in a 10×6 ICC grid, all within 15 m, with ordinary frustum
+admission. Source identities, appearances, replica counts and positions are
+recorded in its report. Walk animation samples the real native clips; every
+replica's bone palette and the rendered poses must change across the strips.
+
+```sh
+AOMAC_CHAR_SMOOTH_OUT="$HOME/aomac-handoff/gfx/parity/CharSmooth/synthetic60" \
+CARGO_TARGET_DIR=/tmp/CharSmooth/target \
+cargo test --release -p aomac -j 2 character_smoothing_synthetic_crowd_evidence -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The exercised synthetic stress run selected eight captured appearances
+covering all four breeds and male/female humanoids, including native cloth,
+armour and attachments. All 60 primary bodies were admitted, at distances
+8.75–14.35 m. GPU means were OFF **1.25465 ms**, ON **1.53562 ms**:
+**+0.28098 ms** (+22.4% of this isolated world-render baseline).
+Render-submission CPU wall increased **0.15480 ms**; it is not GPU time and
+excludes `Play`/simulation. Both ON legs changed pixels and the final OFF
+matched the original OFF exactly. Native walk palettes changed for every
+replica across the three inspected motion poses. The visible before/after
+sheet shows gentler body/head contours while weapons retain their original
+topology. Retained PNGs/strips/CSV/report:
+`~/aomac-handoff/gfx/parity/CharSmooth/synthetic60/`.

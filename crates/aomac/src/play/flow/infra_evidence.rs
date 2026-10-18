@@ -51,6 +51,415 @@ fn infrastructure_percentiles_use_nearest_rank() {
     assert_eq!(percentile(&[4.0, 1.0, 3.0, 2.0], 0.95), 4.0);
 }
 
+/// Run alone under the GPU timing lock; output must be an absolute directory.
+#[test]
+#[ignore = "installed client + GPU; real captured ICC character smoothing ABBA evidence"]
+fn character_smoothing_crowd_evidence() {
+    const CROWD_SIZE: (u32, u32) = (1920, 1200);
+    use super::super::super::dvalue::Variant;
+    let out = std::path::PathBuf::from(std::env::var_os("AOMAC_CHAR_SMOOTH_OUT")
+        .expect("set AOMAC_CHAR_SMOOTH_OUT to an absolute output directory"));
+    assert!(out.is_absolute(), "AOMAC_CHAR_SMOOTH_OUT must be absolute");
+    std::fs::create_dir_all(&out).unwrap();
+    let warmup = count("AOMAC_CHAR_SMOOTH_WARMUP", 60);
+    let measured = count("AOMAC_CHAR_SMOOTH_FRAMES", 120);
+    let started = Instant::now();
+    let within_lock = || assert!(started.elapsed() < Duration::from_secs(270),
+        "character evidence exceeded its 270s GPU-lock execution allowance");
+    let mut report = std::fs::File::create(out.join("report.txt")).unwrap();
+    writeln!(report, "zone_ithaca.rec Testy 25988; real Play/HUD/registry; no copied or synthetic actors; {}x{}; requested MSAA=4; warmup={warmup} measured={measured}; frozen camera/time ABBA off/on/on/off. Headless only; no real-window claim.", CROWD_SIZE.0, CROWD_SIZE.1).unwrap();
+    let mut r = rig().expect("character smoothing evidence requires installed client data");
+    let mut o = ao_render::Offscreen::evidence_timing(&r.p, CROWD_SIZE).unwrap();
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 25988 });
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_ithaca.rec")));
+    o.host = std::mem::replace(&mut r.host, Host::headless());
+    o.host.msaa_samples = Some(4);
+    loop {
+        within_lock();
+        o.frame(&mut r.p, 1.0 / 60.0);
+        if r.p.screen == Screen::InWorld && r.p.zone.world.cpu_benchmark_scene().0 && r.p.zone.in_play_sent { break; }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    let id = r.p.zone.char_id;
+    r.p.fake_events.push_back(LoginEvent::ZoneFrame(ao_net::n3::outgoing::n3_frame(
+        0, id, ao_net::n3::outgoing::char_in_play(id as i32),
+    )));
+    o.frame(&mut r.p, 0.0);
+    o.frame(&mut r.p, FADE_OUT);
+    assert!(r.p.game_input_open() && !r.p.loading_active);
+    {
+        let values = &mut r.p.hud.as_mut().unwrap().dvalues;
+        for control in super::super::super::enhanced::controls().into_iter()
+            .filter(|control| control.name.starts_with("Aomac")) {
+            values.set(control.name, control.default);
+        }
+        assert!(!values.enhanced_settings().any_enabled(), "registry defaults must be all-off");
+        assert!(values.persists("AomacCharacterSmoothing"), "smoothing choice must persist");
+        values.set_i64("AomacEdgeSmoothing", 2); // Play maps this registry index to host MSAA=4.
+        values.set_i64("BoundingBoxTargeting", 0);
+    }
+    let own = r.p.zone.own().expect("captured Testy");
+    let at = Vec3::new(own.pos[0], own.pos[1] + 1.6, -own.pos[2]);
+    let camera = Camera::look_at(at + Vec3::new(0.0, 3.0, 12.0), at);
+    o.fixed_camera(Some(camera));
+    o.frame(&mut r.p, 0.0);
+    o.wait_for_pipeline_warmup();
+    o.frame(&mut r.p, 0.0);
+    assert_eq!(o.msaa_samples(), 4, "actual renderer MSAA must be 4, not a quality fallback");
+    assert!(r.p.zone.triangle_targeting);
+    let mut bodies = r.p.zone.world.pick_bodies(id as i32);
+    bodies.sort_by_key(|body| body.id);
+    let remote = bodies.iter().filter(|body| body.id != id as i32).count();
+    let near = bodies.iter().filter(|body| body.id != id as i32
+        && Vec3::from(body.pos).distance_squared(camera.pos) <= 225.0).count();
+    let (_, triangles) = r.p.zone.world.cpu_benchmark_scene();
+    assert!(remote > 0 && near > 0 && triangles > 0, "requires real nearby posed CAT crowd");
+    writeln!(report, "actual_msaa={} camera={camera:?} dynels={} real_remote_characters={} visible_pick_bodies={remote} near_pick_bodies_15m={near} original_remote_body_triangles={triangles}; near count uses real visible body origins, not a claim that every CAT is eligible for smoothing.", o.msaa_samples(), r.p.zone.dynels.len(), r.p.zone.world.chars.len()).unwrap();
+    let rays: Vec<_> = bodies.iter().filter(|body| body.id != id as i32).map(|body| {
+        let local = (Vec3::from(body.bounds.0) + Vec3::from(body.bounds.1)) * (0.5 * body.scale);
+        let centre = Vec3::from(body.pos) + glam::Quat::from_rotation_y(body.yaw) * local;
+        super::super::super::hud_target::Ray { origin: camera.pos,
+            dir: (centre - camera.pos).normalize(), len: 799.5 }
+    }).collect();
+    let pick_snapshot = |p: &Play| {
+        rays.iter().map(|ray| (
+            bodies.iter().map(|body| p.zone.world.pick_character_hit(body, ray, false).map(f32::to_bits)).collect::<Vec<_>>(),
+            super::super::super::interact_use::pick_objects(ray, &p.zone, p.player.as_ref()),
+        )).collect::<Vec<_>>()
+    };
+    let original_picks = pick_snapshot(&r.p);
+    assert!(original_picks.iter().any(|(hits, _)| hits.iter().any(Option::is_some)),
+        "the CPU invariant must exercise real native triangle hits");
+    let mut csv = std::fs::File::create(out.join("frames.csv")).unwrap();
+    writeln!(csv, "leg,smoothing,frame,render_submit_cpu_wall_ms,world_gpu_ms").unwrap();
+    let mut gpu = [Vec::new(), Vec::new()];
+    let mut cpu = [Vec::new(), Vec::new()];
+    let mut before = None;
+    for (leg, enabled) in [false, true, true, false].into_iter().enumerate() {
+        within_lock();
+        r.p.hud.as_mut().unwrap().dvalues.set("AomacCharacterSmoothing", Variant::Bool(enabled));
+        // Apply the real Play registry route once, then retain its actual actors and camera.
+        o.frame(&mut r.p, 0.0);
+        o.wait_for_pipeline_warmup();
+        o.frame(&mut r.p, 0.0);
+        assert_eq!(o.enhanced_settings().character_smoothing, enabled);
+        assert_eq!(o.msaa_samples(), 4);
+        let mut current = r.p.zone.world.pick_bodies(id as i32);
+        current.sort_by_key(|body| body.id);
+        assert_eq!(current, bodies, "render smoothing must retain native posed pick bounds");
+        assert_eq!(pick_snapshot(&r.p), original_picks,
+            "native triangle distances and CPU target selection must not change with smoothing");
+        o.set_effect_gpu_profiling_for_evidence(false).unwrap();
+        o.set_gpu_timing(true).expect("actual GPU timestamps required; no CPU fallback");
+        for frame in 0..warmup + measured {
+            within_lock();
+            let start = Instant::now();
+            o.render_frozen().unwrap();
+            let cpu_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let gpu_ms = o.read_frame_gpu_ms().unwrap().expect("actual completed GPU sample");
+            assert!(gpu_ms.is_finite() && gpu_ms >= 0.0);
+            if frame >= warmup {
+                gpu[usize::from(enabled)].push(gpu_ms);
+                cpu[usize::from(enabled)].push(cpu_ms);
+                writeln!(csv, "{leg},{enabled},{},{cpu_ms:.9},{gpu_ms:.9}", frame - warmup).unwrap();
+            }
+        }
+        o.set_gpu_timing(false).unwrap();
+        let pixels = o.frozen_rgba().unwrap();
+        image::save_buffer(out.join(format!("abba_{leg}_smoothing_{enabled}.png")),
+            &pixels, CROWD_SIZE.0, CROWD_SIZE.1, image::ColorType::Rgba8).unwrap();
+        if leg == 0 { before = Some(pixels); }
+        else if enabled {
+            assert!(Some(&pixels) != before.as_ref(), "smoothing ON must visibly differ from the original OFF snapshot");
+        }
+        else if leg == 3 {
+            assert!(pixels == before.take().unwrap(), "all-off repeat must have exact pixel parity");
+        }
+        writeln!(report, "leg={leg} smoothing={enabled} actual_msaa={} CPU original bounds/triangle hits/selection unchanged", o.msaa_samples()).unwrap();
+        report.flush().unwrap();
+    }
+    for (name, samples) in [("world_gpu", &gpu), ("render_submit_cpu_wall", &cpu)] {
+        for (enabled, values) in samples.iter().enumerate() {
+            writeln!(report, "{name} smoothing={} samples={} mean_ms={:.9} p50_ms={:.9} p95_ms={:.9}",
+                enabled == 1, values.len(), mean(values), percentile(values, 0.5), percentile(values, 0.95)).unwrap();
+        }
+        writeln!(report, "{name} ABBA_on_minus_off_ms={:.9}", mean(&samples[1]) - mean(&samples[0])).unwrap();
+    }
+    writeln!(report, "All-off before/after exact pixel parity PASS. Frozen GPU scope includes native skinning and smoothing compute/world passes; CPU scope is render submission only, not Play/update or GPU waiting. PNG/readback excluded from measured samples.").unwrap();
+    // Three genuinely advancing Play poses, paired off/on without advancing between each pair.
+    r.p.gui.clear_focus();
+    r.p.game_input(ao_render::GameInput::Key { code: KeyCode::KeyW, pressed: true, repeat: false }, &mut o.host);
+    let start_anchor = r.p.player.as_ref().and_then(|player| player.effect_anchor(0));
+    let mut strips = [image::RgbaImage::new(CROWD_SIZE.0 * 3, CROWD_SIZE.1),
+        image::RgbaImage::new(CROWD_SIZE.0 * 3, CROWD_SIZE.1)];
+    for frame in 0..3 {
+        within_lock();
+        r.p.hud.as_mut().unwrap().dvalues.set("AomacCharacterSmoothing", Variant::Bool(false));
+        o.frame(&mut r.p, 1.0 / 15.0);
+        assert!(r.p.player.as_ref().unwrap().movement_active(), "motion evidence must exercise actual native walking");
+        std::thread::sleep(Duration::from_millis(40));
+        for enabled in [false, true] {
+            let values = &mut r.p.hud.as_mut().unwrap().dvalues;
+            values.set("AomacCharacterSmoothing", Variant::Bool(enabled));
+            o.set_enhanced_settings(values.enhanced_settings());
+            o.wait_for_pipeline_warmup();
+            o.render_frozen().unwrap();
+            assert_eq!(o.msaa_samples(), 4);
+            let image = image::RgbaImage::from_raw(CROWD_SIZE.0, CROWD_SIZE.1, o.frozen_rgba().unwrap()).unwrap();
+            image::imageops::replace(&mut strips[usize::from(enabled)], &image, i64::from(frame * CROWD_SIZE.0), 0);
+        }
+    }
+    r.p.game_input(ao_render::GameInput::Key { code: KeyCode::KeyW, pressed: false, repeat: false }, &mut o.host);
+    assert_ne!(r.p.player.as_ref().and_then(|player| player.effect_anchor(0)), start_anchor,
+        "walking strips must change the actual character anchor, not merely advance sky time");
+    for (enabled, strip) in strips.iter().enumerate() {
+        strip.save(out.join(format!("animation_smoothing_{}.png", enabled == 1))).unwrap();
+    }
+    writeln!(report, "Animation strips: physical W through real Play, three walking frames advancing dt=1/15s each, fixed camera; actual own head anchor changed; each off/on pair shares one pose and time, no copied actors. elapsed_seconds={:.3}", started.elapsed().as_secs_f64()).unwrap();
+    report.flush().unwrap();
+    csv.flush().unwrap();
+    within_lock();
+}
+
+/// Fixture-only synthetic crowd: captured appearances, native rigs and animation, never live dynels.
+#[test]
+#[ignore = "installed client + GPU; synthetic real-asset 60-humanoid ICC stress evidence"]
+fn character_smoothing_synthetic_crowd_evidence() {
+    use super::super::super::avatar::{Avatar, AvatarPose};
+    use super::super::super::dvalue::Variant;
+    use ao_formats::character::{actor::ActorAssets, Role};
+    use std::sync::Arc;
+    const RES: (u32, u32) = (1920, 1200);
+    const ACTORS: usize = 60;
+    const MODEL_BASE: u64 = 0x5359_4e54_0000_0000;
+    const ACTOR_BASE: u32 = 0xee00_0000;
+    let out = std::path::PathBuf::from(std::env::var_os("AOMAC_CHAR_SMOOTH_OUT")
+        .expect("set AOMAC_CHAR_SMOOTH_OUT to an absolute output directory"));
+    assert!(out.is_absolute(), "AOMAC_CHAR_SMOOTH_OUT must be absolute");
+    std::fs::create_dir_all(&out).unwrap();
+    let started = Instant::now();
+    let within_lock = || assert!(started.elapsed() < Duration::from_secs(270),
+        "synthetic crowd exceeded its 270s GPU-lock execution allowance");
+    let warmup = count("AOMAC_CHAR_SMOOTH_WARMUP", 60);
+    let measured = count("AOMAC_CHAR_SMOOTH_FRAMES", 120);
+    assert!(warmup >= 60 && measured >= 120, "stress evidence requires 60 warmup + 120 measured per leg");
+    let mut report = std::fs::File::create(out.join("report.txt")).unwrap();
+    writeln!(report, "SYNTHETIC REAL-ASSET CROWD: fixture-only replicas, NOT a captured/live population. ICC world from zone_ithaca.rec, real Play/HUD registry and native Avatar/ActorRig path. 60 actors; 1920x1200; MSAA4; frozen OFF/ON/ON/OFF; warmup={warmup} measured={measured}. Headless only.").unwrap();
+    let mut r = rig().expect("synthetic crowd requires installed client data");
+    let mut o = ao_render::Offscreen::evidence_timing(&r.p, RES).unwrap();
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 25988 });
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_ithaca.rec")));
+    o.host = std::mem::replace(&mut r.host, Host::headless());
+    o.host.msaa_samples = Some(4);
+    loop {
+        within_lock();
+        o.frame(&mut r.p, 1.0 / 60.0);
+        if r.p.screen == Screen::InWorld && r.p.zone.world.cpu_benchmark_scene().0 && r.p.zone.in_play_sent { break; }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    let id = r.p.zone.char_id;
+    r.p.fake_events.push_back(LoginEvent::ZoneFrame(ao_net::n3::outgoing::n3_frame(
+        0, id, ao_net::n3::outgoing::char_in_play(id as i32))));
+    o.frame(&mut r.p, 0.0);
+    o.frame(&mut r.p, FADE_OUT);
+    assert!(r.p.game_input_open() && !r.p.loading_active);
+    {
+        let values = &mut r.p.hud.as_mut().unwrap().dvalues;
+        for control in super::super::super::enhanced::controls().into_iter()
+            .filter(|control| control.name.starts_with("Aomac")) {
+            values.set(control.name, control.default);
+        }
+        values.set_i64("AomacEdgeSmoothing", 2);
+    }
+    // Decode the same recorded wire frames as Play; no invented head, cloth or attachment choices.
+    let mut sources = Vec::new();
+    for (capture, rec) in [
+        ("zone_ithaca.rec", include_str!("../../../../../docs/captures/zone_ithaca.rec")),
+        ("zone_newchar_ithaca.rec", include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")),
+    ] {
+        for frame in captured(rec) {
+            let Ok(message) = ao_net::n3::decode(&frame) else { continue };
+            if let ao_net::n3::N3::Dynel(ao_net::n3::dynel::Dynel::SimpleCharFullUpdate(update)) = message.body {
+                if (1..=4).contains(&update.breed) {
+                    sources.push((capture, message.header.target.instance, *update));
+                }
+            }
+        }
+    }
+    // First cover every captured breed/sex pair, then fill with distinct captured outfits.
+    let mut selected = Vec::new();
+    let mut breeds_sexes = std::collections::BTreeSet::new();
+    let mut appearances = std::collections::BTreeSet::new();
+    for first_pass in [true, false] {
+        for (capture, identity, update) in &sources {
+            let signature = format!("{:?}/{:?}/{:?}/{:?}/{:?}/{:?}", update.breed, update.sex,
+                update.head_mesh, update.fatness, update.cloth, update.attractors);
+            if selected.len() < 8 && !appearances.contains(&signature)
+                && (!first_pass || !breeds_sexes.contains(&(update.breed, update.sex))) {
+                appearances.insert(signature);
+                breeds_sexes.insert((update.breed, update.sex));
+                selected.push((*capture, *identity, update));
+            }
+        }
+    }
+    assert!(selected.len() >= 2 && breeds_sexes.len() >= 2,
+        "requires at least two distinct captured humanoid appearances and breed/sex pairs");
+    let breeds: std::collections::BTreeSet<_> = breeds_sexes.iter().map(|&(breed, _)| breed).collect();
+    let sexes: std::collections::BTreeSet<_> = breeds_sexes.iter().map(|&(_, sex)| sex).collect();
+    assert!(breeds.len() >= 2 && sexes.contains(&2) && sexes.contains(&3),
+        "capture-sourced crowd must cover multiple breeds plus male and female humanoids");
+    assert!(selected.iter().any(|(_, _, update)| !update.cloth.is_empty()),
+        "captured armour/cloth coverage is required");
+    writeln!(report, "captured_breeds={breeds:?} captured_sexes={sexes:?}; wire sex2=male sex3=female; appearance selection first covers breed/sex pairs, then distinct head/cloth/attractor outfits (maximum8).").unwrap();
+    let dir = ao_gui::client_dir();
+    let store = ao_rdb::RecordStore::open(&dir).unwrap();
+    let own = r.p.zone.own().unwrap();
+    let origin = Vec3::new(own.pos[0], own.pos[1], -own.pos[2]);
+    // Ten columns by six rows, all origins inside the camera's 15m eligibility sphere.
+    let camera = Camera::look_at(origin + Vec3::new(0.0, 4.5, 9.0), origin + Vec3::new(0.0, 1.0, -1.0));
+    o.fixed_camera(Some(camera));
+    let mut avatars = Vec::new();
+    for (index, (capture, identity, update)) in selected.iter().enumerate() {
+        within_lock();
+        let mut avatar = Avatar::new(&store, &dir, ACTOR_BASE + index as u32, update,
+            ActorAssets::new(&store).unwrap()).expect("captured humanoid must load faithfully");
+        assert!(avatar.model().native_skin.is_some(), "real native CAT skin required");
+        avatar.set_pose(&store, AvatarPose { role: Role::Walk, speed: 1.5, ref_speed: 1.5 }).unwrap();
+        avatar.update(0.2 + index as f32 * 0.037);
+        o.host.actor_models.push((MODEL_BASE + index as u64, Arc::new(avatar.model().clone())));
+        writeln!(report, "source={capture} identity={identity} name={:?} breed={} sex={} head={:?} fatness={} cloth={:?} attractors={:?} model_key={:#x} native_vertices={} meshes={} replicas={}",
+            update.name, update.breed, update.sex, update.head_mesh, update.fatness, update.cloth,
+            update.attractors, MODEL_BASE + index as u64, avatar.model().native_skin.as_ref().unwrap().len(),
+            avatar.model().meshes.len(), (0..ACTORS).filter(|ordinal| ordinal % selected.len() == index).count()).unwrap();
+        avatars.push(avatar);
+    }
+    struct Crowd<'a> {
+        play: &'a mut Play,
+        avatars: &'a mut [Avatar],
+        origin: Vec3,
+        frames: Vec<ao_scene::ActorFrame>,
+    }
+    impl ao_render::Frontend for Crowd<'_> {
+        fn gui(&self) -> &ao_gui::Gui { self.play.gui() }
+        fn input(&mut self, event: InputEvent, host: &mut Host) { self.play.input(event, host); }
+        fn frame(&mut self, dt: f32, size: (u32, u32), host: &mut Host) -> ao_gui::DrawList {
+            let list = self.play.frame(dt, size, host);
+            for avatar in self.avatars.iter_mut() { avatar.update(dt); }
+            let poses: Vec<_> = self.avatars.iter().map(Avatar::frame).collect();
+            self.frames = (0..ACTORS).map(|ordinal| {
+                let source = ordinal % poses.len();
+                let mut actor = poses[source].clone();
+                actor.id = ACTOR_BASE + ordinal as u32;
+                actor.model = MODEL_BASE + source as u64;
+                // Only world placement/identity change: native scale, skin, mounts and materials survive.
+                actor.transform[3] = (self.origin + Vec3::new(
+                    (ordinal % 10) as f32 * 0.9 - 4.05, 0.0,
+                    1.5 - (ordinal / 10) as f32 * 1.1)).extend(1.0).to_array();
+                actor.always = false;
+                actor
+            }).collect();
+            host.actors.clone_from(&self.frames);
+            host.dynamic_lights.clear(); // No light from the replaced real actor batch.
+            list
+        }
+    }
+    let mut crowd = Crowd { play: &mut r.p, avatars: &mut avatars, origin, frames: Vec::new() };
+    o.frame(&mut crowd, 0.0);
+    o.wait_for_pipeline_warmup();
+    o.frame(&mut crowd, 0.0);
+    assert_eq!(o.msaa_samples(), 4);
+    let visible = o.host.previous_visible_actors.iter()
+        .filter(|id| (ACTOR_BASE..ACTOR_BASE + ACTORS as u32).contains(*id)).count();
+    assert_eq!(visible, ACTORS, "all 60 bodies must reach the actual renderer primary draw batch");
+    writeln!(report, "camera={camera:?}; origin={origin:?}; grid=10x6 spacing=(0.9,1.1)m; actual_msaa={}; actual_primary_body_draws={visible}; appearances={} breed_sex_pairs={:?}; native palettes/rigid mounted part matrices/part_attractors retained; ordinary primary visibility (always=false), not forced visibility.", o.msaa_samples(), selected.len(), breeds_sexes).unwrap();
+    for actor in &crowd.frames {
+        let pos = Vec3::from_slice(&actor.transform[3][..3]);
+        assert!(pos.distance_squared(camera.pos) <= 225.0);
+        assert!(actor.character && actor.skin.is_none() && actor.skin_pose.is_some());
+        writeln!(report, "replica_id={} model_key={:#x} position={pos:?} camera_distance_m={:.6} palette_bones={} mounted_parts={} attractor_slots={}", actor.id, actor.model,
+            pos.distance(camera.pos), actor.skin_pose.as_ref().unwrap().len(), actor.parts.len(), actor.part_attractors.len()).unwrap();
+    }
+    let mut csv = std::fs::File::create(out.join("frames.csv")).unwrap();
+    writeln!(csv, "leg,smoothing,frame,render_submit_cpu_wall_ms,world_gpu_ms").unwrap();
+    let mut gpu = [Vec::new(), Vec::new()];
+    let mut cpu = [Vec::new(), Vec::new()];
+    let mut baseline = None;
+    for (leg, enabled) in [false, true, true, false].into_iter().enumerate() {
+        crowd.play.hud.as_mut().unwrap().dvalues.set("AomacCharacterSmoothing", Variant::Bool(enabled));
+        o.frame(&mut crowd, 0.0);
+        o.wait_for_pipeline_warmup();
+        o.frame(&mut crowd, 0.0);
+        assert_eq!(o.msaa_samples(), 4);
+        assert_eq!(o.enhanced_settings().character_smoothing, enabled);
+        o.set_effect_gpu_profiling_for_evidence(false).unwrap();
+        o.set_gpu_timing(true).unwrap();
+        for frame in 0..warmup + measured {
+            within_lock();
+            let start = Instant::now();
+            o.render_frozen().unwrap();
+            let cpu_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let gpu_ms = o.read_frame_gpu_ms().unwrap().expect("completed GPU timestamp required");
+            assert!(gpu_ms.is_finite() && gpu_ms >= 0.0);
+            if frame >= warmup {
+                gpu[usize::from(enabled)].push(gpu_ms);
+                cpu[usize::from(enabled)].push(cpu_ms);
+                writeln!(csv, "{leg},{enabled},{},{cpu_ms:.9},{gpu_ms:.9}", frame - warmup).unwrap();
+            }
+        }
+        o.set_gpu_timing(false).unwrap();
+        let pixels = o.frozen_rgba().unwrap();
+        image::save_buffer(out.join(format!("abba_{leg}_smoothing_{enabled}.png")),
+            &pixels, RES.0, RES.1, image::ColorType::Rgba8).unwrap();
+        if leg == 0 { baseline = Some(pixels); }
+        else if enabled { assert_ne!(Some(&pixels), baseline.as_ref(), "ON must visibly change the crowd"); }
+        else { assert_eq!(pixels, baseline.take().unwrap(), "OFF repeat must be pixel exact"); }
+    }
+    for (name, samples) in [("world_gpu", &gpu), ("render_submit_cpu_wall", &cpu)] {
+        for (enabled, values) in samples.iter().enumerate() {
+            writeln!(report, "{name} smoothing={} samples={} mean_ms={:.9} p50_ms={:.9} p95_ms={:.9}",
+                enabled == 1, values.len(), mean(values), percentile(values, 0.5), percentile(values, 0.95)).unwrap();
+        }
+        writeln!(report, "{name} ABBA_on_minus_off_ms={:.9}", mean(&samples[1]) - mean(&samples[0])).unwrap();
+    }
+    // Full-resolution strips keep the actual replicated bodies in view, not the original own avatar.
+    let mut strips = [image::RgbaImage::new(RES.0 * 3, RES.1), image::RgbaImage::new(RES.0 * 3, RES.1)];
+    let mut previous_palettes: Option<Vec<Vec<u32>>> = None;
+    let mut previous_pixels: Option<Vec<u8>> = None;
+    for pose in 0..3 {
+        within_lock();
+        // Advance only native limbs: world/sky/camera stay frozen, so rendered differences
+        // cannot be satisfied by moving scenery or the replaced original own avatar.
+        for avatar in crowd.avatars.iter_mut() { avatar.update(0.17); }
+        o.frame(&mut crowd, 0.0);
+        let palettes: Vec<Vec<_>> = crowd.frames.iter().map(|actor| actor.skin_pose.as_ref().unwrap()
+            .iter().flat_map(|bone| bone.rows.iter().flatten().map(|value| value.to_bits())).collect()).collect();
+        if let Some(previous) = &previous_palettes {
+            assert!(palettes.iter().zip(previous).all(|(current, before)| current != before),
+                "every replicated body's native limb palette must advance");
+        }
+        previous_palettes = Some(palettes);
+        for enabled in [false, true] {
+            o.set_enhanced_settings(ao_render::EnhancedSettings { character_smoothing: enabled, ..Default::default() });
+            o.wait_for_pipeline_warmup();
+            o.render_frozen().unwrap();
+            let pixels = o.frozen_rgba().unwrap();
+            if !enabled {
+                if let Some(previous) = &previous_pixels { assert_ne!(&pixels, previous, "rendered native walking poses must change"); }
+                previous_pixels = Some(pixels.clone());
+            }
+            let image = image::RgbaImage::from_raw(RES.0, RES.1, pixels).unwrap();
+            image::imageops::replace(&mut strips[usize::from(enabled)], &image, i64::from(pose * RES.0), 0);
+        }
+    }
+    for (enabled, strip) in strips.iter().enumerate() {
+        strip.save(out.join(format!("animation_smoothing_{}.png", enabled == 1))).unwrap();
+    }
+    writeln!(report, "PASS: 60/60 submitted native humanoids within15m; frozen OFF exact parity; both ON legs visibly differ; three advancing native walking palettes and rendered poses. Animation is synthetic fixture playback of native walk, not captured movement. GPU scope is frozen world rendering including native skin/smoothing; CPU is render submission only. elapsed_seconds={:.3}", started.elapsed().as_secs_f64()).unwrap();
+    report.flush().unwrap();
+    csv.flush().unwrap();
+    within_lock();
+}
+
 /// Run alone under the GPU timing lock, with an absolute AOMAC_INFRA_OUT directory.
 /// Defaults: 120 warmup + 600 measured frames per ABBA leg. For an initial short GPU-lock
 /// chunk use AOMAC_INFRA_WARMUP=60 AOMAC_INFRA_FRAMES=120; counts are recorded, not hidden.
