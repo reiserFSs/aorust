@@ -370,29 +370,6 @@ fn icc_retail_sky_screenshots() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn graphics_fixture_msaa(value: Option<&std::ffi::OsStr>) -> anyhow::Result<u32> {
-    match value {
-        None => Ok(1),
-        Some(value) if value == "1" => Ok(1),
-        Some(value) if value == "2" => Ok(2),
-        Some(value) if value == "4" => Ok(4),
-        Some(value) if value == "8" => Ok(8),
-        Some(value) => anyhow::bail!("AOMAC_GFX_MSAA must be 1, 2, 4 or 8, got {value:?}"),
-    }
-}
-
-#[test]
-fn graphics_fixture_msaa_defaults_and_bounds() {
-    assert_eq!(graphics_fixture_msaa(None).unwrap(), 1);
-    assert_eq!(graphics_fixture_msaa(Some("1".as_ref())).unwrap(), 1);
-    assert_eq!(graphics_fixture_msaa(Some("2".as_ref())).unwrap(), 2);
-    assert_eq!(graphics_fixture_msaa(Some("4".as_ref())).unwrap(), 4);
-    assert_eq!(graphics_fixture_msaa(Some("8".as_ref())).unwrap(), 8);
-    for invalid in ["", "0", "3", "16", "invalid"] {
-        assert!(graphics_fixture_msaa(Some(invalid.as_ref())).is_err());
-    }
-}
-
 /// Frozen world evidence: no network, window, wall-clock simulation or desktop capture.
 /// Run with `AOMAC_GFX_OUT=$HOME/aomac-handoff/gfx/<new-run>`; see docs/play.md.
 #[test]
@@ -533,6 +510,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     for step in 0..16 {
                         let position = interaction_start.lerp(interaction_end, step as f32 / 15.0);
                         avatar.set_transform(position.to_array(), 0.0);
+                        off.host.post_focus = Some(position.to_array());
                         off.host.dynamic_lights.extend(avatar.lights());
                         off.host.actors.push(avatar.frame());
                         off.host.grass_benders.clear();
@@ -1055,6 +1033,13 @@ fn graphics_fixture_post_selectors_are_independent_and_composable() {
     assert!(s.taa && s.fxaa && s.cas && s.motion_blur > 0.0 && s.depth_of_field && s.grading_enabled);
     assert!(graphics_fixture_post_features(defaults, "unknown").is_err());
     assert!(graphics_fixture_post_features(defaults, "taa,").is_err());
+    let foliage = graphics_fixture_settings("all-foliage").unwrap();
+    let combined = graphics_fixture_post_features(foliage, "taa,dof,grading").unwrap();
+    assert_eq!(combined, ao_render::EnhancedSettings {
+        taa: true, depth_of_field: true, grading_enabled: true, zone_lut: true,
+        vignette: 0.15, contrast: 1.1, saturation: 1.1, warmth: 0.55, night_cool: 0.2,
+        ..foliage
+    });
 }
 
 #[test]
