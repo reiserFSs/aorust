@@ -161,6 +161,14 @@ fn shader_source(channels: (bool, bool, bool), night: NightMode, moon_shadows: b
             "let receiver = authored_moon_receiver(i, i.n, false);"
         } else { "let receiver = i;" });
     let mut native = crate::shader_source::load("shader.wgsl", include_str!("shader.wgsl")).into_owned();
+    if night != NightMode::AsGame {
+        // Match enhanced_shader's varying extension without duplicating its
+        // lighting or ShadowFrame. Sprigs always use the non-ground receiver.
+        native = native.replace("    @location(12) env_uv: vec2<f32>,",
+            "    @location(12) env_uv: vec2<f32>,\n    @location(14) sun_share: vec3<f32>,");
+        native = native.replace("    var o: VOut;",
+            "    var o: VOut;\n    o.sun_share = vec3<f32>(0.0);");
+    }
     crate::foliage::append_shader(&mut native);
     let native = native.replace("@vertex\nfn vs(", "fn canopy_native_vs(");
     let source = format!("{native}\n{}\n{leaf}",
@@ -236,6 +244,25 @@ mod tests {
     fn canopy_post_mask_preserves_fog_without_directional_energy() {
         let source = shader_source((false, false, true), NightMode::AsGame, false);
         assert!(source.contains("output.sun = vec4<f32>(0.0, 0.0, native_fog(i.fog), output.beauty.a);"));
+    }
+    #[test]
+    fn canopy_night_shader_contract_keeps_shared_receiver_and_native_shading() {
+        for night in [NightMode::AsGame, NightMode::Dark, NightMode::Moonlit] {
+            for shadows in [false, true] {
+                let source = shader_source((true, true, true), night, shadows);
+                let authored = night != NightMode::AsGame;
+                assert_eq!(source.contains("@location(14) sun_share: vec3<f32>,"), authored);
+                assert_eq!(source.contains("o.sun_share = vec3<f32>(0.0);"), authored);
+                assert_eq!(source.contains("let receiver = authored_moon_receiver(i, i.n, false);"), authored);
+                assert_eq!(source.matches("fn authored_moon_receiver(").count(), usize::from(authored));
+                assert_eq!(source.matches("struct ShadowFrame {").count(), 1);
+                assert_eq!(source.contains("fn authored_moon_visibility("), night == NightMode::Moonlit && shadows);
+                assert_eq!(source.contains("fn enhanced_sky_open("), night == NightMode::Moonlit);
+                assert!(source.contains("output.beauty = shade(receiver, 1u);"));
+                assert!(source.contains("if i.color.a <= 0.0 { discard; }"));
+                assert!(source.contains("output.fog = max(output.fog, vtx(v).fog);"));
+            }
+        }
     }
     #[test]
     fn sprigs_are_bounded_deterministic_and_never_modify_native_geometry() {
@@ -411,6 +438,8 @@ mod tests {
         assert_eq!(renderer.sun_shadows.as_ref().unwrap().resolution, 1, "Moonlit needs no sun cascades");
         capture(&mut renderer, NightMode::Moonlit, true);
         capture(&mut renderer, NightMode::Dark, false);
+        capture(&mut renderer, NightMode::Dark, true);
+        assert_eq!(native, capture(&mut renderer, NightMode::AsGame, true), "moon shadows alone leave native sprigs unchanged");
         assert_eq!(native, capture(&mut renderer, NightMode::AsGame, false), "night toggles rebuild and roundtrip");
         for vertex in &mut scene.meshes[1].vertices { vertex.color[3] = 1.0; }
         upload(&mut renderer, &scene, true);

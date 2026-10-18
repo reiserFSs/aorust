@@ -1179,7 +1179,9 @@ extinction or signals from hidden/non-admitted actors.
 The single grass pipeline and optional canopy sprigs consume the published
 `moon_direction` / `moon_g` source and darker-night amount before native fog.
 Grass retains native per-corner lamp/Gouraud lighting and baked root openness;
-sprigs reuse the shared moon receiver and native exposure lattice. The expanded
+sprigs reuse the shared moon receiver and native exposure lattice. Their night
+vertex output carries the receiver's required `sun_share` lane initialized to zero:
+sprigs always take its non-ground branch, preserving native alpha and fog. The expanded
 admitted-light pool and point-shadow consumers are a separate, explicitly
 coordinated lighting integration after that producer is published.
 Canopy auxiliary masks keep zero added directional energy but retain native fog
