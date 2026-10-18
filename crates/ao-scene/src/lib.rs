@@ -550,6 +550,8 @@ pub struct Scene {
     /// at the camera every frame and overrides `environment.fog_color` / `fog_end` (and the clear colour when it equals
     /// the fog colour). `None` = the static environment fog.
     pub fog_model: Option<FogModel>,
+    /// Exact dungeon tile containment windows, ordered by native room then tile; empty outdoors.
+    pub room_volumes: Vec<RoomVolume>,
     /// Distance dependent statel visibility, see [`StatelLod`]. `None` = every instance is always drawn.
     pub statel_lod: Option<StatelLod>,
     /// Constant rotations of `sky` instances (the Shadowlands vortex: a `Counter` that grows with `GameDeltaTime`).
@@ -603,6 +605,15 @@ pub struct FogVolume {
     pub radius: f32,
     /// Dungeon room the volume belongs to: it is only evaluated while that room is the camera's room (see [`FogModel::rooms`]).
     pub room: Option<u32>,
+}
+
+/// Inclusive scene-space bounds of one nonempty dungeon tile's native containment window.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RoomVolume {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    /// Native room index + 1; zero is reserved for unknown/outdoor.
+    pub room: u32,
 }
 
 /// The client's per-frame fog accumulation (`VisualFog_t::AddFog` DisplaySystem @0x1005820c, `process` @0x10058443).

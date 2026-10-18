@@ -90,6 +90,8 @@ pub(super) fn controls() -> Vec<Control> {
         Control::slider(Lighting, "Sunlight", "AomacSunBoost", "Sunlight Brightness", "%.2f", 0.6, 0.0, 0.6),
         Control::check(Lighting, "Contact Shadows", "AomacContactShadows", "Contact Shadows"),
         Control::slider(Lighting, "Contact Shadows", "AomacContactStrength", "Contact Shadow Strength", "%.2f", 0.8, 0.0, 1.0),
+        Control::check(Lighting, "Indirect Light", "AomacIndirectLight", "Screen-space Indirect Light"),
+        Control::slider(Lighting, "Indirect Light", "AomacIndirectStrength", "Diffuse Bounce Strength", "%.2f", 1.0, 0.0, 3.0),
         Control::check(Lighting, "Moon and Night", "AomacMoonShadows", "Moon Shadows"),
         Control::radio(Lighting, "Moon and Night", "AomacNightMode", "Night Lighting", &[("As Game", 0), ("Moonlit", 1), ("Dark", 2)], 0, 0, 2),
         Control::slider(Lighting, "Moon and Night", "AomacMoonIntensity", "Moon Intensity", "%.2fx", 1.0, 0.0, 4.0),
@@ -246,6 +248,33 @@ mod tests {
             Variant::Bool(value) => Variant::Bool(!value),
             _ => [control.min.as_ref(), control.max.as_ref()].into_iter().flatten().find(|value| **value != control.default).unwrap().clone(),
         }
+    }
+
+    #[test]
+    fn indirect_light_maps_independently_and_resets_with_lighting() {
+        let mut d = values();
+        let defaults = ao_render::EnhancedSettings::default();
+        assert_eq!(d.enhanced_settings(), defaults);
+        let controls = controls();
+        let toggle = controls.iter().find(|control| control.name == "AomacIndirectLight").unwrap();
+        let strength = controls.iter().find(|control| control.name == "AomacIndirectStrength").unwrap();
+        assert_eq!(toggle.page, PageId::Lighting);
+        assert_eq!(toggle.label, "Screen-space Indirect Light");
+        assert_eq!(strength.page, PageId::Lighting);
+        assert_eq!(d.min_max(strength.name), (Variant::Float(0.0), Variant::Float(3.0)));
+        assert!(d.set(strength.name, Variant::Float(2.5)));
+        assert_eq!(d.enhanced_settings(), ao_render::EnhancedSettings { indirect_strength: 2.5, ..defaults });
+        assert!(!d.enhanced_settings().any_enabled());
+        assert!(d.set(toggle.name, Variant::Bool(true)));
+        let expected = ao_render::EnhancedSettings { indirect_light: true, indirect_strength: 2.5, ..defaults };
+        assert_eq!(d.enhanced_settings(), expected);
+        let mut loaded = values();
+        assert!(loaded.load_config(&d.save_config(CAT_MAIN), CAT_MAIN, false));
+        assert_eq!(loaded.enhanced_settings(), expected);
+        reset(&mut loaded, Some(PageId::Ambient));
+        assert_eq!(loaded.enhanced_settings(), expected);
+        reset(&mut loaded, Some(PageId::Lighting));
+        assert_eq!(loaded.enhanced_settings(), defaults);
     }
     #[test]
     fn material_switches_are_independent_default_off_and_live() {

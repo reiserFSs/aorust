@@ -35,7 +35,7 @@ fn grass_shadow_receiver_preserves_ambient_and_disables_without_caster_layer() {
 #[test]
 fn grass_sun_visibility_is_gouraud_without_fragment_shadow_reads() {
     for shadows in [false, true] {
-        let source = crate::grass::shader_source((false, false, true, false, false), shadows);
+        let source = crate::grass::shader_source((false, false, true, false, false, false), shadows);
         let vertex = source.split_once("fn grass_vertex(").unwrap().1.split_once("\n}").unwrap().0;
         let fragment = source.split_once("fn fs_grass(").unwrap().1.split_once("\n}").unwrap().0;
         assert!(source.contains("@location(13) sunlight: vec4<f32>"));
@@ -120,7 +120,7 @@ fn grass_sun_depth_is_separate_and_avoids_mask_and_point_bindings() {
     for reserved in [8, 9, 10, 11, 12, 13, 14, 15] {
         assert!(!grass.contains(&format!("@group(3) @binding({reserved})")));
     }
-    let combined = crate::grass::shader_source((false, false, false, false, false), true);
+    let combined = crate::grass::shader_source((false, false, false, false, false, false), true);
     assert_eq!(combined.matches("@group(3) @binding(8)").count(), 1, "terrain mask must remain binding 8");
     assert_eq!(combined.matches("@group(3) @binding(16)").count(), 1);
 }

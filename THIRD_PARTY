@@ -125,6 +125,19 @@ follow rvk/shaders/ao.frag and ao_blur.frag from ao-vk
 (https://github.com/wannabuh/ao-vk, MIT License). The algorithm was re-expressed in
 WGSL for this project's depth-bilateral pipeline; no source text or assets are copied.
 
+Screen-space diffuse indirect light
+===================================
+
+The quarter-resolution horizon gather and surface-plane bilateral blur in
+crates/ao-render/src/indirect_light.{rs,wgsl} independently reimplement ao-vk's
+rvk/shaders/gi.frag and gi_blur.frag, inspected at
+09a864809d152b6041d144412aa1603fb9afe93c:
+https://github.com/wannabuh/ao-vk
+The MIT license and Copyright (c) 2026 wannabuh notice above apply. This renderer
+uses only admitted, fog-attenuated diffuse-share radiance (not scene beauty),
+explicit diffuse albedo, native room-volume and collision sky-open masks, and
+current-frame-only sampling. No upstream artwork or binary assets are included.
+
 Enhanced atmosphere: ao-vk
 ==========================
 

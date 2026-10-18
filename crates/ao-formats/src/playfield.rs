@@ -265,13 +265,15 @@ pub fn load_playfield_report_with_weather(
                 room: room_id,
             }));
         }
-        if !report.fogs.is_empty() {
-            let volumes = report.fogs.clone();
-            let mut model = environment::fog_model(&env, sky.as_ref(), volumes);
-            model.rooms = (!rec.is_outdoor()).then(|| zone_locator(store, id).ok()).flatten().map(|zl| ao_scene::RoomLocator(std::sync::Arc::new(move |p| zl.room_at(p))));
-            scene.fog_model = Some(model);
-        }
         props = file.zones.iter().map(|z| z.statels.iter().filter(|s| s.mesh != 0).map(|s| s.pos).collect()).collect();
+    }
+    if !report.fogs.is_empty() {
+        let mut model = environment::fog_model(&env, sky.as_ref(), report.fogs.clone());
+        model.rooms = (!rec.is_outdoor()).then(|| zone_locator(store, id).ok()).flatten().map(|zl| ao_scene::RoomLocator(std::sync::Arc::new(move |p| zl.room_at(p))));
+        scene.fog_model = Some(model);
+    }
+    if dungeon {
+        scene.room_volumes = zone_locator(store, id)?.room_volumes();
     }
     if let Some(g) = &grid {
         spot = dungeon::entry_spot(g, &rec, &props);

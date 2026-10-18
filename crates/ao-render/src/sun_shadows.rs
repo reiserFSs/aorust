@@ -194,7 +194,7 @@ impl GrassCaster {
                 buffer(5, true), texture(6), wgpu::BindGroupLayoutEntry { binding: 7, visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None }, texture(8), buffer(14, true)],
         });
-        let mut source = crate::grass::shader_source((false, false, false, false, false), false);
+        let mut source = crate::grass::shader_source((false, false, false, false, false, false), false);
         source.push_str(&crate::shader_source::load("grass_caster.wgsl", include_str!("grass_caster.wgsl")));
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("shared grass caster geometry"), source: wgpu::ShaderSource::Wgsl(source.into()) });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {

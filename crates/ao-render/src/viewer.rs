@@ -1406,6 +1406,8 @@ impl Offscreen {
     }
     pub fn world_variant_cache_len(&self) -> usize { self.r.world_variant_cache_len() }
     pub fn emissive_seed_rgba(&self) -> Result<Option<Vec<u8>>> { self.r.emissive_seed_rgba() }
+    #[allow(clippy::type_complexity)]
+    pub fn indirect_light_masks_rgba(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>> { self.r.indirect_light_masks_rgba() }
     /// Explicit probe confidence and same-stage observed/analytic reflection readbacks.
     #[allow(clippy::type_complexity)]
     pub fn material_probe_evidence(&self) -> Result<Option<(Vec<u8>, Vec<u8>, Vec<u8>)>> {

@@ -2,7 +2,7 @@
 use crate::gpu_stats::GpuStatsExt;
 
 /// Four native R8 lattice corners per cell; absent cells remain entirely closed.
-/// The header is eight words followed by row-major cells, shared with WGSL.
+/// Eight-word header, row-major cells, then a bitset distinguishing known closed cells from holes.
 #[derive(Default)]
 pub(super) struct MoonExposure {
     words: Vec<u32>,
@@ -34,7 +34,11 @@ impl MoonExposure {
         // Bound retained CPU data to WebGPU's default storage-binding limit.
         // Oversized/invalid playfields fail closed rather than partially exposing roofs.
         if count == 0 || count > (128 * 1024 * 1024 - 32) / 4 { return out; }
-        out.words = vec![0; 8 + count];
+        let bitset_start = 8 + count;
+        let words = bitset_start + count.div_ceil(32);
+        if words > 128 * 1024 * 1024 / 4 { return out; }
+        out.words = vec![0; words];
+        out.words[5] = bitset_start as u32;
         out.words[..5].copy_from_slice(&[
             (lo[0] as f32).to_bits(), (lo[1] as f32).to_bits(),
             (1.0 / step).to_bits(), width as u32, height as u32,
@@ -50,7 +54,9 @@ impl MoonExposure {
             for y in 0..p.cells {
                 for x in 0..p.cells {
                     let a = y * (p.cells + 1) + x;
-                    out.words[8 + (y0 + y) * width + x0 + x] = u32::from_le_bytes([
+                    let cell = (y0 + y) * width + x0 + x;
+                    out.words[bitset_start + cell / 32] |= 1u32 << (cell % 32);
+                    out.words[8 + cell] = u32::from_le_bytes([
                         sky[a], sky[a + 1], sky[a + p.cells + 1], sky[a + p.cells + 2],
                     ]);
                 }
@@ -98,6 +104,19 @@ mod tests {
         a * (1.0 - t[1]) + b * t[1]
     }
 
+    fn known(data: &MoonExposure, world: [f32; 3]) -> bool {
+        if data.words.is_empty() { return false; }
+        let h = &data.words;
+        if h[5] == 0 { return false; }
+        let p = [world[0] * f32::from_bits(h[2]) - f32::from_bits(h[0]),
+            -world[2] * f32::from_bits(h[2]) - f32::from_bits(h[1])];
+        if !(p[0] >= 0.0 && p[1] >= 0.0 && p[0] <= h[3] as f32 && p[1] <= h[4] as f32) { return false; }
+        let x = (p[0] as u32).min(h[3] - 1);
+        let y = (p[1] as u32).min(h[4] - 1);
+        let cell = (y * h[3] + x) as usize;
+        h[h[5] as usize + cell / 32] & (1u32 << (cell % 32)) != 0
+    }
+
     #[test]
     fn exact_native_interpolation_roof_and_unknown_cells() {
         use ao_scene::{ground_detail::GroundPatch, Mesh, Scene, Vertex};
@@ -109,15 +128,24 @@ mod tests {
         scene.ground_detail.push(patch);
         let exposure = MoonExposure::from_scene(&scene);
         assert_eq!(sample(&exposure, [-16.25, 200.0, -28.75]), 0.0, "roofed cell closes actors at any elevation");
+        assert!(known(&exposure, [-16.25, 200.0, -28.75]), "closed native cells remain known");
         let expected = (128.0 + 255.0) / (4.0 * 255.0);
         assert!((sample(&exposure, [-13.75, 3.0, -28.75]) - expected).abs() < 1e-6);
         assert_eq!(sample(&exposure, [-17.6, 0.0, -28.0]), 0.0);
         assert_eq!(sample(&exposure, [0.0, 0.0, 0.0]), 0.0);
         assert_eq!(sample(&MoonExposure::from_scene(&Scene::default()), [0.0; 3]), 0.0);
+        assert!(!known(&exposure, [-17.6, 0.0, -28.0]));
+        assert!(!known(&MoonExposure::default(), [0.0; 3]));
         // Missing patches inside the bounding rectangle must not interpolate neighbours.
         let mut distant = scene.ground_detail[0].clone();
         distant.origin[0] += 4;
         scene.ground_detail.push(distant);
-        assert_eq!(sample(&MoonExposure::from_scene(&scene), [-10.0, 0.0, -28.75]), 0.0);
+        let gapped = MoonExposure::from_scene(&scene);
+        assert_eq!(sample(&gapped, [-10.0, 0.0, -28.75]), 0.0);
+        assert!(!known(&gapped, [-10.0, 0.0, -28.75]), "missing patch differs from known closed");
+        for vertex in &mut scene.meshes[0].vertices { vertex.color[3] = 1.0; }
+        let closed = MoonExposure::from_scene(&scene);
+        assert_eq!(sample(&closed, [-16.25, 0.0, -28.75]), 0.0);
+        assert!(known(&closed, [-16.25, 0.0, -28.75]), "all-zero native R8 cells are still known");
     }
 }

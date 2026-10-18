@@ -39,6 +39,24 @@ fn enhanced_ground_receiver(i: VOut, beauty: vec4<f32>, multiplier: bool) -> vec
     let sky_fraction = clamp(g.ambient_g.rgb / max(i.light, vec3<f32>(0.001)), vec3<f32>(0.0), vec3<f32>(1.0));
     return vec4<f32>(min(clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), diffuse * ao_share(sky_fraction)), beauty.a);
 }
+// Evaluate texture derivatives before the native fragment's coverage discard.
+// Reflectance is never reconstructed from saturated lighting, fog or specular.
+fn enhanced_albedo(i: VOut, ground: bool) -> vec4<f32> {
+    let uv = select(i.uv + mat.scroll.xy * g.fog.z, i.uv, ground);
+    let texel = sample_clamped(tex, uv);
+    if (u32(mat.native.z) & 48u) != 0u {
+        return vec4<f32>(0.0);
+    }
+    // Primary static facades may receive independently of their native
+    // lighting/effect mode or local fog colour; extinction still bounds RGB.
+    // Actor exceptions remain excluded, and the diffuse donor gate is separate.
+    let actor = (u32(mat.native.z) & 128u) != 0u;
+    if actor && (native_unlit() || i.effect != 0u || mat.scroll.z > 1.5 || all(mat.emissive.rgb >= vec3<f32>(1.0)) || (mat.emissive.w > 0.5 && mat.emissive.w < 1.5)) {
+        return vec4<f32>(0.0);
+    }
+    let fog = select(native_fog(i.fog), ground_fog(i), ground);
+    return vec4<f32>(clamp(texel.rgb * select(i.tint, vec3<f32>(1.0), ground), vec3<f32>(0.0), vec3<f32>(1.0)) * (1.0 - fog), 1.0);
+}
 fn enhanced_emission(i: VOut, beauty: vec4<f32>) -> vec4<f32> {
     // SetMaterial (Randy1004b199) supplies a lighting floor, not a glow flag.
     // Only channels that alone saturate native D3D7 lighting are self-lit;

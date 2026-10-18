@@ -4,11 +4,23 @@ use crate::effect_gpu::EffectPassEncoder as _;
 use crate::{gpu_stats::{GpuStatsExt, TextureViewStatsExt}, DEPTH};
 use crate::pipeline_creation::RenderPipeline;
 pub(super) const AUX: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+pub(super) const ALBEDO: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// SSGI reads bounded native UNORM diffuse; AO additionally needs signed porosity alpha.
+pub(super) fn ambient_format(settings: &crate::EnhancedSettings) -> wgpu::TextureFormat {
+    if settings.indirect_light && !settings.ambient_occlusion { ALBEDO } else { AUX }
+}
+
+/// Reuse the otherwise disabled emission slot for albedo, avoiding sparse MRT exports.
+pub(super) fn compact_indirect(settings: &crate::EnhancedSettings) -> bool {
+    settings.indirect_light && !settings.emissive_bloom && !settings.needs_sun_mask()
+        && !settings.cloud_shadows && !settings.material_reflections && !settings.environment_probe
+}
 
 /// Colour attachments the world pass declares, including the optional cloud-only water budget.
 /// Every world-pass pipeline must declare the same count.
 pub(super) fn target_count(settings: &crate::EnhancedSettings) -> usize {
-    if settings.material_reflections || settings.environment_probe { 7 } else if settings.cloud_shadows { 5 } else if settings.needs_sun_mask() { 4 } else if settings.ambient_occlusion || settings.emissive_bloom { 3 } else { 1 }
+    if compact_indirect(settings) { 3 } else if settings.indirect_light { 8 } else if settings.material_reflections || settings.environment_probe { 7 } else if settings.cloud_shadows { 5 } else if settings.needs_sun_mask() { 4 } else if settings.ambient_occlusion || settings.emissive_bloom { 3 } else { 1 }
 }
 
 pub(super) struct EnhancedFrame {
@@ -22,9 +34,14 @@ pub(super) struct EnhancedFrame {
     pub water_cloud: Option<wgpu::TextureView>,
     pub reflection_surface: Option<wgpu::TextureView>,
     pub reflection_mask: Option<wgpu::TextureView>,
+    /// RGB is native textured reflectance times fog extinction and resolved/native-blend coverage.
+    /// Zero RGB excludes receivers. Alpha carries native opacity/coverage, even for excluded fades;
+    /// overlays attenuate both channels without seeding new receiver energy.
+    pub albedo: Option<wgpu::TextureView>,
+    compact_indirect: bool,
     pub depth: wgpu::TextureView,
     pub resolved_depth: wgpu::TextureView,
-    pub msaa: Option<[Option<wgpu::TextureView>; 7]>,
+    pub msaa: Option<[Option<wgpu::TextureView>; 8]>,
     pub composite: RenderPipeline,
     pub composite_bg: wgpu::BindGroup,
     depth_resolve: Option<(RenderPipeline, wgpu::BindGroup)>,
@@ -37,20 +54,23 @@ impl EnhancedFrame {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
         }).create_view_tracked(&Default::default());
         let colour = make(format, 1, "Enhanced native UNORM colour");
-        let ambient = settings.ambient_occlusion.then(|| make(AUX, 1, "Enhanced ambient share"));
+        let ambient_format = ambient_format(&settings);
+        let compact_indirect = compact_indirect(&settings);
+        let ambient = (settings.ambient_occlusion || settings.indirect_light).then(|| make(ambient_format, 1, "Enhanced ambient share"));
         let emissive = settings.emissive_bloom.then(|| make(AUX, 1, "Enhanced authored emission"));
         let sun = settings.needs_sun_mask().then(|| make(AUX, 1, "Enhanced sun mask"));
         let water_cloud = water_cloud.then(|| Self::water_cloud_view(device, size, 1));
         let reflections = settings.material_reflections || settings.environment_probe;
         let reflection_surface = reflections.then(|| make(AUX, 1, "Reflection normal roughness"));
         let reflection_mask = reflections.then(|| make(AUX, 1, "Reflection static primary admission"));
+        let albedo = settings.indirect_light.then(|| make(ALBEDO, 1, "Indirect diffuse albedo"));
         let depth = make(DEPTH, samples, "Enhanced sampleable depth");
         let resolved_depth = if samples == 1 { depth.clone() } else { make(DEPTH, 1, "Enhanced resolved depth") };
-        let msaa = (samples > 1).then(|| [Some(make(format, samples, "Enhanced MSAA native colour")), settings.ambient_occlusion.then(|| make(AUX, samples, "Enhanced MSAA ambient")), settings.emissive_bloom.then(|| make(AUX, samples, "Enhanced MSAA emission")), settings.needs_sun_mask().then(|| make(AUX, samples, "Enhanced MSAA sun mask")), water_cloud.as_ref().map(|_| Self::water_cloud_view(device, size, samples)), reflections.then(|| make(AUX, samples, "MSAA reflection surface")), reflections.then(|| make(AUX, samples, "MSAA reflection admission"))]);
+        let msaa = (samples > 1).then(|| [Some(make(format, samples, "Enhanced MSAA native colour")), (settings.ambient_occlusion || settings.indirect_light).then(|| make(ambient_format, samples, "Enhanced MSAA ambient")), if compact_indirect { Some(make(ALBEDO, samples, "MSAA indirect albedo")) } else { settings.emissive_bloom.then(|| make(AUX, samples, "Enhanced MSAA emission")) }, settings.needs_sun_mask().then(|| make(AUX, samples, "Enhanced MSAA sun mask")), water_cloud.as_ref().map(|_| Self::water_cloud_view(device, size, samples)), reflections.then(|| make(AUX, samples, "MSAA reflection surface")), reflections.then(|| make(AUX, samples, "MSAA reflection admission")), (settings.indirect_light && !compact_indirect).then(|| make(ALBEDO, samples, "MSAA indirect albedo"))]);
         let composite = compiled.colour.clone();
         let composite_bg = bind(device, &compiled.colour_layout, &colour);
         let depth_resolve = (samples > 1).then(|| (compiled.depth.clone(), bind(device, &compiled.depth_layout, &depth)));
-        Self { size, sample_count: samples, colour, ambient, emissive, sun, water_cloud, reflection_surface, reflection_mask, depth, resolved_depth, msaa, composite, composite_bg, depth_resolve }
+        Self { size, sample_count: samples, colour, ambient, emissive, sun, water_cloud, reflection_surface, reflection_mask, albedo, compact_indirect, depth, resolved_depth, msaa, composite, composite_bg, depth_resolve }
     }
     fn water_cloud_view(device: &wgpu::Device, size: (u32, u32), samples: u32) -> wgpu::TextureView {
         device.create_texture_tracked(&wgpu::TextureDescriptor {
@@ -68,10 +88,10 @@ impl EnhancedFrame {
         }
     }
     pub fn target_count(&self) -> usize {
-        if self.reflection_surface.is_some() { 7 } else if self.water_cloud.is_some() { 5 } else if self.sun.is_some() { 4 } else if self.ambient.is_some() || self.emissive.is_some() { 3 } else { 1 }
+        if self.compact_indirect { 3 } else if self.albedo.is_some() { 8 } else if self.reflection_surface.is_some() { 7 } else if self.water_cloud.is_some() { 5 } else if self.sun.is_some() { 4 } else if self.ambient.is_some() || self.emissive.is_some() { 3 } else { 1 }
     }
     pub fn attachment(&self, index: usize) -> Option<wgpu::RenderPassColorAttachment<'_>> {
-        let resolved = [Some(&self.colour), self.ambient.as_ref(), self.emissive.as_ref(), self.sun.as_ref(), self.water_cloud.as_ref(), self.reflection_surface.as_ref(), self.reflection_mask.as_ref()][index]?;
+        let resolved = [Some(&self.colour), self.ambient.as_ref(), if self.compact_indirect { self.albedo.as_ref() } else { self.emissive.as_ref() }, self.sun.as_ref(), self.water_cloud.as_ref(), self.reflection_surface.as_ref(), self.reflection_mask.as_ref(), if self.compact_indirect { None } else { self.albedo.as_ref() }][index]?;
         let msaa = self.msaa.as_ref().and_then(|views| views[index].as_ref());
         Some(wgpu::RenderPassColorAttachment { view: msaa.unwrap_or(resolved), resolve_target: msaa.map(|_| resolved), depth_slice: None,
             ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: if msaa.is_some() { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store } } })

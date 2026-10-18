@@ -3,9 +3,10 @@
 pub(super) fn source(settings: crate::EnhancedSettings) -> String {
     let sun_shadows = settings.sun_shadows || (settings.ground_grass && settings.grass_sun_shadows);
     let shadows = sun_shadows || settings.moon_shadows;
-    let ao = settings.ambient_occlusion;
+    let ao = settings.ambient_occlusion || settings.indirect_light;
     let bloom = settings.emissive_bloom;
     let hdr = settings.needs_sun_mask();
+    let compact_indirect = crate::enhanced::compact_indirect(&settings);
     let materials = settings.generated_normals || settings.material_maps || settings.material_pbr
         || settings.material_reflections || settings.environment_probe;
     let material_specular = settings.material_specular || settings.material_pbr;
@@ -59,14 +60,20 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
     source = source.replace("@fragment\nfn fs_", "fn enhanced_original_fs_");
     source = source.replace(" -> @location(0) vec4<f32>", " -> vec4<f32>");
     source.push_str(&crate::shader_source::load("enhanced_output.wgsl", OUTPUT));
-    if settings.cloud_shadows || reflections {
+    if settings.cloud_shadows || reflections || (settings.indirect_light && !compact_indirect) {
         source = source.replace("    @location(3) sun: vec4<f32>,", "    @location(3) sun: vec4<f32>,\n    @location(4) water_cloud: vec4<f32>,");
     }
-    if reflections {
+    if reflections || (settings.indirect_light && !compact_indirect) {
         source = source.replace("    @location(4) water_cloud: vec4<f32>,", "    @location(4) water_cloud: vec4<f32>,\n    @location(5) reflection_surface: vec4<f32>,\n    @location(6) reflection_mask: vec4<f32>,");
+    }
+    if compact_indirect {
+        source = source.replace("@location(2) emission:", "@location(2) albedo:");
+    } else if settings.indirect_light {
+        source = source.replace("    @location(6) reflection_mask: vec4<f32>,", "    @location(6) reflection_mask: vec4<f32>,\n    @location(7) albedo: vec4<f32>,");
     }
     for name in names {
         let ambient = match name.as_str() {
+            "fs_blend" if settings.indirect_light => "vec4<f32>(0.0, 0.0, 0.0, beauty.a)",
             "fs_opaque" | "fs_fade_opaque" | "fs_fade_test" | "fs_test" | "fs_blend" => "enhanced_ao_receiver(i, beauty)",
             "fs_ground_fused" | "fs_ground_base" | "fs_ground_simple" => "enhanced_ground_receiver(i, beauty, false)",
             "fs_ground_shadow" => "enhanced_ground_receiver(i, beauty, true)",
@@ -112,14 +119,32 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
             if name == "fs_ground_shadow" { ", vec4<f32>(1.0)".to_owned() }
             else if matches!(name.as_str(), "fs_opaque" | "fs_fade_opaque" | "fs_fade_test" | "fs_test" | "fs_blend") { ", vec4<f32>(enhanced_water_cloud(i, beauty), 0.0, 0.0, beauty.a)".to_owned() }
             else { ", vec4<f32>(0.0, 0.0, 0.0, beauty.a)".to_owned() }
-        } else if reflections { ", vec4<f32>(0.0)".to_owned() } else { String::new() };
+        } else if reflections || (settings.indirect_light && !compact_indirect) { ", vec4<f32>(0.0)".to_owned() } else { String::new() };
         let reflection = if reflections {
             let primary = matches!(name.as_str(), "fs_opaque" | "fs_test" | "fs_fade_opaque" | "fs_fade_test" | "fs_ground_fused" | "fs_ground_base" | "fs_ground_simple");
             if primary {
                 ", vec4<f32>(material_shading_normal(i), material_roughness(i)), vec4<f32>(material_reflectivity(i), native_fog(i.fog), material_static_source(i), select(0.0, 1.0, i.effect == 0u && (u32(mat.native.z) & 128u) == 0u))"
             } else { ", vec4<f32>(0.0), vec4<f32>(0.0)" }
+        } else if settings.indirect_light && !compact_indirect { ", vec4<f32>(0.0), vec4<f32>(0.0)" } else { "" };
+        let albedo_sample = if settings.indirect_light {
+            match name.as_str() {
+                "fs_opaque" | "fs_test" | "fs_fade_opaque" | "fs_fade_test" => "    let albedo_sample = enhanced_albedo(i, false);\n",
+                "fs_ground_fused" | "fs_ground_base" | "fs_ground_simple" => "    let albedo_sample = enhanced_albedo(i, true);\n",
+                _ => "    let albedo_sample = vec4<f32>(0.0);\n",
+            }
         } else { "" };
-        source.push_str(&format!("\n@fragment fn {name}(i: VOut) -> EnhancedOutput {{\n{geometric_normal}    let envelope = vec4<f32>(1.0);\n    let emission_sample = {emission_sample};\n    let beauty = enhanced_original_{name}({fragment_input});\n    let bounded_beauty = clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0));\n    return EnhancedOutput(beauty, {ambient}, {emission_result}, {sun}{water}{reflection});\n}}\n"));
+        let albedo = if settings.indirect_light {
+            if matches!(name.as_str(), "fs_opaque" | "fs_test" | "fs_fade_opaque" | "fs_fade_test" | "fs_ground_fused" | "fs_ground_base" | "fs_ground_simple") {
+                ", vec4<f32>(albedo_sample.rgb, beauty.a)"
+            } else {
+                // Alpha-over/additive targets suppress source RGB; native
+                // multiplicative targets consume beauty only as a filter.
+                ", vec4<f32>(beauty.rgb, beauty.a)"
+            }
+        } else { "" };
+        let third = if compact_indirect { albedo.strip_prefix(", ").expect("compact albedo output") } else { emission_result.as_str() };
+        let albedo = if compact_indirect { "" } else { albedo };
+        source.push_str(&format!("\n@fragment fn {name}(i: VOut) -> EnhancedOutput {{\n{geometric_normal}    let envelope = vec4<f32>(1.0);\n    let emission_sample = {emission_sample};\n{albedo_sample}    let beauty = enhanced_original_{name}({fragment_input});\n    let bounded_beauty = clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0));\n    return EnhancedOutput(beauty, {ambient}, {third}, {sun}{water}{reflection}{albedo});\n}}\n"));
     }
     source = source.replace("sun_visibility(i.wpos)", "sun_visibility(i.wpos, i.n, i.clip.xy)");
     if shadows {
@@ -136,7 +161,7 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
         source.push_str("\nfn sun_visibility(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>) -> f32 { return 1.0; }\n");
     }
     // Remove disabled effects structurally, not merely by multiplying by zero.
-    for (enabled, name) in [(ao, "enhanced_ao_receiver"), (ao, "enhanced_ground_receiver"), (bloom, "enhanced_emission"), (hdr, "enhanced_sun"), (settings.cloud_shadows, "enhanced_water_cloud")] {
+    for (enabled, name) in [(ao, "enhanced_ao_receiver"), (ao, "enhanced_ground_receiver"), (settings.indirect_light, "enhanced_albedo"), (bloom, "enhanced_emission"), (hdr, "enhanced_sun"), (settings.cloud_shadows, "enhanced_water_cloud")] {
         if !enabled {
             let start = source.find(&format!("fn {name}(")).expect("enhanced helper");
             let end = start + source[start..].find("\n}\n").expect("enhanced helper end") + 3;
@@ -177,7 +202,56 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
     if (crate::EnhancedSettings { grass_point_shadows: false, ..settings }).needs_admitted_lights() {
         crate::point_shadows::apply_shader(&mut source, local_light_shadows, clustered_lighting);
     }
+    if settings.indirect_light {
+        capture_indirect_diffuse(&mut source);
+    }
     source
+}
+
+/// Capture the actual diffuse term before environment/specular/emission additions.
+/// Beauty expressions and the AO-only generated shader remain untouched.
+fn capture_indirect_diffuse(source: &mut String) {
+    *source = source.replace("    let envelope = vec4<f32>(1.0);", "    enhanced_diffuse = vec3<f32>(0.0);\n    let envelope = vec4<f32>(1.0);");
+    let diffuse = source.find("    var texture_color = min(t.rgb").expect("fragment diffuse calculation");
+    let diffuse_end = diffuse + source[diffuse..].find('\n').expect("fragment diffuse line end");
+    source.insert_str(diffuse_end, "\n    enhanced_diffuse = texture_color;");
+    *source = source.replace("    let authored_fog = ", "    enhanced_diffuse *= 1.0 - f;\n    let authored_fog = ");
+    *source = source.lines().map(|line| {
+        if line.trim_start().starts_with("let diffuse = max(beauty.rgb - ") {
+            "    let diffuse = max(enhanced_diffuse, vec3<f32>(0.0));"
+        } else { line }
+    }).collect::<Vec<_>>().join("\n");
+    *source = source.replace(
+        "if multiplier { return vec4<f32>(clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), beauty.a); }",
+        "if multiplier { return vec4<f32>(clamp(enhanced_diffuse, vec3<f32>(0.0), vec3<f32>(1.0)), beauty.a); }",
+    );
+    if source.contains("fn material_ground(") {
+        *source = source.replace(
+            "    let diffuse = material_diffuse(i, light);",
+            "    let diffuse = material_diffuse(i, light);\n    enhanced_diffuse = select(mix(diffuse, vec3<f32>(1.0), ground_fog(i)), base * diffuse * (1.0 - ground_fog(i)), fused);",
+        );
+    }
+    for name in ["fused", "base", "shadow", "simple"] {
+        let start = source.find(&format!("fn enhanced_original_fs_ground_{name}(")).expect("ground diffuse capture");
+        let end = start + source[start..].find("\n}").expect("ground fragment end");
+        if source[start..end].contains("material_ground(") { continue; }
+        // Wrap the already evaluated diffuse expression, without another texture sample.
+        let argument = start + source[start..end].find("mix(").expect("ground native fog") + 4;
+        let mut depth = 0;
+        let length = source[argument..end].char_indices().find_map(|(offset, ch)| {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => return Some(offset),
+                _ => {}
+            }
+            None
+        }).expect("ground fog first argument");
+        let value = source[argument..argument + length].to_owned();
+        source.replace_range(argument..argument + length,
+            &format!("enhanced_capture_ground({value}, ground_fog(i), {})", name == "shadow"));
+    }
+    source.push_str("\nvar<private> enhanced_diffuse: vec3<f32>;\nfn enhanced_capture_ground(value: vec3<f32>, fog: f32, multiplier: bool) -> vec3<f32> {\n    enhanced_diffuse = select(value * (1.0 - fog), mix(value, vec3<f32>(1.0), fog), multiplier);\n    return value;\n}\n");
 }
 
 /// Reuse the world receiver verbatim; grass packs it beside its cell buffers.
@@ -226,6 +300,138 @@ mod tests {
         assert!(helper.contains("fn ao_share("));
         assert_eq!(helper.matches("fn ").count(), 1, "do not copy world-only receiver dependencies");
         assert!(helper.trim_end().ends_with('}'));
+    }
+
+    #[test]
+    fn indirect_receiver_blends_track_native_transmittance_once() {
+        let over = wgpu::BlendState::ALPHA_BLENDING;
+        let target = crate::albedo_target(Some(over), false, "fs_blend");
+        assert_eq!(target.format, crate::enhanced::ALBEDO);
+        let blend = target.blend.unwrap();
+        assert_eq!(blend.color.src_factor, wgpu::BlendFactor::Zero);
+        assert_eq!(blend.color.dst_factor, wgpu::BlendFactor::OneMinusSrcAlpha);
+        assert_eq!(blend.alpha, blend.color, "overlay extinction affects RGB and eligibility together");
+        let additive = wgpu::BlendState { color: wgpu::BlendComponent { dst_factor: wgpu::BlendFactor::One, ..over.color }, alpha: over.alpha };
+        assert_eq!(crate::albedo_target(Some(additive), false, "fs_add").blend.unwrap().color.dst_factor, wgpu::BlendFactor::One);
+        for native in [ao_scene::Blend::ZeroSourceColor, ao_scene::Blend::DestinationColorSourceColor] {
+            let state = crate::native_blend_state(native);
+            assert_eq!(crate::albedo_target(Some(state), false, "fs_blend").blend.unwrap().color, state.color,
+                "multiplicative overlays filter existing receiver RGB with the actual native colour equation");
+        }
+        let fade = crate::albedo_target(Some(over), true, "fs_fade_opaque").blend.unwrap();
+        assert_eq!(fade.color, over.color, "native fade alpha applies once through RGB blending");
+        assert_eq!(fade.alpha, wgpu::BlendComponent::REPLACE);
+        let excluded = crate::albedo_target(Some(over), true, "fs_sprite").blend.unwrap();
+        assert_eq!(excluded.alpha.src_factor, wgpu::BlendFactor::Zero);
+        assert_eq!(excluded.alpha.dst_factor, wgpu::BlendFactor::Zero);
+        assert_eq!(excluded.color, excluded.alpha, "excluded depth owners must not leak beauty RGB through partial MSAA coverage");
+        assert!(crate::albedo_target(Some(over), false, "fs_ground_shadow").write_mask.is_empty());
+    }
+
+    #[test]
+    fn indirect_only_reuses_emission_slot_and_compacts_bounded_source() {
+        for ao in [false, true] {
+            let settings = crate::EnhancedSettings { indirect_light: true, ambient_occlusion: ao, ..Default::default() };
+            assert!(crate::enhanced::compact_indirect(&settings));
+            assert_eq!(crate::enhanced::target_count(&settings), 3);
+            assert_eq!(crate::enhanced::ambient_format(&settings), if ao { crate::enhanced::AUX } else { crate::enhanced::ALBEDO });
+            let source = super::source(settings);
+            assert!(source.contains("@location(2) albedo: vec4<f32>"));
+            assert!(!source.contains("@location(2) emission:"));
+            for (location, field) in [(4, "water_cloud"), (5, "reflection_surface"), (6, "reflection_mask"), (7, "albedo")] {
+                assert!(!source.contains(&format!("@location({location}) {field}:")));
+            }
+            assert!(source.contains("return EnhancedOutput(beauty, enhanced_ao_receiver(i, beauty), vec4<f32>(albedo_sample.rgb, beauty.a),"));
+            let grass = crate::grass::shader_source((ao, false, false, false, false, true), false);
+            assert!(grass.contains("@location(1) ambient:"));
+            assert!(grass.contains("@location(2) albedo:"));
+            assert!(!grass.contains("@location(7) albedo:"));
+            assert!(!grass.contains("@location(4) water_cloud:"));
+            assert_eq!(grass.contains("fn ao_share("), ao, "SSGI-only excluded grass does not compute an unused AO receiver");
+        }
+        for settings in [
+            crate::EnhancedSettings { indirect_light: true, emissive_bloom: true, ..Default::default() },
+            crate::EnhancedSettings { indirect_light: true, hdr: true, ..Default::default() },
+            crate::EnhancedSettings { indirect_light: true, cloud_shadows: true, ..Default::default() },
+            crate::EnhancedSettings { indirect_light: true, material_reflections: true, ..Default::default() },
+        ] {
+            assert!(!crate::enhanced::compact_indirect(&settings));
+            assert_eq!(crate::enhanced::target_count(&settings), 8);
+        }
+    }
+
+    #[test]
+    fn indirect_albedo_is_primary_textured_and_keeps_sparse_mrt_shape() {
+        let settings = crate::EnhancedSettings { indirect_light: true, emissive_bloom: true, ..Default::default() };
+        let source = super::source(settings);
+        assert_eq!(crate::enhanced::target_count(&settings), 8);
+        for (location, field) in [(4, "water_cloud"), (5, "reflection_surface"), (6, "reflection_mask"), (7, "albedo")] {
+            assert!(source.contains(&format!("@location({location}) {field}: vec4<f32>")));
+        }
+        assert!(source.contains("fn enhanced_ao_receiver("), "SSGI reuses the conservative native diffuse share without enabling AO");
+        assert!(source.contains("all(emissive <= vec3<f32>(0.0))"));
+        assert!(source.contains("i.ao_info.x < 0.5"));
+        let receiver = source.split("fn enhanced_albedo(").nth(1).unwrap().split("\n}").next().unwrap();
+        assert!(!receiver.contains("i.ao_info.x"), "partially emissive lit receivers are not forbidden just because they cannot donate");
+        assert!(receiver.contains("let actor = (u32(mat.native.z) & 128u) != 0u;"));
+        assert!(receiver.contains("if actor && (native_unlit()"), "static baked/unlit facades can receive while unlit actors remain excluded");
+        let static_gate = receiver.split("if actor &&").next().unwrap();
+        assert!(!static_gate.contains("i.effect"), "ordinary static primary effect modes retain a receiver RGB budget");
+        assert!(!static_gate.contains("mat.scroll.z"), "material-local fog colour cannot disqualify a static receiver");
+        assert!(receiver.contains("if actor && (native_unlit() || i.effect != 0u || mat.scroll.z > 1.5"),
+            "actor effect/local-fog exclusions remain explicit");
+        assert!(receiver.contains("if (u32(mat.native.z) & 48u) != 0u"), "water and presentation overlays remain excluded");
+        let donor = source.split("fn enhanced_ao_receiver(").nth(1).unwrap().split("\n}").next().unwrap();
+        assert!(donor.contains("native_unlit() || i.ao_info.x < 0.5"), "static receiver admission must not weaken the pure-lit donor gate");
+        assert!(source.contains("let texel = sample_clamped(tex, uv);"));
+        assert!(source.contains("let fog = select(native_fog(i.fog), ground_fog(i), ground);"));
+        assert!(source.contains("vec3<f32>(1.0)) * (1.0 - fog), 1.0);"), "receiver RGB carries native extinction exactly once");
+        assert!(source.contains("vec4<f32>(albedo_sample.rgb, beauty.a)"), "even ineligible native primary fades retain opacity for destination extinction");
+        assert!(!source.contains("albedo_sample.a * beauty.a"));
+        for name in ["fs_opaque", "fs_test", "fs_fade_opaque", "fs_fade_test", "fs_ground_fused", "fs_ground_base", "fs_ground_simple"] {
+            let body = source.split(&format!("@fragment fn {name}(")).nth(1).unwrap().split("\n}").next().unwrap();
+            assert!(body.find("let albedo_sample = enhanced_albedo(").unwrap() < body.find("let beauty = enhanced_original_").unwrap(),
+                "sample derivatives before the native discard");
+        }
+        for name in ["fs_blend", "fs_sprite", "fs_add", "fs_env", "fs_lava", "fs_ground_shadow"] {
+            let body = source.split(&format!("@fragment fn {name}(")).nth(1).unwrap().split("\n}").next().unwrap();
+            assert!(body.contains("let albedo_sample = vec4<f32>(0.0);"), "{name} must not become a diffuse receiver");
+            assert!(body.contains(", vec4<f32>(beauty.rgb, beauty.a));"),
+                "{name}: overlays retain native colour/opacity only as destination transmittance");
+        }
+        assert!(!super::source(crate::EnhancedSettings::default()).contains("fn enhanced_albedo("));
+    }
+
+    #[test]
+    fn indirect_source_captures_diffuse_before_material_extras() {
+        for settings in [
+            crate::EnhancedSettings { indirect_light: true, ..Default::default() },
+            crate::EnhancedSettings { indirect_light: true, material_specular: true, ..Default::default() },
+            crate::EnhancedSettings { indirect_light: true, material_maps: true, material_pbr: true, clustered_lighting: true, sun_shadows: true, ..Default::default() },
+        ] {
+            let source = super::source(settings);
+            let vertex = source.split("fn vtx(").nth(1).unwrap().split("\n}").next().unwrap();
+            assert!(!vertex.contains("enhanced_diffuse"), "fragment capture must never match the vertex environment branch");
+            assert!(!vertex.contains("texture_color"));
+            let shade = source.split("fn shade(").nth(1).unwrap().split("\n}").next().unwrap();
+            let capture = shade.find("enhanced_diffuse = texture_color;").unwrap();
+            assert!(capture < shade.find("if mat.native.x > 0.5").unwrap(), "native environment texture is not diffuse");
+            assert!(capture < shade.find("let lit = min(texture_color + spec,").unwrap());
+            if settings.material_pbr {
+                assert!(capture < shade.find("texture_color += material_emissive(i);").unwrap());
+                assert!(shade.find("light = material_diffuse(i, light);").unwrap() < capture);
+                let ground = source.split("fn material_ground(").nth(1).unwrap().split("\n}").next().unwrap();
+                assert!(ground.find("enhanced_diffuse = select(").unwrap() < ground.find("let extra =").unwrap());
+            } else {
+                assert!(source.contains("enhanced_capture_ground(tile * light, ground_fog(i), false)"));
+                assert!(source.contains("enhanced_capture_ground(light, ground_fog(i), true)"));
+            }
+            assert!(shade.contains("enhanced_diffuse *= 1.0 - f;"));
+            assert!(source.contains("let diffuse = max(enhanced_diffuse, vec3<f32>(0.0));"));
+            assert!(!source.contains("let diffuse = max(beauty.rgb - "));
+            assert!(source.contains("if multiplier { return vec4<f32>(clamp(enhanced_diffuse,"));
+        }
+        assert!(!super::source(crate::EnhancedSettings { ambient_occlusion: true, material_pbr: true, ..Default::default() }).contains("enhanced_diffuse"));
     }
 
     #[test]

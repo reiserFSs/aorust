@@ -1817,6 +1817,44 @@ World and grass receivers share the runtime-loaded `enhanced_output.wgsl` AO bud
 Ambient-attachment alpha follows the resolved depth owner: depth-writing pipelines replace
 it, while non-depth-writing blends preserve it; RGB blending is unchanged.
 
+**Screen-space Indirect Light** (`AomacIndirectLight`, off by default) is an independent
+Lighting switch; **Diffuse Bounce Strength** (`AomacIndirectStrength`, default 1, range
+0–3) controls its contribution. `indirect_light.{rs,wgsl}` adapts ao-vk's quarter-resolution
+horizon gather (three directions, six radial probes each) and two five-tap surface-plane bilateral blur passes (one horizontal,
+one vertical, both at spacing 1), then depth-aware upsamples against explicit textured
+diffuse albedo. Unlike ao-vk's HDR-beauty source, only the
+existing fog-attenuated diffuse-share attachment can send light: specular, authored
+emission, spells, overlays, sky and unlit surfaces cannot become bounce sources. The
+source is deliberately conservative (sky fill plus the existing bounded direct-diffuse
+share, not every lit channel), avoiding a second full-resolution radiance attachment.
+The isolated effect uses three attachments: native beauty, bounded RGBA8 diffuse
+and fog-weighted albedo. With AO, the diffuse attachment remains RGBA16Float for its
+porous-grass tag; with bloom/sun/cloud/reflection attachments, albedo uses MRT eight.
+Albedo includes native overlay transmittance and MSAA coverage exactly once.
+Static opaque/cutout baked façades can receive light without becoming donors.
+Diffuse is captured before environment, GGX specular and material-emission additions.
+A current-frame quarter-resolution donor cache validates source footprints once,
+retaining exact primary depth, compressed normals and room/open-domain metadata.
+Native beauty and AO-only execution are unchanged.
+Native dungeon tile volumes preserve `ZoneLocator` room numbering and containment;
+an upload-invalidated stackless BVH avoids per-pixel tile scans, and unknown indoor
+points fail closed. The collision-baked world-space sky-open lattice distinguishes
+known-open, known-closed and unknown cells. Bounce stays within matching known
+domains; closed regions still receive local bounce, but open/closed transitions
+and missing cells never bridge rooms. Vertical outdoor receivers probe 0.5 m
+horizontally along the admitted surface normal instead of testing only the ground
+beneath the façade. Every transfer stage applies room/domain gates.
+The local 3 m bounce fades from 50–80 m camera distance; farther geometry retains
+its native appearance and cached depth still blocks nearer light paths.
+There is no history, accumulated actor list or frame-varying random phase, so a
+disappeared actor cannot leave indirect-light history. Native fog remains unchanged.
+This is an Enhanced artistic effect, not reconstructed retail lighting.
+Release ABBA measurements on Apple M4 Pro (20-core GPU), 1920×1200, actual 4× MSAA,
+120 warm-up / 600 measured frames per phase: **+0.973 ms Newland** and **+0.998 ms ICC**.
+This exceeds the original 0.8 ms target; the switch remains manual opt-in, off by
+default and excluded from Modern. Evidence, motion strips and safety checks:
+`~/aomac-handoff/gfx/parity/IndirectFx/`.
+
 Bloom (`emissive_bloom`) is a 7-level pyramid (`bloom.wgsl`, structure from ao-vk `bloom_down/up.frag`, see THIRD_PARTY):
 a 13-tap Karis-weighted first downsample, `[1,3,3,1]` downsamples and a 3x3-tent upsample that mixes each level's own
 light with the wider level (60 % wider, energy-preserving, so halos are round and wide rather than nearest-neighbour

@@ -1026,7 +1026,7 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
     let names = ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows",
         "AomacMaterialSpecular", "AomacClusteredLighting", "AomacMoonShadows", "AomacLocalLightShadows",
         "AomacHeightHaze", "AomacLandHaze", "AomacValleyMist", "AomacVolumetricShafts",
-        "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs"];
+        "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs", "AomacIndirectLight"];
     assert_eq!(d.enhanced_settings(), EnhancedSettings::default());
     d.open_user(&tmp, "account", 7);
     // Retain every lighting combination, then each atmosphere switch and all-on.
@@ -1043,6 +1043,7 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
             height_haze: mask & 1024 != 0, land_haze: mask & 2048 != 0, valley_mist: mask & 4096 != 0,
             volumetric_shafts: mask & 8192 != 0, cloud_gap_shafts: mask & 16384 != 0,
             volumetric_clouds: mask & 32768 != 0, cloud_shadows: mask & 65536 != 0, sky_discs: mask & 131072 != 0,
+            indirect_light: mask & 262144 != 0,
             ..Default::default()
         };
         assert_eq!(d.enhanced_settings(), expected);
@@ -1079,6 +1080,7 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
         ("AomacShadowStrength", 0.4), ("AomacShadowSoftness", 2.0), ("AomacAoRadius", 2.0), ("AomacAoStrength", 0.5), ("AomacBloomStrength", 0.25),
         ("AomacGrassDensity", 1.5), ("AomacGrassDistance", 35.0), ("AomacSunBoost", 0.5), ("AomacGrade", 0.5), ("AomacContactStrength", 0.7),
         ("AomacLampIntensity", 2.0), ("AomacCarriedLightIntensity", 1.5),
+        ("AomacIndirectStrength", 2.5),
     ] {
         assert!(d.persists(name));
         d.set(name, Variant::Float(value));
@@ -1096,6 +1098,35 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
     let mut again = DValues::new(&tmp);
     again.open_user(&tmp, "account", 7);
     assert_eq!(again.enhanced_settings(), d.enhanced_settings());
+    std::fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
+fn enhanced_indirect_strength_bounds_persist_without_enabling_the_effect() {
+    use ao_render::EnhancedSettings;
+    let tmp = crate::play::prefs::test_dir().join("aomac-indirect-light-persist");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let mut d = DValues::new(&tmp);
+    d.open_user(&tmp, "account", 7);
+    for (strength, expected) in [(-1.0, 0.0), (0.0, 0.0), (1.0, 1.0), (2.5, 2.5), (4.0, 3.0)] {
+        assert!(d.set("AomacIndirectStrength", Variant::Float(strength)));
+        let settings = EnhancedSettings { indirect_strength: expected, ..Default::default() };
+        assert_eq!(d.enhanced_settings(), settings);
+        assert!(!settings.any_enabled());
+        d.save_user();
+        let mut again = DValues::new(&tmp);
+        again.open_user(&tmp, "account", 7);
+        assert_eq!(again.enhanced_settings(), settings);
+    }
+    assert!(d.set("AomacIndirectLight", Variant::Bool(true)));
+    d.save_user();
+    let mut again = DValues::new(&tmp);
+    again.open_user(&tmp, "account", 7);
+    assert_eq!(again.enhanced_settings(), EnhancedSettings {
+        indirect_light: true, indirect_strength: 3.0, ..Default::default()
+    });
+    again.restore_original_graphics();
+    assert_eq!(again.enhanced_settings(), EnhancedSettings::default());
     std::fs::remove_dir_all(tmp).unwrap();
 }
 
@@ -1210,6 +1241,7 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
         "AomacGrassPointShadows",
         "AomacHeightHaze", "AomacLandHaze", "AomacValleyMist", "AomacVolumetricShafts",
         "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs",
+        "AomacIndirectLight",
         "AomacFoliageEdges", "AomacFoliageSway", "AomacFoliagePush", "AomacFoliageLeaves", "AomacFoliageFlutter",
         "AomacFoliageFalling", "AomacGrassTrails", "AomacFoliageSubdivision", "AomacFoliageTranslucency", "AomacFoliageLod",
         "AomacWaterWaves", "AomacWaterRipples", "AomacWaterRefraction", "AomacWaterReflections",
@@ -1233,6 +1265,7 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
         ("AomacGrassDensity", 1.5), ("AomacGrassDistance", 35.0), ("AomacSunBoost", 0.5), ("AomacGrade", 0.5), ("AomacContactStrength", 0.7),
         ("AomacLampIntensity", 2.0), ("AomacCarriedLightIntensity", 1.5),
         ("AomacMoonIntensity", 2.5), ("AomacDarkNightStrength", 0.75),
+        ("AomacIndirectStrength", 2.5),
         ("AomacWaterRealism", 0.75),
         ("AomacWaterWakeStrength", 3.0), ("AomacWaterWakeVisibility", 1.0),
         ("AomacWaterWakeDuration", 0.5), ("AomacWaterWakeSpeed", 4.0),
@@ -1265,6 +1298,7 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
         "AomacGrassPointShadows",
         "AomacHeightHaze", "AomacLandHaze", "AomacValleyMist", "AomacVolumetricShafts",
         "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs",
+        "AomacIndirectLight",
         "AomacFoliageEdges", "AomacFoliageSway", "AomacFoliagePush", "AomacFoliageLeaves", "AomacFoliageFlutter",
         "AomacFoliageFalling", "AomacGrassTrails", "AomacFoliageSubdivision", "AomacFoliageTranslucency", "AomacFoliageLod",
         "AomacWaterWaves", "AomacWaterRipples", "AomacWaterRefraction", "AomacWaterReflections",

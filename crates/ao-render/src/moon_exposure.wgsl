@@ -1,5 +1,5 @@
 // Native baked openness, quantized identically to each ground holo1 R8 texture.
-// Header: lattice origin x/z, reciprocal cell size, cell width/height, 3 reserved.
+// Header: lattice origin x/z, reciprocal cell size, width/height, known-bitset offset, 2 reserved.
 @group(3) @binding(7) var<storage, read> moon_sky_cells: array<u32>;
 
 fn enhanced_sky_open(world: vec3<f32>) -> f32 {
@@ -15,4 +15,18 @@ fn enhanced_sky_open(world: vec3<f32>) -> f32 {
     let corners = vec4<f32>(f32(packed & 255u), f32((packed >> 8u) & 255u),
         f32((packed >> 16u) & 255u), f32((packed >> 24u) & 255u)) / 255.0;
     return mix(mix(corners.x, corners.y, t.x), mix(corners.z, corners.w, t.x), t.y);
+}
+
+// Presence is separate from openness: a native all-zero cell is known closed;
+// missing patches and positions outside the lattice remain unknown.
+fn enhanced_sky_known(world: vec3<f32>) -> bool {
+    let size = vec2<u32>(moon_sky_cells[3], moon_sky_cells[4]);
+    let bitset = moon_sky_cells[5];
+    if any(size == vec2<u32>(0u)) || bitset == 0u { return false; }
+    let origin = vec2<f32>(bitcast<f32>(moon_sky_cells[0]), bitcast<f32>(moon_sky_cells[1]));
+    let lattice = vec2<f32>(world.x, -world.z) * bitcast<f32>(moon_sky_cells[2]) - origin;
+    if !all(lattice >= vec2<f32>(0.0)) || !all(lattice <= vec2<f32>(size)) { return false; }
+    let cell = min(vec2<u32>(lattice), size - vec2<u32>(1u));
+    let index = cell.y * size.x + cell.x;
+    return (moon_sky_cells[bitset + index / 32u] & (1u << (index % 32u))) != 0u;
 }

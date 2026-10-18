@@ -1003,12 +1003,16 @@ Subway interior control. This selects the real fixture scene without altering it
 camera or authored clock. No atmosphere visual acceptance is claimed here.
 
 `AOMAC_GFX_FEATURE` layers independent postprocessing onto that profile. Accepted
-names are `taa`, `fxaa`, `cas`, `motion_blur`, `dof`, and `grading`; combine with
+names are `taa`, `fxaa`, `cas`, `motion_blur`, `dof`, `grading`, `sun_shadows`, and `indirect`; combine with
 commas (for example `taa,cas,motion_blur,dof,grading`). TAA takes precedence over
 FXAA when both are selected. Motion blur uses strength 0.5; grading uses contrast
 1.1, saturation 1.1, warmth 0.55, night-cool 0.2, vignette 0.15 and the identity
 day/night LUT, without enabling HDR or loading an external file. Other knobs
 retain their explicit defaults.
+The isolated `indirect` profile enables Screen-space Indirect Light at its default
+strength; `indirect-neutral` retains its exact attachments with strength zero.
+Use `AOMAC_GFX_MSAA=4` for indirect-light evidence and the ordinary frozen-frame
+timing switch for ABBA comparisons. The effect has no temporal history.
 With DoF enabled, each view contains an actual captured own-character Avatar.
 Existing actor/light-bar views retain their authored placement; other explicit
 own-avatar views search native dry, level collision terrain and require clear
@@ -1295,11 +1299,14 @@ Each step supplies the matching own-avatar bender and calls `render_frozen`:
 frontend/upload steps alone do not advance renderer-owned trail history.
 The final pose and interaction state are frozen for capture/timing.
 
-For actual motion evidence, set `AOMAC_GFX_SEQUENCE=stationary` or `interaction`.
+For actual motion evidence, set `AOMAC_GFX_SEQUENCE=stationary`, `interaction`, or `camera`.
 `AOMAC_GFX_SEQUENCE_START` selects the initial elapsed seconds (default 2),
 `AOMAC_GFX_SEQUENCE_DT` the seconds between captures (default 0.5), and
 `AOMAC_GFX_SEQUENCE_COUNT` the strip length (5–8, default 6). The fixture advances
 and renders real substeps no larger than 1/60 s rather than seeking the clock.
+The camera sequence adds a deterministic ±0.04-radian yaw and ±0.2 m horizontal
+translation while retaining the same actor/data timing; it is suitable for
+checking screen-space indirect-light stability without temporal accumulation.
 The interaction sequence selects a real native leafy shrub, excluding grass and
 flowers, crosses it and leaves it while the actor remains admitted, so the later
 frames show spring recovery rather than a frozen contact. Selection uses

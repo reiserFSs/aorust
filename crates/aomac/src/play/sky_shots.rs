@@ -442,6 +442,9 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         writeln!(manifest, "enhanced_settings={settings:?}")?;
         writeln!(manifest, "foliage_interaction={interaction}\nfoliage_interaction_steps=16\nfoliage_interaction_dt=0\nfoliage_interaction_source=captured_visible_own_avatar\nfoliage_interaction_pose=idle")?;
         writeln!(manifest, "sequence={sequence:?}\nsequence_simulation_dt_max={}\nsequence_game_clock=frozen_snapshot\nsequence_avatar_pose=captured_idle_translated_on_terrain", 1.0 / 60.0)?;
+        if sequence.is_some_and(|sequence| sequence.camera_pan) {
+            writeln!(manifest, "sequence_camera_motion=sinusoidal_yaw_and_horizontal_translation\nsequence_camera_yaw_amplitude_radians=0.04\nsequence_camera_translation_amplitude_m=0.2\nsequence_camera_progress=clamped_sample_interval\nsequence_camera_actor_and_game_timing=unchanged")?;
+        }
         writeln!(manifest, "post_features={features:?}\nforce_own_avatar={own_avatar}\npost_focus_policy=actual_fixture_avatar_position_when_present\npost_warmup_frames={post_warmup_frames}\ntiming_camera_pan={camera_pan}\ntiming_effect_time_mode={effect_time_mode}\ntiming_effect_dt_seconds={effect_dt:?}")?;
         let baseline = std::env::var_os("AOMAC_GFX_BASELINE").map(PathBuf::from);
         let png_only = std::env::var_os("AOMAC_GFX_PNG_ONLY").is_some();
@@ -574,6 +577,10 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                             |point| collision.borrow().terrain_height(point))?)
                     } else { None };
                     writeln!(manifest, "{name} sequence_frame={index:02} renderer_time={target} sample_dt={} avatar_scene={position:?}", sequence.dt)?;
+                    if sequence.camera_pan {
+                        let camera = graphics_fixture_sequence_camera(fixed, index as f32 / (sequence.count - 1) as f32);
+                        writeln!(manifest, "{name} sequence_frame={index:02} camera_scene={:?} camera_yaw={}", camera.pos, camera.yaw)?;
+                    }
                 }
             }
             let camera_underwater = super::flow::camera_underwater(collision.borrow().liquid_at(fixed.pos.to_array()), fixed.pos.y);
@@ -644,6 +651,11 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                                 off.host.actors.push(avatar.frame());
                                 off.host.grass_benders.clear();
                                 off.host.grass_benders.push(ao_render::GrassBender { actor: None, position: position.to_array() });
+                            }
+                            if sequence.camera_pan {
+                                let progress = (elapsed + dt - sequence.start)
+                                    / (sequence.dt * (sequence.count - 1) as f32);
+                                off.fixed_camera(Some(graphics_fixture_sequence_camera(fixed, progress)));
                             }
                             off.frame(&mut shot, dt);
                             elapsed += dt;
@@ -764,6 +776,13 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     off.wait_for_pipeline_warmup();
                 }
                 let raw = off.rgba(&shot, &list)?;
+                if measure && settings.indirect_light && std::env::var_os("AOMAC_GFX_INDIRECT_TIMING").is_some() {
+                    let (receiver, donor) = off.indirect_light_masks_rgba()?.context("Indirect light receiver/donor masks")?;
+                    image::save_buffer(out.join(format!("{name}-indirect-receiver.png")),
+                        &receiver, size.0, size.1, image::ColorType::Rgba8)?;
+                    image::save_buffer(out.join(format!("{name}-indirect-donor.png")),
+                        &donor, size.0, size.1, image::ColorType::Rgba8)?;
+                }
                 if name == "newland-lightbar-night" && profile == "local-shadows-one" {
                     ensure!(off.point_shadow_owner_is_selected(25988)?,
                         "Newland carried-light timing requires actual current GPU owner admission and a selected cube for Testy/25988");
@@ -835,6 +854,24 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                         std::fs::write(out.join(format!("{name}-camera-pan-frame-gpu.txt")),
                             format!("profile={profile}\npost_features={features:?}\nmsaa_requested={msaa}\nmsaa_actual={actual_msaa}\nresolution=1920x1200\nwarmup=120\nsamples=600\nunits=milliseconds\neffect_time_mode={effect_time_mode}\neffect_dt_seconds={effect_dt:?}\ncamera_motion=authored_right_1_metre_per_second\ncamera_start={fixed:?}\ncloud_field_cache=native_layer_and_eye_key;camera_changes_every_sample\nframe_p50_p95_p99={percentiles:?}\n"))?;
                     }
+                }
+                if measure && std::env::var_os("AOMAC_GFX_INDIRECT_TIMING").is_some() {
+                    let overlay = off.host.effect_gpu_overlay;
+                    off.host.effect_gpu_overlay = true;
+                    off.set_effect_gpu_profiling_for_evidence(true)?;
+                    off.prepare_frozen_rendering();
+                    for _ in 0..120 {
+                        off.render_frozen()?;
+                        std::thread::sleep(std::time::Duration::from_millis(3));
+                        off.poll_effect_gpu_costs();
+                    }
+                    let mut report = format!("profile={profile}\nsource=effect_gpu_timestamp_queries\nphase=after_whole_frame_timer_disabled\nframes=120\npoll_sleep_ms=3\nunits=milliseconds\n");
+                    for cost in off.effect_gpu_costs() {
+                        writeln!(report, "label={:?} average_ms={} samples={}", cost.label, cost.average_ms, cost.samples)?;
+                    }
+                    off.set_effect_gpu_profiling_for_evidence(false)?;
+                    off.host.effect_gpu_overlay = overlay;
+                    std::fs::write(out.join(format!("{name}-effect-gpu.txt")), report)?;
                 }
                 if measure && profile == "shadows" && std::env::var_os("AOMAC_GFX_SHADOW_TIMING").is_some() {
                     graphics_shadow_timing(&mut off, &out, &name)?;
@@ -1445,6 +1482,7 @@ fn graphics_fixture_backlit_view_requires_native_canopy_ground_and_los() {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct GraphicsFixtureSequence {
     interaction: bool,
+    camera_pan: bool,
     start: f32,
     dt: f32,
     count: usize,
@@ -1459,8 +1497,8 @@ fn graphics_fixture_sequence(
             "AOMAC_GFX_SEQUENCE_START/DT/COUNT require AOMAC_GFX_SEQUENCE");
         return Ok(None);
     };
-    ensure!(matches!(mode, "stationary" | "interaction"),
-        "AOMAC_GFX_SEQUENCE must be stationary or interaction");
+    ensure!(matches!(mode, "stationary" | "interaction" | "camera"),
+        "AOMAC_GFX_SEQUENCE must be stationary, interaction, or camera");
     let start = start.unwrap_or("2").parse::<f32>()?;
     let dt = dt.unwrap_or("0.5").parse::<f32>()?;
     let count = count.unwrap_or("6").parse::<usize>()?;
@@ -1469,7 +1507,14 @@ fn graphics_fixture_sequence(
     ensure!(dt.is_finite() && (0.05..=2.0).contains(&dt),
         "AOMAC_GFX_SEQUENCE_DT must be finite sample spacing in 0.05..=2 seconds");
     ensure!((5..=8).contains(&count), "AOMAC_GFX_SEQUENCE_COUNT must be 5..=8");
-    Ok(Some(GraphicsFixtureSequence { interaction: mode == "interaction", start, dt, count }))
+    Ok(Some(GraphicsFixtureSequence { interaction: mode == "interaction", camera_pan: mode == "camera", start, dt, count }))
+}
+
+fn graphics_fixture_sequence_camera(mut camera: Camera, progress: f32) -> Camera {
+    let sweep = (progress.clamp(0.0, 1.0) * std::f32::consts::TAU).sin();
+    camera.yaw += sweep * 0.04;
+    camera.pos.x += sweep * 0.2;
+    camera
 }
 
 fn graphics_fixture_sequence_position(
@@ -1490,9 +1535,19 @@ fn graphics_fixture_sequence_position(
 fn graphics_fixture_sequence_controls_and_grounded_rebound() {
     assert_eq!(graphics_fixture_sequence(None, None, None, None).unwrap(), None);
     let defaults = graphics_fixture_sequence(Some("stationary"), None, None, None).unwrap().unwrap();
-    assert_eq!((defaults.start, defaults.dt, defaults.count, defaults.interaction), (2.0, 0.5, 6, false));
+    assert_eq!((defaults.start, defaults.dt, defaults.count, defaults.interaction, defaults.camera_pan), (2.0, 0.5, 6, false, false));
     let interaction = graphics_fixture_sequence(Some("interaction"), Some("0"), Some("2"), Some("8")).unwrap().unwrap();
-    assert!(interaction.interaction);
+    assert!(interaction.interaction && !interaction.camera_pan);
+    let pan = graphics_fixture_sequence(Some("camera"), None, None, None).unwrap().unwrap();
+    assert!(pan.camera_pan && !pan.interaction);
+    assert_eq!((pan.start, pan.dt, pan.count), (defaults.start, defaults.dt, defaults.count));
+    let fixed = Camera::look_at(Vec3::new(10.0, 20.0, 30.0), Vec3::new(10.0, 20.0, 20.0));
+    for (progress, sweep) in [(-1.0, 0.0), (0.0, 0.0), (0.25, 1.0), (0.75, -1.0)] {
+        let camera = graphics_fixture_sequence_camera(fixed, progress);
+        assert_eq!(camera.pos, fixed.pos + Vec3::X * (sweep * 0.2));
+        assert_eq!(camera.yaw, fixed.yaw + sweep * 0.04);
+        assert_eq!(camera.pitch, fixed.pitch);
+    }
     for (mode, start, dt, count) in [
         (None, Some("1"), None, None),
         (Some("wind"), None, None, None),
@@ -1962,6 +2017,8 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
     let mut settings = ao_render::EnhancedSettings::default();
     match profile {
         "faithful" => {}
+        "indirect" => settings.indirect_light = true,
+        "indirect-neutral" => { settings.indirect_light = true; settings.indirect_strength = 0.0; }
         "rain" => settings.enhanced_rain = true,
         "wet-surfaces" => settings.wet_surfaces = true,
         "weather-particles" => settings.weather_particles = true,
@@ -2185,6 +2242,7 @@ fn graphics_fixture_post_features(mut settings: ao_render::EnhancedSettings, fea
     for feature in features.split([',', '+']) {
         match feature {
             "sun_shadows" => settings.sun_shadows = true,
+            "indirect" => settings.indirect_light = true,
             "taa" => settings.taa = true,
             "fxaa" => settings.fxaa = true,
             "cas" => settings.cas = true,
@@ -2199,7 +2257,7 @@ fn graphics_fixture_post_features(mut settings: ao_render::EnhancedSettings, fea
                 settings.warmth = 0.55;
                 settings.night_cool = 0.2;
             }
-            _ => anyhow::bail!("unknown AOMAC_GFX_FEATURE {feature:?}; use comma-separated taa,fxaa,cas,motion_blur,dof,grading,sun_shadows"),
+            _ => anyhow::bail!("unknown AOMAC_GFX_FEATURE {feature:?}; use comma-separated taa,fxaa,cas,motion_blur,dof,grading,sun_shadows,indirect"),
         }
     }
     Ok(settings)
@@ -2353,6 +2411,9 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
         assert!(!settings.moon_shadows && !settings.sun_shadows);
     }
     assert!(graphics_fixture_settings("contact").unwrap().contact_shadows);
+    assert!(graphics_fixture_settings("indirect").unwrap().indirect_light);
+    assert_eq!(graphics_fixture_settings("indirect-neutral").unwrap().indirect_strength, 0.0);
+    assert!(graphics_fixture_post_features(Default::default(), "indirect").unwrap().indirect_light);
     let isolated = graphics_fixture_settings("shadows-hdr-contact").unwrap();
     assert!(isolated.sun_shadows && isolated.hdr && isolated.contact_shadows);
     assert!(!graphics_fixture_settings("shadows-hdr").unwrap().contact_shadows);

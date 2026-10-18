@@ -15,6 +15,7 @@ pub struct EnhancedSettings {
     /// Cached Phong subdivision of nearby CAT bodies and mounted heads.
     pub character_smoothing: bool,
     pub ambient_occlusion: bool,
+    pub indirect_light: bool,
     pub emissive_bloom: bool,
     pub ground_grass: bool,
     pub grass_tufts: bool,
@@ -106,6 +107,8 @@ pub struct EnhancedSettings {
     pub shadow_softness: f32,
     pub ao_radius: f32,
     pub ao_strength: f32,
+    /// Diffuse bounce strength for screen-space indirect light (0..=3).
+    pub indirect_strength: f32,
     pub bloom_strength: f32,
     pub grass_density: f32,
     pub grass_distance: f32,
@@ -124,6 +127,7 @@ impl Default for EnhancedSettings {
             grass_tufts: false, grass_species: false, grass_path_thinning: false, grass_gust_bands: false,
             grass_sunlight: false, grass_sun_shadows: false, grass_point_shadows: false,
             character_smoothing: false,
+            indirect_light: false, indirect_strength: 1.0,
             height_haze: false, land_haze: false, valley_mist: false, volumetric_shafts: false,
             cloud_gap_shafts: false, volumetric_clouds: false, cloud_shadows: false, sky_discs: false,
             material_specular: false, clustered_lighting: false, moon_shadows: false, local_light_shadows: false,
@@ -154,7 +158,7 @@ impl Default for EnhancedSettings {
 impl EnhancedSettings {
     pub fn any_enabled(self) -> bool {
         self.sun_shadows || self.ambient_occlusion || self.emissive_bloom || self.ground_grass || self.needs_grade() || self.contact_shadows
-            || self.character_smoothing
+            || self.character_smoothing || self.indirect_light
             || self.height_haze || self.land_haze || self.valley_mist || self.volumetric_shafts
             || self.cloud_gap_shafts || self.volumetric_clouds || self.cloud_shadows || self.sky_discs
             || self.material_specular || self.clustered_lighting || self.moon_shadows || self.local_light_shadows
@@ -232,6 +236,7 @@ impl EnhancedSettings {
             shadow_softness: finite(self.shadow_softness, 4.0, defaults.shadow_softness),
             ao_radius: finite(self.ao_radius, 5.0, defaults.ao_radius),
             ao_strength: finite(self.ao_strength, 2.0, defaults.ao_strength),
+            indirect_strength: finite(self.indirect_strength, 3.0, defaults.indirect_strength),
             bloom_strength: finite(self.bloom_strength, 1.0, defaults.bloom_strength),
             grass_density: finite(self.grass_density, 2.0, defaults.grass_density),
             grass_distance: finite(self.grass_distance, 180.0, defaults.grass_distance),
@@ -262,6 +267,23 @@ impl EnhancedSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indirect_light_is_independent_default_off_and_bounded() {
+        let defaults = EnhancedSettings::default();
+        assert!(!defaults.indirect_light && !defaults.any_enabled() && !defaults.needs_sun_mask());
+        assert_eq!(defaults.indirect_strength, 1.0);
+        let enabled = EnhancedSettings { indirect_light: true, ..defaults };
+        assert!(enabled.any_enabled() && !enabled.needs_sun_mask());
+        assert!(!enabled.ambient_occlusion && !enabled.hdr && !enabled.needs_grade());
+        assert_eq!(enabled.clamped(), enabled);
+        for (strength, expected) in [(-1.0, 0.0), (0.0, 0.0), (2.0, 2.0), (4.0, 3.0),
+            (f32::NAN, 1.0), (f32::INFINITY, 1.0), (f32::NEG_INFINITY, 1.0)] {
+            let settings = EnhancedSettings { indirect_strength: strength, ..defaults }.clamped();
+            assert_eq!(settings.indirect_strength, expected);
+            assert!(!settings.any_enabled() && !settings.needs_sun_mask());
+        }
+    }
 
     #[test]
     fn texture_material_switches_are_independent_and_default_off() {

@@ -185,17 +185,30 @@ impl crate::Renderer {
     }
     /// Explicit offline diagnostic; no resources or passes exist until requested.
     pub fn emissive_seed_rgba(&self) -> anyhow::Result<Option<Vec<u8>>> {
+        self.enhanced_mask_rgba(self.enhanced_frame.as_ref().and_then(|frame| frame.emissive.as_ref()))
+    }
+
+    /// Explicit offline SSGI receiver/donor readback, in that order.
+    #[allow(clippy::type_complexity)]
+    pub fn indirect_light_masks_rgba(&self) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>)>> {
         let Some(frame) = self.enhanced_frame.as_ref() else { return Ok(None); };
-        let Some(emission) = frame.emissive.as_ref() else { return Ok(None); };
+        let Some(receiver) = self.enhanced_mask_rgba(frame.albedo.as_ref())? else { return Ok(None); };
+        let Some(donor) = self.enhanced_mask_rgba(frame.ambient.as_ref())? else { return Ok(None); };
+        Ok(Some((receiver, donor)))
+    }
+
+    fn enhanced_mask_rgba(&self, mask: Option<&wgpu::TextureView>) -> anyhow::Result<Option<Vec<u8>>> {
+        let Some(frame) = self.enhanced_frame.as_ref() else { return Ok(None); };
+        let Some(mask) = mask else { return Ok(None); };
         let output = self.device.create_texture_tracked(&wgpu::TextureDescriptor {
-            label: Some("Authored emission mask diagnostic"),
+            label: Some("Enhanced mask diagnostic"),
             size: wgpu::Extent3d { width: frame.size.0, height: frame.size.1, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: self.format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
         });
         let bind = self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
-            label: Some("Authored emission mask diagnostic"), layout: self.enhanced_pipelines.source_layout(),
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(emission) }],
+            label: Some("Enhanced mask diagnostic"), layout: self.enhanced_pipelines.source_layout(),
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(mask) }],
         });
         let mut encoder = self.device.create_command_encoder(&Default::default());
         frame.composite(&mut encoder, &output.create_view_tracked(&Default::default()), Some(&bind), None);

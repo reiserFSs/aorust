@@ -824,7 +824,7 @@ pub(super) fn build(store: &RecordStore, rec: &Record, scene: &mut Scene) -> Res
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::io::Cursor;
 
@@ -851,7 +851,7 @@ mod tests {
 
     /// 6x6 map, tile index 1 (id 7) on a 3x3 block at (1,1) minus its (3,3) corner; stream word
     /// `k` of the only neighbour row (tile 1 next to tile 0) is `101 + k`.
-    fn fixture(doors: &[u32]) -> Vec<u8> {
+    pub(in crate::playfield) fn fixture(doors: &[u32]) -> Vec<u8> {
         let mut d = b"GNDA".to_vec();
         d.extend([0; 4]);
         d.extend(1u32.to_le_bytes());

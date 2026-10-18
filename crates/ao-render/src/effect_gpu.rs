@@ -265,6 +265,7 @@ fn effect_label(file: &'static str, pass: Option<&str>) -> &'static str {
         "shadow_pass" | "sun_shadows" => "Directional shadows",
         "point_shadows" => "Point shadows", "ambient_occlusion" => "Ambient occlusion",
         "contact_shadows" => "Contact shadows", "bloom" => "Bloom",
+        "indirect_light" => "Indirect light",
         "grade" => "HDR / grading", "volumetric_clouds" => "Volumetric clouds",
         "cloud_shadows" => "Cloud shadows", "sky_discs" => "Sky discs",
         "rain_wet" => "Rain / wetness", "weather_particles" => "Weather particles",

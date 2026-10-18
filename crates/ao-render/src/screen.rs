@@ -141,7 +141,8 @@ pub(super) fn depth_clear_pipeline(device:&wgpu::Device,format:wgpu::TextureForm
     let target = wgpu::ColorTargetState {format,blend:None,write_mask:wgpu::ColorWrites::empty()};
     let auxiliary=wgpu::ColorTargetState {format:crate::enhanced::AUX,blend:None,write_mask:wgpu::ColorWrites::empty()};
     let reflections=settings.material_reflections || settings.environment_probe;
-    let targets = [Some(target), settings.ambient_occlusion.then(|| auxiliary.clone()), settings.emissive_bloom.then(|| auxiliary.clone()), settings.needs_sun_mask().then(|| auxiliary.clone()), settings.cloud_shadows.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R16Float, blend: None, write_mask: wgpu::ColorWrites::empty() }), reflections.then(|| auxiliary.clone()), reflections.then_some(auxiliary)];
+    let mut targets = [Some(target), (settings.ambient_occlusion || settings.indirect_light).then(|| wgpu::ColorTargetState { format: crate::enhanced::ambient_format(&settings), ..auxiliary.clone() }), settings.emissive_bloom.then(|| auxiliary.clone()), settings.needs_sun_mask().then(|| auxiliary.clone()), settings.cloud_shadows.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R16Float, blend: None, write_mask: wgpu::ColorWrites::empty() }), reflections.then(|| auxiliary.clone()), reflections.then_some(auxiliary), settings.indirect_light.then_some(wgpu::ColorTargetState { format: crate::enhanced::ALBEDO, blend: None, write_mask: wgpu::ColorWrites::empty() })];
+    if crate::enhanced::compact_indirect(&settings) { targets.swap(2, 7); }
     crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
         label:Some("native viewport depth clear"),layout:Some(&layout),
         vertex:wgpu::VertexState {module:&shader,entry_point:Some("vs"),compilation_options:Default::default(),buffers:&[]},

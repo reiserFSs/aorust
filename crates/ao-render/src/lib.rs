@@ -3,6 +3,9 @@
 mod actors;
 mod bloom;
 mod contact_shadows;
+mod indirect_light;
+#[cfg(test)]
+mod indirect_light_tests;
 mod atmosphere;
 mod atmosphere_stack;
 #[cfg(test)]
@@ -775,6 +778,7 @@ pub struct Renderer {
     point_mesh_revisions: Vec<u64>,
     ambient_occlusion: Option<ambient_occlusion::AmbientOcclusion>,
     contact_shadows: Option<contact_shadows::ContactShadows>,
+    indirect_light: Option<indirect_light::IndirectLight>,
     atmosphere: Option<atmosphere::Atmosphere>,
     volumetric_clouds: Option<volumetric_clouds::VolumetricClouds>,
     sky_discs: Option<sky_discs::SkyDiscs>,
@@ -855,6 +859,7 @@ pub struct Renderer {
     lens: ao_scene::Lens,
     /// Camera dependent fog (statel fog volumes), see `Scene::fog_model`.
     fog: Option<ao_scene::FogModel>,
+    indirect_rooms: Vec<ao_scene::RoomVolume>,
     /// Multiplier of the accumulated fog density, see [`ao_scene::fog_mode_density_scale`] (`FogMode` pref).
     fog_density_scale: f32,
     /// Statel distance LOD state, see `Scene::statel_lod`.
@@ -972,11 +977,31 @@ fn make_clamp_sampler(device: &wgpu::Device, anisotropy: u16) -> wgpu::Sampler {
 }
 
 /// Ambient alpha tags the depth owner, independently of material RGB blending.
-fn ambient_target(state: Option<wgpu::BlendState>, depth_write: bool) -> wgpu::ColorTargetState {
+fn ambient_target(state: Option<wgpu::BlendState>, depth_write: bool, format: wgpu::TextureFormat) -> wgpu::ColorTargetState {
     wgpu::ColorTargetState {
-        format: enhanced::AUX,
+        format,
         blend: state.map(|state| wgpu::BlendState { alpha: wgpu::BlendComponent::REPLACE, ..state }),
         write_mask: if depth_write { wgpu::ColorWrites::ALL } else { wgpu::ColorWrites::COLOR },
+    }
+}
+
+fn albedo_target(state: Option<wgpu::BlendState>, depth_write: bool, fs: &str) -> wgpu::ColorTargetState {
+    let primary = matches!(fs, "fs_opaque" | "fs_test" | "fs_fade_opaque" | "fs_fade_test" | "fs_ground_fused" | "fs_ground_base" | "fs_ground_simple");
+    let extinguish = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::Zero, operation: wgpu::BlendOperation::Add };
+    let blend = if !depth_write {
+        // Alpha-over/additive overlays cannot seed RGB. Multiplicative
+        // overlays instead filter the existing budget with native colour.
+        let retain = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: state.map_or(wgpu::BlendFactor::Zero, |s| s.color.dst_factor), operation: wgpu::BlendOperation::Add };
+        let color = state.filter(|s| s.color.dst_factor == wgpu::BlendFactor::Src).map_or(retain, |s| s.color);
+        Some(wgpu::BlendState { color, alpha: retain })
+    } else if primary {
+        state.map(|s| wgpu::BlendState { color: s.color, alpha: wgpu::BlendComponent::REPLACE })
+    } else {
+        Some(wgpu::BlendState { color: extinguish, alpha: extinguish })
+    };
+    wgpu::ColorTargetState {
+        format: enhanced::ALBEDO, blend,
+        write_mask: if fs != "fs_ground_shadow" { wgpu::ColorWrites::ALL } else { wgpu::ColorWrites::empty() },
     }
 }
 
@@ -1002,7 +1027,9 @@ fn compile_pipeline(
         let water_cloud = settings.cloud_shadows.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R16Float, blend: state, write_mask: wgpu::ColorWrites::RED });
         // The native ground lightmap multiplies existing coverage; retain its base material metadata.
         let reflection = (settings.material_reflections || settings.environment_probe).then_some(wgpu::ColorTargetState { format: enhanced::AUX, blend: None, write_mask: if fs == "fs_ground_shadow" { wgpu::ColorWrites::empty() } else { wgpu::ColorWrites::ALL } });
-        let targets = [Some(target), settings.ambient_occlusion.then(|| ambient_target(state, depth_write)), settings.emissive_bloom.then_some(auxiliary), sun_mask, water_cloud, reflection.clone(), reflection];
+        let albedo = settings.indirect_light.then(|| albedo_target(state, depth_write, fs));
+        let mut targets = [Some(target), (settings.ambient_occlusion || settings.indirect_light).then(|| ambient_target(state, depth_write, enhanced::ambient_format(&settings))), settings.emissive_bloom.then_some(auxiliary), sun_mask, water_cloud, reflection.clone(), reflection, albedo];
+        if enhanced::compact_indirect(&settings) { targets.swap(2, 7); }
         pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
             label: Some(fs),
             // Ground effects 8-11 sample `ground_palette` (holo0) at bind group 2; liquids (12/13) use `fs_blend`,
@@ -1275,6 +1302,7 @@ impl Renderer {
         let point_program = point_shadows::Compiled::new(&device);
         let ambient_occlusion = Some(ambient_occlusion::AmbientOcclusion::new(&device, format));
         let contact_shadows = Some(contact_shadows::ContactShadows::new(&device, format));
+        let indirect_light = Some(indirect_light::IndirectLight::new(&device, format));
         let cluster_programs = clustered_lighting::Programs::new(&device);
         let atmosphere = Some(atmosphere::Atmosphere::new(&device, format));
         let volumetric_clouds = Some(volumetric_clouds::VolumetricClouds::new(&device, format, &msaa_supported));
@@ -1312,6 +1340,7 @@ impl Renderer {
             point_program,
             ambient_occlusion,
             contact_shadows,
+            indirect_light,
             atmosphere,
             volumetric_clouds,
             sky_discs,
@@ -1391,6 +1420,7 @@ impl Renderer {
             env: default_environment(100.0),
             lens: ao_scene::Lens::default(),
             fog: None,
+            indirect_rooms: Vec::new(),
             fog_density_scale: 1.0,
             lod: None,
             ground: None,
@@ -1434,6 +1464,7 @@ impl Renderer {
             && self.shadow_pipelines.is_ready()
             && self.ambient_occlusion.as_ref().is_some_and(|ao| ao.is_ready())
             && self.contact_shadows.as_ref().is_some_and(|contact| contact.is_ready())
+            && self.indirect_light.as_ref().is_some_and(|pass| pass.is_ready())
             && self.atmosphere.as_ref().is_some_and(|pass| pass.is_ready())
             && self.volumetric_clouds.as_ref().is_some_and(|pass| pass.is_ready())
             && self.sky_discs.as_ref().is_some_and(|pass| pass.is_ready())
@@ -1460,6 +1491,7 @@ impl Renderer {
         self.shadow_pipelines.wait();
         self.ambient_occlusion.as_ref().expect("startup AO pipelines").wait();
         self.contact_shadows.as_ref().expect("startup contact pipelines").wait();
+        self.indirect_light.as_ref().expect("startup indirect-light pipelines").wait();
         self.atmosphere.as_ref().expect("startup atmosphere pipelines").wait();
         self.volumetric_clouds.as_ref().expect("startup cloud pipelines").wait();
         self.sky_discs.as_ref().expect("startup sky disc pipelines").wait();
@@ -1684,7 +1716,7 @@ impl Renderer {
     pub fn msaa_samples(&self) -> u32 { self.world.msaa }
 
     fn clamp_msaa(&self, requested: u32, settings: EnhancedSettings) -> u32 {
-        let auxiliary = settings.ambient_occlusion || settings.emissive_bloom || settings.needs_sun_mask() || settings.material_reflections || settings.environment_probe;
+        let auxiliary = settings.ambient_occlusion || settings.indirect_light || settings.emissive_bloom || settings.needs_sun_mask() || settings.material_reflections || settings.environment_probe;
         if auxiliary {
             self.msaa_supported.iter().copied().filter(|&count| count <= requested
                 && self.auxiliary_msaa.sample_count_supported(count)
@@ -1853,6 +1885,7 @@ impl Renderer {
         let changed_frame = previous.any_enabled() != settings.any_enabled()
             || previous.ambient_occlusion != settings.ambient_occlusion
             || previous.emissive_bloom != settings.emissive_bloom
+            || previous.indirect_light != settings.indirect_light
             || previous.needs_sun_mask() != settings.needs_sun_mask()
             || (previous.material_reflections || previous.environment_probe) != (settings.material_reflections || settings.environment_probe);
         self.enhanced_settings = settings;
@@ -1866,7 +1899,7 @@ impl Renderer {
         if settings.weather_particles {
             if self.weather_particles.is_none() { self.weather_particles = Some(weather_particles::WeatherParticles::new(&self.device, self.format)); }
         } else { self.weather_particles = None; }
-        self.moon_exposure.sync(&self.device, settings.night_mode == NightMode::Moonlit);
+        self.moon_exposure.sync(&self.device, settings.night_mode == NightMode::Moonlit || settings.indirect_light);
         if previous.night_mode != settings.night_mode {
             self.sun_shadows = None;
             self.point_shadows = None;
@@ -1907,6 +1940,9 @@ impl Renderer {
         if !settings.contact_shadows {
             self.contact_shadows.as_mut().expect("startup contact pipelines").release_targets();
         }
+        if !settings.indirect_light {
+            self.indirect_light.as_mut().expect("startup indirect-light pipelines").release_targets();
+        }
         if !settings.sun_shadows && !settings.moon_shadows && !(settings.ground_grass && settings.grass_sun_shadows)
             && !settings.volumetric_shafts && !settings.needs_admitted_lights()
             && settings.night_mode != NightMode::Moonlit { self.sun_shadows = None; }
@@ -1922,6 +1958,7 @@ impl Renderer {
     fn release_effect_targets(&mut self) {
         self.ambient_occlusion.as_mut().expect("startup AO pipelines").release_targets();
         self.contact_shadows.as_mut().expect("startup contact pipelines").release_targets();
+        self.indirect_light.as_mut().expect("startup indirect-light pipelines").release_targets();
         self.release_atmosphere_targets();
         if let Some(particles) = self.weather_particles.as_mut() { particles.release_targets(); }
         if let Some(weather) = self.rain_wet.as_mut() { weather.release_targets(); }
@@ -1956,11 +1993,13 @@ impl Renderer {
     pub fn enhanced_target_bytes(&self) -> u64 {
         self.enhanced_frame.as_ref().map_or(0, |frame| {
             let pixels = u64::from(frame.size.0) * u64::from(frame.size.1);
-            let colour = 4 + 8 * (u64::from(frame.ambient.is_some()) + u64::from(frame.emissive.is_some()) + u64::from(frame.sun.is_some()) + u64::from(frame.reflection_surface.is_some()) + u64::from(frame.reflection_mask.is_some())) + 2 * u64::from(frame.water_cloud.is_some());
+            let ambient_bytes = if enhanced::ambient_format(&self.enhanced_settings) == enhanced::ALBEDO { 4 } else { 8 };
+            let colour = 4 + ambient_bytes * u64::from(frame.ambient.is_some()) + 8 * (u64::from(frame.emissive.is_some()) + u64::from(frame.sun.is_some()) + u64::from(frame.reflection_surface.is_some()) + u64::from(frame.reflection_mask.is_some())) + 2 * u64::from(frame.water_cloud.is_some()) + 4 * u64::from(frame.albedo.is_some());
             let samples = u64::from(frame.sample_count);
             pixels * (colour + 4 * samples + if samples > 1 { colour * samples + 4 } else { 0 })
         }) + self.ambient_occlusion.as_ref().map_or(0, ambient_occlusion::AmbientOcclusion::target_bytes)
             + self.contact_shadows.as_ref().map_or(0, contact_shadows::ContactShadows::target_bytes)
+            + self.indirect_light.as_ref().map_or(0, indirect_light::IndirectLight::target_bytes)
             + self.bloom.as_ref().map_or(0, |bloom| bloom.bytes)
             + self.grade.as_ref().map_or(0, grade::Grade::bytes)
             + self.atmosphere_target_bytes()
@@ -2054,7 +2093,7 @@ impl Renderer {
         self.sky.directional_epoch = self.time;
         self.water_light = scene.water_light;
         self.moon_exposure = moon_exposure::MoonExposure::from_scene(scene);
-        self.moon_exposure.sync(&self.device, self.enhanced_settings.night_mode == NightMode::Moonlit);
+        self.moon_exposure.sync(&self.device, self.enhanced_settings.night_mode == NightMode::Moonlit || self.enhanced_settings.indirect_light);
         self.sun_shadows = None;
         self.point_shadows = None;
         self.sky.clouds.clear();
@@ -2259,6 +2298,8 @@ impl Renderer {
         self.env = scene.environment.unwrap_or_else(|| default_environment(radius));
         self.lens = scene.lens.unwrap_or_default();
         self.fog = scene.fog_model.clone();
+        self.indirect_rooms.clone_from(&scene.room_volumes);
+        self.indirect_light.as_mut().expect("startup indirect-light pipelines").invalidate_rooms();
         let slots = instance_slots(scene, &mesh_range);
         self.spaceship_slots = vec![false; insts.len()];
         for &instance in &scene.spaceships {
@@ -3074,6 +3115,7 @@ impl Renderer {
             enhanced_frame.and_then(|frame| frame.attachment(4)),
             enhanced_frame.and_then(|frame| frame.attachment(5)),
             enhanced_frame.and_then(|frame| frame.attachment(6)),
+            enhanced_frame.and_then(|frame| frame.attachment(7)),
         ];
         if isolate_sky { attachments[0].as_mut().unwrap().ops.store = wgpu::StoreOp::Store; }
         if split_effect_cost {
@@ -3300,6 +3342,18 @@ impl Renderer {
         }
         if self.enhanced_settings.contact_shadows {
             self.encode_enhanced_contact_shadows(&mut enc, vp, cam.pos, Vec3::from(env.sun_dir), far);
+        }
+        if self.enhanced_settings.indirect_light {
+            if let (Some(frame), Some(sky)) = (self.enhanced_frame.as_ref(), self.moon_exposure.buffer()) {
+                if let (Some(diffuse), Some(albedo)) = (&frame.ambient, &frame.albedo) {
+                    let rooms = self.indirect_rooms.as_slice();
+                    let indoors = !rooms.is_empty() || self.fog.as_ref().is_some_and(|fog| fog.rooms.is_some());
+                    self.indirect_light.as_mut().expect("startup indirect-light pipelines").encode(
+                        &self.device, &self.queue, &mut enc, &frame.resolved_depth, diffuse, albedo, sky,
+                        rooms, indoors, &frame.colour, frame.size, vp, cam.pos, self.enhanced_settings.indirect_strength,
+                    );
+                }
+            }
         }
         self.encode_atmosphere_stack(&mut enc, vp, cam.pos, far, env);
         self.encode_weather(&mut enc, vp, cam.pos, env);
@@ -3588,9 +3642,9 @@ mod sky_tests {
     #[test]
     fn ambient_alpha_follows_depth_owner_without_changing_rgb_blending() {
         for state in [None, Some(wgpu::BlendState::ALPHA_BLENDING), Some(native_blend_state(Blend::SourceColorOne))] {
-            for depth_write in [false, true] {
-                let target = ambient_target(state, depth_write);
-                assert_eq!(target.format, enhanced::AUX);
+            for (depth_write, format) in [false, true].into_iter().flat_map(|write| [enhanced::AUX, enhanced::ALBEDO].map(|format| (write, format))) {
+                let target = ambient_target(state, depth_write, format);
+                assert_eq!(target.format, format);
                 assert_eq!(target.blend.map(|blend| blend.color), state.map(|blend| blend.color));
                 assert_eq!(target.blend.map(|blend| blend.alpha), state.map(|_| wgpu::BlendComponent::REPLACE));
                 assert_eq!(target.write_mask, if depth_write { wgpu::ColorWrites::ALL } else { wgpu::ColorWrites::COLOR });
