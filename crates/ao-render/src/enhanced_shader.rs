@@ -237,7 +237,7 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
 fn early_rejection(source: &mut String) {
     if source.contains("fn material_prepare(") {
         *source = source.replace("fn material_prepare(i: VOut) {", "fn material_prepare_derivatives(i: VOut) {");
-        let start = source.find("    var geometric_visibility = 1.0;").expect("material receiver");
+        let start = source.find("    material_visibility_value = sun_visibility(").expect("material receiver");
         let end = source[start..].find("    material_albedo_value =").unwrap() + start;
         let receiver = source[start..end].replace("cross(dpdx(i.wpos), dpdy(i.wpos))", "early_geometric_normal");
         source.replace_range(start..end, "");
@@ -608,16 +608,36 @@ fn pixel(p: vec4<f32>, early: bool) -> vec4<f32> {{
         });
         let ggx = generated[generated.find("fn authored_specular(").unwrap()..].split("\n}").next().unwrap();
         let math = include_str!("authored_specular.wgsl").split("fn authored_specular(").next().unwrap();
+        // Extend the existing numeric memo probe with the generated caller chain,
+        // not a second scene fixture. The instrumented uncached body counts misses;
+        // fog/admission image regressions continue to cover actual shadow maps.
+        let mut receiver_source = crate::moon_shadows::shader(generated.clone(), true, true);
+        crate::foliage_detail::append_shader(&mut receiver_source, true, false);
+        let function = |name: &str| {
+            let start = receiver_source.find(&format!("fn {name}(")).unwrap();
+            let end = start + receiver_source[start..].find("\n}").unwrap() + 2;
+            receiver_source[start..end].to_owned()
+        };
+        let prepare = function("material_prepare");
+        let no_provenance = prepare.replace("fn material_prepare(", "fn material_prepare_without_provenance(")
+            .replace("MATERIAL_STATIC_PROVENANCE", "false");
+        let sunlight = function("authored_sun_visibility");
+        let moon_visibility = function("authored_moon_visibility");
+        let transmission = function("foliage_detail_transmission");
         let source = format!(r#"
 struct VOut {{ wpos: vec3<f32>, n: vec3<f32>, clip: vec4<f32>, tint: vec4<f32>, effect: u32 }}
 struct Globals {{ eye: vec4<f32>, sun_dir: vec4<f32>, sun_g: vec4<f32> }}
-struct Material {{ emissive: vec4<f32> }}
+struct Material {{ emissive: vec4<f32>, native: vec4<f32> }}
 struct ShadowFrame {{ moon_direction: vec4<f32> }}
 var<private> g: Globals;
 var<private> mat: Material;
 var<private> shadow_frame: ShadowFrame;
 var<private> enhanced_sun_visibility: f32 = 1.0;
 var<private> calls: u32 = 0u;
+const MATERIAL_STATIC_PROVENANCE: bool = true;
+var<private> early_geometric_normal: vec3<f32>;
+var<private> material_visibility_value: f32;
+var<private> material_static_visibility_value: f32;
 var<private> material_footprint: f32 = 1.0;
 var<private> material_variance: f32 = 0.0;
 var<private> material_albedo_value: vec3<f32> = vec3<f32>(0.5);
@@ -639,6 +659,11 @@ fn sun_visibility_uncached(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>
 {math}
 {ggx}
 }}
+{prepare}
+{no_provenance}
+{sunlight}
+{moon_visibility}
+{transmission}
 @vertex fn vs(@builtin(vertex_index) n: u32) -> @builtin(position) vec4<f32> {{
     return vec4<f32>(vec2<f32>(f32((n << 1u) & 2u), f32(n & 2u)) * 2.0 - 1.0, 0.0, 1.0);
 }}
@@ -648,11 +673,42 @@ fn sun_visibility_uncached(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>
     let normal = vec3<f32>(0.0, 0.6, 0.8);
     g = Globals(vec4<f32>(world + normal, 1.0), vec4<f32>(normal, 0.0), vec4<f32>(1.0));
     authored_normal = normal;
+    mat.native.z = 64.0;
+    // The raw facet differs from both the artistic normal and its normalized/
+    // flipped counterpart, so either old caller would force a second miss.
+    early_geometric_normal = normal * 3.0;
+    var chain_ok = true;
+    for (var mode = 0u; mode < 4u; mode++) {{
+        calls = 0u;
+        sun_memo_valid = false;
+        enhanced_sun_visibility = 1.0;
+        shadow_frame.moon_direction.w = f32(mode / 2u);
+        let artist = VOut(world, vec3<f32>(1.0, 0.0, 0.0), p, vec4<f32>(32.0), 0u);
+        if mode % 2u == 0u {{ material_prepare_without_provenance(artist); }}
+        else {{ material_prepare(artist); }}
+        chain_ok = chain_ok && calls == select(1u, 0u, mode == 2u);
+        var surface = artist;
+        surface.n = early_geometric_normal;
+        let transfer = foliage_detail_transmission(world, surface.n, p.xy);
+        let beauty_visibility = authored_sun_visibility(world, surface.n, p.xy);
+        let moon_visibility_value = authored_moon_visibility(surface);
+        chain_ok = chain_ok && calls == 1u && all(transfer >= vec3<f32>(0.0));
+        chain_ok = chain_ok && select(material_visibility_value == beauty_visibility,
+            material_visibility_value == 1.0, mode >= 2u);
+        if mode % 2u != 0u {{
+            chain_ok = chain_ok && material_static_visibility_value == select(beauty_visibility, moon_visibility_value, mode >= 2u);
+        }}
+        // Sunlight's moon-neutral reset must not destroy raw visibility on a hit.
+        chain_ok = chain_ok && enhanced_sun_visibility == select(0.0, 1.0, world.x > 1.0);
+    }}
+    shadow_frame.moon_direction.w = 0.0;
+    sun_memo_valid = false;
+    calls = 0u;
     let floor_value = sun_visibility(world, normal, p.xy);
     let first_raw = enhanced_sun_visibility;
     let i = VOut(world, normal, p, vec4<f32>(32.0), 0u);
     let highlight = authored_specular(i, vec3<f32>(0.0));
-    var ok = calls == 1u && enhanced_sun_visibility == first_raw;
+    var ok = chain_ok && calls == 1u && enhanced_sun_visibility == first_raw;
     ok = ok && select(all(highlight == vec3<f32>(0.0)) && floor_value > 0.0,
         any(highlight > vec3<f32>(0.0)), p.x > 1.0);
     let repeated = sun_visibility(world, normal, p.xy);
@@ -727,20 +783,16 @@ fn sun_visibility_uncached(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>
                 expected.split("\n}").next().unwrap(), "fog, cascade, admission and grass receiver math stays verbatim");
             let source = if moon { crate::moon_shadows::shader(source, true, true) } else { source };
             let prepare = source.split("fn material_prepare(").nth(1).unwrap().split("\n}").next().unwrap();
-            let geometric = prepare.find("geometric_visibility = sun_visibility(i.wpos, early_geometric_normal, i.clip.xy);").unwrap();
-            let shading = prepare.find("material_visibility_value = ").unwrap();
-            let provenance = prepare.split("if MATERIAL_STATIC_PROVENANCE {").nth(1).unwrap().split("\n    }").next().unwrap();
-            assert!(provenance.contains("geometric_visibility = sun_visibility("),
-                "without static provenance, only the shading-normal receiver is queried");
-            assert!(shading < geometric, "retain the geometric receiver passed to beauty in the one-entry memo");
-            let after_geometric = prepare[geometric..].split_once('\n').unwrap().1;
-            assert!(!after_geometric.contains("sun_visibility("), "no later query may evict the beauty receiver");
-            let static_visibility = if moon {
-                "material_static_visibility_value = min(shading_raw, geometric_visibility);"
-            } else {
-                "material_static_visibility_value = min(material_visibility_value, geometric_visibility);"
-            };
-            assert!(prepare.contains(static_visibility));
+            let sunlight = if moon { "authored_sun_visibility" } else { "sun_visibility" };
+            assert!(prepare.contains(&format!("material_visibility_value = {sunlight}(i.wpos, early_geometric_normal, i.clip.xy);")));
+            assert!(prepare.contains("material_static_visibility_value = material_visibility_value;"));
+            assert!(!prepare.contains("i.n") && !prepare.contains("min("),
+                "material visibility and provenance share only the facet receiver");
+            assert_eq!(prepare.contains("if MATERIAL_STATIC_PROVENANCE {"), moon,
+                "only moon provenance needs a separately guarded raw query");
+            if moon {
+                assert!(prepare.contains("if MATERIAL_STATIC_PROVENANCE { material_static_visibility_value = sun_visibility(i.wpos, early_geometric_normal, i.clip.xy); }"));
+            }
             assert!(!prepare.contains("dpdx(") && !prepare.contains("dpdy("),
                 "receiver preparation after discard must use the hoisted geometric normal");
             let ggx = source.split("fn authored_specular(").nth(1).unwrap().split("\n}").next().unwrap();
@@ -771,7 +823,7 @@ fn sun_visibility_uncached(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>
         } } }
         let mut foliage = super::source(crate::EnhancedSettings { sun_shadows: true, ..Default::default() });
         crate::foliage_detail::append_shader(&mut foliage, true, false);
-        assert!(foliage.contains("sun_visibility(world, lit_side, pixel)"));
+        assert!(foliage.contains("sun_visibility(world, normal, pixel)"));
         assert!(foliage.contains("bitcast<vec4<u32>>(vec4<f32>(normal, pixel.y))"));
         assert!(!super::source(crate::EnhancedSettings::default()).contains("sun_memo_"));
     }

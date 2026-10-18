@@ -54,11 +54,11 @@ pub(super) fn shader(mut source: String, shadows: bool, moonlit: bool) -> String
         source = source.replace("sun_visibility(", "authored_sun_visibility(")
             .replace("fn authored_sun_visibility(", "fn sun_visibility(");
         // Beauty deliberately treats the moon maps as neutral for sunlight.
-        // Probe provenance must instead reject either smooth/geometric raw
-        // moon shadow, including actor casters, after early coverage rejection.
+        // Persistent provenance must reject raw moon shadows, including actor
+        // casters, while sunlight stays neutral. Reuse beauty's facet receiver.
         source = source.replace(
-            "        geometric_visibility = authored_sun_visibility(i.wpos, early_geometric_normal, i.clip.xy);\n        material_static_visibility_value = min(material_visibility_value, geometric_visibility);",
-            "        let shading_raw = sun_visibility(i.wpos, i.n, i.clip.xy);\n        geometric_visibility = sun_visibility(i.wpos, early_geometric_normal, i.clip.xy);\n        material_static_visibility_value = min(shading_raw, geometric_visibility);",
+            "    material_static_visibility_value = material_visibility_value;",
+            "    material_static_visibility_value = material_visibility_value;\n    if MATERIAL_STATIC_PROVENANCE { material_static_visibility_value = sun_visibility(i.wpos, early_geometric_normal, i.clip.xy); }",
         );
         let reset = if source.contains("var<private> enhanced_sun_visibility:") { "enhanced_sun_visibility = 1.0; " } else { "" };
         source.push_str(&format!("\nfn authored_sun_visibility(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>) -> f32 {{\n    if shadow_frame.moon_direction.w > 0.0 {{ {reset}return 1.0; }}\n    return sun_visibility(world, normal, pixel);\n}}\n"));
@@ -118,16 +118,13 @@ mod tests {
             });
             let generated = shader(original, true, moonlit);
             let prepare = generated.split("fn material_prepare(").nth(1).unwrap().split("\n}").next().unwrap();
-            assert!(prepare.contains("material_visibility_value = authored_sun_visibility(i.wpos, i.n, i.clip.xy);"),
-                "material sunlight still uses neutral visibility when moon maps are active");
-            assert!(prepare.contains("material_static_visibility_value = min(shading_raw, geometric_visibility);"),
-                "persistent probe observations must see actual moon actor shadows");
-            assert!(!prepare.contains("authored_sun_visibility(i.wpos, early_geometric_normal"));
-            let geometric = prepare.find("geometric_visibility = sun_visibility(").unwrap();
-            let sunlight = prepare.find("material_visibility_value = authored_sun_visibility(").unwrap();
-            let raw_shading = prepare.find("let shading_raw = sun_visibility(i.wpos, i.n, i.clip.xy);").unwrap();
-            assert!(sunlight < raw_shading && raw_shading < geometric,
-                "raw moon provenance leaves the geometric memo available to moon lighting");
+            assert!(prepare.contains("material_visibility_value = authored_sun_visibility(i.wpos, early_geometric_normal, i.clip.xy);"),
+                "material sunlight stays neutral when moon maps are active");
+            let raw = "if MATERIAL_STATIC_PROVENANCE { material_static_visibility_value = sun_visibility(i.wpos, early_geometric_normal, i.clip.xy); }";
+            assert!(prepare.contains(raw), "persistent observations must see raw moon actor shadows only when requested");
+            assert!(!prepare.contains("i.n") && !prepare.contains("min("));
+            assert!(prepare.find("material_visibility_value = authored_sun_visibility(").unwrap() < prepare.find(raw).unwrap(),
+                "raw moon provenance leaves the shared facet memo available to moon lighting");
             assert!(generated.contains("let visibility = material_static_visibility_value;"));
         }
     }

@@ -186,7 +186,7 @@ mod tests {
         append_shader(&mut source,true,false);
         let fog = "let rgb = select(mix(lit, authored_fog, f), lit, add);";
         assert!(source.contains(fog) && original.contains(fog));
-        assert!(source.contains("sun_visibility(world, lit_side, pixel)"));
+        assert!(source.contains("sun_visibility(world, normal, pixel)"));
         assert!(source.contains("max(g.sun_g.rgb, vec3<f32>(0.0))"));
         assert!(!source.contains("foliage_pushers"));
         for sun in [0.0f32, 0.5, 1.0] { for visible in [0.0f32, 0.5, 1.0] { for fog in [0.0f32, 0.5, 1.0] {

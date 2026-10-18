@@ -2010,20 +2010,30 @@ of referencing an unavailable cache.
 
 Directional receivers (`sun_shadows.wgsl`) skip the adjacent cascade when its
 crossfade weight is zero, matching the existing grass receiver guard; positive
-crossfades retain the same taps, bias, visibility and fog math. Material static
-provenance (`materials.wgsl`) queries the shading normal first and geometric plane
-last, keeping the one-entry exact receiver memo available to beauty/GGX/clusters:
-receiving wrappers pass `surface.n = early_geometric_normal` to those consumers.
-The minimum of the two visibility values is unchanged, and geometric derivatives
-remain hoisted before discard. Moon generation queries raw shading then geometric
-provenance while sunlight remains neutral under moon
-maps; existing raw-visibility resets and cache-hit restoration remain unchanged.
-Source regressions in `shadow_tests`, `enhanced_shader` and `moon_shadows` cover the
-zero-weight guard, query order, provenance minimum and derivative separation.
+crossfades retain the same taps, bias, visibility and fog math. Enhanced materials,
+static provenance, beauty/GGX/clusters and foliage transmission share the exact
+hoisted facet receiver plane (`early_geometric_normal`) through the per-pixel memo.
+Authored, smooth and mapped normals still drive their existing lighting cosines
+and BRDFs; transmission normalizes/flips only its lighting normal, not its receiver.
+Moon sunlight remains neutral, while a `MATERIAL_STATIC_PROVENANCE` guard queries
+raw facet visibility (including admitted actor shadows) for persistent observations.
+Moon beauty reuses that same query; without provenance, preparation adds no raw
+moon query. Existing raw-cache resets and cache-hit restoration remain unchanged.
+This is **not image-identical**: material diffuse's bump delta now uses facet-plane
+bias rather than smooth-plane bias, static provenance no longer takes the minimum
+of smooth/facet visibility, and transmission avoids normalization/flip rounding.
+Faithful rendering is untouched. Shadow caster admission, native fog extinction,
+coverage rejection and current-frame-only evaluation remain unchanged.
+The compact `pbr_shadow_raw_reuse_and_exact_memo_side_effects_on_gpu` numeric
+regression extracts generated receiver preparation and transmission functions,
+counts instrumented uncached queries across the material/provenance/transmission/
+beauty chain in sun/moon frames with provenance on/off, and retains raw-hit controls.
+It is not an image/fairness fixture; existing hidden-actor, fog, moon-roof and
+history-admission GPU regressions still cover those contracts with real shadow maps.
+Source contracts retain verbatim cascade/fog/admission math and derivative hoisting.
 PBR omits the overwritten `clustered_receiver_spec` call (including its local-light
 shadow scan); non-PBR calls and native unlit/effect/room specular pass-through remain.
-These are work-elimination changes, not reduced quality settings; byte parity
-and whole-frame performance still require the acceptance/marginal fixtures above.
+Whole-frame performance still requires the acceptance/marginal fixtures above.
 
 Sun cascades admit loaded static geometry, including terrain patches, by their
 light volume rather than the camera-visible instance list. Their depth range

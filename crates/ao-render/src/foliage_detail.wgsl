@@ -19,8 +19,7 @@ fn foliage_detail_transmission(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<
     // Broad transmission plus forward scatter, as rvk's 0.5 through + 0.7 glare.
     let through_leaf = max(-dot(facing, sun), 0.0);
     let toward_eye = pow(max(dot(-view, sun), 0.0), 4.0);
-    // Bias on the lit side, never away from the light into the leaf's own shadow.
-    let lit_side = select(-n, n, dot(n, sun) >= 0.0);
-    let visible = sun_visibility(world, lit_side, pixel);
+    // Share the exact receiver plane with beauty; normalize only the lighting cosines.
+    let visible = sun_visibility(world, normal, pixel);
     return sunlight * ((0.5 * through_leaf + 0.7 * toward_eye) * visible);
 }
