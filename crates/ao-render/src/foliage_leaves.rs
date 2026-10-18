@@ -156,7 +156,7 @@ fn shader_source(channels: (bool, bool, bool), night: NightMode, moon_shadows: b
         .replace("//__SUN_FIELD__", if channels.2 { "@location(3) sun: vec4<f32>," } else { "" })
         .replace("//__AMBIENT_WRITE__", if channels.0 { "output.ambient = vec4<f32>(0.0);" } else { "" })
         .replace("//__EMISSIVE_WRITE__", if channels.1 { "output.emissive = vec4<f32>(0.0);" } else { "" })
-        .replace("//__SUN_WRITE__", if channels.2 { "output.sun = vec4<f32>(0.0);" } else { "" })
+        .replace("//__SUN_WRITE__", if channels.2 { "output.sun = vec4<f32>(0.0, 0.0, native_fog(i.fog), output.beauty.a);" } else { "" })
         .replace("//__MOON_RECEIVER__", if night != NightMode::AsGame {
             "let receiver = authored_moon_receiver(i, i.n, false);"
         } else { "let receiver = i;" });
@@ -232,6 +232,11 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn canopy_post_mask_preserves_fog_without_directional_energy() {
+        let source = shader_source((false, false, true), NightMode::AsGame, false);
+        assert!(source.contains("output.sun = vec4<f32>(0.0, 0.0, native_fog(i.fog), output.beauty.a);"));
+    }
     #[test]
     fn sprigs_are_bounded_deterministic_and_never_modify_native_geometry() {
         let vertex = |pos| ao_scene::Vertex { pos, normal: [0.0, 0.0, 1.0], uv: [0.5, 0.5], color: [1.0; 4] };

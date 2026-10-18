@@ -1182,6 +1182,11 @@ Grass retains native per-corner lamp/Gouraud lighting and baked root openness;
 sprigs reuse the shared moon receiver and native exposure lattice. The expanded
 admitted-light pool and point-shadow consumers are a separate, explicitly
 coordinated lighting integration after that producer is published.
+Canopy auxiliary masks keep zero added directional energy but retain native fog
+in blue and beauty coverage in alpha, matching post-processing's mask contract.
+Procedural surfaces without a native motion-raster owner retain reactive motion
+and ID zero, so TAA and motion blur reject their history rather than retaining
+a revoked character's bend or trail.
 
 The ignored headless regression
 `graphics_offline_night_preserves_fog_and_hidden_actor_isolation` uses
