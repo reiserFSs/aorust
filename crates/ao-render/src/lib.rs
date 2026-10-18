@@ -36,6 +36,7 @@ mod pipelines;
 mod foliage_edges;
 mod foliage;
 mod foliage_detail;
+mod foliage_leaves;
 use pipelines::{Pipelines, Slot as PipelineSlot, Spec as PipelineSpec};
 mod heat_haze;
 mod gpu_stats;
@@ -677,6 +678,7 @@ pub struct Renderer {
     grass: Option<grass::Grass>,
     foliage: foliage::Foliage,
     foliage_detail_state: foliage_detail::State,
+    canopy_leaves: foliage_leaves::Leaves,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub format: wgpu::TextureFormat,
@@ -1202,6 +1204,7 @@ impl Renderer {
             grass: None,
             foliage: foliage::Foliage::default(),
             foliage_detail_state: foliage_detail::State::default(),
+            canopy_leaves: foliage_leaves::Leaves::default(),
             stats: FrameStats::default(),
             time: 0.0,
             movers: vec![],
@@ -1311,6 +1314,7 @@ impl Renderer {
         self.contact_shadows.as_ref().expect("startup contact pipelines").wait();
         self.screen.wait();
         self.heat_haze.wait();
+        self.canopy_leaves.wait();
         self.wait_skin_pipeline();
         if let Some(temporal) = &self.temporal_programs { temporal.wait(); }
         if let Some(motion) = &self.motion_programs { motion.wait(); }
@@ -1822,6 +1826,7 @@ impl Renderer {
         // Keep VisualWater's style order (water, acid, lava, star, shallow), including both coplanar passes.
         self.gpu = Gpu { meshes, inst_bufs, mats, opaque, blended, liquid, insts, mesh_range, radius, grid };
         self.foliage = foliage::Foliage::default();
+        self.canopy_leaves.upload(&self.device, scene, &self.gpu);
         self.drawn_visuals.retain(|key, _| matches!(key, VisualKey::Actor(..)));
         self.liquids = scene.liquids.iter().cloned().map(native_liquid::LiquidRun::new).collect();
         self.heat_haze.reset();
@@ -2491,6 +2496,7 @@ impl Renderer {
             let previous = self.post_previous_view.map_or(native_vp, |(matrix, _)| matrix);
             self.prepare_motion_vectors(t.size, native_vp, previous);
         }
+        self.prepare_canopy_leaves();
         let shadow_start = timed.then(std::time::Instant::now);
         self.encode_enhanced_shadows(&mut enc, cam, t.size, env, far);
         if let Some(start) = shadow_start { cpu.shadow_prepare_encode_ms = start.elapsed().as_secs_f64() * 1000.0; }
@@ -2688,6 +2694,7 @@ impl Renderer {
             for priority in [1, 2, 3, 4, 5, 6, 10, 7] {
                 world_phase(&mut pass, priority);
             }
+            calls.set(calls.get() + self.draw_canopy_leaves(&mut pass) as usize);
         }
         if let Some(frame) = enhanced_frame {
             frame.resolve_depth(&mut enc);

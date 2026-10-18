@@ -149,6 +149,7 @@ impl Renderer {
             // actors require at least one current-frame depth-tested visible pixel.
             self.draw_static_shadows(&mut pass, &shadows, false);
             self.draw_actor_shadows(&mut pass, &shadows, false);
+            self.draw_canopy_leaf_shadows(&mut pass, &shadows);
         }
         self.sun_shadows = Some(shadows);
     }

@@ -560,7 +560,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     off.prepare_frozen_rendering();
                     for _ in 0..8 { off.render_frozen()?; }
                 }
-                if interaction || false || false || false {
+                if interaction || settings.foliage_leaves || settings.foliage_flutter || settings.foliage_falling {
                     off.rgba(&shot, &list)?;
                     off.wait_for_pipeline_warmup();
                 }
@@ -829,7 +829,7 @@ fn graphics_offline_night_preserves_fog_and_hidden_actor_isolation() -> anyhow::
             }
             let list = off.frame(&mut shot, 0.0);
             if settings.ground_grass { off.warm_grass_tiles(); }
-            if false || false || false {
+            if settings.foliage_leaves || settings.foliage_flutter || settings.foliage_falling {
                 off.rgba(&shot, &list)?;
                 off.wait_for_pipeline_warmup();
             }
@@ -882,6 +882,9 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
         "foliage-edges" => settings.foliage_edges = true,
         "foliage-sway" => settings.foliage_sway = true,
         "foliage-push" => settings.foliage_push = true,
+        "foliage-leaves" => settings.foliage_leaves = true,
+        "foliage-flutter" => settings.foliage_flutter = true,
+        "foliage-falling" => settings.foliage_falling = true,
         "foliage-subdivision" => settings.foliage_subdivision = true,
         "foliage-translucency" => settings.foliage_translucency = true,
         "foliage-lod" => settings.foliage_lod = true,
@@ -891,6 +894,9 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             settings.foliage_edges = true;
             settings.foliage_sway = true;
             settings.foliage_push = true;
+            settings.foliage_leaves = true;
+            settings.foliage_flutter = true;
+            settings.foliage_falling = true;
             settings.foliage_subdivision = true;
             settings.foliage_translucency = true;
             settings.foliage_lod = true;
@@ -947,7 +953,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             grass_density: 1.0, grass_distance: 50.0, sun_boost: 0.5, grade_strength: 0.8, contact_strength: 0.4,
             ..Default::default()
         },
-        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before|foliage-edges|foliage-sway|foliage-push|foliage-subdivision|foliage-translucency|foliage-lod|all-foliage|all-foliage-shadows"),
+        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before|foliage-edges|foliage-sway|foliage-push|foliage-leaves|foliage-flutter|foliage-falling|foliage-subdivision|foliage-translucency|foliage-lod|all-foliage|all-foliage-shadows"),
     }
     Ok(settings)
 }
@@ -1018,7 +1024,9 @@ fn graphics_fixture_foliage_profiles_are_independent() {
     }
     check!(
         "foliage-edges" => foliage_edges, "foliage-sway" => foliage_sway,
-        "foliage-push" => foliage_push, "foliage-subdivision" => foliage_subdivision,
+        "foliage-push" => foliage_push, "foliage-leaves" => foliage_leaves,
+        "foliage-flutter" => foliage_flutter, "foliage-falling" => foliage_falling,
+        "foliage-subdivision" => foliage_subdivision,
         "foliage-translucency" => foliage_translucency, "foliage-lod" => foliage_lod,
     );
     assert_eq!(graphics_fixture_settings("all-foliage-shadows").unwrap(),

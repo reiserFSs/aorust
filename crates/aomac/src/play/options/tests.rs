@@ -973,7 +973,9 @@ fn foliage_graphics_switches_roundtrip_independently_and_restore() {
     }
     check!(
         "AomacFoliageEdges" => foliage_edges, "AomacFoliageSway" => foliage_sway,
-        "AomacFoliagePush" => foliage_push, "AomacFoliageSubdivision" => foliage_subdivision,
+        "AomacFoliagePush" => foliage_push, "AomacFoliageLeaves" => foliage_leaves,
+        "AomacFoliageFlutter" => foliage_flutter, "AomacFoliageFalling" => foliage_falling,
+        "AomacFoliageSubdivision" => foliage_subdivision,
         "AomacFoliageTranslucency" => foliage_translucency, "AomacFoliageLod" => foliage_lod,
     );
     std::fs::remove_dir_all(tmp).unwrap();
@@ -1094,7 +1096,8 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
     for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows",
         "AomacHeightHaze", "AomacLandHaze", "AomacValleyMist", "AomacVolumetricShafts",
         "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs",
-        "AomacFoliageEdges", "AomacFoliageSway", "AomacFoliagePush", "AomacFoliageSubdivision", "AomacFoliageTranslucency", "AomacFoliageLod"] {
+        "AomacFoliageEdges", "AomacFoliageSway", "AomacFoliagePush", "AomacFoliageLeaves", "AomacFoliageFlutter",
+        "AomacFoliageFalling", "AomacFoliageSubdivision", "AomacFoliageTranslucency", "AomacFoliageLod"] {
         let view = r.show(name);
         assert!(!r.gui.checked(r.win(), &view));
         r.click(&view);
@@ -1126,7 +1129,8 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
     for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows",
         "AomacHeightHaze", "AomacLandHaze", "AomacValleyMist", "AomacVolumetricShafts",
         "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs",
-        "AomacFoliageEdges", "AomacFoliageSway", "AomacFoliagePush", "AomacFoliageSubdivision", "AomacFoliageTranslucency", "AomacFoliageLod"] {
+        "AomacFoliageEdges", "AomacFoliageSway", "AomacFoliagePush", "AomacFoliageLeaves", "AomacFoliageFlutter",
+        "AomacFoliageFalling", "AomacFoliageSubdivision", "AomacFoliageTranslucency", "AomacFoliageLod"] {
         let view = r.show(name);
         assert!(!r.gui.checked(r.win(), &view));
     }

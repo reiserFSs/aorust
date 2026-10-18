@@ -147,7 +147,7 @@ pub(crate) struct SunShadows {
 /// Size-independent shadow programs, shared by every runtime target allocation.
 pub(crate) struct Compiled {
     pub pipelines: std::collections::HashMap<(bool, usize, bool), Option<crate::pipeline_creation::RenderPipeline>>,
-    caster_layout: wgpu::BindGroupLayout,
+    pub(super) caster_layout: wgpu::BindGroupLayout,
     visibility_layout: wgpu::BindGroupLayout,
     visibility_pipeline: crate::pipeline_creation::ComputePipeline,
 }
