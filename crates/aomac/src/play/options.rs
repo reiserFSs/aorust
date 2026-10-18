@@ -240,6 +240,7 @@ fn page_xml(page: &Page, idx: usize, n: &mut usize) -> String {
     s
 }
 
+
 impl HudOptions {
     pub(super) fn handles(kind: super::hud::WindowKind) -> bool {
         kind == super::hud::WindowKind::Options

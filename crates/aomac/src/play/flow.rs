@@ -1779,7 +1779,7 @@ impl Frontend for Play {
             self.zone.world.update_with_collision(dt, host.camera.pos.to_array(), host.camera.forward().to_array(), host, query, |id| {
                 player?.effect_anchor(id).map(|matrix| glam::Mat4::from_cols_array_2d(&matrix))
             });
-            if host.enhanced().is_some_and(|s| s.ground_grass && s.grass_density > 0.0 && s.grass_distance > 0.0) {
+            if host.enhanced().is_some_and(|s| s.foliage_enabled() || s.interaction_enabled()) {
                 host.grass_wind = self.world_weather.as_ref().map_or([0.0; 3], |weather| weather.state().wind);
                 host.grass_benders.retain(|bender| bender.actor.is_none());
                 host.grass_benders.extend(self.zone.world.grass_characters()

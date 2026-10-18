@@ -934,6 +934,51 @@ fn enhanced_page_options_default_to_retail_and_persist_across_a_restart() {
 }
 
 #[test]
+fn foliage_graphics_switches_roundtrip_independently_and_restore() {
+    use ao_render::EnhancedSettings;
+    use super::super::enhanced::{self, ControlKind, PageId};
+    let controls = enhanced::controls();
+    let pages = enhanced::pages();
+    let page = pages.iter().find(|page| page.label == "Enhanced/Grass & Plants").unwrap();
+    let tmp = crate::play::prefs::test_dir().join("aomac-foliage-effects-persist");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let mut d = DValues::new(&tmp);
+    d.open_user(&tmp, "account", 7);
+    assert_eq!(d.enhanced_settings(), EnhancedSettings::default());
+    macro_rules! check {
+        ($($name:literal => $field:ident),+ $(,)?) => {$(
+            let control = controls.iter().find(|control| control.name == $name).unwrap();
+            assert_eq!(control.page, PageId::Foliage);
+            assert!(matches!(control.kind, ControlKind::Check));
+            assert_eq!(control.default, Variant::Bool(false));
+            assert_eq!(page.opts().into_iter().filter(|opt| opt.var == $name).count(), 1);
+            d.restore_original_graphics();
+            assert_eq!(d.get($name), Some(&Variant::Bool(false)));
+            assert!(d.persists($name));
+            d.set($name, Variant::Bool(true));
+            let expected = EnhancedSettings { $field: true, ..Default::default() };
+            assert_eq!(d.enhanced_settings(), expected);
+            d.save_user();
+            let mut again = DValues::new(&tmp);
+            again.open_user(&tmp, "other-account", 99);
+            assert_eq!(again.enhanced_settings(), expected);
+            again.restore_original_graphics();
+            assert_eq!(again.enhanced_settings(), EnhancedSettings::default());
+            again.save_user();
+            let mut restored = DValues::new(&tmp);
+            restored.open_user(&tmp, "third-account", 100);
+            assert_eq!(restored.get($name), Some(&Variant::Bool(false)));
+            assert_eq!(restored.enhanced_settings(), EnhancedSettings::default());
+        )+};
+    }
+    check!(
+        "AomacFoliageSway" => foliage_sway,
+        "AomacFoliagePush" => foliage_push, "AomacFoliageSubdivision" => foliage_subdivision,
+        );
+    std::fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
 fn enhanced_graphics_default_persistence_independence_and_reset() {
     use ao_render::EnhancedSettings;
     let tmp = crate::play::prefs::test_dir().join("aomac-enhanced-effects-persist");
@@ -1047,7 +1092,8 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
     let Some(mut r) = Rig::new() else { return };
     for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows",
         "AomacHeightHaze", "AomacLandHaze", "AomacValleyMist", "AomacVolumetricShafts",
-        "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs"] {
+        "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs",
+        "AomacFoliageSway", "AomacFoliagePush", "AomacFoliageSubdivision", ] {
         let view = r.show(name);
         assert!(!r.gui.checked(r.win(), &view));
         r.click(&view);
@@ -1078,7 +1124,8 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
     }
     for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows",
         "AomacHeightHaze", "AomacLandHaze", "AomacValleyMist", "AomacVolumetricShafts",
-        "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs"] {
+        "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs",
+        "AomacFoliageSway", "AomacFoliagePush", "AomacFoliageSubdivision", ] {
         let view = r.show(name);
         assert!(!r.gui.checked(r.win(), &view));
     }

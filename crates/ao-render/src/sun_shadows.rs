@@ -6,11 +6,12 @@ pub(crate) const CASCADES: usize = 3;
 #[cfg(test)]
 pub(crate) const RESOLUTION: u32 = 1024;
 fn shader_source() -> std::borrow::Cow<'static, str> {
-    if std::env::var_os("AOMAC_SHADER_DIR").is_none() {
-        return concat!(include_str!("shader.wgsl"), "\n", include_str!("sun_shadows.wgsl")).into();
-    }
-    format!("{}\n{}", crate::shader_source::load("shader.wgsl", include_str!("shader.wgsl")),
-        crate::shader_source::load("sun_shadows.wgsl", include_str!("sun_shadows.wgsl"))).into()
+    let mut source = format!("{}\n{}", crate::shader_source::load("shader.wgsl", include_str!("shader.wgsl")),
+        crate::shader_source::load("sun_shadows.wgsl", include_str!("sun_shadows.wgsl")));
+    crate::foliage::append_shader(&mut source);
+    source = source.replace("    let wp = model * vec4<f32>(v.pos, 1.0);\n    var o: ShadowVertex;",
+        "    var wp = model * vec4<f32>(v.pos, 1.0);\n    if (u32(mat.native.z) & 64u) != 0u { wp = vec4<f32>(foliage_vertex(v, vtx(v)).wpos, 1.0); }\n    var o: ShadowVertex;");
+    source.into()
 }
 
 pub(crate) fn receiver_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {

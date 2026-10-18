@@ -33,6 +33,8 @@ mod native_ground;
 mod native_texture;
 mod native_liquid;
 mod pipelines;
+mod foliage;
+mod foliage_detail;
 use pipelines::{Pipelines, Slot as PipelineSlot, Spec as PipelineSpec};
 mod heat_haze;
 mod gpu_stats;
@@ -209,6 +211,9 @@ struct Globals {
     directional: [[f32; 4]; 16],
     moon_direction: [f32; 4],
     moon_g: [f32; 4],
+    foliage_wind: [f32; 4],
+    foliage_flags: [f32; 4],
+    foliage_pushers: [[f32; 4]; 16],
 }
 
 /// One submesh draw. Scene pipes use `material_pipe`; sky draws use `sky_material_pipe`.
@@ -223,6 +228,7 @@ struct Draw {
     node: Option<(u32, i32)>,
     origin: [f32; 3],
     projection_pass: bool,
+    vegetation: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -593,7 +599,7 @@ fn mat_uniform(s: &ao_scene::Submesh) -> [f32; 32] {
         | (u32::from(!s.fog_enabled) << 1) | (u32::from(!s.lighting_enabled) << 2)
         // Authored SRCCOLOR/ONE effects use fs_blend, not the additive entry.
         | (u32::from(s.blend == Blend::SourceColorOne && !s.liquid && !s.sky_points && !s.sky_fog) << 3)
-        | (u32::from(s.liquid) << 4) | (u32::from(s.overlay) << 5);
+        | (u32::from(s.liquid) << 4) | (u32::from(s.overlay) << 5) | (u32::from(s.vegetation) << 6);
     [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], fog_mode, s.sun_flicker as u32 as f32, wu, au, wv, av, s.specular[0], s.specular[1], s.specular[2], s.shininess, s.texture_clamp as u32 as f32, fr, fg, fb, s.uv_camera[0], s.uv_camera[1], s.uv_camera[2], s.uv_camera[3],
         s.stage1_env_texture.is_some() as u32 as f32, f32::from(s.alpha_test.unwrap_or(30)) / 255.0, native_flags as f32, f32::from(s.alpha_func)]
 }
@@ -668,6 +674,8 @@ pub struct FrameCpuTimings {
 
 pub struct Renderer {
     grass: Option<grass::Grass>,
+    foliage: foliage::Foliage,
+    foliage_detail_state: foliage_detail::State,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub format: wgpu::TextureFormat,
@@ -1191,6 +1199,8 @@ impl Renderer {
             gpu_timer: None,
             cpu_timings: None,
             grass: None,
+            foliage: foliage::Foliage::default(),
+            foliage_detail_state: foliage_detail::State::default(),
             stats: FrameStats::default(),
             time: 0.0,
             movers: vec![],
@@ -1578,6 +1588,7 @@ impl Renderer {
     /// Replaces the GPU-side scene.
     pub fn upload(&mut self, scene: &Scene) {
         self.reset_post_history();
+        self.foliage_detail_state = foliage_detail::State::default();
         self.sky_dot_counter = 0.0;
         self.sky.directional_epoch = self.time;
         self.water_light = scene.water_light;
@@ -1650,8 +1661,8 @@ impl Renderer {
         // One bind group per distinct (texture, base colour, emissive, glow mask).
         let mut mat_of: HashMap<(usize, usize, bool, [u32; 32]), usize> = HashMap::new();
         let mut mats: Vec<wgpu::BindGroup> = vec![];
-        let mut material = |dev: &Renderer, view: usize, s: &ao_scene::Submesh, ground_patch: Option<&ao_scene::ground_detail::GroundPatch>| {
-            let u = ground_patch.map_or_else(|| mat_uniform(s), |p| native_ground::material_uniform(s, p));
+        let mut material = |dev: &Renderer, view: usize, s: &ao_scene::Submesh, ground_patch: Option<&ao_scene::ground_detail::GroundPatch>, mesh: &ao_scene::Mesh| {
+            let u = ground_patch.map_or_else(|| foliage::material_bounds(mat_uniform(s), s, mesh), |p| native_ground::material_uniform(s, p));
             let env_view = s.stage1_env_texture.and_then(|key| view_of.get(&key).copied()).unwrap_or(0);
             *mat_of.entry((view, env_view, s.texture_clamp, u.map(f32::to_bits))).or_insert_with(|| {
                 let ub = dev.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
@@ -1708,27 +1719,27 @@ impl Renderer {
             }
             mesh_range.push(range);
             insts.extend(list);
-            let vb = self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&mesh.vertices),
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            });
             let mut indices = Vec::with_capacity(idx_total);
             for (si, s) in mesh.submeshes.iter().enumerate() {
                 let first = indices.len() as u32;
                 let nv = mesh.vertices.len() as u32;
                 append_primitive_indices(&mut indices, s, nv);
                 let count = indices.len() as u32 - first;
+                let vegetation = s.vegetation && !s.liquid;
+                if vegetation {
+                    self.foliage_detail_state.bake(mi, first, &mesh.vertices, &indices[first as usize..(first + count) as usize]);
+                }
                 if count > 0 {
                     let view = s.texture.and_then(|k| view_of.get(&k).copied()).unwrap_or(0);
-                    let mat = material(self, view, s, scene.ground_detail.iter().find(|p| p.mesh == mi));
+                    let mat = material(self, view, s, scene.ground_detail.iter().find(|p| p.mesh == mi), mesh);
                     ground_materials[mi][si] = mat;
                     if let (Some(patch), Some(key)) = (scene.ground_detail.iter().find(|p| p.mesh == mi), s.texture) {
                         let uniform = native_ground::material_uniform(s, patch);
                         ground_texture_materials.insert(mat, (key, uniform));
                     }
                     let d = Draw { mesh: mi, first_index: first, count, mat, pipe: world_material_pipe(s),
-                        priority: s.render_priority, node: s.render_node, origin: s.render_origin, projection_pass: s.projection_pass };
+                        priority: s.render_priority, node: s.render_node, origin: s.render_origin, projection_pass: s.projection_pass,
+                        vegetation };
                     if s.liquid {
                         liquid.push(d)
                     } else if blended_material(s.blend) {
@@ -1738,6 +1749,11 @@ impl Renderer {
                     }
                 }
             }
+            let vb = self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&mesh.vertices),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
             let ib = self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: bytemuck::cast_slice(&indices),
@@ -1804,6 +1820,7 @@ impl Renderer {
         let grid = ([grid.origin.x, grid.origin.y, grid.origin.z, grid.cell], [grid.dims[0], grid.dims[1], grid.dims[2], 0]);
         // Keep VisualWater's style order (water, acid, lava, star, shallow), including both coplanar passes.
         self.gpu = Gpu { meshes, inst_bufs, mats, opaque, blended, liquid, insts, mesh_range, radius, grid };
+        self.foliage = foliage::Foliage::default();
         self.drawn_visuals.retain(|key, _| matches!(key, VisualKey::Actor(..)));
         self.liquids = scene.liquids.iter().cloned().map(native_liquid::LiquidRun::new).collect();
         self.heat_haze.reset();
@@ -1919,7 +1936,8 @@ impl Renderer {
                 });
                 let pipe = sky_material_pipe(s);
                 draws.push(Draw { mesh: mi, first_index: first, count, mat, pipe,
-                    priority: s.render_priority, node: None, origin: s.render_origin, projection_pass: s.projection_pass });
+                    priority: s.render_priority, node: None, origin: s.render_origin, projection_pass: s.projection_pass,
+                    vegetation: false });
             }
             let ibytes = (indices.len() * 4) as u64;
             let (ib, created) = ensure_buf(&self.device, old_ib, &mut self.sky.index_capacity[mi], ibytes, wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST, "sky indices");
@@ -2300,7 +2318,7 @@ impl Renderer {
         let (water_color, water_dir) = self.water_light.unwrap_or_default();
         self.sky_dot_counter = (self.sky_dot_counter + 0.01) % 1.0;
         let moon = self.enhanced_moonlight();
-        let g = Globals {
+        let mut g = Globals {
             view_proj: vp.to_cols_array_2d(),
             eye: cam.pos.extend(far).to_array(),
             sun_dir: v4(Vec3::from(env.sun_dir).normalize_or_zero().to_array(), 0.0),
@@ -2334,8 +2352,10 @@ impl Renderer {
                     self.sky.pose.daylight.filter(|day| day.is_finite()).map_or(0.0, |day|
                         self.enhanced_settings.dark_night_strength * (1.0 - day.clamp(0.0, 1.0)))
                 } else { 0.0 }),
+            foliage_wind: { let (phase, wind) = self.foliage.wind(); [wind[0], wind[1], wind[2], phase] },
+            foliage_flags: [f32::from(u8::from(self.enhanced_settings.foliage_sway)), f32::from(u8::from(self.enhanced_settings.foliage_push)), 0.0, 0.0],
+            foliage_pushers: [[0.0; 4]; 16],
         };
-        self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
 
         // Frustum cull per instance (bounding spheres), compacting survivors per mesh.
         let planes = frustum_planes(&vp);
@@ -2355,6 +2375,10 @@ impl Renderer {
         }
         self.frame = (self.frame + 1) % INST_RING;
         self.prepare_actors(cam.pos, cam.forward(), &planes);
+        self.foliage.prepare(cam.pos, vp, self.act.enhanced_grass_actor_ids(env.fog_end.max(env.fog_start + 1e-3)), self.enhanced_settings.foliage_enabled());
+        self.foliage_detail_state.prepare(&self.device, self.enhanced_settings.foliage_subdivision);
+        g.foliage_pushers = self.foliage.pushers();
+        self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
         let grass_start = timed.then(std::time::Instant::now);
         self.prepare_enhanced_grass(cam, vp, env.fog_end.max(env.fog_start + 1e-3), 0.5 * t.size.1 as f32 / (0.5 * self.lens.vertical_fov(aspect)).tan());
         if let Some(start) = grass_start { cpu.grass_prepare_ms = start.elapsed().as_secs_f64() * 1000.0; }
@@ -2517,7 +2541,7 @@ impl Renderer {
             if self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows || self.enhanced_settings.night_mode == NightMode::Moonlit {
                 pass.set_bind_group(3, &self.sun_shadows.as_ref().expect("shadow maps prepared before world").receiver, &[]);
             }
-            let (pipe, mesh, mat) = (std::cell::Cell::new(usize::MAX), std::cell::Cell::new((false, usize::MAX)), std::cell::Cell::new((false, usize::MAX)));
+            let (pipe, mesh, mat) = (std::cell::Cell::new(usize::MAX), std::cell::Cell::new((false, usize::MAX, false)), std::cell::Cell::new((false, usize::MAX)));
             let draw = |pass: &mut wgpu::RenderPass, d: &Draw, insts: std::ops::Range<u32>, sky: bool| {
                 if pipe.get() != d.pipe {
                     pass.set_pipeline(if d.pipe >= 1000 { &self.world.ground_pipes[d.pipe - 1000] }
@@ -2525,17 +2549,29 @@ impl Renderer {
                         else { &self.world.pipes[d.pipe] });
                     pipe.set(d.pipe);
                 }
-                if mesh.get() != (sky, d.mesh) {
-                    let (vb, ib) = if sky { &self.sky.meshes } else { &self.gpu.meshes }[d.mesh].as_ref().unwrap();
+                let detail = if !sky && d.vegetation && self.enhanced_settings.foliage_subdivision
+                    && insts.clone().any(|vi| {
+                        let instance = &self.gpu.insts[self.vis_src[vi as usize] as usize];
+                        foliage_detail::use_subdivision(instance.center, instance.radius, self.foliage.selected())
+                    }) {
+                    self.foliage_detail_state.get(d.mesh, d.first_index)
+                } else { None };
+                let mesh_key = (sky, d.mesh, detail.is_some());
+                if mesh.get() != mesh_key {
+                    let (vb, ib) = detail.map(|(vb, ib, _)| (vb, ib)).unwrap_or_else(|| {
+                        let (vb, ib) = if sky { &self.sky.meshes } else { &self.gpu.meshes }[d.mesh].as_ref().unwrap();
+                        (vb, ib)
+                    });
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                    mesh.set((sky, d.mesh));
+                    mesh.set(mesh_key);
                 }
                 if mat.get() != (sky, d.mat) {
                     pass.set_bind_group(1, &if sky { &self.sky.mats } else { &self.gpu.mats }[d.mat], &[]);
                     mat.set((sky, d.mat));
                 }
-                pass.draw_indexed(d.first_index..d.first_index + d.count, 0, insts.clone());
+                let [first, count] = detail.map_or([d.first_index, d.count], |(_, _, range)| range);
+                pass.draw_indexed(first..first + count, 0, insts.clone());
                 calls.set(calls.get() + 1);
                 if !sky && d.count != 0 {
                     if let Some((node, next)) = d.node {
@@ -2551,7 +2587,7 @@ impl Renderer {
                 if self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows || self.enhanced_settings.night_mode == NightMode::Moonlit {
                     pass.set_bind_group(3, &self.sun_shadows.as_ref().expect("shadow maps prepared before world").receiver, &[]);
                 }
-                pipe.set(usize::MAX); mesh.set((false, usize::MAX)); mat.set((false, usize::MAX));
+                pipe.set(usize::MAX); mesh.set((false, usize::MAX, false)); mat.set((false, usize::MAX));
                 if let Some(inst) = inst_buf {
                     pass.set_vertex_buffer(1, inst.slice(..));
                     let first = self.sorted.partition_point(|command| command.0 < priority);
@@ -2609,7 +2645,7 @@ impl Renderer {
                     if stage == 1 && self.ground_state.path() != GroundPath::ShadowsTwoPass { break; }
                     pass.set_bind_group(0,&self.globals_bg,&[]);
                     pass.set_vertex_buffer(1,inst.slice(..));
-                    pipe.set(usize::MAX);mesh.set((false,usize::MAX));mat.set((false,usize::MAX));
+                    pipe.set(usize::MAX);mesh.set((false,usize::MAX,false));mat.set((false,usize::MAX));
                     for d in &self.gpu.opaque {
                         let Some(palette) = &ground.materials[d.mesh] else { continue; };
                         let r = self.vis_range[d.mesh].clone();

@@ -14,6 +14,9 @@ pub struct EnhancedSettings {
     pub ambient_occlusion: bool,
     pub emissive_bloom: bool,
     pub ground_grass: bool,
+    pub foliage_sway: bool,
+    pub foliage_push: bool,
+    pub foliage_subdivision: bool,
     /// HDR scene + tonemap/grade/dither present; daylight sun and mild outdoor sky fill.
     pub hdr: bool,
     pub grading_enabled: bool,
@@ -73,6 +76,8 @@ impl Default for EnhancedSettings {
             grading_enabled: false, zone_lut: false, vignette: 0.0, contrast: 1.0, saturation: 1.0, warmth: 0.5,
             night_cool: 0.0,
             taa: false, fxaa: false, cas: false, cas_strength: 0.5, motion_blur: 0.0, depth_of_field: false, dof_aperture: 2.0, dof_max_radius: 8.0,
+            foliage_sway: false, foliage_push: false,
+            foliage_subdivision: false,
             shadow_map_size: 2048, shadow_strength: 0.45, shadow_softness: 1.5, ao_radius: 1.75, ao_strength: 1.5, bloom_strength: 0.6,
             grass_density: 1.0, grass_distance: 160.0, sun_boost: 0.6, grade_strength: 0.8, contact_strength: 0.8,
         }
@@ -84,8 +89,16 @@ impl EnhancedSettings {
         self.sun_shadows || self.ambient_occlusion || self.emissive_bloom || self.ground_grass || self.needs_grade() || self.contact_shadows
             || self.height_haze || self.land_haze || self.valley_mist || self.volumetric_shafts
             || self.cloud_gap_shafts || self.volumetric_clouds || self.cloud_shadows || self.sky_discs
-            || self.moon_shadows || self.night_mode != NightMode::AsGame
+            || self.moon_shadows || self.night_mode != NightMode::AsGame || self.foliage_enabled()
             || self.post_enabled()
+    }
+
+    pub fn foliage_enabled(self) -> bool {
+        self.foliage_sway || self.foliage_push || self.foliage_subdivision
+    }
+
+    pub fn interaction_enabled(self) -> bool {
+        self.foliage_push || self.foliage_subdivision || self.ground_grass
     }
 
     pub fn needs_grade(self) -> bool {
@@ -168,6 +181,26 @@ mod tests {
             cas_strength: 9.0, motion_blur: 9.0, dof_aperture: 9.0, dof_max_radius: 99.0, ..defaults }.clamped();
         assert_eq!((bounded.vignette, bounded.contrast, bounded.saturation, bounded.warmth, bounded.night_cool), (1.0, 2.0, 0.0, 1.0, 1.0));
         assert_eq!((bounded.cas_strength, bounded.motion_blur, bounded.dof_aperture, bounded.dof_max_radius), (1.0, 1.0, 8.0, 16.0));
+    }
+
+    #[test]
+    fn foliage_switches_are_independent_and_default_off() {
+        let defaults = EnhancedSettings::default();
+        assert!(!defaults.foliage_enabled() && !defaults.interaction_enabled());
+        macro_rules! check {
+            ($($field:ident => $interaction:expr),+ $(,)?) => {$(
+                assert!(!defaults.$field);
+                let settings = EnhancedSettings { $field: true, ..defaults };
+                assert!(settings.foliage_enabled() && settings.any_enabled());
+                assert_eq!(settings.interaction_enabled(), $interaction);
+                assert_eq!(settings.clamped(), settings);
+            )+};
+        }
+        check!(
+            foliage_sway => false, foliage_push => true,
+            foliage_subdivision => true,
+            );
+        assert!(EnhancedSettings { ground_grass: true, ..defaults }.interaction_enabled());
     }
 
     #[test]

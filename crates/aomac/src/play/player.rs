@@ -755,7 +755,7 @@ impl Player {
             host.actor_models.push((avatar::MODEL_KEY, self.avatar.model_arc()));
             self.model_sent = true;
         }
-        if host.enhanced().is_some_and(|s| s.ground_grass && s.grass_density > 0.0 && s.grass_distance > 0.0) {
+        if host.enhanced().is_some_and(|s| s.foliage_enabled() || s.interaction_enabled()) {
             host.grass_benders.clear();
             host.grass_benders.push(ao_render::GrassBender { actor: None, position: scene_pos(pos) });
             host.grass_exposure = self.collision.as_ref().map(|surface| {
@@ -764,6 +764,7 @@ impl Player {
                     .unwrap_or_else(|| grass_exposure_surface(Rc::clone(surface)))
             });
         } else {
+            host.grass_benders.clear();
             host.grass_exposure = None;
         }
         // `VisualCATMesh_t::RunFunction` -> `RefreshAlpha`: opacity from the camera <-> head attractor distance (own character only)

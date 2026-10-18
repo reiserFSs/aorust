@@ -11,6 +11,7 @@ pub(super) struct Key {
     ao: bool,
     bloom: bool,
     sun_mask: bool,
+    foliage: [bool; 3],
     pub msaa: u32,
 }
 
@@ -18,9 +19,10 @@ impl Key {
     pub(super) fn of(settings: EnhancedSettings, msaa: u32) -> Self {
         Self { shadows: settings.sun_shadows || settings.moon_shadows, ao: settings.ambient_occlusion,
             moon_shadows: settings.moon_shadows, night_mode: settings.night_mode,
-            bloom: settings.emissive_bloom, sun_mask: settings.needs_sun_mask(), msaa }
+            bloom: settings.emissive_bloom, sun_mask: settings.needs_sun_mask(), msaa,
+            foliage: [settings.foliage_sway, settings.foliage_push, settings.foliage_subdivision] }
     }
-    fn enhanced(self) -> bool { self.shadows || self.ao || self.bloom || self.sun_mask || self.night_mode != super::NightMode::AsGame }
+    fn enhanced(self) -> bool { self.shadows || self.ao || self.bloom || self.sun_mask || self.night_mode != super::NightMode::AsGame || self.foliage.iter().any(|&v| v) }
 }
 
 pub(super) struct Pipes {
@@ -137,9 +139,13 @@ impl Request {
     pub(super) fn prepare(&self) -> Pipes {
         let shader = self.key.enhanced().then(|| {
             let source = super::enhanced_shader::source(self.settings);
-            let source = if self.settings.night_mode != super::NightMode::AsGame {
+            let mut source = if self.settings.night_mode != super::NightMode::AsGame {
                 super::moon_shadows::shader(source, self.settings.moon_shadows, self.settings.night_mode == super::NightMode::Moonlit)
             } else { source };
+            if self.settings.foliage_enabled() {
+                super::foliage::append_shader(&mut source);
+                super::foliage_detail::append_shader(&mut source, false, false);
+            }
             self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("Enhanced world"), source: wgpu::ShaderSource::Wgsl(source.into()),
             })

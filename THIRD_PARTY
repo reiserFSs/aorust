@@ -117,3 +117,18 @@ from the same revision. Copyright (c) 2026 wannabuh; the full MIT permission and
 warranty notice above applies to these ports. Exact native pose motion, per-tap
 admission identity validation, own-character focus and current-frame depth guards
 are specific to this renderer.
+
+Native foliage and recovering grass trails
+==========================================
+
+The split foliage core/edge partition, damped spring-back response, canopy sprig
+and gust-falling leaf construction, and recovering trail field in
+crates/ao-render/src/foliage*.{rs,wgsl} and grass.{rs,wgsl} are ports/adaptations
+of ao-vk's rvk/draw.cpp, leaves.cpp, grass.cpp and shaders/ffp.vert,
+ffp_main.glsl, sway.glsl, wind.glsl and grass.vert.
+Source: https://github.com/wannabuh/ao-vk (MIT, Copyright (c) 2026 wannabuh).
+The MIT permission and warranty notice above applies to these adaptations.
+Native resource-name classification, current-frame source admission/revocation,
+world-anchored stabilized wind, unchanged original canopy coverage and bounded
+native topology refinement are specific to this renderer. No client assets are
+redistributed.

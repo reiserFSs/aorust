@@ -1694,3 +1694,5 @@ screenshot readback. It warms 120 frames, records 600 samples, and writes
 milliseconds. Acquire the shared GPU timing lock before timing; do not run
 concurrent captures or GPU tests.
 
+
+Native foliage sway, admitted-character push and near-character subdivision are independent default-off controls on Enhanced/Grass & Plants. Their fixture profiles are `foliage-sway`, `foliage-push` and `foliage-subdivision`; `all-foliage` combines the available foliage switches plus Ground Grass. Source identity is documented in `docs/formats.md`; native trunks, actors and unknown textures remain rigid. Wind shares stabilized grass weather; source-owned spring contacts revoke on lost final-camera admission or terrain LOS.

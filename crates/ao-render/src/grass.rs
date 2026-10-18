@@ -21,12 +21,12 @@ const MIN_BLADE_PIXELS: f32 = 0.8;
 
 /// Effect-local radians, never derived from the native f32 animation clock.
 /// Integer shader harmonics make every component continuous across TAU.
-fn advance_wind_phase(phase: f64, dt: f32) -> f64 {
+pub(super) fn advance_wind_phase(phase: f64, dt: f32) -> f64 {
     let dt = if dt.is_finite() { dt.clamp(0.0, 0.1) } else { 0.0 };
     (phase + f64::from(dt) * 0.05).rem_euclid(std::f64::consts::TAU)
 }
 
-fn wind_target(wind: [f32; 3]) -> [f32; 3] {
+pub(super) fn wind_target(wind: [f32; 3]) -> [f32; 3] {
     let speed = wind[0].hypot(wind[2]);
     let direction = if speed > 0.05 { [wind[0] / speed, wind[2] / speed] } else { [0.8, 0.6] };
     [direction[0], direction[1], (0.35 + 0.1 * speed).min(2.5)]
@@ -34,7 +34,7 @@ fn wind_target(wind: [f32; 3]) -> [f32; 3] {
 
 /// Smooth the effect's bend vector, not native weather. Do not renormalize the
 /// filtered direction: reversals should pass gently through stillness.
-fn smooth_wind(filtered: [f32; 3], wind: [f32; 3], dt: f32) -> [f32; 3] {
+pub(super) fn smooth_wind(filtered: [f32; 3], wind: [f32; 3], dt: f32) -> [f32; 3] {
     let target = wind_target(wind);
     let dt = if dt.is_finite() { dt.clamp(0.0, 0.1) } else { 0.0 };
     let share = -(-dt * 0.5).exp_m1();
@@ -127,10 +127,8 @@ pub(super) struct Grass {
     surface_parities: Vec<u32>,
     samples: u32,
     channels: (bool, bool, bool),
-    wind: [f32; 3],
     wind_phase: f64,
     filtered_wind: [f32; 3],
-    wind_seeded: bool,
     benders: [[f32; 3]; MAX_BENDERS],
     bender_count: usize,
     inputs: Vec<GrassBender>,
@@ -212,7 +210,7 @@ impl Grass {
         Self {
             #[cfg(test)]
             forced_band: None,
-            pipeline, bind, layout, shadows, cells_buffer, params_buffer, visible_buffer, noise_view, noise_sampler, mask_view, green_bytes: green.layers.len(), cells: Vec::with_capacity(MAX_CELLS), batches: Vec::with_capacity(MAX_CELLS), visible: std::array::from_fn(|_| Vec::with_capacity(MAX_CELLS)), draws: Vec::new(), stride: 0, band_strides: [0; BANDS], surface_heights: Vec::new(), surface_parities: Vec::new(), samples, channels, wind: [0.0; 3], wind_phase: 0.0, filtered_wind, wind_seeded: false, benders: [[0.0; 3]; MAX_BENDERS], bender_count: 0, inputs: Vec::with_capacity(MAX_BENDERS), prepare_cpu_ns: 0, exposure: None, exposure_cache: std::collections::HashMap::with_capacity(MAX_EXPOSURE_CELLS * 2), exposure_order: std::collections::VecDeque::with_capacity(MAX_EXPOSURE_CELLS), candidates: Vec::with_capacity(MAX_CELLS), order: Vec::with_capacity(MAX_CELLS), last_selection: None, last_radius: 0, last_path: super::GroundPath::Simple, pending: false }
+            pipeline, bind, layout, shadows, cells_buffer, params_buffer, visible_buffer, noise_view, noise_sampler, mask_view, green_bytes: green.layers.len(), cells: Vec::with_capacity(MAX_CELLS), batches: Vec::with_capacity(MAX_CELLS), visible: std::array::from_fn(|_| Vec::with_capacity(MAX_CELLS)), draws: Vec::new(), stride: 0, band_strides: [0; BANDS], surface_heights: Vec::new(), surface_parities: Vec::new(), samples, channels, wind_phase: 0.0, filtered_wind, benders: [[0.0; 3]; MAX_BENDERS], bender_count: 0, inputs: Vec::with_capacity(MAX_BENDERS), prepare_cpu_ns: 0, exposure: None, exposure_cache: std::collections::HashMap::with_capacity(MAX_EXPOSURE_CELLS * 2), exposure_order: std::collections::VecDeque::with_capacity(MAX_EXPOSURE_CELLS), candidates: Vec::with_capacity(MAX_CELLS), order: Vec::with_capacity(MAX_CELLS), last_selection: None, last_radius: 0, last_path: super::GroundPath::Simple, pending: false }
     }
     #[allow(clippy::too_many_arguments)]
     pub fn prepare(&mut self, queue: &wgpu::Queue, ground: &GroundRun, liquids: &[super::native_liquid::LiquidRun], camera: Vec3, settings: super::EnhancedSettings, path: super::GroundPath, view: Option<(super::Mat4, f32)>) {
@@ -557,7 +555,7 @@ fn terrain_normals(ground: &GroundRun, grid: [i32; 2], size: f32) -> Option<[[f3
 }
 
 
-fn select_benders(
+pub(super) fn select_benders(
     inputs: &mut [GrassBender], eye: Vec3, vp: super::Mat4,
     admitted: impl Iterator<Item = u32>,
     line_of_sight: Option<&dyn Fn([f32; 3], [f32; 3]) -> bool>,
@@ -602,10 +600,12 @@ impl super::Renderer {
     /// Advance only Enhanced grass with real frame seconds, once per frontend frame.
     /// Stalls are bounded independently of native animation and game-day clocks.
     pub fn advance_grass_wind(&mut self, dt: f32) {
+        self.foliage.advance(dt);
         self.ensure_grass();
+        let (phase, wind) = self.foliage.wind_state();
         if let Some(grass) = &mut self.grass {
-            grass.wind_phase = advance_wind_phase(grass.wind_phase, dt);
-            grass.filtered_wind = smooth_wind(grass.filtered_wind, grass.wind, dt);
+            grass.wind_phase = phase;
+            grass.filtered_wind = wind;
         }
     }
     fn ensure_grass(&mut self) {
@@ -618,12 +618,7 @@ impl super::Renderer {
         };
         if self.grass.as_ref().is_none_or(|grass| grass.samples != self.msaa_samples() || grass.channels != (settings.ambient_occlusion, settings.emissive_bloom, settings.needs_sun_mask()) || grass.shadows != settings.sun_shadows) {
             let mut grass = Grass::new(&self.device, &self.queue, &ground.green, &self.world.grass);
-            if let Some(previous) = &self.grass {
-                grass.wind = previous.wind;
-                grass.wind_phase = previous.wind_phase;
-                grass.filtered_wind = previous.filtered_wind;
-                grass.wind_seeded = previous.wind_seeded;
-            }
+            (grass.wind_phase, grass.filtered_wind) = self.foliage.wind_state();
             self.grass = Some(grass);
             if let Some(shadows) = &mut self.sun_shadows { shadows.grass_receiver = None; }
         }
@@ -636,6 +631,7 @@ impl super::Renderer {
         }
     }
     pub(super) fn clear_enhanced_grass_inputs(&mut self) {
+        self.foliage.clear_inputs();
         if let Some(grass) = &mut self.grass { grass.inputs.clear(); }
     }
     /// Current-frame opaque character candidates. Admission, LOS and nearest-source
@@ -645,23 +641,21 @@ impl super::Renderer {
     /// The snapshot remains valid for repeated draws/screenshots until the next
     /// actor batch replaces it; visibility is still checked again on every render.
     pub fn set_enhanced_grass_inputs(&mut self, benders: &mut Vec<GrassBender>, wind: [f32; 3]) {
+        self.foliage.set_inputs(benders, wind);
         self.ensure_grass();
+        let (phase, filtered_wind) = self.foliage.wind_state();
         if let Some(grass) = &mut self.grass {
             std::mem::swap(&mut grass.inputs, benders);
             grass.inputs.retain(|b| b.position.iter().all(|v| v.is_finite()));
             benders.clear();
-            grass.wind = wind.map(|v| if v.is_finite() { v } else { 0.0 });
-            // A still render has no dt to converge through: start at the first
-            // supplied weather vector, then smooth subsequent weather frames.
-            if !grass.wind_seeded {
-                grass.filtered_wind = wind_target(grass.wind);
-                grass.wind_seeded = true;
-            }
+            grass.wind_phase = phase;
+            grass.filtered_wind = filtered_wind;
         } else {
             *benders = Vec::new();
         }
     }
     pub fn set_enhanced_grass_exposure(&mut self, exposure: Option<GrassExposure>) {
+        self.foliage.set_exposure(exposure.clone());
         self.ensure_grass();
         if let Some(grass) = &mut self.grass {
             if grass.exposure.as_ref().map(|old| old.generation) != exposure.as_ref().map(|new| new.generation) {

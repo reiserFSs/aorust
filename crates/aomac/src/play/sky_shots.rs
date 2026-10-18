@@ -370,6 +370,29 @@ fn icc_retail_sky_screenshots() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn graphics_fixture_msaa(value: Option<&std::ffi::OsStr>) -> anyhow::Result<u32> {
+    match value {
+        None => Ok(1),
+        Some(value) if value == "1" => Ok(1),
+        Some(value) if value == "2" => Ok(2),
+        Some(value) if value == "4" => Ok(4),
+        Some(value) if value == "8" => Ok(8),
+        Some(value) => anyhow::bail!("AOMAC_GFX_MSAA must be 1, 2, 4 or 8, got {value:?}"),
+    }
+}
+
+#[test]
+fn graphics_fixture_msaa_defaults_and_bounds() {
+    assert_eq!(graphics_fixture_msaa(None).unwrap(), 1);
+    assert_eq!(graphics_fixture_msaa(Some("1".as_ref())).unwrap(), 1);
+    assert_eq!(graphics_fixture_msaa(Some("2".as_ref())).unwrap(), 2);
+    assert_eq!(graphics_fixture_msaa(Some("4".as_ref())).unwrap(), 4);
+    assert_eq!(graphics_fixture_msaa(Some("8".as_ref())).unwrap(), 8);
+    for invalid in ["", "0", "3", "16", "invalid"] {
+        assert!(graphics_fixture_msaa(Some(invalid.as_ref())).is_err());
+    }
+}
+
 /// Frozen world evidence: no network, window, wall-clock simulation or desktop capture.
 /// Run with `AOMAC_GFX_OUT=$HOME/aomac-handoff/gfx/<new-run>`; see docs/play.md.
 #[test]
@@ -386,6 +409,11 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         Ok("1") => true,
         Ok("0") | Err(std::env::VarError::NotPresent) => false,
         _ => anyhow::bail!("AOMAC_GFX_OWN_AVATAR must be 0 or 1"),
+    };
+    let interaction = match std::env::var_os("AOMAC_GFX_FOLIAGE_INTERACTION") {
+        None => false,
+        Some(value) if value == "1" => true,
+        Some(value) => anyhow::bail!("AOMAC_GFX_FOLIAGE_INTERACTION must be 1 when set, got {value:?}"),
     };
     ensure!(!out.exists(), "refusing to overwrite evidence {}", out.display());
     std::fs::create_dir_all(&out)?;
@@ -411,6 +439,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         writeln!(manifest, "icc_clock=authored_frozen2648.69\nsun_low_high_night_source=Borealis800")?;
         writeln!(manifest, "enhanced_settings={settings:?}")?;
         writeln!(manifest, "post_features={features:?}\nforce_own_avatar={own_avatar}\npost_focus_policy=actual_fixture_avatar_position_when_present\npost_warmup_frames=8")?;
+        writeln!(manifest, "foliage_interaction={interaction}\nfoliage_interaction_steps=16\nfoliage_interaction_dt=0\nfoliage_interaction_source=captured_visible_own_avatar\nfoliage_interaction_pose=idle")?;
         let baseline = std::env::var_os("AOMAC_GFX_BASELINE").map(PathBuf::from);
         let png_only = std::env::var_os("AOMAC_GFX_PNG_ONLY").is_some();
         writeln!(manifest, "png_only={png_only}")?;
@@ -451,13 +480,18 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                         graphics_fixture_newland_camera(|point| collision.terrain_height(point))).transpose()?;
                     scene_load_time += started.elapsed();
                     scene_load_count += 1;
-                    let grass_exposure = if settings.ground_grass && settings.grass_density > 0.0 {
+                    let grass_exposure = if settings.foliage_enabled() || settings.interaction_enabled() {
                         Some(super::player::grass_exposure_surface(std::rc::Rc::new(std::cell::RefCell::new(collision))))
                     } else { None };
                     entry.insert((scene, grass_exposure, grounded_camera))
                 }
             };
             let fixed = grounded_camera.unwrap_or(fixed);
+            let interaction_end = fixed.pos + fixed.forward() * 3.0 - Vec3::Y;
+            let interaction_start = interaction_end - Vec3::X;
+            if interaction {
+                writeln!(manifest, "{name} interaction_start_scene={interaction_start:?} interaction_end_scene={interaction_end:?}")?;
+            }
             let capture = |measure: bool| -> anyhow::Result<(Vec<u8>, Lens, usize, usize)> {
                 // Fresh renderers and the original per-capture CRT reset remain independent.
                 // Both consume clones of the same immutable snapshot, including across views.
@@ -480,7 +514,22 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 if measure { std::fs::write(out.join(format!("{name}-msaa.txt")), format!("requested={msaa}\nactual={actual_msaa}\n"))?; }
                 let lightbar = matches!(name.as_str(), "borealis-lightbar-night" | "borealis-lightbar-night-close");
                 let authored_actor = name.starts_with("icc-actor-") || lightbar;
-                if authored_actor || settings.depth_of_field || own_avatar {
+                if interaction {
+                    let mut avatar = super::avatar::Avatar::new(&store, &dir, 25988, &actor,
+                        ao_formats::character::actor::ActorAssets::new(&store)?)?;
+                    off.host.actor_models.push((super::avatar::MODEL_KEY, std::sync::Arc::new(avatar.model().clone())));
+                    if grass_exposure.is_some() { off.warm_grass_tiles(); }
+                    off.prepare_frozen_rendering();
+                    for step in 0..16 {
+                        let position = interaction_start.lerp(interaction_end, step as f32 / 15.0);
+                        avatar.set_transform(position.to_array(), 0.0);
+                        off.host.dynamic_lights.extend(avatar.lights());
+                        off.host.actors.push(avatar.frame());
+                        off.host.grass_benders.clear();
+                        off.host.grass_benders.push(ao_render::GrassBender { actor: None, position: position.to_array() });
+                        list = off.frame(&mut shot, 0.0);
+                    }
+                } else if authored_actor || settings.depth_of_field || own_avatar {
                     let mut appearance = actor.clone();
                     if lightbar {
                         appearance.attractors.retain(|mount| mount.place != 5);
@@ -510,6 +559,10 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 if settings.post_enabled() {
                     off.prepare_frozen_rendering();
                     for _ in 0..8 { off.render_frozen()?; }
+                }
+                if interaction || false || false || false {
+                    off.rgba(&shot, &list)?;
+                    off.wait_for_pipeline_warmup();
                 }
                 let raw = off.rgba(&shot, &list)?;
                 if !sky_pixels.is_empty() {
@@ -776,9 +829,13 @@ fn graphics_offline_night_preserves_fog_and_hidden_actor_isolation() -> anyhow::
             }
             let list = off.frame(&mut shot, 0.0);
             if settings.ground_grass { off.warm_grass_tiles(); }
+            if false || false || false {
+                off.rgba(&shot, &list)?;
+                off.wait_for_pipeline_warmup();
+            }
             off.rgba(&shot, &list)
         };
-        for profile in ["faithful", "grass", "all-no-bloom"] {
+        for profile in ["faithful", "grass", "all-no-bloom", "all-foliage"] {
             let absent = render(profile, false, 0)?;
             let hidden = render(profile, false, 1)?;
             ensure!(absent == hidden, "{name}/{profile}: zero-alpha non-admitted body or its bender changed the image");
@@ -822,6 +879,16 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
         "ao" => settings.ambient_occlusion = true,
         "bloom" => settings.emissive_bloom = true,
         "grass" => settings.ground_grass = true,
+        "foliage-sway" => settings.foliage_sway = true,
+        "foliage-push" => settings.foliage_push = true,
+        "foliage-subdivision" => settings.foliage_subdivision = true,
+        "all-foliage" | "all-foliage-shadows" => {
+            settings.sun_shadows = profile == "all-foliage-shadows";
+            settings.ground_grass = true;
+            settings.foliage_sway = true;
+            settings.foliage_push = true;
+            settings.foliage_subdivision = true;
+        }
         "hdr" => settings.hdr = true,
         "hdr-bloom" => { settings.hdr = true; settings.emissive_bloom = true; }
         "hdr-bloom-max" => { settings.hdr = true; settings.emissive_bloom = true; settings.sun_boost = 0.6; }
@@ -874,7 +941,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             grass_density: 1.0, grass_distance: 50.0, sun_boost: 0.5, grade_strength: 0.8, contact_strength: 0.4,
             ..Default::default()
         },
-        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before"),
+        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before|foliage-sway|foliage-push|foliage-subdivision|all-foliage|all-foliage-shadows"),
     }
     Ok(settings)
 }
@@ -930,6 +997,30 @@ fn graphics_fixture_post_selectors_are_independent_and_composable() {
     assert!(s.taa && s.fxaa && s.cas && s.motion_blur > 0.0 && s.depth_of_field && s.grading_enabled);
     assert!(graphics_fixture_post_features(defaults, "unknown").is_err());
     assert!(graphics_fixture_post_features(defaults, "taa,").is_err());
+}
+
+#[test]
+fn graphics_fixture_foliage_profiles_are_independent() {
+    let all = graphics_fixture_settings("all-foliage").unwrap();
+    let defaults = ao_render::EnhancedSettings::default();
+    macro_rules! check {
+        ($($name:literal => $field:ident),+ $(,)?) => {$(
+            assert_eq!(graphics_fixture_settings($name).unwrap(),
+                ao_render::EnhancedSettings { $field: true, ..defaults });
+            assert!(all.$field);
+        )+};
+    }
+    check!(
+        "foliage-sway" => foliage_sway,
+        "foliage-push" => foliage_push, "foliage-subdivision" => foliage_subdivision,
+        );
+    assert_eq!(graphics_fixture_settings("all-foliage-shadows").unwrap(),
+        ao_render::EnhancedSettings { sun_shadows: true, ..all });
+    assert!(!all.sun_shadows && !all.hdr
+        && !all.ambient_occlusion && !all.emissive_bloom && !all.contact_shadows);
+    for old in ["faithful", "neutral", "grass", "all", "all-no-bloom", "all-before"] {
+        assert!(!graphics_fixture_settings(old).unwrap().foliage_enabled());
+    }
 }
 
 #[test]
@@ -1115,7 +1206,7 @@ fn graphics_enhanced_cpu_timing() -> anyhow::Result<()> {
             off.host.anisotropy = Some(1);
             off.host.fog_density_scale = Some(1.0);
             off.host.enhanced_settings = Some(settings);
-            if settings.ground_grass { off.host.grass_exposure = Some(exposure.clone()); }
+            if settings.foliage_enabled() || settings.interaction_enabled() { off.host.grass_exposure = Some(exposure.clone()); }
             off.host.grass_wind = weather.wind;
             off.frame(&mut shot, 0.0);
             if settings.ground_grass { off.warm_grass_tiles(); }
