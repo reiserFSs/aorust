@@ -1950,6 +1950,25 @@ native ground with combined Enhanced effects, 4× MSAA and TAA, plus standalone
 admitted-material and directional receiver controls. It does not change source
 admission, native fog, preset membership or the separate grass/canopy layouts.
 
+Enhanced world entrypoints (`enhanced_shader.rs::early_rejection`) sample native
+coverage first and reject before material visibility, clustered/GGX lighting or
+directional receivers. The uniform prefix retains native implicit mip selection
+and mapped-normal derivatives; `material_prepare_derivatives` still samples maps
+because GGX variance differentiates the sampled normal. Primary colour/alpha,
+environment and ground-palette samples are reused rather than repeated after
+discard. Native ALPHATEST comparisons, frame-alpha replacement, Mode5 light-alpha,
+sky and ground-tile thresholds remain native. Only zero-coverage `fs_test`/
+`fs_sky_test` fragments gain A2C rejection; positive alpha is never hard-cut at
+4× MSAA, and faded tests do not enable A2C. Holo/lava/overlay operations with no
+native alpha test gain no rejection. The faithful `shader.wgsl` is unchanged.
+Direct canopy `shade` calls initialize the same primary/environment cache before
+discard and reject rounded coverage before moon illumination
+(`foliage_leaves.wgsl::fs_canopy`). Paired soft-edge wrappers use
+`foliage_edges.rs::foliage_edge_reject`, relaxing native GREATER/GREATEREQUAL
+exactly like their shade copy so positive edge alpha survives both guards.
+Native-only directional memo variants omit the HDR/GGX raw side channel instead
+of referencing an unavailable cache.
+
 Sun cascades admit loaded static geometry, including terrain patches, by their
 light volume rather than the camera-visible instance list. Their depth range
 expands for loaded caster spheres overlapping the existing cascade XY footprint:

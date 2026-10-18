@@ -55,10 +55,10 @@ pub(super) fn shader(mut source: String, shadows: bool, moonlit: bool) -> String
             .replace("fn authored_sun_visibility(", "fn sun_visibility(");
         // Beauty deliberately treats the moon maps as neutral for sunlight.
         // Probe provenance must instead reject either smooth/geometric raw
-        // moon shadow, including actor casters, before native alpha discard.
+        // moon shadow, including actor casters, after early coverage rejection.
         source = source.replace(
-            "material_static_visibility_value = min(material_visibility_value, authored_sun_visibility(i.wpos, cross(dpdx(i.wpos), dpdy(i.wpos)), i.clip.xy));",
-            "material_static_visibility_value = min(sun_visibility(i.wpos, i.n, i.clip.xy), sun_visibility(i.wpos, cross(dpdx(i.wpos), dpdy(i.wpos)), i.clip.xy));",
+            "material_static_visibility_value = min(material_visibility_value, authored_sun_visibility(i.wpos, early_geometric_normal, i.clip.xy));",
+            "material_static_visibility_value = min(sun_visibility(i.wpos, i.n, i.clip.xy), sun_visibility(i.wpos, early_geometric_normal, i.clip.xy));",
         );
         let reset = if source.contains("var<private> enhanced_sun_visibility:") { "enhanced_sun_visibility = 1.0; " } else { "" };
         source.push_str(&format!("\nfn authored_sun_visibility(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>) -> f32 {{\n    if shadow_frame.moon_direction.w > 0.0 {{ {reset}return 1.0; }}\n    return sun_visibility(world, normal, pixel);\n}}\n"));
@@ -120,7 +120,7 @@ mod tests {
             let prepare = generated.split("fn material_prepare(").nth(1).unwrap().split("\n}").next().unwrap();
             assert!(prepare.contains("material_visibility_value = authored_sun_visibility(i.wpos, i.n, i.clip.xy);"),
                 "material sunlight still uses neutral visibility when moon maps are active");
-            assert!(prepare.contains("material_static_visibility_value = min(sun_visibility(i.wpos, i.n, i.clip.xy), sun_visibility(i.wpos, cross(dpdx(i.wpos), dpdy(i.wpos)), i.clip.xy));"),
+            assert!(prepare.contains("material_static_visibility_value = min(sun_visibility(i.wpos, i.n, i.clip.xy), sun_visibility(i.wpos, early_geometric_normal, i.clip.xy));"),
                 "persistent probe observations must see actual moon actor shadows");
             assert!(!prepare.contains("min(material_visibility_value, authored_sun_visibility("));
             assert!(generated.contains("let visibility = material_static_visibility_value;"));

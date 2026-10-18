@@ -33,6 +33,25 @@ fn grass_shadow_receiver_preserves_ambient_and_disables_without_caster_layer() {
 }
 
 #[test]
+fn shadow_receiver_quality_has_bounded_tap_budget_without_changing_coverage() {
+    let source = include_str!("sun_shadows.wgsl");
+    let low = source.split_once("if layer >= 2u || shadow_frame.moon_budget.w == 0.0 {").unwrap().1
+        .split_once("let texel_world").unwrap().0;
+    assert!(low.contains("i < 4u"));
+    assert_eq!(low.matches("textureSampleCompareLevel(").count(), 1);
+    assert!(!low.contains("textureLoad("));
+    assert!(low.contains("return visibility * 0.25;"));
+    assert!(low.contains("dot(gradient, sample_uv - uv) - 0.00002"));
+    assert!(source.contains("softness <= 0.0 && shadow_frame.moon_budget.w != 0.0"));
+    assert!(source.contains("i < 5u"));
+    assert!(source.contains("i < 12u"));
+    assert!(!include_str!("grass_shadow.wgsl").contains("moon_budget.w"));
+    assert!(!include_str!("volumetric_shafts.wgsl").contains("moon_budget.w"));
+    assert_eq!(std::mem::size_of::<sun_shadows::ShadowUniform>(), 288);
+    assert_eq!(std::mem::offset_of!(sun_shadows::ShadowUniform, moon_budget), 272);
+}
+
+#[test]
 fn grass_sun_visibility_is_gouraud_without_fragment_shadow_reads() {
     for shadows in [false, true] {
         let source = crate::grass::shader_source((false, false, true, false, false, false), shadows);
@@ -323,18 +342,32 @@ fn grass_and_shafts_do_not_enable_world_solid_shadow_receivers() {
         texture_to_rgba(renderer, &output, width, height).unwrap()
     };
     let shafts_only = capture(&mut renderer);
-    renderer.set_enhanced_settings(EnhancedSettings { grass_sun_shadows: true, ..settings });
-    let grass_and_shafts = capture(&mut renderer);
-    let shadows = renderer.sun_shadows.as_ref().expect("shafts retain real maps");
-    assert!(!shadows.static_commands.is_empty(), "control must populate solid maps for shafts");
-    assert_eq!(shadows.coverage_uniform.control[3], 0, "solid surface reception must remain disabled");
-    // No grass terrain exists in this scene: enabling its receiver must not
-    // reveal the solid silhouettes that only the shaft ray march requested.
-    assert_eq!(shafts_only, grass_and_shafts);
-    renderer.set_enhanced_settings(EnhancedSettings { sun_shadows: true, grass_sun_shadows: true, ..settings });
-    let world_shadows = capture(&mut renderer);
-    assert_eq!(renderer.sun_shadows.as_ref().unwrap().coverage_uniform.control[3], 1);
-    assert_ne!(grass_and_shafts, world_shadows, "control must visibly receive the wall's solid shadow");
+    for quality in [0, 1] {
+        let settings = EnhancedSettings { shadow_quality: quality, grass_sun_shadows: true, ..settings };
+        renderer.set_enhanced_settings(settings);
+        let grass_and_shafts = capture(&mut renderer);
+        let shadows = renderer.sun_shadows.as_ref().expect("shafts retain real maps");
+        assert!(!shadows.static_commands.is_empty(), "control must populate solid maps for shafts");
+        assert_eq!(shadows.coverage_uniform.control[3], 0);
+        assert_eq!(shadows.coverage_uniform.moon_budget[3], quality as f32);
+        // Quality must not reveal solid silhouettes requested only by shafts,
+        // or change the separately sampled grass field.
+        assert_eq!(shafts_only, grass_and_shafts);
+        renderer.set_enhanced_settings(EnhancedSettings { sun_shadows: true, ..settings });
+        let world_shadows = capture(&mut renderer);
+        assert_eq!(renderer.sun_shadows.as_ref().unwrap().coverage_uniform.control[3], 1);
+        assert_ne!(grass_and_shafts, world_shadows, "both tiers must receive the wall's solid shadow");
+        assert_eq!(world_shadows, capture(&mut renderer), "receiver taps must be deterministic");
+        if quality == 0 {
+            renderer.set_enhanced_settings(EnhancedSettings { sun_shadows: true, shadow_softness: 0.0, ..settings });
+            assert_eq!(world_shadows, capture(&mut renderer), "Low must remain four-tap PCF at zero softness");
+        }
+        if quality == 1 {
+            renderer.set_enhanced_settings(EnhancedSettings { sun_shadows: true, grass_sun_shadows: true,
+                ..EnhancedSettings { ground_grass: true, volumetric_shafts: true, ..Default::default() } });
+            assert_eq!(world_shadows, capture(&mut renderer), "default receiver pixels must equal Normal");
+        }
+    }
 }
 
 fn quad(points: [[f32; 3]; 4], normal: [f32; 3]) -> ao_scene::Mesh {

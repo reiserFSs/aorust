@@ -105,12 +105,16 @@ pub struct EnhancedSettings {
     pub water_wake_treading: f32,
     pub water_wake_splash: f32,
     pub shadow_map_size: u32,
+    /// Directional world receiver: 0 = Low (4 PCF taps), 1 = Normal (PCSS).
+    pub shadow_quality: u32,
     /// Share of the sun that full shadow removes (the rest stays as sky-lit shade).
     pub shadow_strength: f32,
     /// Penumbra growth per blocker distance; 0 is the hard 3x3 PCF.
     pub shadow_softness: f32,
     pub ao_radius: f32,
     pub ao_strength: f32,
+    /// Half-resolution AO sample budget: 0 = Low, 1 = Normal, 2 = High.
+    pub ao_quality: u32,
     /// Diffuse bounce strength for screen-space indirect light (0..=3).
     pub indirect_strength: f32,
     pub bloom_strength: f32,
@@ -152,6 +156,8 @@ impl Default for EnhancedSettings {
             water_foam: false, water_wakes: false, waterfalls: false, underwater: false,
             water_caustics: false, water_sun_glint: false, water_realism: 0.5,
             cloud_quality: 1, water_quality: 1,
+            ao_quality: 1,
+            shadow_quality: 1,
             water_wake_strength: 2.0, water_wake_visibility: 2.0, water_wake_duration: 0.3,
             water_wake_speed: 3.6, water_wake_treading: 1.0, water_wake_splash: 1.0,
             shadow_map_size: 2048, shadow_strength: 0.45, shadow_softness: 1.5, ao_radius: 1.75, ao_strength: 1.5, bloom_strength: 0.6,
@@ -240,6 +246,7 @@ impl EnhancedSettings {
         let defaults = Self::default();
         Self {
             shadow_map_size: self.shadow_map_size.clamp(256, 4096),
+            shadow_quality: self.shadow_quality.min(1),
             cloud_quality: self.cloud_quality.clamp(1, 2),
             water_quality: self.water_quality.clamp(1, 2),
             point_shadow_count: self.point_shadow_count.clamp(1, 16),
@@ -251,6 +258,7 @@ impl EnhancedSettings {
             shadow_softness: finite(self.shadow_softness, 4.0, defaults.shadow_softness),
             ao_radius: finite(self.ao_radius, 5.0, defaults.ao_radius),
             ao_strength: finite(self.ao_strength, 2.0, defaults.ao_strength),
+            ao_quality: self.ao_quality.min(2),
             indirect_strength: finite(self.indirect_strength, 3.0, defaults.indirect_strength),
             bloom_strength: finite(self.bloom_strength, 1.0, defaults.bloom_strength),
             grass_density: finite(self.grass_density, 2.0, defaults.grass_density),
@@ -464,6 +472,14 @@ mod tests {
         assert_eq!((bounded.shadow_map_size, bounded.ao_radius, bounded.ao_strength), (256, 0.0, 2.0));
         assert_eq!((bounded.bloom_strength, bounded.grass_density, bounded.grass_distance), (1.0, 2.0, 180.0));
         assert_eq!(defaults.shadow_map_size, 2048);
+        assert_eq!(defaults.shadow_quality, 1);
+        for (input, expected) in [(0, 0), (1, 1), (2, 1), (u32::MAX, 1)] {
+            assert_eq!(EnhancedSettings { shadow_quality: input, ..defaults }.clamped().shadow_quality, expected);
+        }
+        assert_eq!(defaults.ao_quality, 1);
+        for (input, expected) in [(0, 0), (1, 1), (2, 2), (3, 2), (u32::MAX, 2)] {
+            assert_eq!(EnhancedSettings { ao_quality: input, ..defaults }.clamped().ao_quality, expected);
+        }
         let shadow = EnhancedSettings { shadow_strength: 2.0, shadow_softness: 9.0, ..defaults }.clamped();
         assert_eq!((shadow.shadow_strength, shadow.shadow_softness), (1.0, 4.0));
         assert_eq!(EnhancedSettings { shadow_map_size: u32::MAX, ..defaults }.clamped().shadow_map_size, 4096);

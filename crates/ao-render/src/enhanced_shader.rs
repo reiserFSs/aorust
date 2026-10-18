@@ -164,9 +164,20 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
             // Capture before the final mix: beauty retains its native Enhanced shadow strength.
             source = source.replace(
                 "    return mix(1.0, visible, clamp(shadow_frame.forward.w, 0.0, 1.0));",
-                "    enhanced_sun_visibility = visible;\n    return mix(1.0, visible, clamp(shadow_frame.forward.w, 0.0, 1.0));",
+                "    sun_memo_wrote_raw = true;\n    enhanced_sun_visibility = visible;\n    return mix(1.0, visible, clamp(shadow_frame.forward.w, 0.0, 1.0));",
             );
         }
+        source = source.replace("fn sun_visibility(", "fn sun_visibility_uncached(");
+        if settings.needs_full_sun_mask() || material_specular {
+            source.push_str(SUN_VISIBILITY_MEMO);
+        } else {
+            // Native-only consumers have no raw HDR/GGX side channel.
+            source.push_str(&SUN_VISIBILITY_MEMO.lines().filter(|line| {
+                !line.contains("sun_memo_raw") && !line.contains("sun_memo_has_raw")
+                    && !line.contains("sun_memo_wrote_raw")
+            }).collect::<Vec<_>>().join("\n"));
+        }
+        source = source.replace("    let envelope = vec4<f32>(1.0);", "    sun_memo_valid = false;\n    let envelope = vec4<f32>(1.0);");
     } else {
         source.push_str("\nfn sun_visibility(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>) -> f32 { return 1.0; }\n");
     }
@@ -216,8 +227,151 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
     if settings.indirect_light {
         capture_indirect_diffuse(&mut source);
     }
+    early_rejection(&mut source);
     source
 }
+
+// Keep all derivative-dependent work in the uniform prefix. In particular,
+// mapped-normal variance differentiates sampled normals, so that preparation
+// cannot move below discard; visibility queries can and must.
+fn early_rejection(source: &mut String) {
+    if source.contains("fn material_prepare(") {
+        *source = source.replace("fn material_prepare(i: VOut) {", "fn material_prepare_derivatives(i: VOut) {");
+        let start = source.find("    material_visibility_value = sun_visibility(").expect("material receiver");
+        let end = source[start..].find("    material_albedo_value =").unwrap() + start;
+        let receiver = source[start..end].replace("cross(dpdx(i.wpos), dpdy(i.wpos))", "early_geometric_normal");
+        source.replace_range(start..end, "");
+        source.push_str(&format!("\nfn material_prepare(i: VOut) {{\n{receiver}}}\n"));
+        *source = source.replace("    material_prepare(i);", "    material_prepare_derivatives(i);\n    early_normal_dx = dpdx(material_normal_value / max(length(material_normal_value), 1e-6));\n    early_normal_dy = dpdy(material_normal_value / max(length(material_normal_value), 1e-6));\n    early_reject(i, early_mode);\n    material_prepare(i);");
+    }
+    // These are the only native entrypoint families with discard. Cache their
+    // primary sample once, retaining the exact sampler, UV and implicit mip.
+    for sample in [
+        "sample_clamped(tex, i.uv + mat.scroll.xy * g.fog.z)",
+        "sample_clamped(tex, sky_uv(i))",
+        "sample_clamped(tex, i.uv)",
+    ] {
+        // Lava/crust are unrelated native operations; only change the helpers
+        // and env entrypoint that actually participate in early rejection.
+        for function in ["shade", "shade_sky", "ground_tile", "enhanced_original_fs_env"] {
+            let marker = format!("fn {function}(");
+            if let Some(start) = source.find(&marker) {
+                let end = source[start..].find("\n}").unwrap() + start;
+                let body = source[start..end].replace(sample, "early_primary");
+                source.replace_range(start..end, &body);
+            }
+        }
+    }
+    *source = source.replace("sample_clamped(env_tex, i.env_uv)", "early_environment");
+    *source = source.replace("sample_clamped(holo0, vec2<f32>(i.wpos.x, -i.wpos.z) * mat.wave.xz)", "early_palette");
+    *source = source.replace("sample_clamped(tex, i.uv + mat.scroll.xy * g.fog.z)", "early_primary");
+    *source = source.replace("sample_clamped(tex, material_uv(i))", "early_material_primary");
+    for (function, cached) in [("enhanced_albedo", "early_primary"), ("material_prepare_derivatives", "early_material_primary")] {
+        if let Some(start) = source.find(&format!("fn {function}(")) {
+            let end = source[start..].find("\n}").unwrap() + start;
+            let body = source[start..end].replace("sample_clamped(tex, uv)", cached);
+            source.replace_range(start..end, &body);
+        }
+    }
+    // Authored/clustered derivatives must also precede the divergent discard.
+    *source = source.replace("max(length(fwidth(i.wpos)), 1e-6)", "early_footprint");
+    *source = source.replace("    let dx = dpdx(n);\n    let dy = dpdy(n);", "    let dx = early_normal_dx;\n    let dy = early_normal_dy;");
+    let names: Vec<String> = source.lines().filter_map(|line| line.strip_prefix("@fragment fn ").and_then(|s| s.split_once('(')).map(|(name, _)| name.to_owned())).collect();
+    for name in names {
+        let mode = match name.as_str() {
+            "fs_opaque" => 0, "fs_test" => 1, "fs_blend" => 2,
+            "fs_add" | "fs_mesh_add" => 3, "fs_fade_opaque" => 4,
+            "fs_fade_test" => 5, "fs_sprite" => 6, "fs_add_one" => 9,
+            "fs_sky_test" => 11, "fs_sky_opaque" | "fs_sky_blend" | "fs_sky_add" | "fs_sky_add_one" => 12,
+            "fs_ground_fused" | "fs_ground_base" | "fs_ground_simple" => 13,
+            "fs_env" => 14, _ => 15,
+        };
+        let uv = if (11..=12).contains(&mode) { "sky_uv(i)" } else if mode == 13 || mode == 14 { "i.uv" } else { "i.uv + mat.scroll.xy * g.fog.z" };
+        let material_sample = if source.contains("fn material_prepare_derivatives(") {
+            if mode <= 9 || mode == 15 { "    early_material_primary = early_primary;\n" }
+            else { "    early_material_primary = sample_clamped(tex, material_uv(i));\n" }
+        } else { "" };
+        let environment_sample = if mode <= 9 { "    if mat.native.x > 0.5 { early_environment = sample_clamped(env_tex, i.env_uv); }\n" } else { "" };
+        let palette_sample = if name.starts_with("fs_ground_") { "    early_palette = sample_clamped(holo0, vec2<f32>(i.wpos.x, -i.wpos.z) * mat.wave.xz);\n" } else { "" };
+        let prefix = format!("\n    let early_mode = {mode}u;\n    early_primary = sample_clamped(tex, {uv});\n{material_sample}{environment_sample}{palette_sample}    early_geometric_normal = cross(dpdx(i.wpos), dpdy(i.wpos));\n    early_footprint = max(length(fwidth(i.wpos)), 1e-6);\n    let early_n = i.n / max(length(i.n), 1e-6);\n    early_normal_dx = dpdx(early_n);\n    early_normal_dy = dpdy(early_n);\n");
+        let marker = format!("@fragment fn {name}(i: VOut) -> EnhancedOutput {{");
+        *source = source.replace(&marker, &format!("{marker}{prefix}"));
+        if !source.contains("fn material_prepare_derivatives(") {
+            let start = source.find(&marker).unwrap();
+            let end = source[start..].find("\n}").unwrap() + start;
+            let body = source[start..end].replacen("    let envelope =", "    early_reject(i, early_mode);\n    let envelope =", 1);
+            source.replace_range(start..end, &body);
+        }
+        if mode == 12 || mode == 15 {
+            let start = source.find(&marker).unwrap();
+            let end = source[start..].find("\n}").unwrap() + start;
+            let body = source[start..end].replace("    early_reject(i, early_mode);\n", "");
+            source.replace_range(start..end, &body);
+        }
+    }
+    source.push_str(EARLY_REJECTION);
+}
+
+const EARLY_REJECTION: &str = r#"
+var<private> early_primary: vec4<f32>;
+var<private> early_material_primary: vec4<f32>;
+var<private> early_environment: vec4<f32>;
+var<private> early_palette: vec4<f32>;
+var<private> early_geometric_normal: vec3<f32>;
+var<private> early_footprint: f32;
+var<private> early_normal_dx: vec3<f32>;
+var<private> early_normal_dy: vec3<f32>;
+fn early_reject(i: VOut, mode: u32) {
+    if mode <= 9u {
+        let material_alpha = select(mat.color.a, i.fade, i.fade < 1.0);
+        let texture_alpha = select(early_primary.a, 1.0, mat.emissive.w > 0.5 && mat.emissive.w < 1.5);
+        let alpha = texture_alpha * i.color.a * material_alpha;
+        if native_alpha_test() && !native_alpha_pass(alpha) { discard; }
+        if (mode == 1u || mode == 5u) && !native_alpha_test() {
+            if g.fog.w <= 0.5 && alpha < 0.5 { discard; }
+        }
+        // Only fs_test enables A2C; frame-faded tests remain native blending.
+        if mode == 1u && g.fog.w > 0.5 && alpha <= 0.0 { discard; }
+    } else if mode == 11u {
+        let alpha = early_primary.a * i.color.a * mat.color.a;
+        if g.fog.w <= 0.5 && alpha < 0.5 { discard; }
+        if g.fog.w > 0.5 && alpha <= 0.0 { discard; }
+    } else if mode == 13u {
+        if early_primary.a <= 128.0 / 255.0 { discard; }
+    } else if mode == 14u {
+        let alpha = early_primary.a * i.color.a * select(mat.color.a, i.fade, i.fade < 1.0);
+        if native_alpha_test() && !native_alpha_pass(alpha) { discard; }
+    }
+}
+"#;
+
+// ponytail: one entry covers adjacent repeated receivers, not arbitrary history;
+// a different normal evicts it rather than risking a changed receiver-plane bias.
+const SUN_VISIBILITY_MEMO: &str = r#"
+var<private> sun_memo_valid: bool = false;
+var<private> sun_memo_key0: vec4<u32>;
+var<private> sun_memo_key1: vec4<u32>;
+var<private> sun_memo_value: f32;
+var<private> sun_memo_raw: f32;
+var<private> sun_memo_wrote_raw: bool = false;
+var<private> sun_memo_has_raw: bool;
+fn sun_visibility(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>) -> f32 {
+    let key0 = bitcast<vec4<u32>>(vec4<f32>(world, pixel.x));
+    let key1 = bitcast<vec4<u32>>(vec4<f32>(normal, pixel.y));
+    if sun_memo_valid && all(key0 == sun_memo_key0) && all(key1 == sun_memo_key1) {
+        if sun_memo_has_raw { enhanced_sun_visibility = sun_memo_raw; }
+        return sun_memo_value;
+    }
+    sun_memo_wrote_raw = false;
+    sun_memo_value = sun_visibility_uncached(world, normal, pixel);
+    sun_memo_has_raw = sun_memo_wrote_raw;
+    sun_memo_raw = enhanced_sun_visibility;
+    sun_memo_key0 = key0;
+    sun_memo_key1 = key1;
+    sun_memo_valid = true;
+    return sun_memo_value;
+}
+"#;
 
 /// Capture the actual diffuse term before environment/specular/emission additions.
 /// Beauty expressions and the AO-only generated shader remain untouched.
@@ -300,6 +454,305 @@ const OUTPUT: &str = include_str!("enhanced_output.wgsl");
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn early_alpha_rejection_precedes_every_receiver_and_preserves_native_source() {
+        let faithful = include_str!("shader.wgsl");
+        for pbr in [false, true] {
+            let source = super::source(crate::EnhancedSettings {
+                sun_shadows: true, moon_shadows: true, generated_normals: true,
+                material_maps: true, material_pbr: pbr, material_specular: true,
+                material_reflections: true, clustered_lighting: true,
+                local_light_shadows: true, indirect_light: true, emissive_bloom: true,
+                hdr: true, ..Default::default()
+            });
+            for wrapper in source.split("@fragment fn ").skip(1) {
+                let wrapper = wrapper.split("\n}").next().unwrap();
+                let prepare = wrapper.find("material_prepare(i);").unwrap();
+                if let Some(reject) = wrapper.find("early_reject(i, early_mode);") {
+                    assert!(wrapper.find("material_prepare_derivatives(i);").unwrap() < reject);
+                    assert!(reject < prepare);
+                    assert!(reject < wrapper.find("let beauty =").unwrap());
+                }
+            }
+            let derivatives = source.split("fn material_prepare_derivatives(").nth(1).unwrap().split("\n}").next().unwrap();
+            assert!(!derivatives.contains("sun_visibility("));
+            assert!(derivatives.contains("dpdx(material_normal_value)"));
+            assert!(source.contains("early_primary = sample_clamped(tex, i.uv + mat.scroll.xy * g.fog.z)"));
+            assert!(source.contains("early_environment = sample_clamped(env_tex, i.env_uv)"));
+        }
+        assert_eq!(crate::shader_source::load("shader.wgsl", faithful).as_ref(), faithful);
+        assert!(!faithful.contains("early_reject"));
+        assert!(faithful.find("let lit = min(texture_color + spec,").unwrap() < faithful.find("if native_alpha_test() && !native_alpha_pass(alpha)").unwrap());
+    }
+
+    #[test]
+    fn dense_cutout_early_alpha_matches_native_comparisons_and_frame_fade_on_gpu() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let r = crate::Renderer::new(&instance, None).expect("early-alpha coverage GPU");
+        let faithful = include_str!("shader.wgsl");
+        let function = |name: &str| {
+            let start = faithful.find(&format!("fn {name}(")).unwrap();
+            &faithful[start..start + faithful[start..].find("\n}").unwrap() + 2]
+        };
+        for samples in [1, 4] { for mode in [0, 1, 2, 5, 6, 11, 13, 14] {
+            let source = format!(r#"
+struct VOut {{ color: vec4<f32>, fade: f32 }}
+struct Material {{ color: vec4<f32>, emissive: vec4<f32>, native: vec4<f32> }}
+struct Globals {{ fog: vec4<f32> }}
+var<private> mat: Material;
+var<private> g: Globals;
+fn native_alpha_test() -> bool {{ return (u32(mat.native.z) & 1u) != 0u; }}
+{}
+{}
+@vertex fn vs(@builtin(vertex_index) n: u32) -> @builtin(position) vec4<f32> {{
+    return vec4<f32>(vec2<f32>(f32((n << 1u) & 2u), f32(n & 2u)) * 2.0 - 1.0, 0.0, 1.0);
+}}
+fn pixel(p: vec4<f32>, early: bool) -> vec4<f32> {{
+    let col = u32(p.x);
+    let row = u32(p.y);
+    // Every native compare, disabled ALPHATEST, material/frame replacement and
+    // Mode5 texture-alpha-as-light, including exact 128/255 terrain threshold.
+    mat.native = vec4<f32>(0.0, 128.0 / 255.0, select(1.0, 0.0, col / 8u == 0u), f32(col / 8u));
+    mat.color = vec4<f32>(1.0, 1.0, 1.0, select(0.75, 1.0, row < 4u));
+    mat.emissive.w = select(0.0, 1.0, row == 6u);
+    g.fog.w = {};
+    let a = array<f32, 8>(0.0, 1.0 / 255.0, 0.25, 0.49, 0.5, 128.0 / 255.0, 0.75, 1.0)[col % 8u];
+    early_primary = vec4<f32>(1.0, 1.0, 1.0, a);
+    let i = VOut(vec4<f32>(1.0), select(1.0, 0.5, row == 5u));
+    if early {{ early_reject(i, {}u); }}
+    let alpha = select(a, 1.0, mat.emissive.w > 0.5 && mat.emissive.w < 1.5) * i.color.a * select(mat.color.a, i.fade, i.fade < 1.0);
+    if {}u <= 9u {{
+        if native_alpha_test() && !native_alpha_pass(alpha) {{ discard; }}
+        if ({}u == 1u || {}u == 5u) && !native_alpha_test() && g.fog.w <= 0.5 && alpha < 0.5 {{ discard; }}
+    }} else if {}u == 11u {{
+        if g.fog.w <= 0.5 && a * mat.color.a < 0.5 {{ discard; }}
+    }} else if {}u == 13u {{
+        if a <= 128.0 / 255.0 {{ discard; }}
+    }} else {{
+        if native_alpha_test() && !native_alpha_pass(a * select(mat.color.a, i.fade, i.fade < 1.0)) {{ discard; }}
+    }}
+    return vec4<f32>(0.75, 0.5, 0.25, select(alpha, a * mat.color.a, {}u == 11u));
+}}
+@fragment fn reference(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {{ return pixel(p, false); }}
+@fragment fn optimized(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {{ return pixel(p, true); }}
+"#, function("native_alpha_pass"), super::EARLY_REJECTION, if samples > 1 { "1.0" } else { "0.0" }, mode, mode, mode, mode, mode, mode, mode);
+            let source = if mode == 2 || mode == 6 {
+                source.replace("if native_alpha_test() && !native_alpha_pass(alpha) {",
+                    "if native_alpha_test() && select(!native_alpha_pass(alpha), alpha <= 0.0, u32(mat.native.w) == 5u || u32(mat.native.w) == 7u) {")
+            } else { source };
+            let module = r.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("dense native alpha coverage"), source: wgpu::ShaderSource::Wgsl(source.into()) });
+            let mut captures = Vec::new();
+            for entry in ["reference", "optimized"] {
+                let pipeline = r.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: None, layout: None,
+                    vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+                    fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some(entry), targets: &[Some(wgpu::ColorTargetState { format: r.format, blend: None, write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),
+                    primitive: Default::default(), depth_stencil: None,
+                    multisample: wgpu::MultisampleState { count: samples, mask: !0, alpha_to_coverage_enabled: samples > 1 && (mode == 1 || mode == 11) },
+                    multiview_mask: None, cache: None,
+                });
+                let texture = |count| r.device.create_texture(&wgpu::TextureDescriptor {
+                    label: None, size: wgpu::Extent3d { width: 72, height: 8, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: count,
+                    dimension: wgpu::TextureDimension::D2, format: r.format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | if count == 1 { wgpu::TextureUsages::COPY_SRC } else { wgpu::TextureUsages::empty() }, view_formats: &[],
+                });
+                let output = texture(1);
+                let view = output.create_view(&Default::default());
+                let msaa = (samples > 1).then(|| texture(samples));
+                let msaa_view = msaa.as_ref().map(|t| t.create_view(&Default::default()));
+                let mut encoder = r.device.create_command_encoder(&Default::default());
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: msaa_view.as_ref().unwrap_or(&view), resolve_target: msaa_view.as_ref().map(|_| &view), depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })], ..Default::default()
+                    });
+                    pass.set_pipeline(&pipeline);
+                    pass.draw(0..3, 0..128);
+                }
+                r.queue.submit([encoder.finish()]);
+                captures.push(crate::texture_to_rgba(&r, &output, 72, 8).unwrap());
+            }
+            assert_eq!(captures[0], captures[1], "{samples}x mode {mode}: native comparisons/frame fade/CAT coverage");
+            assert!(captures[0].iter().any(|&v| v != 0), "coverage positive control");
+            if mode == 2 || mode == 6 {
+                for compare in [5, 7] {
+                    let pixel = (compare * 8 + 2) * 4;
+                    assert!(captures[1][pixel] > 0 && captures[1][pixel + 3] > 0,
+                        "{samples}x: positive 0.25 native soft-edge alpha must survive GT/GE root rejection");
+                }
+            }
+        }}
+    }
+    #[test]
+    fn pbr_shadow_raw_reuse_and_exact_memo_side_effects_on_gpu() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let r = crate::Renderer::new(&instance, None).expect("PBR raw visibility regression GPU");
+        for pbr in [false, true] { for moon in [false, true] {
+            let combined = super::source(crate::EnhancedSettings {
+                material_pbr: pbr, material_specular: true, sun_shadows: true,
+                moon_shadows: true, hdr: true, material_reflections: true,
+                environment_probe: true, clustered_lighting: true,
+                night_mode: if moon { crate::NightMode::Moonlit } else { crate::NightMode::AsGame },
+                ..Default::default()
+            });
+            let mut combined = if moon { crate::moon_shadows::shader(combined, true, true) } else { combined };
+            crate::foliage::append_shader(&mut combined);
+            crate::foliage_detail::append_shader(&mut combined, true, true);
+            let _shader = r.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("combined PBR/specular HDR probe clustered foliage moon visibility"),
+                source: wgpu::ShaderSource::Wgsl(combined.into()),
+            });
+        } }
+        let generated = super::source(crate::EnhancedSettings {
+            material_pbr: true, material_specular: true, sun_shadows: true, hdr: true,
+            ..Default::default()
+        });
+        let ggx = generated[generated.find("fn authored_specular(").unwrap()..].split("\n}").next().unwrap();
+        let math = include_str!("authored_specular.wgsl").split("fn authored_specular(").next().unwrap();
+        let source = format!(r#"
+struct VOut {{ wpos: vec3<f32>, n: vec3<f32>, clip: vec4<f32>, tint: vec4<f32>, effect: u32 }}
+struct Globals {{ eye: vec4<f32>, sun_dir: vec4<f32>, sun_g: vec4<f32> }}
+struct Material {{ emissive: vec4<f32> }}
+struct ShadowFrame {{ moon_direction: vec4<f32> }}
+var<private> g: Globals;
+var<private> mat: Material;
+var<private> shadow_frame: ShadowFrame;
+var<private> enhanced_sun_visibility: f32 = 1.0;
+var<private> calls: u32 = 0u;
+var<private> material_footprint: f32 = 1.0;
+var<private> material_variance: f32 = 0.0;
+var<private> material_albedo_value: vec3<f32> = vec3<f32>(0.5);
+fn native_unlit() -> bool {{ return false; }}
+fn material_alpha(i: VOut) -> f32 {{ return 0.5; }}
+fn material_metallic(i: VOut) -> f32 {{ return 0.0; }}
+fn material_ambient_specular(i: VOut, n: vec3<f32>, v: vec3<f32>, f0: vec3<f32>) -> vec3<f32> {{ return vec3<f32>(0.0); }}
+fn authored_local_spec(p: vec3<f32>, n: vec3<f32>, a: f32, f: vec3<f32>) -> array<vec3<f32>, 2> {{
+    return array<vec3<f32>, 2>(vec3<f32>(0.0), vec3<f32>(0.0));
+}}
+fn sun_visibility_uncached(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>) -> f32 {{
+    calls += 1u;
+    if world.x < 0.0 {{ return 1.0; }}
+    sun_memo_wrote_raw = true;
+    enhanced_sun_visibility = select(0.0, 1.0, world.x > 1.0);
+    return mix(1.0, enhanced_sun_visibility, 0.6);
+}}
+{memo}
+{math}
+{ggx}
+}}
+@vertex fn vs(@builtin(vertex_index) n: u32) -> @builtin(position) vec4<f32> {{
+    return vec4<f32>(vec2<f32>(f32((n << 1u) & 2u), f32(n & 2u)) * 2.0 - 1.0, 0.0, 1.0);
+}}
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {{
+    sun_memo_valid = false;
+    let world = vec3<f32>(p.x, 0.0, 0.0);
+    let normal = vec3<f32>(0.0, 0.6, 0.8);
+    g = Globals(vec4<f32>(world + normal, 1.0), vec4<f32>(normal, 0.0), vec4<f32>(1.0));
+    authored_normal = normal;
+    let floor_value = sun_visibility(world, normal, p.xy);
+    let first_raw = enhanced_sun_visibility;
+    let i = VOut(world, normal, p, vec4<f32>(32.0), 0u);
+    let highlight = authored_specular(i, vec3<f32>(0.0));
+    var ok = calls == 1u && enhanced_sun_visibility == first_raw;
+    ok = ok && select(all(highlight == vec3<f32>(0.0)) && floor_value > 0.0,
+        any(highlight > vec3<f32>(0.0)), p.x > 1.0);
+    let repeated = sun_visibility(world, normal, p.xy);
+    ok = ok && bitcast<u32>(repeated) == bitcast<u32>(floor_value);
+    // Distinct foliage-normal scales, positions, signed zero and both pixel
+    // components miss even when their resulting visibility is identical.
+    let a = sun_visibility(world, normal * 2.0, p.xy);
+    let b = sun_visibility(world + vec3<f32>(0.0, 0.0, 1.0), normal * 2.0, p.xy);
+    let c = sun_visibility(world, normal, vec2<f32>(0.0, p.y));
+    let d = sun_visibility(world, normal, vec2<f32>(bitcast<f32>(0x80000000u), p.y));
+    let e = sun_visibility(world, normal, vec2<f32>(bitcast<f32>(0x80000000u), p.y + 1.0));
+    ok = ok && calls == 6u;
+    // No-write early returns preserve the current caller state on a hit,
+    // rather than replaying the state preceding the original query.
+    let early = sun_visibility(vec3<f32>(-1.0), normal, p.xy);
+    enhanced_sun_visibility = 0.375;
+    let early_hit = sun_visibility(vec3<f32>(-1.0), normal, p.xy);
+    ok = ok && calls == 7u && early == early_hit && enhanced_sun_visibility == 0.375;
+    sun_memo_valid = false;
+    let reset = sun_visibility(vec3<f32>(-1.0), normal, p.xy);
+    ok = ok && calls == 8u && reset == 1.0;
+    return vec4<f32>(vec3<f32>(select(0.0, 1.0, ok)), 1.0);
+}}
+"#, memo = super::SUN_VISIBILITY_MEMO);
+        let shader = r.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("generated PBR raw visibility and exact receiver memo"), source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let pipeline = r.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None, layout: None,
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState { format: r.format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                compilation_options: Default::default() }),
+            primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
+        });
+        let texture = r.device.create_texture(&wgpu::TextureDescriptor {
+            label: None, size: wgpu::Extent3d { width: 2, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: r.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let mut encoder = r.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view, resolve_target: None, depth_slice: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })], ..Default::default()
+            });
+            pass.set_pipeline(&pipeline);
+            pass.draw(0..3, 0..1);
+        }
+        r.queue.submit([encoder.finish()]);
+        assert_eq!(crate::texture_to_rgba(&r, &texture, 2, 1).unwrap(), vec![255; 8],
+            "shadowed GGX is zero despite beauty's floor; lit GGX is positive; exact hits restore raw writes only");
+    }
+
+    #[test]
+    fn exact_sun_receiver_reuse_preserves_combined_paths_and_moon() {
+        for pbr in [false, true] { for clustered in [false, true] { for moon in [false, true] {
+            let settings = crate::EnhancedSettings {
+                sun_shadows: true, moon_shadows: true, hdr: true,
+                material_specular: true, material_pbr: pbr, clustered_lighting: clustered,
+                material_reflections: true, environment_probe: true, ..Default::default()
+            };
+            let source = super::source(settings);
+            let mut expected = String::new();
+            super::append_shadow_receiver(&mut expected, 0);
+            let expected = expected.split("fn sun_visibility(").nth(1).unwrap();
+            let actual = source.split("fn sun_visibility_uncached(").nth(1).unwrap().split("\n}").next().unwrap();
+            assert_eq!(actual.replace("    sun_memo_wrote_raw = true;\n    enhanced_sun_visibility = visible;\n", ""),
+                expected.split("\n}").next().unwrap(), "fog, cascade, admission and grass receiver math stays verbatim");
+            let source = if moon { crate::moon_shadows::shader(source, true, true) } else { source };
+            let prepare = source.split("fn material_prepare(").nth(1).unwrap().split("\n}").next().unwrap();
+            assert!(prepare.contains("i.wpos, i.n, i.clip.xy"));
+            assert!(prepare.contains("i.wpos, early_geometric_normal, i.clip.xy"));
+            let ggx = source.split("fn authored_specular(").nth(1).unwrap().split("\n}").next().unwrap();
+            assert!(ggx.contains("var visibility = "));
+            assert!(ggx.contains("sun_visibility(i.wpos, i.n, i.clip.xy)"));
+            assert!(!ggx.contains("var visibility = material_visibility_value"));
+            assert!(source.contains("share * enhanced_sun_visibility * (1.0 - fog)"));
+            for wrapper in source.split("@fragment fn ").skip(1) {
+                let wrapper = wrapper.split("\n}").next().unwrap();
+                assert!(wrapper.find("sun_memo_valid = false;").unwrap() < wrapper.find("material_prepare(i);").unwrap());
+            }
+            if clustered {
+                assert!(source.contains("fn clustered_receiver("));
+                assert!(source.contains("fn clustered_receiver_spec("));
+            }
+            if moon {
+                assert!(source.contains("return sun_visibility(world, normal, pixel);"));
+                assert!(source.contains("sun_memo_value = sun_visibility_uncached(world, normal, pixel);"),
+                    "moon renaming must not redirect the memo miss back into itself");
+            }
+        } } }
+        let mut foliage = super::source(crate::EnhancedSettings { sun_shadows: true, ..Default::default() });
+        crate::foliage_detail::append_shader(&mut foliage, true, false);
+        assert!(foliage.contains("sun_visibility(world, lit_side, pixel)"));
+        assert!(foliage.contains("bitcast<vec4<u32>>(vec4<f32>(normal, pixel.y))"));
+        assert!(!super::source(crate::EnhancedSettings::default()).contains("sun_memo_"));
+    }
     #[test]
     fn grass_ao_share_reuses_runtime_world_budget() {
         let shader = crate::shader_source::load("enhanced_output.wgsl", super::OUTPUT);
@@ -442,13 +895,17 @@ mod tests {
         assert!(receiver.contains("if (u32(mat.native.z) & 48u) != 0u"), "water and presentation overlays remain excluded");
         let donor = source.split("fn enhanced_ao_receiver(").nth(1).unwrap().split("\n}").next().unwrap();
         assert!(donor.contains("native_unlit() || i.ao_info.x < 0.5"), "static receiver admission must not weaken the pure-lit donor gate");
-        assert!(source.contains("let texel = sample_clamped(tex, uv);"));
+        assert!(receiver.contains("let texel = early_primary;"));
         assert!(source.contains("let fog = select(native_fog(i.fog), ground_fog(i), ground);"));
         assert!(source.contains("vec3<f32>(1.0)) * (1.0 - fog), 1.0);"), "receiver RGB carries native extinction exactly once");
         assert!(source.contains("vec4<f32>(albedo_sample.rgb, beauty.a)"), "even ineligible native primary fades retain opacity for destination extinction");
         assert!(!source.contains("albedo_sample.a * beauty.a"));
         for name in ["fs_opaque", "fs_test", "fs_fade_opaque", "fs_fade_test", "fs_ground_fused", "fs_ground_base", "fs_ground_simple"] {
             let body = source.split(&format!("@fragment fn {name}(")).nth(1).unwrap().split("\n}").next().unwrap();
+            let cached = body.find("early_primary = sample_clamped(tex,").unwrap();
+            let reject = body.find("early_reject(i, early_mode);").unwrap();
+            assert!(cached < reject && reject < body.find("let albedo_sample = enhanced_albedo(").unwrap(),
+                "primary native sampling precedes rejection; SSGI reuses surviving cached texels");
             assert!(body.find("let albedo_sample = enhanced_albedo(").unwrap() < body.find("let beauty = enhanced_original_").unwrap(),
                 "sample derivatives before the native discard");
         }
@@ -750,12 +1207,19 @@ struct Output {{ @location(3) sun: vec4<f32>, @location(4) water: vec4<f32> }}
             let generated = super::source(crate::EnhancedSettings { sun_shadows: shadows, hdr: true, ..Default::default() });
             let wrapper = generated[generated.find("@fragment fn fs_ground_shadow(").unwrap()..]
                 .split("\n}").next().unwrap().replacen("@fragment ", "", 1);
+            // This probe isolates the multiplier, not the uniform sampling
+            // prefix (covered by the complete generated-shader regressions).
+            let start = wrapper.find("\n    let early_mode").unwrap();
+            let end = wrapper.find("    early_normal_dy = dpdy(early_n);\n").unwrap() + "    early_normal_dy = dpdy(early_n);\n".len();
+            let mut wrapper = wrapper;
+            wrapper.replace_range(start..end, "\n");
             // Exercise the generated wrapper with a fake roof receiver: beauty
             // retains its artistic floor while raw direct visibility is zero.
             let source = format!(r#"
 struct VOut {{ clip: vec4<f32>, n: vec3<f32>, wpos: vec3<f32> }}
 struct EnhancedOutput {{ beauty: vec4<f32>, ambient: vec4<f32>, emission: vec4<f32>, sun: vec4<f32> }}
 var<private> enhanced_sun_visibility: f32 = 1.0;
+var<private> sun_memo_valid: bool = false;
 fn enhanced_original_fs_ground_shadow(i: VOut) -> vec4<f32> {{
     enhanced_sun_visibility = select(0.0, 1.0, i.clip.x >= 1.0);
     return vec4<f32>(0.4, 0.4, 0.4, 1.0);
@@ -829,6 +1293,21 @@ fn enhanced_original_fs_ground_shadow(i: VOut) -> vec4<f32> {{
                     material_specular: flags & 16 != 0, clustered_lighting: flags & 32 != 0,
                     local_light_shadows: flags & 64 != 0, ..Default::default()
                 }).into()),
+            });
+        }
+        for pbr in [false, true] {
+            let source = super::source(crate::EnhancedSettings {
+                sun_shadows: true, moon_shadows: true, ambient_occlusion: true,
+                emissive_bloom: true, hdr: true, generated_normals: true,
+                material_maps: true, material_pbr: pbr, material_specular: true,
+                material_reflections: true, environment_probe: true,
+                clustered_lighting: true, local_light_shadows: true,
+                indirect_light: true, cloud_shadows: true, ..Default::default()
+            });
+            let source = crate::moon_shadows::shader(source, true, true);
+            let _shader = renderer.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("combined early-alpha derivative legality"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
             });
         }
     }

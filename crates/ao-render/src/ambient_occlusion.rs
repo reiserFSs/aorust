@@ -10,6 +10,16 @@ struct Params {
     inverse_vp: [[f32; 4]; 4],
     vp: [[f32; 4]; 4],
     control: [f32; 4],
+    budget: [u32; 4],
+}
+
+fn sample_budget(quality: u32) -> [u32; 4] {
+    let (directions, steps) = match quality.min(2) {
+        0 => (4, 3),
+        1 => (6, 4),
+        _ => (8, 6),
+    };
+    [directions, steps, 0, 0]
 }
 
 pub(super) struct AmbientOcclusion {
@@ -74,7 +84,7 @@ impl AmbientOcclusion {
     pub(super) fn release_targets(&mut self) { self.targets = None; }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, depth: &wgpu::TextureView, ambient: &wgpu::TextureView, colour: &wgpu::TextureView, size: (u32, u32), vp: Mat4, radius: f32, strength: f32, fog_depth: f32, grass_present: bool, mut timer: Option<&mut crate::FrameGpuTimer>) {
+    pub(super) fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, depth: &wgpu::TextureView, ambient: &wgpu::TextureView, colour: &wgpu::TextureView, size: (u32, u32), vp: Mat4, radius: f32, strength: f32, quality: u32, fog_depth: f32, grass_present: bool, mut timer: Option<&mut crate::FrameGpuTimer>) {
         if !radius.is_finite() || radius <= 0.0 || !strength.is_finite() || strength <= 0.0 || size.0 == 0 || size.1 == 0 { return; }
         if self.targets.as_ref().is_none_or(|targets| targets.size != size || targets.depth != *depth || targets.ambient != *ambient) {
             let create = |label| device.create_texture_tracked(&wgpu::TextureDescriptor {
@@ -101,7 +111,7 @@ impl AmbientOcclusion {
         let inverse_vp = vp.as_dmat4().inverse();
         let reference = inverse_vp.w_axis.truncate() / inverse_vp.w_axis.w;
         let relative_inverse_vp = (glam::DMat4::from_translation(-reference) * inverse_vp).as_mat4();
-        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&Params { inverse_vp: relative_inverse_vp.to_cols_array_2d(), vp: vp.to_cols_array_2d(), control: [radius, strength.clamp(0.0, 2.0), fog_depth, u32::from(grass_present) as f32] }));
+        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&Params { inverse_vp: relative_inverse_vp.to_cols_array_2d(), vp: vp.to_cols_array_2d(), control: [radius, strength.clamp(0.0, 2.0), fog_depth, u32::from(grass_present) as f32], budget: sample_budget(quality) }));
         for (index, (label, pipeline, input, output, load)) in [
             ("ambient AO estimate", &self.estimate, &targets.raw_bind, &targets.raw, wgpu::LoadOp::Clear(wgpu::Color::BLACK)),
             ("ambient AO bilateral blur", &self.blur, &targets.blur_bind, &targets.filtered, wgpu::LoadOp::Clear(wgpu::Color::BLACK)),
@@ -147,7 +157,7 @@ impl crate::Renderer {
         let Some(ambient) = frame.ambient.as_ref() else { return; };
         let ao = self.ambient_occlusion.as_mut().expect("AO pipelines warmed at startup");
         ao.encode(&self.device, &self.queue, encoder, &frame.resolved_depth, ambient, &frame.colour,
-            frame.size, vp, settings.ao_radius, settings.ao_strength, fog_depth, self.grass.as_ref().is_some_and(|grass| grass.has_draws()), None);
+            frame.size, vp, settings.ao_radius, settings.ao_strength, settings.ao_quality, fog_depth, self.grass.as_ref().is_some_and(|grass| grass.has_draws()), None);
     }
 
     /// AO-owned textures/uniform plus its ambient MRT, excluding shared colour/depth
@@ -165,7 +175,43 @@ impl crate::Renderer {
 mod tests {
     #[test]
     fn half_resolution_memory_covers_odd_extents() {
-        assert_eq!(super::AmbientOcclusion::incremental_bytes((3, 5)), 2 * 3 * 32 + 144);
+        assert_eq!(super::AmbientOcclusion::incremental_bytes((3, 5)), 2 * 3 * 32 + 160);
+    }
+
+    #[test]
+    fn quality_budget_and_shader_uniform_layout_match() {
+        use std::mem::{offset_of, size_of};
+        for (quality, expected) in [(0, [4, 3, 0, 0]), (1, [6, 4, 0, 0]), (2, [8, 6, 0, 0]), (u32::MAX, [8, 6, 0, 0])] {
+            assert_eq!(super::sample_budget(quality), expected);
+        }
+        let source = include_str!("ambient_occlusion.wgsl");
+        let module = wgpu::naga::front::wgsl::parse_str(source).expect("AO WGSL parses");
+        wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), wgpu::naga::valid::Capabilities::all()).validate(&module).expect("AO WGSL validates");
+        let params = module.types.iter().find(|(_, ty)| ty.name.as_deref() == Some("Params")).unwrap().1;
+        let wgpu::naga::TypeInner::Struct { members, span } = &params.inner else { panic!("AO Params must be a struct"); };
+        assert_eq!(*span as usize, size_of::<super::Params>());
+        assert_eq!(size_of::<super::Params>(), 160);
+        let expected = [
+            ("inverse_vp", offset_of!(super::Params, inverse_vp)),
+            ("vp", offset_of!(super::Params, vp)),
+            ("control", offset_of!(super::Params, control)),
+            ("budget", offset_of!(super::Params, budget)),
+        ];
+        assert_eq!(members.len(), expected.len());
+        for (member, (name, offset)) in members.iter().zip(expected) {
+            assert_eq!(member.name.as_deref(), Some(name));
+            assert_eq!(member.offset as usize, offset);
+        }
+        for operation in [
+            "budget: vec4<u32>",
+            "let directions = clamp(params.budget.x, 4u, 8u);",
+            "let steps = clamp(params.budget.y, 3u, 6u);",
+            "direction < directions", "step < steps",
+            "(TAU / f32(directions))", "/ f32(steps)",
+            "occlusion / f32(directions * steps)",
+        ] {
+            assert!(source.contains(operation), "missing uniform-driven AO operation: {operation}");
+        }
     }
 
     #[test]
@@ -193,13 +239,15 @@ mod tests {
 
     #[test]
     fn hidden_actor_cannot_change_visible_ao_and_zero_ambient_is_untouched() {
-        check_primary_depth((64, 64), false);
+        for quality in 0..=2 {
+            check_primary_depth((64, 64), false, quality);
+        }
     }
 
     #[test]
     #[ignore = "explicit offline GPU timing at the design resolution"]
     fn ambient_occlusion_gpu_timing() {
-        check_primary_depth((1920, 1200), true);
+        check_primary_depth((1920, 1200), true, 1);
     }
 
     #[test]
@@ -313,7 +361,7 @@ mod tests {
             "repeated AO toggles must reuse startup/variant pipelines without frame-thread compilation");
     }
 
-    fn check_primary_depth((width, height): (u32, u32), measure: bool) {
+    fn check_primary_depth((width, height): (u32, u32), measure: bool, quality: u32) {
         use crate::{Renderer, gpu_stats::GpuStatsExt};
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let renderer = Renderer::new(&instance, None).expect("AO fairness requires offscreen GPU");
@@ -385,7 +433,7 @@ struct Params { vp: mat4x4<f32> }
                     depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
                 });
             }
-            ao.encode(device, queue, &mut encoder, &depth, ambient_view, &colour_view, (width, height), vp, 1.5, 1.0, super::fog_depth_limit(0.1, 100.0, fog_end), false, timer.as_mut());
+            ao.encode(device, queue, &mut encoder, &depth, ambient_view, &colour_view, (width, height), vp, 1.5, 1.0, quality, super::fog_depth_limit(0.1, 100.0, fog_end), false, timer.as_mut());
             let readback = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("AO fairness readback"), size: u64::from(width) * u64::from(height) * 4, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
             encoder.copy_texture_to_buffer(wgpu::TexelCopyTextureInfo { texture: &colour, mip_level: 0, origin: Default::default(), aspect: wgpu::TextureAspect::All }, wgpu::TexelCopyBufferInfo { buffer: &readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) } }, wgpu::Extent3d { width, height, depth_or_array_layers: 1 });
             queue.submit([encoder.finish()]);

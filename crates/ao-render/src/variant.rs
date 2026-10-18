@@ -536,7 +536,7 @@ mod tests {
             keys.push(key);
         }
         assert_eq!(Key::of(defaults, 1), Key::of(EnhancedSettings {
-            shadow_map_size: 4096, point_shadow_count: 16,
+            shadow_map_size: 4096, shadow_quality: 0, point_shadow_count: 16,
             lamp_intensity: 2.0, carried_light_intensity: 2.0, moon_intensity: 2.0,
             dark_night_strength: 0.5, shadow_strength: 0.5, shadow_softness: 2.0,
             ao_strength: 0.5, bloom_strength: 0.5, ..defaults

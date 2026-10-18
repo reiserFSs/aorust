@@ -143,6 +143,11 @@ struct CanopyOutput {
 }
 @fragment fn fs_canopy(i: VOut) -> CanopyOutput {
     var output: CanopyOutput;
+    // Initialize the shared shade cache before any divergent coverage. The
+    // generated world wrappers normally own this prefix; sprigs call shade directly.
+    early_primary = sample_clamped(tex, i.uv + mat.scroll.xy * g.fog.z);
+    if mat.native.x > 0.5 { early_environment = sample_clamped(env_tex, i.env_uv); }
+    //__SUN_MEMO_RESET__
     let surface_normal = cross(dpdx(i.wpos), dpdy(i.wpos));
     if i.color.a <= 0.0 { discard; }
     var rounded = i;
@@ -150,6 +155,7 @@ struct CanopyOutput {
     // PCF receiver-plane gradients need the actual card plane, not its
     // outward-rounded lighting normal (the native lighting is already baked).
     rounded.n = select(i.n, surface_normal, dot(surface_normal, surface_normal) > 0.0000001);
+    early_reject(rounded, 1u);
     //__MOON_RECEIVER__
     output.beauty = shade(receiver, 1u);
     //__AMBIENT_WRITE__

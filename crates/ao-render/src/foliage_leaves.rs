@@ -291,6 +291,9 @@ fn shader_source_with_fog(channels: (bool, bool, bool, bool, bool), night: Night
         .replace("//__EMISSIVE_WRITE__", if channels.1 { "output.emissive = vec4<f32>(0.0);" } else { "" })
         .replace("//__SUN_WRITE__", if channels.2 { "output.sun = enhanced_sun(receiver, output.beauty, false, 0.0);" } else { "" })
         .replace("//__WATER_WRITE__", if channels.3 { "output.water_cloud = 0.0;" } else { "" })
+        .replace("//__SUN_MEMO_RESET__", if sun_shadows || (night == NightMode::Moonlit && moon_shadows) {
+            "sun_memo_valid = false;"
+        } else { "" })
         .replace("//__MOON_RECEIVER__", if night != NightMode::AsGame {
             "let receiver = authored_moon_receiver(rounded, i.n, false);"
         } else { "let receiver = rounded;" });
@@ -424,6 +427,16 @@ mod tests {
                 assert!(source.contains("output.beauty = shade(receiver, 1u);"));
                 assert!(source.contains("if i.color.a <= 0.0 { discard; }"));
                 assert!(source.contains("output.fog = max(output.fog, vtx(v).fog);"));
+                let canopy = source.split("fn fs_canopy(").nth(1).unwrap().split("\n}").next().unwrap();
+                let sample = canopy.find("early_primary = sample_clamped(tex, i.uv + mat.scroll.xy * g.fog.z);").unwrap();
+                let reject = canopy.find("early_reject(rounded, 1u);").unwrap();
+                assert!(sample < canopy.find("if i.color.a <= 0.0").unwrap());
+                assert!(sample < reject && reject < canopy.find("output.beauty = shade(").unwrap());
+                assert!(canopy.find("sun_memo_valid = false;").unwrap() < reject);
+                if authored {
+                    assert!(reject < canopy.find("authored_moon_receiver(").unwrap(),
+                        "sprig coverage must precede the moon receiver too");
+                }
             }
         }
     }

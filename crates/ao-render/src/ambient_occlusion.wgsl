@@ -2,8 +2,6 @@
 // Direction/step sampling and the sum/(directions*steps) normalisation follow
 // ao-vk rvk/shaders/ao.frag (MIT, wannabuh/ao-vk), see THIRD_PARTY.
 const TAU = 6.2831853;
-const DIRECTIONS = 6;
-const STEPS = 4;
 // Sky-fill share is darkened SKY_BOOST x harder than the raw occlusion; the
 // receiver weights the sun share by SUN_CAP / SKY_BOOST so at most SUN_CAP of it
 // is removed. Must match AO_SKY_BOOST / AO_SUN_CAP in enhanced_output.wgsl.
@@ -14,6 +12,7 @@ struct Params {
     inverse_vp: mat4x4<f32>,
     vp: mat4x4<f32>,
     control: vec4<f32>, // radius, strength, original fog-end depth, grass present
+    budget: vec4<u32>, // directions, steps, reserved, reserved
 }
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var depth: texture_depth_2d;
@@ -120,11 +119,13 @@ fn selected_pixel(half: vec2<i32>, sample: vec4<u32>) -> vec2<i32> {
     let tile = vec2<u32>(position.xy) % vec2<u32>(3u);
     let noise = (f32((tile.x * 3u + tile.y * 7u) % 9u) + 0.5) / 9.0;
     var occlusion = 0.0;
-    for (var direction = 0; direction < DIRECTIONS; direction++) {
-        let angle = (f32(direction) + noise) * (TAU / f32(DIRECTIONS));
+    let directions = clamp(params.budget.x, 4u, 8u);
+    let steps = clamp(params.budget.y, 3u, 6u);
+    for (var direction = 0u; direction < directions; direction++) {
+        let angle = (f32(direction) + noise) * (TAU / f32(directions));
         let axis = vec2<f32>(cos(angle), sin(angle));
-        for (var step = 0; step < STEPS; step++) {
-            let t = (f32(step) + fract(noise * 7.0 + f32(step) * 0.618)) / f32(STEPS);
+        for (var step = 0u; step < steps; step++) {
+            let t = (f32(step) + fract(noise * 7.0 + f32(step) * 0.618)) / f32(steps);
             let sample_pixel = pixel + vec2<i32>(round(axis * (t * radius_pixels + 1.0)));
             if !inside(sample_pixel) { continue; }
             let sample_z = raw_depth_at(sample_pixel);
@@ -139,7 +140,7 @@ fn selected_pixel(half: vec2<i32>, sample: vec4<u32>) -> vec2<i32> {
         }
     }
     // Strength is an exponent on the open fraction: 0 -> neutral, always within [0, 1].
-    let open = 1.0 - clamp(OCCLUSION_GAIN * occlusion / f32(DIRECTIONS * STEPS), 0.0, 1.0);
+    let open = 1.0 - clamp(OCCLUSION_GAIN * occlusion / f32(directions * steps), 0.0, 1.0);
     return encoded((1.0 - pow(open, params.control.y)) * center.share, z, pixel, n);
 }
 // Reject separation across either surface, not tangential separation along it:

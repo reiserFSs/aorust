@@ -63,7 +63,7 @@ pub(crate) struct ShadowUniform {
     pub forward: [f32; 4],
     pub control: [u32; 4],
     pub moon_direction: [f32; 4],
-    pub moon_budget: [f32; 4],
+    pub moon_budget: [f32; 4], // xyz: moon energy; w: bounded world receiver quality.
 }
 
 
@@ -122,7 +122,7 @@ impl CascadeFrame {
         Some(Self { uniform: ShadowUniform { matrices,
             splits: [splits[0], splits[1], splits[2], near], eye: eye.extend(useful_far).to_array(),
             forward: forward.extend(horizon_fade(authored_sun.y)).to_array(), control: [0; 4],
-            moon_direction: [0.0; 4], moon_budget: [0.0; 4] } })
+            moon_direction: [0.0; 4], moon_budget: [0.0, 0.0, 0.0, 1.0] } })
     }
     pub(crate) fn include_caster_depth(&mut self, casters: impl Clone + Iterator<Item = (Vec3, f32)>) {
         for matrix in &mut self.uniform.matrices {

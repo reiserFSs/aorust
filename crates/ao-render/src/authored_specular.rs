@@ -148,14 +148,16 @@ pub(super) fn append_materials(source: &mut String, settings: crate::EnhancedSet
         *source = source.replace("    let f0 = clamp(vec3<f32>(i.light.w, i.dlight.w, i.spec.w), vec3<f32>(0.0), vec3<f32>(1.0));",
             "    let albedo = material_albedo_value;\n    let f0 = mix(vec3<f32>(0.04), albedo, material_metallic(i));");
         *source = source.replace(" || power <= 0.0 || !any(f0 > vec3<f32>(0.0))", "");
-        // Ground alpha testing can discard inside ground_tile; all derivatives
-        // and implicit samples for GGX were cached by material_prepare first.
+        // The generated early-rejection prefix caches GGX derivatives and
+        // implicit samples before discard, then performs receiver queries.
+        // GGX uses the same geometric receiver/raw visibility as authored
+        // specular. The smooth-normal material sample belongs to diffuse only;
+        // replacing this call left the raw reset below with no shadow query.
         let start = source.find("fn authored_specular(").expect("material GGX");
         let end = start + source[start..].find("\n}").expect("material GGX end");
         let body = source[start..end]
             .replace("    let dx = dpdx(n);\n    let dy = dpdy(n);\n    let variance = max(dot(dx, dx), dot(dy, dy));\n", "    let variance = material_variance;\n")
             .replace("max(length(fwidth(i.wpos)), 1e-6)", "material_footprint")
-            .replace("sun_visibility(i.wpos, i.n, i.clip.xy)", "material_visibility_value")
             .replace("return max(local + sun", "return max(material_ambient_specular(i, n, v, f0) + local + sun");
         source.replace_range(start..end, &body);
     }
@@ -319,7 +321,8 @@ mod tests {
                     hdr: true, material_specular: true, ..Default::default()
                 });
                 assert!(source.contains("fn authored_ggx"));
-                assert!(source.contains("let dx = dpdx(n)"));
+                assert!(source.contains("let dx = early_normal_dx"));
+                assert!(source.contains("early_normal_dx = dpdx(early_n)"));
                 assert!(source.contains("to_g(eff_spec), eff_power"));
                 assert!(source.contains("return max(local + sun,"));
                 assert!(!source.contains("@location(16)"));

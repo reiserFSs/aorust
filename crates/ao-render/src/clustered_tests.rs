@@ -149,6 +149,8 @@ struct Globals {{ fog:vec4<f32>, fog_g:vec4<f32> }}
 var<private> g:Globals;
 var<private> mat:Material;
 var<private> alpha_sample:f32;
+var<private> early_primary:vec4<f32>;
+var<private> early_environment:vec4<f32>;
 const tex:u32=0u;
 const env_tex:u32=1u;
 fn sample_clamped(t:u32, uv:vec2<f32>)->vec4<f32>{{return vec4<f32>(1.0,1.0,1.0,alpha_sample);}}
@@ -163,6 +165,7 @@ fn clustered_receiver_spec(i:VOut, spec:vec3<f32>)->vec3<f32>{{return vec3<f32>(
 {NUMERIC_VERTEX}
 @fragment fn fs(@builtin(position) p:vec4<f32>)->@location(0) vec4<f32>{{
     alpha_sample=select(0.5,0.0,p.x>=1.0);
+    early_primary=vec4<f32>(1.0,1.0,1.0,alpha_sample);
     mat.color=vec4<f32>(1.0); mat.emissive.w=1.0;
     var i:VOut; i.color=vec4<f32>(1.0); i.tint=vec4<f32>(1.0); i.fade=1.0;
     return shade(i,0u);
@@ -186,6 +189,7 @@ struct Globals {{ ambient_g:vec4<f32>, fog_g:vec4<f32> }}
 var<private> g:Globals;
 var<private> clustered_normal:vec3<f32>;
 var<private> visibility:f32;
+var<private> early_footprint:f32;
 fn sun_visibility(p:vec3<f32>, n:vec3<f32>, pixel:vec2<f32>)->f32{{return visibility;}}
 fn clustered_pixel_lights(p:vec3<f32>, n:vec3<f32>, footprint:f32)->vec3<f32>{{return vec3<f32>(0.2);}}
 fn clustered_night_light(i:VOut,n:vec3<f32>,ground:bool,light:vec3<f32>,retained:vec3<f32>)->vec3<f32>{{return light;}}

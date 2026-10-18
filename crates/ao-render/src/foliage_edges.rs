@@ -44,12 +44,24 @@ pub(super) fn append(source: &mut String) {
         );
     source.push('\n');
     source.push_str(&shade);
+    // The root guard must use the same native comparison relaxation as shade;
+    // otherwise positive soft-edge alpha would be killed before it reaches it.
+    let start = source.find("fn early_reject(").expect("generated early coverage guard");
+    let end = start + source[start..].find("\n}").expect("early coverage guard end") + 2;
+    let reject = source[start..end].replacen("fn early_reject(", "fn foliage_edge_reject(", 1)
+        .replace(
+            "if native_alpha_test() && !native_alpha_pass(alpha) {",
+            "if native_alpha_test() && select(!native_alpha_pass(alpha), alpha <= 0.0, u32(mat.native.w) == 5u || u32(mat.native.w) == 7u) {",
+        );
+    source.push('\n');
+    source.push_str(&reject);
     for (original, stem) in [("fs_blend", "foliage_blend"), ("fs_sprite", "foliage_sprite")] {
         let marker = format!("@fragment fn {original}(");
         let start = source.find(&marker).expect("generated native foliage wrapper");
         let end = start + source[start..].find("\n}").expect("generated foliage wrapper end") + 2;
         let mode = if original == "fs_sprite" { 6 } else { 2 };
         let mut wrapper = source[start..end].to_owned();
+        wrapper = wrapper.replace("early_reject(i, early_mode);", "foliage_edge_reject(i, early_mode);");
         for input in ["i", "surface"] {
             wrapper = wrapper.replace(&format!("enhanced_original_{original}({input})"), &format!("foliage_edge_shade({input}, {mode}u)"));
         }
@@ -74,6 +86,8 @@ mod tests {
                 let start = source.find(&format!("@fragment fn fs_foliage_{stem}_{suffix}(")).unwrap();
                 let body = &source[start..start + source[start..].find("\n}").unwrap()];
                 assert!(body.contains("foliage_edge_shade("));
+                assert!(body.contains("foliage_edge_reject(i, early_mode);"));
+                assert!(body.find("foliage_edge_reject(").unwrap() < body.find("foliage_edge_shade(").unwrap());
                 assert!(body.find("foliage_edge_shade(").unwrap() < body.find("foliage_core(beauty.a)").unwrap());
             }
         }
@@ -82,6 +96,9 @@ mod tests {
         assert_eq!(source.split("fn shade(").nth(1).unwrap().split("\n}").next().unwrap(), native_shade);
         let edge = source.split("fn foliage_edge_shade(").nth(1).unwrap().split("\n}").next().unwrap();
         assert!(edge.contains("alpha <= 0.0, u32(mat.native.w) == 5u || u32(mat.native.w) == 7u"));
+        let reject = source.split("fn foliage_edge_reject(").nth(1).unwrap().split("\n}").next().unwrap();
+        assert!(reject.contains("alpha <= 0.0, u32(mat.native.w) == 5u || u32(mat.native.w) == 7u"),
+            "root coverage and native shade must relax precisely the same comparisons");
         for value in 0..=255 {
             let alpha = value as f32 / 255.0;
             let native_pass = alpha > 0.5;

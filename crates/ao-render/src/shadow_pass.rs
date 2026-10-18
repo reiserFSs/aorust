@@ -185,6 +185,7 @@ impl Renderer {
                 frame.uniform.moon_direction = Vec3::from(direction).normalize().extend(1.0).to_array();
                 frame.uniform.moon_budget = [budget[0], budget[1], budget[2], 0.0];
             }
+            frame.uniform.moon_budget[3] = self.enhanced_settings.shadow_quality.min(1) as f32;
         }
         if admission { self.prepare_actor_shadows(&mut shadows); } else { shadows.actor_ids.clear(); shadows.actor_groups.clear(); }
         if self.enhanced_settings.needs_interaction_admission() {

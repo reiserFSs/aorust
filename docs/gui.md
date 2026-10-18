@@ -1446,8 +1446,8 @@ pinch zoom, widescreen camera FOV, text preferences or session diagnostics/suspe
 | --- | --- |
 | Original | All graphical effect switches off; registry quality defaults, 1× MSAA, 1× anisotropy. |
 | Classic+ | Sun shadows, AO, contact shadows, HDR, grading, bloom, clustered local lighting, authored material specular and local light shadows only; no added grass, sky, water or foliage content. Sun boost 0.15, grade 0.25, bloom 0.2, AO strength 0.6, contact strength 0.4; 4× MSAA and 8× anisotropy. |
-| Modern | Recommended materials/reflections, night/local lighting, weather/clouds, water, foliage/grass and grading effects, with TAA + CAS sharpening and 4× MSAA. FXAA, cinematic depth of field/motion blur and user LUTs remain off. Registry quality defaults, Moonlit night, night tint 0.15, vignette 0.1; 16× anisotropy. |
-| Ultra | Same effects as Modern, plus 4096 shadow map, 8 point shadows, AO radius 2.5 / strength 1.8, grass density 2 / distance 180 m, High cloud/water quality; same MSAA and anisotropy. Cinematic effects and user LUTs remain opt-in. |
+| Modern | Recommended materials/reflections, night/local lighting, weather/clouds, water, foliage/grass and grading effects, with TAA + CAS sharpening and 4× MSAA. FXAA, cinematic depth of field/motion blur and user LUTs remain off. Shadow map 1024, Low shadow receiver/AO, 2 point shadows, grass density 0.5 / distance 96 m, Normal cloud/water; Moonlit night, night tint 0.15, vignette 0.1; 16× anisotropy. |
+| Ultra | Same effects as Modern, with 2048 shadow map, Normal shadow receiver/AO, 4 point shadows, AO radius 2.5 / strength 1.8, grass density 1 / distance 144 m, High cloud/water quality; same MSAA and anisotropy. Cinematic effects and user LUTs remain opt-in. |
 
 Screen-space indirect light remains **off in both Modern and Ultra** and is available as
 a manual, budget-dependent opt-in. It is not included merely because Ultra raises quality:
@@ -1535,6 +1535,18 @@ Replace files before reloading the relevant assets; this is not a file-watching
 texture editor. Maps alone enable normal/AO/emissive and metallic diffuse
 conservation; GGX highlights still require their own switch. See `THIRD_PARTY`
 for ao-vk attribution.
+
+Texture Material GGX and authored specular both use the geometric receiver's raw
+directional visibility, before the artistic beauty shadow floor. Combining PBR,
+specular and shadows must not reset that visibility to fully lit; HDR's direct
+sun share uses the same restored raw value. The smooth-normal material query
+still belongs to diffuse shading, and foliage transmission retains its separate
+normalized, lit-side receiver. Enhanced shaders reuse only consecutive queries
+with identical world-position, normal and pixel-coordinate bits within one
+fragment, including the raw-visibility write (or no-write early return).
+Reflection/probe provenance and clustered receivers can share an exact query;
+different normal scales or directions never share one. Moon maps retain neutral
+sunlight while moon illumination/probe rejection use the actual selected maps.
 
 Reflections use only current primary-screen sources and preserve the receiver's
 native fog extinction. Dynamic actors/effects are conservatively excluded as
@@ -1949,13 +1961,44 @@ is tracked in the pyramid's alpha as the highlight luma) while the highlight sha
 interaction: the tone curve's white is lifted by the halo's size, `tone(x, beta + max(halo rgb))` (capped at beta 0.6), so
 bloomed pixels roll into the shoulder instead of clipping at their own old white; with no halo it is the unchanged curve.
 
+AO Quality (`AomacAoQuality`, `EnhancedSettings::ao_quality`) is an independent sample-budget
+radio: Low (0) uses 4 directions × 3 steps (12 probes), Normal (1, default) retains
+6 × 4 (24 probes), and High (2) uses 8 × 6 (48 probes) per half-resolution estimate.
+Modern selects Low; Classic+ and Ultra retain Normal.
+`ambient_occlusion.rs` uploads the bounded direction/step pair in a 160-byte uniform
+(budget vec4 at byte 144); `ambient_occlusion.wgsl` consumes it in the existing estimate
+pipeline, using the same counts for angular/radial spacing and sample normalization.
+Every tier retains the same world radius, 64-pixel sampling cap, half-resolution
+targets, bilateral reconstruction, primary-visible-depth admission, original fog cutoff
+and grass/MSAA porosity decoding; no new pipelines, history or quarter-resolution path.
+Owned AO storage is `ceil(width/2) × ceil(height/2) × 32 + 160` bytes, independent
+of quality (ambient MRT and shared frame storage excluded).
+Regression coverage in `ambient_occlusion.rs` checks the budgets, WGSL operations,
+Rust/WGSL uniform offsets/size and odd-sized memory accounting; the existing GPU
+hidden-actor/zero-ambient/visible-contact/no-halo/fog contract runs all three tiers
+with unchanged assertions. Registry tests cover bounds, persistence and deterministic presets.
+
+Shadow Receiver Quality (`AomacShadowQuality`, `EnhancedSettings::shadow_quality`) is
+a bounded two-tier radio: Low (0) uses four receiver-plane-corrected PCF taps per
+cascade without a blocker search, including when softness is zero. Normal (1, default)
+preserves the existing near-cascade five-blocker / twelve-PCF PCSS, distant four-tap
+filter, and zero-softness sliding 3×3 filter. Quality occupies the previously unused
+`ShadowFrame.moon_budget.w` (byte 284 of the unchanged 288-byte uniform), independent
+of moon energy in xyz; no binding layout or pipeline key changes. Projection, bias,
+cascade admission/blends, strength, grass shadow coverage and fog reach are unchanged.
+The focused shadow regression covers both tiers' real wall reception, shaft-only
+surface neutrality, deterministic pixels and default/Normal equality; CPU tests pin
+the tap budgets, uniform layout, bounds, persistence and preset values.
+
 | Quality control / DV Main key | Default | Bounds |
 |---|---|---|
 | Shadow Map Size / `AomacShadowMapSize` | 2048 | 256–4096 (UI choices 256/512/1024/2048/4096) |
+| Shadow Receiver Quality / `AomacShadowQuality` | Normal (1) | Low (0) / Normal (1) |
 | Sun Shadow Strength / `AomacShadowStrength` | 0.45 | 0–1 (share of the sun removed in full shadow; 55% remains as shade illumination) |
 | Sun Shadow Softness / `AomacShadowSoftness` | 1.5 | 0–4 (penumbra growth with blocker distance; 0 = hard 3x3 PCF) |
 | Ambient Occlusion Radius / `AomacAoRadius` | 1.75 m | 0–5 m |
 | Ambient Occlusion Strength / `AomacAoStrength` | 1.5 | 0–2 |
+| Ambient Occlusion Quality / `AomacAoQuality` | Normal (1) | Low (0) / Normal (1) / High (2) |
 | Sunlight Brightness / `AomacSunBoost` | 0.6 | 0–0.6 (daylight exposure control; peak lift is 60% of this gamma-space control, 36% at defaults; 0 = faithful) |
 | Colour Grade / `AomacGrade` | 0.8 | 0–1 (HDR present only; luminance-preserving warm daylight / cool night chroma, with gamut compression toward equal-luminance grey rather than lossy clipping; 0 = off) |
 | Contact Shadow Strength / `AomacContactStrength` | 0.8 | 0–1 (share of directional light removed at full contact) |

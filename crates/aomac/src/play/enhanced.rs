@@ -66,13 +66,21 @@ pub(super) fn apply_preset(d: &mut DValues, preset: GraphicsPreset) {
         }
         d.set_raw("AomacMotionBlur", Variant::Float(0.0));
     }
+    if preset == GraphicsPreset::Modern {
+        for (name, value) in [("AomacShadowMapSize", 1024), ("AomacShadowQuality", 0),
+            ("AomacAoQuality", 0), ("AomacPointShadowCount", 2)] {
+            d.set_raw(name, Variant::Int(value));
+        }
+        d.set_raw("AomacGrassDensity", Variant::Float(0.5));
+        d.set_raw("AomacGrassDistance", Variant::Float(96.0));
+    }
     if preset == GraphicsPreset::Ultra {
-        for (name, value) in [("AomacShadowMapSize", 4096), ("AomacPointShadowCount", 8),
-            ("AomacCloudQuality", 2), ("AomacWaterQuality", 2)] {
+        for (name, value) in [("AomacShadowMapSize", 2048), ("AomacShadowQuality", 1),
+            ("AomacPointShadowCount", 4), ("AomacCloudQuality", 2), ("AomacWaterQuality", 2), ("AomacAoQuality", 1)] {
             d.set_raw(name, Variant::Int(value));
         }
         for (name, value) in [("AomacAoRadius", 2.5), ("AomacAoStrength", 1.8),
-            ("AomacGrassDensity", 2.0), ("AomacGrassDistance", 180.0)] {
+            ("AomacGrassDensity", 1.0), ("AomacGrassDistance", 144.0)] {
             d.set_raw(name, Variant::Float(value));
         }
     }
@@ -165,6 +173,7 @@ pub(super) fn controls() -> Vec<Control> {
             &[("Original", 0), ("Classic+", 1), ("Modern", 2), ("Ultra", 3), ("Custom", 4)], 0, 0, 4),
         Control::check(Lighting, "Sun Shadows", "AomacSunShadows", "Sun Shadows"),
         Control::radio(Lighting, "Sun Shadows", "AomacShadowMapSize", "Shadow Map Size", &[("256", 256), ("512", 512), ("1024", 1024), ("2048", 2048), ("4096", 4096)], 2048, 256, 4096),
+        Control::radio(Lighting, "Sun Shadows", "AomacShadowQuality", "Shadow Receiver Quality", &[("Low", 0), ("Normal", 1)], 1, 0, 1),
         Control::slider(Lighting, "Sun Shadows", "AomacShadowStrength", "Sun Shadow Strength", "%.2f", 0.45, 0.0, 1.0),
         Control::slider(Lighting, "Sun Shadows", "AomacShadowSoftness", "Sun Shadow Softness", "%.2f", 1.5, 0.0, 4.0),
         Control::slider(Lighting, "Sunlight", "AomacSunBoost", "Sunlight Brightness", "%.2f", 0.6, 0.0, 0.6),
@@ -189,6 +198,7 @@ pub(super) fn controls() -> Vec<Control> {
         Control::check(Lighting, "Materials & Reflections", "AomacMaterialReflections", "Screen-space Material Reflections"),
         Control::check(Lighting, "Materials & Reflections", "AomacEnvironmentProbe", "Observed Static Environment Probe"),
         Control::check(Ambient, "Ambient Occlusion", "AomacAmbientOcclusion", "Ambient Occlusion"),
+        Control::radio(Ambient, "Ambient Occlusion", "AomacAoQuality", "Ambient Occlusion Quality", &[("Low", 0), ("Normal", 1), ("High", 2)], 1, 0, 2),
         Control::slider(Ambient, "Ambient Occlusion", "AomacAoRadius", "Ambient Occlusion Radius", "%.2f m", 1.75, 0.0, 5.0),
         Control::slider(Ambient, "Ambient Occlusion", "AomacAoStrength", "Ambient Occlusion Strength", "%.2f", 1.5, 0.0, 2.0),
         Control::check(Ambient, "Emissive Bloom", "AomacEmissiveBloom", "Emissive Bloom"),
@@ -340,6 +350,43 @@ mod tests {
             _ => [control.min.as_ref(), control.max.as_ref()].into_iter().flatten().find(|value| **value != control.default).unwrap().clone(),
         }
     }
+
+    #[test]
+    fn ao_quality_is_a_bounded_independent_ambient_radio() {
+        let mut d = values();
+        let inventory = controls();
+        let quality = inventory.iter().find(|control| control.name == "AomacAoQuality").unwrap();
+        assert_eq!(quality.page, PageId::Ambient);
+        assert!(matches!(quality.kind, ControlKind::Radio(choices) if choices == [("Low", 0), ("Normal", 1), ("High", 2)]));
+        assert_eq!(d.min_max(quality.name), (Variant::Int(0), Variant::Int(2)));
+        d.set(quality.name, Variant::Int(0));
+        assert!(!d.enhanced_settings().any_enabled());
+        d.set("AomacAmbientOcclusion", Variant::Bool(true));
+        assert!(d.enhanced_settings().ambient_occlusion);
+        assert_eq!(d.enhanced_settings().ao_quality, 0);
+        reset(&mut d, Some(PageId::Ambient));
+        assert_eq!(d.enhanced_settings(), ao_render::EnhancedSettings::default());
+    }
+    #[test]
+    fn shadow_quality_is_bounded_persisted_and_independent() {
+        let mut d = values();
+        let inventory = controls();
+        let quality = inventory.iter().find(|control| control.name == "AomacShadowQuality").unwrap();
+        assert_eq!(quality.page, PageId::Lighting);
+        assert!(matches!(quality.kind, ControlKind::Radio(choices) if choices == [("Low", 0), ("Normal", 1)]));
+        assert_eq!(d.min_max(quality.name), (Variant::Int(0), Variant::Int(1)));
+        assert_eq!(d.enhanced_settings().shadow_quality, 1);
+        for (input, expected) in [(-1, 0), (0, 0), (1, 1), (2, 1), (i64::MAX, 1)] {
+            d.set(quality.name, Variant::Int(input));
+            let mut restored = values();
+            restored.load_config(&d.save_config(CAT_MAIN), CAT_MAIN, false);
+            assert_eq!(restored.enhanced_settings().shadow_quality, expected);
+            assert!(!restored.enhanced_settings().any_enabled());
+        }
+        reset(&mut d, Some(PageId::Lighting));
+        assert_eq!(d.enhanced_settings(), ao_render::EnhancedSettings::default());
+    }
+
 
     #[test]
     fn indirect_light_maps_independently_and_resets_with_lighting() {
@@ -504,9 +551,13 @@ mod tests {
         }
         assert_eq!(ultra.motion_blur, 0.0);
         assert!(!ultra.indirect_light, "Ultra also keeps indirect light opt-in");
-        assert!(ultra.shadow_map_size > modern.shadow_map_size);
+        assert_eq!((modern.shadow_map_size, ultra.shadow_map_size), (1024, 2048));
+        assert_eq!((classic.shadow_quality, modern.shadow_quality, ultra.shadow_quality), (1, 0, 1));
+        assert_eq!((modern.point_shadow_count, ultra.point_shadow_count), (2, 4));
         assert!(ultra.ao_radius > modern.ao_radius && ultra.ao_strength > modern.ao_strength);
-        assert!(ultra.grass_density > modern.grass_density && ultra.grass_distance > modern.grass_distance);
+        assert_eq!((classic.ao_quality, modern.ao_quality, ultra.ao_quality), (1, 0, 1));
+        assert_eq!((modern.grass_density, modern.grass_distance), (0.5, 96.0));
+        assert_eq!((ultra.grass_density, ultra.grass_distance), (1.0, 144.0));
         assert_eq!(d.get_i64("AomacCloudQuality"), Some(2));
         assert_eq!(d.get_i64("AomacWaterQuality"), Some(2));
         assert_eq!((ultra.cloud_quality, ultra.water_quality), (2, 2));
@@ -521,6 +572,13 @@ mod tests {
             restored.load_config(&quality.save_config(CAT_MAIN), CAT_MAIN, false);
             let settings = restored.enhanced_settings();
             assert_eq!((settings.cloud_quality, settings.water_quality), (expected, expected));
+        }
+        assert_eq!(values().enhanced_settings().ao_quality, 1);
+        for (input, expected) in [(-1, 0), (0, 0), (1, 1), (2, 2), (3, 2), (i64::MAX, 2)] {
+            quality.set("AomacAoQuality", Variant::Int(input));
+            let mut restored = values();
+            restored.load_config(&quality.save_config(CAT_MAIN), CAT_MAIN, false);
+            assert_eq!(restored.enhanced_settings().ao_quality, expected);
         }
         let mut legacy = values();
         legacy.load_config("<Root><Value name=\"AomacWaterWaves\" value=\"true\"/></Root>", CAT_MAIN, false);

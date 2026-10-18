@@ -6,7 +6,7 @@ struct ShadowFrame {
     forward: vec4<f32>,
     control: vec4<u32>,
     moon_direction: vec4<f32>,
-    moon_budget: vec4<f32>,
+    moon_budget: vec4<f32>, // xyz: authored moon energy; w: receiver quality (0 Low, 1 Normal).
 }
 @group(3) @binding(0) var<uniform> shadow_frame: ShadowFrame;
 @group(3) @binding(1) var shadow_maps: texture_depth_2d_array;
@@ -119,7 +119,7 @@ fn cascade_visibility(world: vec3<f32>, normal: vec3<f32>, layer: u32, pixel: ve
     var gradient = vec2<f32>(0.0);
     if abs(plane.z) > 0.000001 { gradient = vec2<f32>(-2.0 * plane.x, 2.0 * plane.y) / plane.z; }
     let softness = bitcast<f32>(shadow_frame.control.y);
-    if softness <= 0.0 {
+    if softness <= 0.0 && shadow_frame.moon_budget.w != 0.0 {
         let texel_position = uv * dimensions - vec2<f32>(0.5);
         let center = floor(texel_position) + vec2<f32>(0.5);
         let fraction = fract(texel_position);
@@ -147,8 +147,9 @@ fn cascade_visibility(world: vec3<f32>, normal: vec3<f32>, layer: u32, pixel: ve
     let lo = guard;
     let hi = vec2<f32>(1.0) - guard;
     let texel_uv = 1.0 / dimensions;
-    if layer >= 2u {
-        // Distant texels are wider than any penumbra: a small fixed filter.
+    if layer >= 2u || shadow_frame.moon_budget.w == 0.0 {
+        // Low uses this four-tap PCF in every cascade, without blocker search.
+        // Normal retains the existing distant-cascade filter and near PCSS.
         var visibility = 0.0;
         for (var i = 0u; i < 4u; i++) {
             let sample_uv = shadow_center(clamp(uv + shadow_vogel(i, 4u, rotation) * 1.5 * texel_uv, lo, hi), dimensions);
