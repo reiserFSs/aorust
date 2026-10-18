@@ -3,6 +3,13 @@ use super::{GrassBender, GrassExposure, Mat4, Vec3};
 
 const PUSHERS: usize = 16;
 const HISTORY: usize = 64;
+
+fn push_spring(age: f32) -> f32 {
+    // Deliberately less damped than ao-vk's exp(-6t) cos(7t): its ~7% rebound
+    // disappears at ordinary third-person distance. This returns ~25% once.
+    let t = (age - 0.08).max(0.0);
+    (-4.0 * t).exp() * (9.0 * t).cos()
+}
 #[derive(Clone, Copy)]
 struct Contact { source: Option<u32>, position: [f32; 3], age: f32 }
 #[derive(Default)]
@@ -46,10 +53,10 @@ impl Foliage {
     }
     fn update_contacts(&mut self) {
         // Source revocation precedes recovery: an unseen enemy cannot leave a spring signal.
-        self.contacts.retain(|p| p.age < 1.6 && self.selected.iter().any(|b| b.actor == p.source));
+        self.contacts.retain(|p| p.age < 2.2 && self.selected.iter().any(|b| b.actor == p.source));
         for bender in &self.selected {
             let last = self.contacts.iter_mut().rev().find(|p| p.source == bender.actor);
-            if let Some(last) = last.filter(|p| Vec3::from_array(p.position).distance_squared(Vec3::from_array(bender.position)) < 0.35 * 0.35) {
+            if let Some(last) = last.filter(|p| Vec3::from_array(p.position).distance_squared(Vec3::from_array(bender.position)) < 0.2 * 0.2) {
                 last.age = 0.0;
             } else {
                 if self.contacts.len() == HISTORY { self.contacts.remove(0); }
@@ -60,8 +67,7 @@ impl Foliage {
     pub fn pushers(&self) -> [[f32; 4]; PUSHERS] {
         let mut out = [[0.0; 4]; PUSHERS];
         for (slot, point) in out.iter_mut().zip(self.contacts.iter().rev()) {
-            let t = (point.age - 0.08).max(0.0);
-            *slot = [point.position[0], point.position[1], point.position[2], (-6.0 * t).exp() * (7.0 * t).cos()];
+            *slot = [point.position[0], point.position[1], point.position[2], push_spring(point.age)];
         }
         out
     }
@@ -109,11 +115,15 @@ mod tests {
         state.update_contacts();
         assert_eq!(state.pushers()[0][3], 1.0);
         state.selected[0].position[0] += 1.0;
-        for _ in 0..8 { state.advance(0.1); }
+        for _ in 0..4 { state.advance(0.1); }
         state.update_contacts();
-        assert!(state.contacts[0].age > 0.7);
-        assert!(state.pushers()[1][3].abs() < 0.03);
-        state.selected.clear(); state.update_contacts();
+        assert!(state.contacts[0].age > 0.39);
+        assert!(state.pushers()[1][3] < -0.2, "departed contact must visibly overshoot upright");
+        for _ in 0..19 { state.advance(0.1); }
+        state.update_contacts();
+        assert_eq!(state.contacts.len(), 1, "old spring must expire, not accumulate");
+        state.set_inputs(&[GrassBender { actor: Some(7), position: [2.0, 0.0, 1.0] }], [0.0; 3]);
+        state.prepare(Vec3::ZERO, Mat4::IDENTITY, std::iter::empty(), true);
         assert!(state.contacts.is_empty());
         assert_eq!(state.pushers(), [[0.0; 4]; PUSHERS]);
     }
@@ -124,6 +134,20 @@ mod tests {
         state.advance(0.1);
         assert_eq!(state.wind().0, super::super::grass::advance_wind_phase(0.0, 0.1) as f32);
         assert_eq!(state.wind().1, super::super::grass::wind_target([2.0, 0.0, 1.0]));
+    }
+    #[test]
+    fn spring_has_readable_rebound_and_no_stationary_pileup() {
+        assert_eq!(push_spring(0.0), 1.0);
+        assert_eq!(push_spring(0.08), 1.0);
+        assert!(push_spring(0.4) < -0.2);
+        assert!(push_spring(1.6).abs() < 0.003);
+        let mut state = Foliage::default();
+        state.selected.push(GrassBender { actor: None, position: [0.0; 3] });
+        for _ in 0..30 { state.advance(0.1); state.update_contacts(); }
+        assert_eq!(state.contacts.len(), 1);
+        assert_eq!(state.pushers()[0][3], 1.0);
+        state.prepare(Vec3::ZERO, Mat4::IDENTITY, std::iter::empty(), false);
+        assert_eq!(state.pushers(), [[0.0; 4]; PUSHERS]);
     }
     #[test]
     fn generated_foliage_shader_contract() {

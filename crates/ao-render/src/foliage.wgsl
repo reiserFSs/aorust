@@ -1,6 +1,13 @@
 // Plant push spring adapted from ao-vk (MIT, Copyright 2026 wannabuh).
-// Wind is the exact stabilized grass oscillator appended by foliage.rs.
+// Shared card/sprig/caster deformation, with ao-vk's centre-rooted branch motion
+// and fixed-world gust axes. All clocks use integer harmonics of the wrapped phase.
 fn foliage_vertex(v: VIn, vertex: VOut) -> VOut {
+    return foliage_vertex_at(v, vertex, g.foliage_wind.w, true);
+}
+
+// A detached leaf samples only wind at its release clock. Actor contacts must
+// never be baked into a persistent fall trajectory after admission revocation.
+fn foliage_vertex_at(v: VIn, vertex: VOut, clock: f32, with_push: bool) -> VOut {
     var o = vertex;
     let model = mat4x4<f32>(vec4<f32>(v.m0.xyz, 0.0), v.m1, v.m2, v.m3);
     // Choose the authored axis which actually points up after placement. This
@@ -22,23 +29,40 @@ fn foliage_vertex(v: VIn, vertex: VOut) -> VOut {
     // World axes remain fixed under weather turns: never multiply spatial
     // phases by a changing wind direction (GrassTwitch a5473f12).
     let aa = vec2<f32>(dot(origin.xz, vec2<f32>(0.8, 0.6)), dot(origin.xz, vec2<f32>(-0.6, 0.8)));
-    let time = g.foliage_wind.w / 0.05;
-    let phase = origin.x * 0.3 + origin.z * 0.25;
+    let time = clock / 0.05;
+    let crown = (o.wpos - origin) / max(height * 0.5, 0.001);
+    let radius = min(length(crown), 1.3);
+    let branch = crown / max(radius, 0.001);
+    let phase = origin.x * 0.31 + origin.z * 0.23 + dot(branch, vec3<f32>(2.3, 1.7, 3.1));
     let gust = grass_gust(aa, time);
-    let amplitude = min(height * 0.06, 0.65) * h * h;
-    var bend = g.foliage_wind.xy * (amplitude * g.foliage_wind.z * (grass_sway(aa, time, phase, gust) + 0.7 * gust)) * g.foliage_flags.x;
-    if g.foliage_flags.y > 0.0 {
+    let strength = min(0.65 + g.foliage_wind.z, 2.3);
+    let storm = clamp((g.foliage_wind.z - 1.2) / 1.3, 0.0, 1.0);
+    let swing = (0.55 * sin(clock * 26.0 + phase) + 0.3 * sin(clock * 58.0 + phase * 1.9))
+        * (1.0 - 0.4 * storm) + 0.6 * gust + 0.8 * storm;
+    // Small plants bend from the ground; raised crowns flex out from their
+    // centre, which stays attached to the unmoving native trunk.
+    let tree = smoothstep(2.0, 5.0, height);
+    let attachment = mix(h * h, min(radius * radius, 1.0) * h, tree);
+    let amplitude = min(height * 0.09, 0.9) * attachment * strength * g.foliage_flags.x;
+    let across = vec2<f32>(-g.foliage_wind.y, g.foliage_wind.x);
+    var bend = amplitude * (g.foliage_wind.xy * swing
+        + across * 0.22 * sin(clock * 42.0 + phase * 2.7));
+    if with_push && g.foliage_flags.y > 0.0 {
         var push = vec2<f32>(0.0);
         for (var k = 0u; k < 16u; k += 1u) {
             let source = g.foliage_pushers[k];
             let delta = o.wpos.xz - source.xz;
             let distance = length(delta);
-            let near = max(1.0 - distance / 1.4, 0.0) * max(1.0 - abs(root.y - source.y) / 1.5, 0.0);
+            // Vertex height, not canopy-base height: nearby low branches can
+            // part around the body, without moving foliage on another floor.
+            let dy = o.wpos.y - source.y;
+            let vertical_reach = smoothstep(-1.0, -0.3, dy) * (1.0 - smoothstep(2.0, 3.0, dy));
+            let near = (1.0 - smoothstep(0.3, 1.8, distance)) * vertical_reach;
             let direction = select(vec2<f32>(0.7071), delta / max(distance, 0.001), distance > 0.001);
-            push += direction * near * near * source.w;
+            push += direction * near * source.w;
         }
         let size = length(push);
-        bend += push / max(size, 1.0) * min(0.75, height * 0.8) * h * h;
+        bend += push / max(size, 1.0) * min(0.85, height * 0.8) * h * sqrt(h);
     }
     // Length-preserving bend: tips cannot rise and expose a brighter silhouette.
     let above = max((o.wpos.y - root.y), 0.0);
