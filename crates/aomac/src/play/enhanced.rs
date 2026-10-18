@@ -110,6 +110,7 @@ pub(super) fn controls() -> Vec<Control> {
         Control::check(Camera, "Camera", "AomacWidescreenFOV", "Widescreen FOV (keep the 4:3 vertical angle)"),
         Control::check(Camera, "Post Processing", "AomacHdr", "HDR Sunlight and Tonemap"),
         Control::slider(Camera, "Post Processing", "AomacGrade", "Colour Grade (warm sun, cool shade)", "%.2f", 0.8, 0.0, 1.0),
+        Control::check(Camera, "Antialiasing", "AomacTaa", "Temporal Antialiasing"),
         Control::radio(Performance, "Interface", "AomacInterfaceScale", "Interface Scale", &[("Auto (retail-equivalent)", 0), ("1x", 1), ("2x", 2), ("3x", 3)], 0, 0, 3),
         Control::check(Performance, "Interface", "AomacBorderlessFullscreen", "Instant Fullscreen (skip animation, hide menu bar/dock)"),
         Control { page: Performance, section: "Text", name: "ChatFontSize", label: "Chat Font Size", kind: ControlKind::Slider { format: "%.0f pt", scale: 0.1 }, default: Variant::Int(140), min: Some(Variant::Int(50)), max: Some(Variant::Int(480)) },
