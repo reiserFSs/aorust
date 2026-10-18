@@ -118,9 +118,14 @@ impl crate::Renderer {
         if cut || room != self.temporal_room || self.post_fog_color != Some(fog_color) { self.reset_post_history(); }
         self.temporal_room = room;
         self.post_fog_color = Some(fog_color);
-        if self.post_target.as_ref().is_none_or(|target| target.size != size) {
+        // Only grading/bloom need a separate display-space post input.
+        if settings.needs_grade() || (settings.emissive_bloom && settings.bloom_strength > 0.0) {
+            if self.post_target.as_ref().is_none_or(|target| target.size != size) {
+                self.reset_post_history();
+                self.post_target = Some(PostTarget::new(&self.device, size, self.format, self.enhanced_pipelines.source_layout()));
+            }
+        } else if self.post_target.take().is_some() {
             self.reset_post_history();
-            self.post_target = Some(PostTarget::new(&self.device, size, self.format, self.enhanced_pipelines.source_layout()));
         }
         if !settings.taa { return native_vp; }
         if self.temporal.as_ref().is_none_or(|temporal| temporal.size() != size) {
@@ -130,7 +135,7 @@ impl crate::Renderer {
         Mat4::from_translation(Vec3::new(2.0*jitter[0]/size.0 as f32,-2.0*jitter[1]/size.1 as f32,0.0))*native_vp
     }
     pub(crate) fn encode_post_frame(&mut self, encoder: &mut wgpu::CommandEncoder, output: &wgpu::TextureView, camera: &crate::Camera, vp: Mat4, far: f32) {
-        if self.post_target.is_none() { return; }
+        if !self.enhanced_settings.post_enabled() { return; }
         if self.enhanced_settings.taa || self.enhanced_settings.motion_blur > 0.0 {
             if let Some(frame) = &self.enhanced_frame {
                 let depth = frame.depth.clone();
@@ -139,11 +144,12 @@ impl crate::Renderer {
         }
         self.finish_motion_frame(encoder);
         let Some(frame) = &self.enhanced_frame else { return; };
-        let target = self.post_target.as_ref().expect("post target allocated");
+        let (input, input_source) = self.post_target.as_ref().map_or(
+            (&frame.colour, &frame.composite_bg), |target| (&target.view, &target.source));
         if let (Some(temporal), Some(motion)) = (&mut self.temporal, &self.motion_vectors) {
-            temporal.encode(&self.device,&self.queue,encoder,&target.view,motion.motion_view(),motion.identity_view(),&frame.resolved_depth,frame.sun.as_ref().expect("postprocessing owns native fog mask"),self.post_fog_color.unwrap_or_default().map(crate::gamma),motion.visibility_changed());
+            temporal.encode(&self.device,&self.queue,encoder,input,motion.motion_view(),motion.identity_view(),&frame.resolved_depth,frame.sun.as_ref().expect("postprocessing owns native fog mask"),self.post_fog_color.unwrap_or_default().map(crate::gamma),motion.visibility_changed());
         }
-        let (view, source) = self.temporal.as_ref().map_or((&target.view,&target.source),|temporal|(temporal.output(),temporal.source()));
+        let (view, source) = self.temporal.as_ref().map_or((input,input_source),|temporal|(temporal.output(),temporal.source()));
         let settings = self.enhanced_settings;
         let spatial_settings = crate::spatial_post::SpatialSettings {
             fxaa: settings.fxaa && !settings.taa, cas: settings.cas, cas_strength: settings.cas_strength,
@@ -156,12 +162,11 @@ impl crate::Renderer {
             fog_color: self.post_fog_color.unwrap_or_default().map(crate::gamma),
         };
         let motion = self.motion_vectors.as_ref().map(|motion|(motion.motion_view(),motion.identity_view()));
-        let resolved = match self.spatial_post.as_mut() {
-            Some(spatial) => spatial.encode(&self.device,&self.queue,encoder,view,&frame.resolved_depth,frame.sun.as_ref().expect("postprocessing owns native fog mask"),motion,frame.size,spatial_settings,projection),
-            None => None,
-        };
+        let output = self.heat_haze.source().unwrap_or(output);
         let timestamps = if self.heat_haze.source().is_none() && self.screen.layers.is_empty() { self.gpu_timer.as_mut().map(crate::FrameGpuTimer::end_pass) } else { None };
-        frame.composite(encoder,self.heat_haze.source().unwrap_or(output),Some(resolved.unwrap_or(source)),timestamps);
+        let encoded = self.spatial_post.as_mut().is_some_and(|spatial|
+            spatial.encode(&self.device,&self.queue,encoder,view,&frame.resolved_depth,frame.sun.as_ref().expect("postprocessing owns native fog mask"),motion,frame.size,spatial_settings,projection,output,timestamps.clone()));
+        if !encoded { frame.composite(encoder,output,Some(source),timestamps); }
         self.post_previous_view=Some((vp,camera.pos));
     }
 }

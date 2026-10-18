@@ -76,6 +76,27 @@ fn assert_interiors(actual: &[u8], expected: &[u8], size: (u32, u32), label: &st
 }
 
 #[test]
+fn post_target_uses_first_frame_settings_before_grade_and_bloom_allocation() {
+    let camera = Camera::look_at(Vec3::new(0.0, 0.0, 6.0), Vec3::ZERO);
+    let dof = EnhancedSettings {
+        depth_of_field: true, dof_aperture: 2.0, dof_max_radius: 8.0, ..Default::default()
+    };
+    let mut r = renderer();
+    for (settings, needs_target) in [
+        (EnhancedSettings { hdr: true, ..dof }, true),
+        (EnhancedSettings { emissive_bloom: true, bloom_strength: 0.5, ..dof }, true),
+        (dof, false),
+    ] {
+        r.set_enhanced_settings(settings);
+        r.post_target = None;
+        assert!(r.grade.is_none() && r.bloom.is_none(), "effect resources have not been allocated yet");
+        r.prepare_post_frame((64, 32), &camera, Mat4::IDENTITY, [0.0; 3]);
+        assert_eq!(r.post_target.is_some(), needs_target,
+            "first-frame target selection must use requested grade/bloom settings, not allocated resources");
+    }
+}
+
+#[test]
 fn post_temporal_moving_rigid_and_skinned_disappearance_and_model_identity() {
     let size = (192, 128);
     let camera = Camera::look_at(Vec3::new(0.0, 0.0, 6.0), Vec3::ZERO);

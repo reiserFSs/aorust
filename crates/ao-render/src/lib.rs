@@ -1915,7 +1915,7 @@ impl Renderer {
         }
         let spatial_enabled = settings.fxaa && !settings.taa || settings.cas || settings.depth_of_field || settings.motion_blur > 0.0;
         if spatial_enabled && self.spatial_post.is_none() {
-            self.spatial_post = Some(spatial_post::SpatialPost::new(&self.device,self.format,self.enhanced_pipelines.source_layout()));
+            self.spatial_post = Some(spatial_post::SpatialPost::new(&self.device,self.format));
         } else if !spatial_enabled { self.spatial_post = None; }
         if !settings.post_enabled() { self.post_target = None; }
         if settings.taa || settings.motion_blur > 0.0 {
@@ -3357,7 +3357,7 @@ impl Renderer {
             bloom.encode(&self.queue, &mut enc, self.enhanced_settings.bloom_strength);
             if let Some(start) = bloom_start { cpu.bloom_ms = start.elapsed().as_secs_f64() * 1000.0; }
         }
-        if let Some(frame) = self.enhanced_frame.as_ref() {
+        if let Some(frame) = self.enhanced_frame.as_ref().filter(|_| !self.enhanced_settings.post_enabled() || self.post_target.is_some()) {
             let post = self.post_target.as_ref();
             let timestamps = if post.is_none() && self.heat_haze.source().is_none() && self.screen.layers.is_empty() { self.gpu_timer.as_mut().map(FrameGpuTimer::end_pass) } else { None };
             let output = post.map_or_else(|| self.heat_haze.source().unwrap_or(resolve), |target| &target.view);

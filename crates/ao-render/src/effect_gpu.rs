@@ -249,7 +249,11 @@ fn effect_label(file: &'static str, pass: Option<&str>) -> &'static str {
         Some("Enhanced canopy leaves") => return "Canopy leaves",
         Some("profiled world continuation") => return "World",
         Some("motion blur") => return "Motion blur",
-        Some("depth of field") => return "Depth of field",
+        Some("DoF prepare") => return "Depth of field prep",
+        Some("DoF tiles") => return "Depth of field tiles",
+        Some("DoF dilation") => return "Depth of field dilation",
+        Some("DoF gather") => return "Depth of field gather",
+        Some("DoF upsample") => return "Depth of field upsample",
         Some("FXAA") => return "FXAA",
         Some("CAS") => return "CAS",
         Some("Fluid smoke") => return "Fluid smoke",
@@ -348,6 +352,18 @@ impl EffectPassEncoder for wgpu::CommandEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dof_stages_have_distinct_profiler_labels() {
+        for (pass, expected) in [
+            ("DoF prepare", "Depth of field prep"),
+            ("DoF tiles", "Depth of field tiles"),
+            ("DoF dilation", "Depth of field dilation"),
+            ("DoF gather", "Depth of field gather"),
+            ("DoF upsample", "Depth of field upsample"),
+        ] {
+            assert_eq!(effect_label("spatial_post.rs", Some(pass)), expected);
+        }
+    }
     #[test]
     fn rolling_window_evicts_old_samples() {
         let mut rolling = Rolling::new(false);

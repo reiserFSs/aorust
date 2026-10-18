@@ -1220,13 +1220,20 @@ Clear pixels retain ordinary filtering rather than the superseded night ceiling.
 Depth of field retains the sign of near/far circle of confusion and approaches
 its configured pixel-radius cap continuously; it no longer saturates every
 background beyond twice the focus depth to the same blur. Exact-focus pixels
-remain unchanged. A bounded pixel-disc gather admits only the same signed
-defocus layer with source-aperture coverage, rather than requiring equal depth
-within 1%; this forms filled bokeh discs from small native highlights without
-importing focused-character colour. Native-fog rejection is unchanged.
+remain unchanged. Resolved colour and signed CoC are reduced to half resolution;
+separate near/far layers use a 48-sample, uniform-area golden-spiral gather with
+source-aperture coverage. An 8×8 half-resolution tile maximum skips focused tiles;
+neighboring tile maxima are dilated once at tile resolution across the maximum
+eight-half-pixel radius. CoC shares colour alpha; native fog uses a compact R16F
+attachment. A CoC/fog-bilateral upsample restores full-resolution silhouettes,
+using hardware gathers for its four CoC/fog neighbors. The final spatial effect
+writes directly to presentation; ungraded/unbloomed input reuses resolved native
+colour without another full-resolution copy. No gather tap
+reads MSAA samples. Native-fog rejection is retained at reduction, gather and
+upsample; small native highlights retain circular apertures rather than a box blur.
 `spatial_shaders_validate_on_gpu` guards exact focus, progressive background
 blur, far highlights across different far depths, circular support and
-foreground isolation. Dense aperture coverage costs more than sparse taps.
+foreground isolation. `dof_targets_round_up_without_losing_edge_pixels` covers odd and 1px targets.
 
 TAA also compares exact GPU-visible actor-pose IDs across frames, reduced from
 all native-depth-admitted MSAA identity samples. A visible-set change rejects
@@ -2833,6 +2840,10 @@ policy as the main timing pass; post camera-yaw sweeps remain a separate report.
 Neither timing pass changes capture/repeat poses or their effect time of zero.
 Both reports give full-frame nearest-rank p50/p95/p99 in milliseconds, not isolated
 pass cost. Acquire the shared GPU timing lock; no concurrent captures or GPU tests.
+`AOMAC_GFX_EFFECT_TIMING=1` separately collects 180 frozen frames with the existing
+per-effect profiler and writes `<view>-effects.txt` (label, rolling mean, samples).
+These overlapping/dependency-inclusive intervals are not additive exclusive pass
+costs; use the full-frame ABBA reports for feature-cost claims.
 
 `AOMAC_GFX_MSAA=4` selects the requested 1920×1200, 4× MSAA lighting
 measurement configuration; the default remains 1 for existing byte-comparison
