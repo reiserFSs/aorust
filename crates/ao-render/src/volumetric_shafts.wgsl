@@ -24,14 +24,17 @@ fn mapped_visibility(world: vec3<f32>, view_depth: f32) -> f32 {
     let view_origin = dot(a.eye.xyz - shadow_frame.eye.xyz, shadow_frame.forward.xyz);
     let view_step = dot(direction, shadow_frame.forward.xyz);
     var lighting = vec2<f32>(0.0);
-    // Fixed midpoint strata stay stable under camera motion; bilateral half-res
-    // reconstruction supplies the spatial filtering without temporal history.
-    for (var i = 0u; i < 24u; i++) {
-        let distance = active_reach * (f32(i) + 0.5) / 24.0;
+    // Quadratic strata spend more samples near admitted cascade occluders.
+    // Interval weights preserve the integral; fixed midpoints need no history.
+    for (var i = 0u; i < 16u; i++) {
+        let u0 = f32(i) / 16.0;
+        let u1 = f32(i + 1u) / 16.0;
+        let weight = u1 * u1 - u0 * u0;
+        let distance = active_reach * 0.5 * (u0 * u0 + u1 * u1);
         let q = direction * distance;
         let remaining = clamp((a.fog.w - distance) / fog_range, 0.0, 1.0);
         let lit = mapped_visibility(q + a.eye.xyz, view_origin + view_step * distance) * gap_transmittance(q);
-        lighting += vec2<f32>(1.0 - lit, lit) * remaining;
+        lighting += vec2<f32>(1.0 - lit, lit) * remaining * weight;
     }
-    return encode_transmittance(end, z, pixel, lighting * (active_reach / max(reach, 0.00001) / 24.0));
+    return encode_transmittance(end, z, pixel, lighting * (active_reach / max(reach, 0.00001)));
 }
