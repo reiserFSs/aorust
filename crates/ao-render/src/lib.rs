@@ -10,6 +10,10 @@ mod atmosphere_stack_tests;
 mod volumetric_clouds;
 mod cloud_shadows;
 mod sky_discs;
+mod rain_wet;
+mod weather_particles;
+mod spell_smoke;
+pub use rain_wet::{WeatherInput, WeatherSurface};
 mod grade;
 mod temporal;
 mod spatial_post;
@@ -697,6 +701,11 @@ pub struct Renderer {
     pub queue: wgpu::Queue,
     pub format: wgpu::TextureFormat,
     enhanced_settings: EnhancedSettings,
+    weather_input: WeatherInput,
+    rain_wet: Option<rain_wet::RainWet>,
+    weather_particles: Option<weather_particles::WeatherParticles>,
+    spell_programs: spell_smoke::Programs,
+    smoke_programs: spell_smoke::Programs,
     enhanced_frame: Option<enhanced::EnhancedFrame>,
     bloom: Option<bloom::Bloom>,
     grade: Option<grade::Grade>,
@@ -1199,10 +1208,15 @@ impl Renderer {
         let volumetric_clouds = Some(volumetric_clouds::VolumetricClouds::new(&device, format, &msaa_supported));
         let sky_discs = Some(sky_discs::SkyDiscs::new(&device, format));
         let mut r = Self {
+            spell_programs: spell_smoke::Programs::new(&device, false),
+            smoke_programs: spell_smoke::Programs::new(&device, true),
             device,
             queue,
             format,
             enhanced_settings: EnhancedSettings::default(),
+            weather_input: WeatherInput::default(),
+            rain_wet: None,
+            weather_particles: None,
             enhanced_frame: None,
             bloom: None,
             grade: None,
@@ -1345,6 +1359,9 @@ impl Renderer {
             && self.temporal_programs.as_ref().is_none_or(temporal::TemporalPrograms::is_ready)
             && self.motion_programs.as_ref().is_none_or(|programs| programs.is_ready())
             && self.spatial_post.as_ref().is_none_or(spatial_post::SpatialPost::is_ready)
+            && self.spell_programs.ready() && self.smoke_programs.ready()
+            && self.rain_wet.as_ref().is_none_or(rain_wet::RainWet::is_ready)
+            && self.weather_particles.as_ref().is_none_or(weather_particles::WeatherParticles::is_ready)
     }
 
     /// Explicit readiness barrier for zone preparation and deterministic evidence, never a frame prerequisite.
@@ -1367,6 +1384,10 @@ impl Renderer {
         if let Some(temporal) = &self.temporal_programs { temporal.wait(); }
         if let Some(motion) = &self.motion_programs { motion.wait(); }
         if let Some(spatial) = &self.spatial_post { spatial.wait(); }
+        self.spell_programs.wait();
+        self.smoke_programs.wait();
+        if let Some(weather) = &self.rain_wet { weather.wait(); }
+        if let Some(particles) = &self.weather_particles { particles.wait(); }
     }
 
     /// Native quality is latched at startup; compression callbacks affect future loads. `better` is the aomac
@@ -1465,6 +1486,10 @@ impl Renderer {
         let settings = settings.clamped();
         let key = variant::Key::of(settings, self.clamp_msaa(self.requested_msaa, settings));
         self.request_world(key, settings, false);
+        if settings.gpu_spell_particles { self.spell_programs.wait(); }
+        if settings.fluid_smoke { self.smoke_programs.wait(); }
+        if let Some(weather) = &self.rain_wet { weather.wait(); }
+        if let Some(particles) = &self.weather_particles { particles.wait(); }
     }
 
     /// Keeps drawing the active variant while an unseen combination compiles on a worker.
@@ -1533,6 +1558,12 @@ impl Renderer {
             || previous.emissive_bloom != settings.emissive_bloom
             || previous.needs_sun_mask() != settings.needs_sun_mask();
         self.enhanced_settings = settings;
+        if settings.enhanced_rain || settings.wet_surfaces || settings.weather_particles {
+            if self.rain_wet.is_none() { self.rain_wet = Some(rain_wet::RainWet::new(&self.device, self.format)); }
+        } else { self.rain_wet = None; }
+        if settings.weather_particles {
+            if self.weather_particles.is_none() { self.weather_particles = Some(weather_particles::WeatherParticles::new(&self.device, self.format)); }
+        } else { self.weather_particles = None; }
         self.moon_exposure.sync(&self.device, settings.night_mode == NightMode::Moonlit);
         if previous.night_mode != settings.night_mode {
             self.sun_shadows = None;
@@ -1589,6 +1620,8 @@ impl Renderer {
         self.ambient_occlusion.as_mut().expect("startup AO pipelines").release_targets();
         self.contact_shadows.as_mut().expect("startup contact pipelines").release_targets();
         self.release_atmosphere_targets();
+        if let Some(particles) = self.weather_particles.as_mut() { particles.release_targets(); }
+        if let Some(weather) = self.rain_wet.as_mut() { weather.release_targets(); }
     }
 
     fn await_enhanced_world(&mut self) {
@@ -1614,6 +1647,7 @@ impl Renderer {
     pub fn frame_pipeline_waits(&self) -> u64 { pipeline_creation::frame_pipeline_waits() }
 
     pub fn enhanced_settings(&self) -> EnhancedSettings { self.enhanced_settings }
+    pub fn set_weather_input(&mut self, input: WeatherInput) { self.weather_input = input; }
     /// Logical optional attachment bytes, not driver allocation/alignment or total GPU residency.
     pub fn enhanced_target_bytes(&self) -> u64 {
         self.enhanced_frame.as_ref().map_or(0, |frame| {
@@ -1626,6 +1660,8 @@ impl Renderer {
             + self.bloom.as_ref().map_or(0, |bloom| bloom.bytes)
             + self.grade.as_ref().map_or(0, grade::Grade::bytes)
             + self.atmosphere_target_bytes()
+            + self.weather_particles.as_ref().map_or(0, weather_particles::WeatherParticles::target_bytes)
+            + self.rain_wet.as_ref().map_or(0, |_| 128 * 128 * 8)
             + self.temporal.as_ref().map_or(0, temporal::Temporal::bytes)
             + self.motion_vectors.as_ref().map_or(0, actors::motion_vectors::MotionVectors::bytes)
             + self.post_target.as_ref().map_or(0, |target| u64::from(target.size.0) * u64::from(target.size.1) * 4)
@@ -2466,7 +2502,7 @@ impl Renderer {
         }
         self.frame = (self.frame + 1) % INST_RING;
         self.prepare_actors(cam.pos, cam.forward(), &planes);
-        self.foliage.prepare(cam.pos, vp, self.act.enhanced_grass_actor_ids(env.fog_end.max(env.fog_start + 1e-3)), self.enhanced_settings.foliage_enabled());
+        self.foliage.prepare(cam.pos, vp, self.act.enhanced_grass_actor_ids(env.fog_end.max(env.fog_start + 1e-3)), self.enhanced_settings.foliage_enabled() || self.enhanced_settings.fluid_smoke);
         self.foliage_detail_state.prepare(&self.device, self.enhanced_settings.foliage_subdivision);
         g.foliage_pushers = self.foliage.pushers();
         self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
@@ -2515,6 +2551,7 @@ impl Renderer {
         let encode_start = timed.then(std::time::Instant::now);
         let mut enc = self.device.create_command_encoder(&Default::default());
         self.encode_actor_skins(&mut enc);
+        self.encode_enhanced_effects(&mut enc, cam);
         if let Some(buf) = self.gpu.inst_bufs.get(self.frame) {
             if !self.vis.is_empty() {
                 self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&self.vis));
@@ -2821,6 +2858,7 @@ impl Renderer {
             self.encode_enhanced_contact_shadows(&mut enc, vp, cam.pos, Vec3::from(env.sun_dir), far);
         }
         self.encode_atmosphere_stack(&mut enc, vp, cam.pos, far, env);
+        self.encode_weather(&mut enc, vp, cam.pos, env);
         // After AO and contact shadows: expose first so the HDR pyramid reads the lifted scene; non-HDR bloom works on the native colour.
         let bloom_strength = if self.bloom.is_some() { self.enhanced_settings.bloom_strength } else { 0.0 };
         if let (Some(grade), Some(frame)) = (&self.grade, self.enhanced_frame.as_ref()) {

@@ -62,6 +62,7 @@ impl World for Ground<'_> {
 pub(super) struct Player {
     store: RecordStore,
     collision: Option<Rc<RefCell<Collision>>>,
+    weather_input: ao_render::WeatherInput,
     movement: Movement,
     avatar: Avatar,
     controls: Controls,
@@ -166,9 +167,17 @@ impl Player {
             }
             let fight = FightLevels::load(&store, playfield);
             let controls = Controls::new(prefs);
+            let collision = collision.map(|collision| Rc::new(RefCell::new(collision)));
+            let outdoor = zones.as_ref().is_some_and(|zones| !zones.is_dungeon());
+            let weather_input = ao_render::WeatherInput {
+                outdoor,
+                surface: collision.as_ref().filter(|_| outdoor).map(|surface| weather_surface(Rc::clone(surface))),
+                ..Default::default()
+            };
             Ok(Self {
                 store,
-                collision: collision.map(|collision| Rc::new(RefCell::new(collision))),
+                collision,
+                weather_input,
                 movement,
                 avatar,
                 controls,
@@ -214,6 +223,16 @@ impl Player {
     /// Loaded playfield surface used by authored effect collision queries (scene coordinates).
     pub fn effect_surface(&self) -> Option<Rc<RefCell<Collision>>> {
         self.collision.clone()
+    }
+
+    /// Live native channels, independent of which enhancement consumes them.
+    pub fn weather_input(&self, state: ao_formats::weather::State) -> ao_render::WeatherInput {
+        ao_render::WeatherInput {
+            rain: state.fields[0],
+            storm: std::array::from_fn(|i| state.fields[i + 3]),
+            wind: flip(state.wind),
+            ..self.weather_input.clone()
+        }
     }
 
     /// TargetSelector (GC 0x10025b96): world LOS between both feet raised by 1.6 m (`10157454`).
@@ -995,6 +1014,34 @@ fn grass_point_exposed(surface: &Collision, point: [f32; 3]) -> bool {
     surface.ground(raised).is_some_and(|ground| ground <= height)
 }
 
+/// Static native geometry only; compute its vertical bound once per loaded Player.
+pub(super) fn weather_surface(surface: Rc<RefCell<Collision>>) -> Rc<dyn Fn([f32; 3]) -> Option<[f32; 2]>> {
+    let ceiling = surface.borrow().surface_ceiling().unwrap_or(f32::NEG_INFINITY);
+    Rc::new(move |point| weather_surface_point(&surface.borrow(), point, ceiling))
+}
+
+fn weather_surface_point(surface: &Collision, point: [f32; 3], ceiling: f32) -> Option<[f32; 2]> {
+    if !point.into_iter().all(f32::is_finite) { return None; }
+    let ground = surface.terrain_height(point).or_else(|| surface.ground(point))?;
+    let low = [point[0], ground + 0.005, point[2]];
+    let high = [point[0], (ground + 1.0).max(ceiling + 1.0), point[2]];
+    // Native triangles are one-sided: a ceiling can face either direction.
+    let mut roof = -1e20_f32;
+    for (mut from, to) in [(low, high), (high, low)] {
+        while let Some(hit) = surface.line(from, to) {
+            roof = roof.max(hit.p[1]);
+            // Native segment intersections admit t >= -EPSILON; move beyond
+            // that tolerance before asking for the next one-sided layer.
+            let step = (to[1] - from[1]).abs() * (4.0 * f32::EPSILON);
+            let next = if to[1] > from[1] { (hit.p[1] + step).next_up() } else { (hit.p[1] - step).next_down() };
+            if !next.is_finite() || (to[1] > from[1] && (next <= from[1] || next >= to[1]))
+                || (to[1] < from[1] && (next >= from[1] || next <= to[1])) { break; }
+            from[1] = next;
+        }
+    }
+    Some([roof, ground])
+}
+
 // Sky fill must reject all roofs, independently of grass's floor-clearance policy.
 fn sky_point_exposed(surface: &Collision, point: [f32; 3], ceiling: f32) -> bool {
     let height = surface.terrain_height(point).unwrap_or(point[1]);
@@ -1704,6 +1751,32 @@ mod tests {
         assert!(!exposed(surface(Some(256.0))), "shelter probing uses loaded geometry bounds, not an arbitrary ray length");
         assert!(grass_point_exposed(&surface(Some(3.0)), [0.0; 3]), "floor-only grass occupancy admits arches without proving sky");
         assert!(!grass_point_exposed(&surface(Some(0.2)), [0.0; 3]), "raised floors still exclude blades");
+    }
+
+    #[test]
+    fn weather_surface_reports_roofs_and_closes_unknown_ground() {
+        let open = weather_surface(Rc::new(RefCell::new(exposure_test_surface(None))));
+        assert_eq!(open([0.0; 3]), Some([-1e20, 0.0]));
+        assert_eq!(open([100.0, 0.0, 100.0]), None);
+        assert_eq!(open([f32::NAN, 0.0, 0.0]), None);
+        let roof = exposure_test_surface(Some((256.0, [-2.0, -2.0, 2.0, 2.0])));
+        let ceiling = roof.surface_ceiling().unwrap();
+        assert_eq!(weather_surface_point(&roof, [0.0; 3], ceiling), Some([256.0, 0.0]));
+        use ao_scene::{Instance, Mesh, Scene, Submesh, Vertex, IDENTITY};
+        for winding in [[0, 1, 2, 0, 2, 3], [2, 1, 0, 3, 2, 0]] {
+            let mut scene = Scene::default();
+            for height in [0.0, 3.0, 256.0] {
+                let mesh = scene.meshes.len();
+                scene.meshes.push(Mesh {
+                    vertices: [[-2.0, height, -2.0], [-2.0, height, 2.0], [2.0, height, 2.0], [2.0, height, -2.0]]
+                        .map(|pos| Vertex { pos, ..Default::default() }).to_vec(),
+                    submeshes: vec![Submesh::new(if height == 0.0 { vec![0, 1, 2, 0, 2, 3] } else { winding.to_vec() }, None)],
+                });
+                scene.instances.push(Instance { mesh, transform: IDENTITY });
+            }
+            let surface = weather_surface(Rc::new(RefCell::new(Collision::from_scene(&scene))));
+            assert_eq!(surface([0.0; 3]), Some([256.0, 0.0]), "both one-sided windings must find the highest stacked roof");
+        }
     }
 
     #[test]

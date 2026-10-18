@@ -54,6 +54,11 @@ pub struct EnhancedSettings {
     pub sky_discs: bool,
     pub material_specular: bool,
     pub clustered_lighting: bool,
+    pub enhanced_rain: bool,
+    pub wet_surfaces: bool,
+    pub weather_particles: bool,
+    pub gpu_spell_particles: bool,
+    pub fluid_smoke: bool,
     pub moon_shadows: bool,
     pub local_light_shadows: bool,
     pub point_shadow_count: u32,
@@ -108,6 +113,8 @@ impl Default for EnhancedSettings {
             point_shadow_count: 4,
             lamp_intensity: 1.0, carried_light_intensity: 1.0,
             night_mode: NightMode::AsGame, moon_intensity: 1.0, dark_night_strength: 0.6,
+            enhanced_rain: false, wet_surfaces: false, weather_particles: false,
+            gpu_spell_particles: false, fluid_smoke: false,
             grading_enabled: false, zone_lut: false, vignette: 0.0, contrast: 1.0, saturation: 1.0, warmth: 0.5,
             night_cool: 0.0,
             taa: false, fxaa: false, cas: false, cas_strength: 0.5, motion_blur: 0.0, depth_of_field: false, dof_aperture: 2.0, dof_max_radius: 8.0,
@@ -133,6 +140,8 @@ impl EnhancedSettings {
             || self.material_specular || self.clustered_lighting || self.moon_shadows || self.local_light_shadows
             || self.night_mode != NightMode::AsGame || self.foliage_enabled() || self.post_enabled()
             || self.water_enabled()
+            || self.enhanced_rain || self.wet_surfaces || self.weather_particles
+            || self.gpu_spell_particles || self.fluid_smoke
     }
 
     /// Enhanced local-light consumers require current-frame owner admission before any source cap.
@@ -170,6 +179,8 @@ impl EnhancedSettings {
         self.needs_grade() || self.contact_shadows || self.post_enabled()
             || self.cloud_shadows || self.volumetric_shafts || self.cloud_gap_shafts
             || self.height_haze || self.land_haze || self.valley_mist || self.sky_discs
+            || self.enhanced_rain || self.wet_surfaces || self.weather_particles
+            || self.gpu_spell_particles || self.fluid_smoke
     }
 
     /// Bound external preferences, replacing non-finite floats with their defaults.

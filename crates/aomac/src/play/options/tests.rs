@@ -982,6 +982,38 @@ fn foliage_graphics_switches_roundtrip_independently_and_restore() {
 }
 
 #[test]
+fn weather_effect_switches_roundtrip_independently_and_restore() {
+    use ao_render::EnhancedSettings;
+    use super::super::enhanced::{self, PageId};
+    let tmp = crate::play::prefs::test_dir().join("aomac-weather-effects-persist");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let mut d = DValues::new(&tmp);
+    d.open_user(&tmp, "account", 7);
+    macro_rules! check {
+        ($($name:literal => $field:ident),+ $(,)?) => {$(
+            d.restore_original_graphics();
+            assert_eq!(d.enhanced_settings(), EnhancedSettings::default());
+            assert!(d.persists($name));
+            d.set($name, Variant::Bool(true));
+            let expected = EnhancedSettings { $field: true, ..Default::default() };
+            assert_eq!(d.enhanced_settings(), expected);
+            d.save_user();
+            let mut again = DValues::new(&tmp);
+            again.open_user(&tmp, "other-account", 99);
+            assert_eq!(again.enhanced_settings(), expected);
+            enhanced::reset(&mut again, Some(PageId::Sky));
+            assert_eq!(again.enhanced_settings(), EnhancedSettings::default());
+        )+};
+    }
+    check!(
+        "AomacEnhancedRain" => enhanced_rain, "AomacWetSurfaces" => wet_surfaces,
+        "AomacWeatherParticles" => weather_particles, "AomacGpuSpellParticles" => gpu_spell_particles,
+        "AomacFluidSmoke" => fluid_smoke,
+    );
+    std::fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
 fn enhanced_graphics_default_persistence_independence_and_reset() {
     use ao_render::EnhancedSettings;
     let tmp = crate::play::prefs::test_dir().join("aomac-enhanced-effects-persist");

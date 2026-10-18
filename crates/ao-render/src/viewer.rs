@@ -113,6 +113,8 @@ pub struct Host {
     pub pointer_warp: Option<(f32, f32)>,
     /// Current weather wind in AO world coordinates (`GCComputeWind`, Gamecode 0x100cd993).
     pub effect_wind: [f32; 3],
+    /// Live native rain/storm channels and static collision capability, in scene coordinates.
+    pub weather_input: crate::WeatherInput,
     /// Current-frame character candidates; final body/visibility admission occurs in the renderer.
     pub grass_benders: Vec<crate::GrassBender>,
     /// Optional native surface capability, retained only while grass is enabled.
@@ -197,6 +199,7 @@ impl Host {
         r.set_water_wind([self.grass_wind[0], self.grass_wind[1], -self.grass_wind[2]]);
         r.set_camera_underwater(self.camera_underwater);
         r.set_enhanced_grass_exposure(self.grass_exposure.clone());
+        r.set_weather_input(self.weather_input.clone());
         r.set_dynamic_lights(&std::mem::take(&mut self.dynamic_lights));
         for (key,texture) in self.screen_textures.drain(..) {r.upload_screen_texture(key,&texture);}
         let fog=self.native_fog.as_ref().map(|state|state.get());
@@ -208,7 +211,7 @@ impl Host {
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
         let grade_lut_root = None;
-        Host { post_focus: None, grade_lut_root, camera_underwater: None, enhanced_settings: None, enhanced_switch: None, grass_wind: [0.0; 3], grass_exposure: None, grass_benders: vec![], actor_visual_resets: vec![], actor_visual_retirements: vec![], pointer_warp: None, smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
+        Host { weather_input: Default::default(), post_focus: None, grade_lut_root, camera_underwater: None, enhanced_settings: None, enhanced_switch: None, grass_wind: [0.0; 3], grass_exposure: None, grass_benders: vec![], actor_visual_resets: vec![], actor_visual_retirements: vec![], pointer_warp: None, smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -225,6 +228,7 @@ impl Host {
     pub fn set_scene(&mut self, scene: Scene) {
         self.effect_sun_direction = scene.environment.map(|env| env.sun_dir.map(|v| -v));
         self.effect_dungeon = None;
+        self.weather_input = Default::default();
         self.scene_generation = self.scene_generation.wrapping_add(1);
         // Queued poses/models belong to the replaced topology, not the newly uploaded scene.
         self.repose = None;
@@ -1708,9 +1712,13 @@ mod tests {
         host.set_scene(Scene { environment: Some(env), ..Scene::default() });
         assert_eq!(host.effect_sun_direction, Some([-0.3, -0.8, 0.4]));
         host.effect_dungeon = Some(true);
+        host.weather_input = crate::WeatherInput { rain: 1.0, outdoor: true, surface: Some(std::rc::Rc::new(|_| Some([-1e20, 0.0]))), ..Default::default() };
         host.set_scene(Scene::default());
         assert_eq!(host.effect_sun_direction, None);
         assert_eq!(host.effect_dungeon, None);
+        assert!(!host.weather_input.outdoor);
+        assert_eq!(host.weather_input.rain, 0.0);
+        assert!(host.weather_input.surface.is_none());
     }
 
 
@@ -1721,9 +1729,18 @@ mod tests {
         let mut host = Host::headless();
         assert_eq!(host.post_focus, None);
         host.post_focus = Some([3.0, 4.0, -5.0]);
+        host.weather_input = crate::WeatherInput {
+            rain: 0.7, storm: [0.1, 0.2, 0.3, 0.4], wind: [2.0, 0.0, -3.0], outdoor: true,
+            surface: Some(std::rc::Rc::new(|_| Some([-1e20, 0.0]))),
+        };
         host.apply_actors(&mut renderer);
         assert_eq!(renderer.post_focus, Some([3.0, 4.0, -5.0]));
         assert_eq!(host.post_focus, None);
+        assert_eq!(renderer.weather_input.rain, 0.7);
+        assert_eq!(renderer.weather_input.storm, [0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(renderer.weather_input.wind, [2.0, 0.0, -3.0], "Host forwarding must not flip scene-space wind again");
+        assert!(renderer.weather_input.outdoor);
+        assert!(std::rc::Rc::ptr_eq(renderer.weather_input.surface.as_ref().unwrap(), host.weather_input.surface.as_ref().unwrap()));
         // Even an always-admitted effect must not manufacture own-character focus.
         host.actors.push(ao_scene::ActorFrame { always: true, ..Default::default() });
         host.apply_actors(&mut renderer);

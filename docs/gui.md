@@ -1386,6 +1386,13 @@ Tonemap (`AomacHdr`) and Contact Shadows (`AomacContactShadows`) checkboxes are
 independent DV Main booleans, all **off** by default, including when an older preferences
 file lacks them. `DValues::enhanced_settings` maps them and the quality controls below to
 `ao_render::EnhancedSettings`; `flow.rs::frame` sends live changes through `Host::enhanced_switch`.
+The **Sky & Weather** page also registers five independent default-off booleans:
+Enhanced Rain (`AomacEnhancedRain`), Wet Surfaces (`AomacWetSurfaces`), Storm Particles
+(`AomacWeatherParticles`), GPU Spell Particles (`AomacGpuSpellParticles`), and Fluid Smoke
+(`AomacFluidSmoke`). They persist in root `Prefs.xml`; page and global resets use the same
+registry. Wet Surfaces does not require Enhanced Rain, and its retained wetness dries
+after native rain stops. Weather receivers require outdoor native collision roof proof;
+unknown collision tiles and indoor zones are excluded.
 Both viewers request a background world-pipeline variant and keep drawing the previous settings
 until it is ready. Variants are keyed by shadows, AO, bloom, sun-mask and clamped MSAA;
 the active set and three cached sets are retained, so a warm toggle reuses its pipelines.

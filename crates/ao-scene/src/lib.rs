@@ -379,6 +379,17 @@ pub struct ActorMaterialOverride {
     pub specular: Option<[f32; 3]>,
 }
 
+/// Exact native effect identity, never inferred from a texture or blend mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EnhancedEmitter {
+    /// Gamecode effect class: 1018 Sparks, 1009 Smoke, or 3017 GlobalSmoke.
+    pub kind: i32,
+    pub position: [f32; 3],
+    pub wind: [f32; 3],
+    pub lifetime: f32,
+    pub rise: f32,
+}
+
 /// A dynamic character-like object (players, NPCs, corpses, weapons in hand) drawn on top of the world by the renderer.
 ///
 /// The renderer keeps one vertex buffer per (actor, model mesh) and the model's index buffers/materials/textures once per
@@ -446,6 +457,8 @@ pub struct ActorFrame {
     /// Native water contact level at the current feet, only when final-camera LOS admits the character.
     /// Water styles 0/4 require feet strictly below the surface; banks and missing collision are `None`.
     pub water_surface: Option<f32>,
+    /// Opt-in GPU enhancement metadata; absent on every ordinary actor.
+    pub enhanced_emitter: Option<EnhancedEmitter>,
 }
 
 impl Default for ActorFrame {
@@ -475,6 +488,7 @@ impl Default for ActorFrame {
             swimming: false,
             water_admitted: false,
             water_surface: None,
+            enhanced_emitter: None,
         }
     }
 }

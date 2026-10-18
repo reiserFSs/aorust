@@ -1274,7 +1274,10 @@ impl Renderer {
                         let skin:Vec<_>=groups.into_iter().flatten().collect();
                         if !skin.is_empty() {
                             let model=if buff.needs_private_model() {0xfac2_0000_0000_0000|u64::from(effect.actor)}else{effect.model_key};
-                            host.actors.push(ActorFrame { id:effect.actor,model,transform:IDENTITY, skin: Some(std::sync::Arc::new(skin)), always:true,alpha:1.0,priority:buff.priority().or_else(||native_priority(template.kind)),render_bucket:buff.render_bucket(),native_shadow_source:buff.native_shadow_source(),..Default::default() });
+                            let enhanced_emitter = (template.kind == 3017 && runtime.is_none_or(|runtime| runtime.visible))
+                                .then(|| ao_scene::EnhancedEmitter { kind: 3017, position: effect.source.w_axis.truncate().to_array(),
+                                    wind: wind.to_array(), lifetime: f32::from_bits(template.word(26).unwrap_or(0)), rise: 1.0 });
+                            host.actors.push(ActorFrame { id:effect.actor,model,transform:IDENTITY, skin: Some(std::sync::Arc::new(skin)), always:true,alpha:1.0,priority:buff.priority().or_else(||native_priority(template.kind)),render_bucket:buff.render_bucket(),native_shadow_source:buff.native_shadow_source(),enhanced_emitter,..Default::default() });
                         }
                         return true;
                     },
@@ -1366,8 +1369,14 @@ impl Renderer {
                 while skin.len() < capacity*4 { skin.push(Vertex { color:[0.0;4],..Vertex::default() }); }
                 if !alive && template.kind == 1005 && template.word(0).unwrap_or(0)&0x200 != 0 { return false; }
             }
+            let enhanced_emitter = if matches!(template.kind, 1009 | 1018)
+                && runtime.is_none_or(|runtime| runtime.visible) {
+                Some(ao_scene::EnhancedEmitter { kind: template.kind, position: effect.source.w_axis.truncate().to_array(), wind: wind.to_array(),
+                    lifetime: f32::from_bits(template.word(if template.kind == 1018 { 35 } else { 26 }).unwrap_or(0)),
+                    rise: if template.kind == 1018 { 0.2 } else { 1.0 } })
+            } else { None };
             // Dynamic world-space skin has no useful bind-pose sphere (actors.rs:191).
-            host.actors.push(ActorFrame { id: effect.actor, model: effect.model_key, transform: IDENTITY, parts: vec![], skin: Some(std::sync::Arc::new(skin)), always: true, alpha: 1.0, priority:native_priority(template.kind), ..Default::default() });
+            host.actors.push(ActorFrame { id: effect.actor, model: effect.model_key, transform: IDENTITY, parts: vec![], skin: Some(std::sync::Arc::new(skin)), always: true, alpha: 1.0, priority:native_priority(template.kind), enhanced_emitter, ..Default::default() });
             true
         };
         self.active.retain_mut(|effect| {

@@ -162,6 +162,9 @@ pub(crate) struct ActorLayer {
     texture_uploads: u64,
     actors: HashMap<u32, ActorGpu>,
     frames: Vec<ActorFrame>,
+    enhanced_effects: HashMap<u32, (spell_smoke::Simulation, bool)>,
+    effect_walkers: HashMap<Option<u32>, Vec3>,
+    effect_time: Option<f32>,
     tick: u64,
     bufs: Vec<wgpu::Buffer>,
     cap: usize,
@@ -651,9 +654,69 @@ impl Renderer {
 
 
 
+    /// Current-frame admitted native emitters only. Revocation drops both fluid and particle history.
+    pub(crate) fn encode_enhanced_effects(&mut self, encoder: &mut wgpu::CommandEncoder, cam: &Camera) {
+        let settings = self.enhanced_settings();
+        let (spell, smoke) = (settings.gpu_spell_particles, settings.fluid_smoke);
+        let layer = &mut self.act;
+        if !spell && !smoke {
+            layer.enhanced_effects.clear(); layer.effect_walkers.clear(); layer.effect_time = None; return;
+        }
+        let dt = layer.effect_time.map_or(0.0, |previous| (self.time - previous).clamp(0.0, 1.0 / 30.0));
+        layer.effect_time = Some(self.time);
+        let mut bodies = Vec::new();
+        let mut walkers = HashMap::new();
+        if smoke {
+            for selected in self.foliage.selected() {
+                let position = Vec3::from_array(selected.position);
+                if let Some(previous) = layer.effect_walkers.get(&selected.actor).filter(|_| dt > 0.0) {
+                    let velocity = (position - *previous) / dt;
+                    if velocity.length_squared() > 0.0025 && velocity.length_squared() < 144.0 {
+                        bodies.push(spell_smoke::Body { feet: selected.position, height: 1.8, velocity: velocity.to_array(), radius: 0.35 });
+                    }
+                }
+                walkers.insert(selected.actor, position);
+            }
+        }
+        if layer.effect_walkers.keys().any(|id| !walkers.contains_key(id)) {
+            // A revoked character cannot leave a pressure/density wake in temporal state.
+            layer.enhanced_effects.clear();
+        }
+        layer.effect_walkers = walkers;
+        let admitted: std::collections::HashSet<_> = layer.items.iter().filter(|item| item.mesh == 0).map(|item| item.actor).collect();
+        let mut sources: Vec<_> = layer.frames.iter().filter_map(|frame| {
+            let emitter = frame.enhanced_emitter?;
+            let is_smoke = matches!(emitter.kind, 1009 | 3017);
+            if !admitted.contains(&frame.id) || !spell_smoke::enabled(emitter.kind, spell, smoke) { return None; }
+            let vertices = frame.skin.as_ref()?;
+            let quad = vertices.as_chunks::<4>().0.iter().find(|quad| quad.iter().all(|v| v.color[3] > 0.0 && v.pos.iter().all(|v| v.is_finite())))?;
+            let center = quad.iter().map(|v| Vec3::from_array(v.pos)).sum::<Vec3>() * 0.25;
+            let radius = quad.iter().map(|v| center.distance(Vec3::from_array(v.pos))).fold(0.0f32, f32::max);
+            let uv_min = quad.iter().fold(glam::Vec2::splat(f32::MAX), |uv,v| uv.min(glam::Vec2::from_array(v.uv)));
+            let uv_max = quad.iter().fold(glam::Vec2::splat(f32::MIN), |uv,v| uv.max(glam::Vec2::from_array(v.uv)));
+            let center = if is_smoke { Vec3::from_array(emitter.position) } else { center };
+            Some((center.distance_squared(cam.pos), frame.id, is_smoke, spell_smoke::Source { position: center.to_array(), radius, color: quad[0].color,
+                uv: [uv_min.x, uv_min.y, uv_max.x-uv_min.x, uv_max.y-uv_min.y], wind: emitter.wind.map(|v| v*0.1), lifetime: emitter.lifetime, rise: emitter.rise }))
+        }).collect();
+        sources.sort_unstable_by(|a,b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut counts = [0usize;2];
+        sources.retain(|source| { let count = &mut counts[usize::from(source.2)]; *count += 1; *count <= spell_smoke::MAX_SOURCES });
+        layer.enhanced_effects.retain(|id,_| sources.iter().any(|source| source.1 == *id));
+        let forward = cam.forward();
+        let right = forward.cross(Vec3::Y).normalize_or_zero();
+        let up = right.cross(forward).normalize_or_zero();
+        for (_, id, smoke, source) in sources {
+            let programs = if smoke { &self.smoke_programs } else { &self.spell_programs };
+            if !programs.ready() { continue; }
+            let (simulation, ready) = layer.enhanced_effects.entry(id).or_insert_with(|| (spell_smoke::Simulation::new(&self.device, programs), false));
+            simulation.update(&self.queue, source, &bodies, dt, self.time, right, up);
+            *ready = simulation.encode(encoder, programs);
+        }
+    }
+
     /// Frustum-culls the submitted actors, fills the instance buffer; called by `render` before the pass.
     pub(crate) fn prepare_actors(&mut self, cam: Vec3, forward: Vec3, planes: &[Vec4; 6]) {
-        let body_fog_enabled = self.enhanced_settings().ground_grass || self.enhanced_settings().water_wakes;
+        let body_fog_enabled = self.enhanced_settings().ground_grass || self.enhanced_settings().water_wakes || self.enhanced_settings().fluid_smoke;
         let sun_enabled = self.enhanced_settings().sun_shadows;
         let layer = &mut self.act;
         layer.items.clear();
@@ -813,7 +876,17 @@ impl Renderer {
                     if effect == 1 {
                         pass.set_bind_group(2, model.holo.as_ref().unwrap(), &[]);
                     }
-                    pass.draw_indexed(d.first_index..d.first_index + d.count, 0, i as u32..i as u32 + 1);
+                    let enhanced = (it.mesh == 0 && std::ptr::eq(d, &mesh.draws[0]))
+                        .then(|| layer.enhanced_effects.get(&it.actor)).flatten().filter(|(_, ready)| *ready);
+                    let replace_smoke = enhanced.is_some() && layer.frames.iter().find(|f| f.id == it.actor)
+                        .and_then(|f| f.enhanced_emitter).is_some_and(|e| matches!(e.kind, 1009 | 3017));
+                    if !replace_smoke { pass.draw_indexed(d.first_index..d.first_index + d.count, 0, i as u32..i as u32 + 1); }
+                    if let Some((simulation, _)) = enhanced {
+                        pass.set_vertex_buffer(0, simulation.vertices.slice(..));
+                        pass.draw(0..simulation.vertex_count, i as u32..i as u32 + 1);
+                        // The next native command must restore its own vertex buffer.
+                        vb_c.set(0);
+                    }
                     if let (Some(key), Some((_, next))) = (actor_visual_key(it, d), d.node) {
                         self.pending_visuals.borrow_mut().insert(key, next);
                     }

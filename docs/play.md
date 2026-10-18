@@ -727,6 +727,81 @@ admitted local lights; the all-off path remains native. Cloud altitude,
 wind, storm state, thickness and light direction come from the native scene,
 not UTC. With all Enhanced switches off, the faithful rendering path is unchanged.
 
+**GPU Spell Particles** (`AomacGpuSpellParticles`, `gpu_spell_particles`) and
+**Fluid Smoke** (`AomacFluidSmoke`, `fluid_smoke`) are independent, default-off
+switches. Gamecode class 1018 (Sparks) alone admits sparkle emitters; classes
+1009 (Smoke) and 3017 (GlobalSmoke) alone admit fluid sources. Beam 3022,
+other nano classes, ordinary actors and material/texture lookalikes never do.
+The identity comes from the native template at `combat/effects.rs`, including
+the separate 3017 buff submission; hidden source runtime flags suppress the
+metadata and zero-alpha native sprite quads cannot become sources.
+
+Sparkles use persistent GPU particle state integrated through the curl of
+three decorrelated gradient-noise potentials. Smoke uses a bounded 24³-cell
+GPU volume per source: semi-Lagrangian velocity/density/temperature transport,
+thermal buoyancy, puffing source injection, authored wind, character capsule
+forces, curl/vorticity confinement, divergence,
+24 pressure-Jacobi iterations and pressure-gradient projection. Density is
+rendered as native-textured, Beer-Lambert cell billboards, not a decorative
+noise animation. Each feature caps its current admitted sources at eight,
+nearest first; the fixed volume resolution is an explicit quality ceiling.
+Both reuse the source's native material, blend, depth and fog pipeline.
+Only the foliage selector's current camera/LOS/fog-admitted walking characters
+can stir smoke. Losing a character admission clears affected temporal fluid
+state conservatively; losing an emitter immediately discards its history.
+Frozen simulation frames rebuild camera-facing vertices without advancing state.
+Upstream MIT algorithms are attributed in `THIRD_PARTY`. Regression coverage:
+`spell_smoke::tests::only_exact_native_classes_and_independent_switches` and
+`spell_smoke::tests::spell_and_fluid_dispatch_real_gpu_stages`; this subsection
+does not claim visual or performance gate results.
+
+**Weather Particles** (`AomacWeatherParticles`, `EnhancedSettings::weather_particles`)
+is a separate default-off Sky & Weather switch for sand, ash, red fallout and
+green fallout. Its four independent channels come directly from native weather
+`f[3]`, `f[4]`, `f[5]` and `f[6]` (`weather.rs`, Gamecode `FUN_100bc970`),
+including their transition ramps; rain, cloud opacity and aggregate storm
+intensity cannot substitute for those channels. The ash name retains the
+inference documented in `weather.rs`. Native wind advects the field in scene
+coordinates without multiplying a newly turned wind vector by elapsed time.
+The procedural grain/flakes and their colours are Enhanced art tuning, not
+retail particle assets. World-anchored wrapping follows ao-vk's MIT-licensed
+`rain.vert`/`rain_common.glsl`; no upstream artwork is included.
+
+Particles have no actor inputs or temporal image history. Indoor weather is
+excluded; native roof/ground heights exclude covered or below-ground particles,
+and missing shelter coverage fails closed. Current admitted scene depth blocks
+particles behind surfaces. Added opacity fades to zero through the existing
+native fog range without modifying fog extinction or revealing distant actors.
+The disabled switch does not encode the particle pass.
+Runnable regressions (not a visual acceptance claim):
+`cargo test --release -p ao-render weather_particles -j2 -- --test-threads=1`
+checks exact channel isolation, indoor exclusion and GPU sand/ash/fallout output
+against roof, fog, foreground-depth and unavailable-shelter controls.
+
+**Enhanced Rain** (`AomacEnhancedRain`) and **Wet Surfaces** (`AomacWetSurfaces`)
+are separate default-off Sky & Weather controls. They consume the native `f[0]`
+precipitation channel and native scene-space wind rather than UTC or a cloud-colour
+guess. Enhanced rain is anchored in world coordinates, is clipped by current
+admitted depth, and places crown/droplet splashes on reconstructed upward
+surfaces using a bounded vertical depth search. Native-water rain rings are
+deferred until a published native water-surface mask API is available; this
+cutover does not add unpublished water integrations. The `rain-water` evidence
+case captures rain over existing native liquid geometry only: generic rain
+pixel changes are not acceptance evidence for water rings.
+The pre-existing faithful path has no native rain geometry submission;
+turning this control off leaves that path untouched, not an invented fallback.
+Wetness accumulates during native rain and decays after it stops; its independent
+receiver darkens flat outdoor surfaces and adds narrow specular/puddle sheen.
+Both require native collision roof/ground proof, reject unknown coverage and
+indoor zones, and attenuate added radiance by native fog. Their procedural
+look is Enhanced art tuning, not a retail rain asset reconstruction.
+The roof atlas covers a bounded 64-metre square, cached on an eight-metre world
+grid; surfaces outside it are excluded rather than guessed exposed.
+Regressions: `rain_wet::tests` (wetness retention, switch independence, GPU
+pipeline and collision-map controls) and
+`weather_effect_switches_roundtrip_independently_and_restore` (root preferences
+roundtrip and page reset). These are runnable checks, not visual acceptance claims.
+
 Height haze analytically integrates an exponential vertical profile; distant
 land haze approaches the authored horizon colour before the native far clip
 (including admitted city ships). Valley mist includes native outdoor fog volumes
@@ -2132,3 +2207,63 @@ interpolation and fail closed for absent cells, invalid mapping and roofed groun
 The GPU storage resource exists only in Moonlit mode; retained source data lets
 changing the night option rebuild it without reloading the zone.
 
+
+### Headless weather and native particle acceptance
+
+`weather_and_particles_graphics` is a dedicated ignored, windowless installed-client
+fixture. With the shared GPU timing lock held, build once from the WeatherFx worktree:
+
+```sh
+CARGO_TARGET_DIR=/tmp/WeatherFx/target cargo test --profile fast -p aomac -j 2 weather_and_particles_graphics --no-run
+```
+
+Run the test executable printed by Cargo (not a copied stale binary):
+
+```sh
+AOMAC_WEATHER_OUT=/tmp/WeatherFx/weather-evidence /absolute/path/to/aomac-test-executable weather_and_particles_graphics --ignored --nocapture --test-threads=1
+```
+
+The output path must be new and under `/tmp/WeatherFx`. For a bounded single-case
+capture, set `AOMAC_WEATHER_CASE` to `rain-outdoor`, `rain-water`, `rain-roof`, `rain-indoor`,
+`wet-drying`, `sand`, `ash`, `fallout-red`, `fallout-green`, `sparkle-curl`, or
+`fluid-smoke`, with a fresh output directory for each run. The complete invocation
+has a 270-second render deadline. Every case uses independent off/on/on/off
+renderers, 32 frozen warmup frames and 96 measured frames at fixed dt 0.25 s,
+640×400, MSAA1. `frames.csv` records whole-frame GPU and CPU spans; `summary.csv`
+contains per-phase mean and nearest-rank p50/p95/p99. The manifest's paired delta is
+`(B1+B2-A0-A3)/2`; it is not an isolated-pass measurement or a performance verdict.
+
+Each before/after PNG has OFF above ON at frame31. Each animated-strip PNG has
+OFF above ON and columns frame0/31/63/95; these are temporal contact strips, not
+video files. Wetness uses real renderer accumulation, then removes rain at frame8
+to capture drying without overriding wetness. Native schedules are searched over
+game days 0 through 31 at 30-second intervals, opening a fresh native weather
+sampler and advancing one frame at each candidate timestamp. A selected case
+requires only its own channel; native effect cases do not require precipitation.
+Actual channel amplitudes and wind are retained in the source state; storm
+channels are isolated explicitly. Metadata records the unmodified source state,
+`weather_pf`, selected `game_day` and time, and scene loading uses that same day.
+Roof/open positions are selected
+by bounded native collision queries; Subway127 supplies the dungeon control.
+`rain-water` uses the existing ICC4582 offshore camera `[1010.4,24,-663.1]`,
+yaw2.4288/pitch−0.2, actual ICC rainfall from the same bounded day search, a native-liquid presence assertion
+and collision-open sky. Only enhanced rain is enabled. This case certifies rain
+over existing native liquid geometry, not water rings. Rings are deferred under
+the approved no-water fallback until a native water-mask API is published.
+Smoke and sparkle use actual installed `gfxtweak` templates and native effect
+construction, never fabricated enhanced emitters. No character actors are added.
+
+The installed-client CPU-only regression (no GPU lock needed) checks independent
+timestamp sampling against native frame-timer-stale reuse:
+
+```sh
+CARGO_TARGET_DIR=/tmp/WeatherFx/target cargo test --profile fast -p aomac -j 2 weather_fixture_samples_fresh_native_timestamps -- --ignored --nocapture
+```
+
+The last OFF phase has no WeatherInput and must match the first OFF phase's
+supplied weather byte-for-byte at every retained frame. Open outdoor and native
+effect cases must change captured pixels; the dungeon must not. The roof case
+retains collision evidence without requiring rain inside shelter. Drying must
+visibly evolve after rain removal. These assertions do not certify aesthetics: status
+keeps `visual_acceptance=unexercised` until the parent inspects the native-asset
+sheets. Retain compact sheets, CSVs and metadata only in the final ≤100 MB handoff.

@@ -1654,6 +1654,11 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
     let mut settings = ao_render::EnhancedSettings::default();
     match profile {
         "faithful" => {}
+        "rain" => settings.enhanced_rain = true,
+        "wet-surfaces" => settings.wet_surfaces = true,
+        "weather-particles" => settings.weather_particles = true,
+        "spell-particles" => settings.gpu_spell_particles = true,
+        "fluid-smoke" => settings.fluid_smoke = true,
         "neutral" => { settings.ground_grass = true; settings.grass_density = 0.0; }
         "shadows" => settings.sun_shadows = true,
         "clustered" => settings.clustered_lighting = true,
@@ -2234,3 +2239,5 @@ fn graphics_bloom_gpu_timing() -> anyhow::Result<()> {
 mod grass_shots;
 #[path = "bloom_seeds.rs"]
 mod bloom_seeds;
+#[path = "weather_shots.rs"]
+mod weather_shots;

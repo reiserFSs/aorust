@@ -185,3 +185,28 @@ rvk/shaders/water_common.glsl, water_sim.comp and water.frag
 the MIT license and permission notice above apply to these portions.
 Native liquid triangles, admitted swimming state, shore topology and scene depth
 replace draw observation. No game assets or upstream binary assets are copied.
+
+Enhanced weather
+================
+
+The world-anchored procedural precipitation and native-weather storm particles in
+crates/ao-render/src/{rain_wet,weather_particles}.{rs,wgsl} adapt the techniques in
+ao-vk rvk/rain.cpp and rvk/shaders/{rain.vert,rain_common.glsl,splash.vert,splash.frag}.
+Source: https://github.com/wannabuh/ao-vk (MIT, Copyright (c) 2026 wannabuh).
+Inspected reference revision: 47fceedf61d375947be20b78d97238cb9c971ca9.
+The complete MIT permission and warranty notice above applies. Native collision
+roof exclusion, admitted depth receivers and independently persisted switches
+are specific to this renderer; no upstream artwork is included.
+
+Enhanced spell particles and fluid smoke
+========================================
+
+crates/ao-render/src/spell_smoke.rs, spell_smoke_common.wgsl,
+spell_particles.wgsl and fluid_smoke.wgsl adapt the bounded GPU particle
+curl-potential flow and stable-fluid advection, buoyancy, character forces,
+pressure Jacobi solve and projection from ao-vk rvk/particles.cpp,
+rvk/smoke.cpp and rvk/shaders/{particles,smoke_sim}.comp.
+Source: https://github.com/wannabuh/ao-vk (MIT, Copyright (c) 2026 wannabuh).
+The complete MIT permission and warranty notice above applies to these ports.
+Exact Gamecode-class admission, immediate revocation and native material
+vertex-buffer rendering are specific to this renderer; no artwork is copied.

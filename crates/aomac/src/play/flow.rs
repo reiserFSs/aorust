@@ -1480,6 +1480,8 @@ impl Frontend for Play {
     fn frame(&mut self, dt: f32, size: (u32, u32), host: &mut Host) -> DrawList {
         host.post_focus = None;
         host.camera_underwater = Some(false);
+        host.weather_input = Default::default();
+        host.effect_wind = [0.0; 3];
         if self.player.is_none() {
             host.grass_exposure = None;
             host.grass_benders.clear();
@@ -1806,6 +1808,11 @@ impl Frontend for Play {
                 let offset = weather.state().quake_offset;
                 super::camera::apply_ground_shake(&mut host.camera, glam::Vec3::new(offset[0], offset[1], -offset[2]));
             }
+            // Native State, not the independently sampled sky/cloud aggregate.
+            // Keep the collision capability live for drying wet surfaces even without rain.
+            host.weather_input = self.player.as_ref().map(|player| player.weather_input(
+                self.world_weather.as_ref().map_or_else(ao_formats::weather::State::clear, |weather| weather.state()),
+            )).unwrap_or_default();
             host.effect_day_time = Some(self.zone.day_time());
             host.effect_game_seconds = self.zone.game_seconds();
             host.effect_first_person = self.player.as_ref().is_some_and(|player| player.camera_mode() == 0);
@@ -1843,7 +1850,7 @@ impl Frontend for Play {
             });
             // Native weather also drives opt-in water when ground grass is disabled.
             host.grass_wind = self.world_weather.as_ref().map_or([0.0; 3], |weather| weather.state().wind);
-            if host.enhanced().is_some_and(|s| s.foliage_enabled() || s.interaction_enabled()) {
+            if host.enhanced().is_some_and(|s| s.foliage_enabled() || s.interaction_enabled() || s.fluid_smoke) {
                 host.grass_benders.retain(|bender| bender.actor.is_none());
                 host.grass_benders.extend(self.zone.world.grass_characters()
                     .map(|(id, position)| ao_render::GrassBender { actor: Some(id), position }));
@@ -1877,7 +1884,7 @@ impl Frontend for Play {
             let liquid = self.player.as_ref().and_then(|player| player.effect_surface())
                 .and_then(|surface| surface.borrow().liquid_at(eye));
             host.camera_underwater = Some(camera_underwater(liquid, eye[1]));
-            let water_surface = if host.enhanced().is_some_and(|settings| settings.water_wakes) {
+            let water_surface = if host.enhanced().is_some_and(|settings| settings.water_wakes || settings.fluid_smoke) {
                 self.player.as_ref().and_then(|player| player.effect_surface())
             } else { None };
             let water_surface = water_surface.as_ref().map(|surface| surface.borrow());
