@@ -898,8 +898,12 @@ actual `Collision::terrain_height`, using scene coordinates without Z inversion.
 The default endpoint is three metres ahead of the frozen camera in XZ; Newland
 instead ends at native pf566 statel+0x4060, mesh95575 `dry_edge_grass_small`,
 scene root `(436.432_34, 25.000_1, -320.404_08)` (endpoint Y is terrain-grounded).
-The camera and native scene remain unchanged. Each step supplies the matching
-own-avatar bender; the final pose and interaction state are frozen for
+Only interaction-mode `borealis-foliage-*` views tilt the frozen camera from the
+crown toward the grounded endpoint plus 0.8 m, keeping the exact same eye and the
+path computed from the original camera. Faithful and effect captures use this
+same framing and path; pair baselines with the same interaction flag. Newland,
+all no-interaction views, the clock and the native scene remain unchanged.
+Each step supplies the matching own-avatar bender; the final pose and interaction state are frozen for
 capture/timing. The manifest records the mode, step count, delta and per-view
 terrain-grounded scene-space endpoints. Missing endpoint terrain fails only this
 opt-in mode. Omit it to preserve the original fixture placement and captures;

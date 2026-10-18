@@ -497,6 +497,11 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 writeln!(manifest, "{name} interaction_start_scene={:?} interaction_end_scene={:?}", path.0, path.1)?;
                 Some(path)
             } else { None };
+            let fixed = match interaction_path {
+                Some((_, interaction_end)) if name.starts_with("borealis-foliage-") =>
+                    Camera::look_at(fixed.pos, interaction_end + Vec3::Y * 0.8),
+                _ => fixed,
+            };
             let capture = |measure: bool| -> anyhow::Result<(Vec<u8>, Lens, usize, usize)> {
                 // Fresh renderers and the original per-capture CRT reset remain independent.
                 // Both consume clones of the same immutable snapshot, including across views.
