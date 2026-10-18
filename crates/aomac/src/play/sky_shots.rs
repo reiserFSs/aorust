@@ -392,6 +392,26 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         Some(value) if value == "1" => true,
         Some(value) => anyhow::bail!("AOMAC_GFX_FOLIAGE_INTERACTION must be 1 when set, got {value:?}"),
     };
+    let sequence_env = |name| -> anyhow::Result<Option<String>> {
+        match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    };
+    let sequence = graphics_fixture_sequence(
+        sequence_env("AOMAC_GFX_SEQUENCE")?.as_deref(),
+        sequence_env("AOMAC_GFX_SEQUENCE_START")?.as_deref(),
+        sequence_env("AOMAC_GFX_SEQUENCE_DT")?.as_deref(),
+        sequence_env("AOMAC_GFX_SEQUENCE_COUNT")?.as_deref(),
+    )?;
+    if sequence.is_some() {
+        ensure!(!interaction, "sequence mode replaces AOMAC_GFX_FOLIAGE_INTERACTION");
+        ensure!(std::env::var_os("AOMAC_GFX_FRAME_TIMING").is_none()
+            && std::env::var_os("AOMAC_GFX_SHADOW_TIMING").is_none()
+            && std::env::var_os("AOMAC_GFX_TIMING_PAN").is_none(),
+            "sequence evidence and frozen timing must be separate runs");
+    }
     ensure!(!out.exists(), "refusing to overwrite evidence {}", out.display());
     std::fs::create_dir_all(&out)?;
     let status = out.join("status.txt");
@@ -410,13 +430,15 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         let resource = command("shasum", &["-a".as_ref(), "256".as_ref(), dir.join("cd_image/rdb.db").as_os_str()])?;
         let weather = ao_formats::weather::State::clear();
         let size = (1920, 1200);
-        let mut manifest = format!("fixture_version=1\nrevision={}\nprofile={profile}\nsize={}x{}\npixel_format=RGBA8\nrow_order=top_to_bottom\nrenderer_time=0\neffect_time=0\ngame_day=0\ncrt_seed=1\ncloud_seed=1\nweather={weather:?}\nmsaa_requested={msaa}\nmsaa_actual={msaa}\nanisotropy=1\nwide=0\nscenery=1\nvisual_acceptance=unexercised\n",
+        let renderer_time = if sequence.is_some() { "per_sequence_frame" } else { "0" };
+        let mut manifest = format!("fixture_version=1\nrevision={}\nprofile={profile}\nsize={}x{}\npixel_format=RGBA8\nrow_order=top_to_bottom\nrenderer_time={renderer_time}\neffect_time={renderer_time}\ngame_day=0\ncrt_seed=1\ncloud_seed=1\nweather={weather:?}\nmsaa_requested={msaa}\nmsaa_actual={msaa}\nanisotropy=1\nwide=0\nscenery=1\nvisual_acceptance=unexercised\n",
             revision, size.0, size.1);
         writeln!(manifest, "source_diff={source_diff:?}\nresource_sha256={resource}")?;
         writeln!(manifest, "icc_clock=authored_frozen2648.69\nsun_low_high_night_source=Borealis800")?;
         writeln!(manifest, "enhanced_settings={settings:?}")?;
         writeln!(manifest, "post_features={features:?}\nforce_own_avatar={own_avatar}\npost_focus_policy=actual_fixture_avatar_position_when_present\npost_warmup_frames=8")?;
         writeln!(manifest, "foliage_interaction={interaction}\nfoliage_interaction_steps=16\nfoliage_interaction_dt=0\nfoliage_interaction_source=captured_visible_own_avatar\nfoliage_interaction_pose=idle")?;
+        writeln!(manifest, "sequence={sequence:?}\nsequence_simulation_dt_max={}\nsequence_game_clock=frozen_snapshot\nsequence_avatar_pose=captured_idle_translated_on_terrain", 1.0 / 60.0)?;
         let baseline = std::env::var_os("AOMAC_GFX_BASELINE").map(PathBuf::from);
         let png_only = std::env::var_os("AOMAC_GFX_PNG_ONLY").is_some();
         writeln!(manifest, "png_only={png_only}")?;
@@ -436,6 +458,10 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
             ensure!(!views.is_empty(), "unknown AOMAC_GFX_VIEW {name:?}");
         }
         writeln!(manifest, "selected_view={selected:?}")?;
+        if sequence.is_some_and(|sequence| sequence.interaction) {
+            ensure!(views.iter().all(|(name, _, _, _)| matches!(name.as_str(), "newland-day" | "newland-dusk" | "newland-night")),
+                "interaction sequence requires AOMAC_GFX_VIEW=newland-day, newland-dusk, or newland-night");
+        }
         writeln!(manifest, "actor_source=docs/captures/zone_ithaca.rec actor_id=25988 actor_name={:?} actor_pos={:?} actor_yaw={:?} actor_pose=idle actor_time=0", actor.name, actor.pos, actor.yaw())?;
         writeln!(manifest, "borealis_lightbar_fixture_override=Testy mount5 mesh26163 field0 byte0 pos[679.6,72.8,-482.7] yaw0 pose_idle_time0 native_mounted_lights=enabled")?;
         std::fs::write(out.join("manifest.txt"), &manifest)?;
@@ -465,6 +491,20 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 }
             };
             let fixed = grounded_camera.unwrap_or(fixed);
+            let fixed = if name == "newland-backlit-day" {
+                let (camera, instance, submesh, canopy, alignment) = graphics_fixture_backlit_camera(
+                    scene, fixed.pos, |point| collision.borrow().terrain_height(point),
+                    |eye, target| collision.borrow().line(eye, target).is_none())?;
+                writeln!(manifest, "{name} backlit_instance={instance} backlit_mesh={} backlit_submesh={submesh} canopy_scene={canopy:?} toward_sun_alignment={alignment} camera_source=native_vegetation_world_bounds_and_authored_sun collision_los=clear material_lighting=true material_fog=true material_depth_write=true", scene.instances[instance].mesh)?;
+                camera
+            } else { fixed };
+            let (fixed, interaction_root) = if sequence.is_some_and(|sequence| sequence.interaction) {
+                let names = ao_formats::character::NameTable::load(&store)?;
+                let selected = graphics_fixture_shrub(scene, fixed.pos, &names, &collision.borrow(), &mut manifest);
+                std::fs::write(out.join("manifest.txt"), &manifest)?;
+                let (root, camera) = selected?;
+                (camera, Some(root))
+            } else { (fixed, None) };
             let interaction_path = if interaction {
                 // Newland pf566 statel+0x4060, mesh95575 dry_edge_grass_small:
                 // native scene root, not a camera-derived or guessed plant position.
@@ -479,6 +519,16 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     Camera::look_at(fixed.pos, interaction_end + Vec3::Y * 0.8),
                 _ => fixed,
             };
+            if let Some(sequence) = sequence {
+                for index in 0..sequence.count {
+                    let target = sequence.start + sequence.dt * index as f32;
+                    let position = if sequence.interaction {
+                        Some(graphics_fixture_sequence_position(interaction_root.context("missing native shrub")?, index as f32 / (sequence.count - 1) as f32,
+                            |point| collision.borrow().terrain_height(point))?)
+                    } else { None };
+                    writeln!(manifest, "{name} sequence_frame={index:02} renderer_time={target} sample_dt={} avatar_scene={position:?}", sequence.dt)?;
+                }
+            }
             let capture = |measure: bool| -> anyhow::Result<(Vec<u8>, Lens, usize, usize)> {
                 // Fresh renderers and the original per-capture CRT reset remain independent.
                 // Both consume clones of the same immutable snapshot, including across views.
@@ -499,6 +549,65 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 let actual_msaa = off.msaa_samples();
                 ensure!(actual_msaa == msaa, "requested MSAA {msaa}, adapter selected {actual_msaa}; evidence requires the requested sample count");
                 if measure { std::fs::write(out.join(format!("{name}-msaa.txt")), format!("requested={msaa}\nactual={actual_msaa}\n"))?; }
+                if let Some(sequence) = sequence {
+                    let mut avatar = if sequence.interaction {
+                        Some(super::avatar::Avatar::new(&store, &dir, 25988, &actor,
+                            ao_formats::character::actor::ActorAssets::new(&store)?)?)
+                    } else { None };
+                    if let Some(avatar) = &mut avatar {
+                        let start = graphics_fixture_sequence_position(interaction_root.context("missing native shrub")?, 0.0,
+                            |point| collision.borrow().terrain_height(point))?;
+                        avatar.set_transform(start.to_array(), std::f32::consts::FRAC_PI_2);
+                        off.host.actor_models.push((super::avatar::MODEL_KEY, std::sync::Arc::new(avatar.model().clone())));
+                        off.host.actors.push(avatar.frame());
+                        off.host.post_focus = Some(start.to_array());
+                        off.host.dynamic_lights.extend(avatar.lights());
+                        off.host.grass_benders.push(ao_render::GrassBender { actor: None, position: start.to_array() });
+                        off.frame(&mut shot, 0.0);
+                    }
+                    if grass_exposure.is_some() { off.warm_grass_tiles(); }
+                    off.prepare_frozen_rendering();
+                    off.render_frozen()?;
+                    off.wait_for_pipeline_warmup();
+                    let mut elapsed = 0.0_f32;
+                    let mut raw = Vec::new();
+                    for index in 0..sequence.count {
+                        let target = sequence.start + sequence.dt * index as f32;
+                        // Render every real simulation step: wind filters and interaction springs
+                        // cannot be sampled by seeking the shader clock or by zero-dt renders.
+                        loop {
+                            let dt = (target - elapsed).min(1.0 / 60.0);
+                            if let Some(avatar) = &mut avatar {
+                                let progress = ((elapsed + dt - sequence.start)
+                                    / (sequence.dt * (sequence.count - 1) as f32)).max(0.0);
+                                let position = graphics_fixture_sequence_position(interaction_root.context("missing native shrub")?, progress,
+                                    |point| collision.borrow().terrain_height(point))?;
+                                avatar.set_transform(position.to_array(), std::f32::consts::FRAC_PI_2);
+                                off.host.post_focus = Some(position.to_array());
+                                off.host.dynamic_lights.extend(avatar.lights());
+                                off.host.actors.push(avatar.frame());
+                                off.host.grass_benders.clear();
+                                off.host.grass_benders.push(ao_render::GrassBender { actor: None, position: position.to_array() });
+                            }
+                            off.frame(&mut shot, dt);
+                            elapsed += dt;
+                            if elapsed >= target { break; }
+                        }
+                        let file = format!("{name}-frame{index:02}.png");
+                        raw = off.frozen_rgba()?;
+                        if measure {
+                            image::save_buffer(out.join(&file), &raw, size.0, size.1, image::ColorType::Rgba8)?;
+                            if let Some(base) = &baseline {
+                                let previous = image::open(base.join(&file))?.into_rgba8().into_raw();
+                                ensure!(previous == raw, "{file}: sequence baseline differs");
+                            }
+                        } else {
+                            let previous = image::open(out.join(&file))?.into_rgba8().into_raw();
+                            ensure!(previous == raw, "{file}: independent sequence captures differ");
+                        }
+                    }
+                    return Ok((raw, lens, counts.0, counts.1));
+                }
                 let lightbar = matches!(name.as_str(), "borealis-lightbar-night" | "borealis-lightbar-night-close");
                 let authored_actor = name.starts_with("icc-actor-") || lightbar;
                 if let Some((interaction_start, interaction_end)) = interaction_path {
@@ -691,11 +800,259 @@ fn graphics_fixture_views(actor: &ao_net::n3::dynel::SimpleCharFullUpdate) -> Ve
         views.push((format!("newland-{light}"), 566, time,
             Camera::look_at([414.0, 2.5, -320.0].into(), [440.0, 1.0, -335.0].into())));
     }
+    views.push(("newland-backlit-day".into(), 566, 3240.0,
+        Camera::look_at([414.0, 2.5, -320.0].into(), [440.0, 1.0, -335.0].into())));
     views.push(("borealis-lightbar-night".into(), 800, 0.0,
         Camera::look_at([679.6, 74.5, -476.7].into(), [679.6, 74.0, -482.7].into())));
     views.push(("borealis-lightbar-night-close".into(), 800, 0.0,
         Camera::look_at([679.6, 74.0, -480.2].into(), [679.6, 74.0, -482.7].into())));
     views
+}
+
+fn graphics_fixture_shrub(
+    scene: &Scene,
+    anchor: Vec3,
+    names: &ao_formats::character::NameTable,
+    collision: &ao_formats::playfield::collision::Collision,
+    manifest: &mut String,
+) -> anyhow::Result<(Vec3, Camera)> {
+    use std::fmt::Write;
+    let mut best: Option<(f32, Vec3, Camera, usize, usize)> = None;
+    for (index, instance) in scene.instances.iter().enumerate() {
+        let mesh = &scene.meshes[instance.mesh];
+        let transform = glam::Mat4::from_cols_array_2d(&instance.transform);
+        for (material, submesh) in mesh.submeshes.iter().enumerate().filter(|(_, submesh)| submesh.vegetation) {
+            let mut lo = Vec3::splat(f32::INFINITY);
+            let mut hi = Vec3::splat(f32::NEG_INFINITY);
+            for &vertex in &submesh.indices {
+                let point = transform.transform_point3(Vec3::from(mesh.vertices[vertex as usize].pos));
+                lo = lo.min(point);
+                hi = hi.max(point);
+            }
+            if !lo.is_finite() || !hi.is_finite() { continue; }
+            let mut root = (lo + hi) * 0.5;
+            let distance = Vec3::new(root.x - anchor.x, 0.0, root.z - anchor.z).length_squared();
+            if distance > 80.0 * 80.0 { continue; }
+            let texture = submesh.texture.and_then(|key| names.name(key.rdb_type, key.id));
+            let height = hi.y - lo.y;
+            writeln!(manifest, "interaction_candidate instance={index} mesh={} submesh={material} texture={texture:?} world_lo={lo:?} world_hi={hi:?} distance={} height={height}", instance.mesh, distance.sqrt())?;
+            if !(0.5..=3.0).contains(&height) || !texture.is_some_and(graphics_fixture_shrub_texture) { continue; }
+            let Some(ground) = collision.terrain_height(root.to_array()) else { continue; };
+            root.y = ground;
+            let ground = |point| collision.terrain_height(point);
+            let (Ok(start), Ok(end)) = (
+                graphics_fixture_sequence_position(root, 0.0, ground),
+                graphics_fixture_sequence_position(root, 0.5, ground),
+            ) else { continue; };
+            if collision.line((start + Vec3::Y * 0.8).to_array(),
+                (end + Vec3::Y * 0.8).to_array()).is_some() { continue; }
+            let mut eye = root + Vec3::new(-5.0, 0.0, 4.0);
+            let Some(ground) = collision.terrain_height(eye.to_array()) else { continue; };
+            eye.y = ground + 1.8;
+            let at = Vec3::new(root.x, (lo.y + height * 0.6).max(root.y + 0.5), root.z);
+            if collision.line(eye.to_array(), at.to_array()).is_some() { continue; }
+            if best.as_ref().is_none_or(|best| distance < best.0) {
+                best = Some((distance, root, Camera::look_at(eye, at), index, material));
+            }
+        }
+    }
+    let (_, root, camera, instance, submesh) = best.ok_or_else(|| anyhow::anyhow!(
+        "no native leafy shrub (world height0.5..3m, not grass/flower, grounded clear LOS) within80m; see interaction_candidate inventory in manifest"))?;
+    writeln!(manifest, "interaction_selected instance={instance} mesh={} submesh={submesh} root={root:?} root_source=native_leaf_world_bounds_center_grounded camera={camera:?} collision_los=clear", scene.instances[instance].mesh)?;
+    Ok((root, camera))
+}
+
+fn graphics_fixture_shrub_texture(name: &str) -> bool {
+    let contains = |word: &str| name.as_bytes().windows(word.len())
+        .any(|window| window.eq_ignore_ascii_case(word.as_bytes()));
+    !["grass", "flower"].iter().any(|word| contains(word))
+        && ["leaf", "leav", "plant", "bush", "palm"].iter().any(|word| contains(word))
+}
+
+#[test]
+fn graphics_fixture_shrub_semantics_exclude_tufts_and_flowers() {
+    for name in ["leaves_hires", "plant_billboards_1024_lars2", "palmblad", "Bush_A"] {
+        assert!(graphics_fixture_shrub_texture(name));
+    }
+    for name in ["dry_edge_grass_small", "grass_plant", "flower_leaves", "tree_trunk", "unknown"] {
+        assert!(!graphics_fixture_shrub_texture(name));
+    }
+}
+
+fn graphics_fixture_backlit_camera(
+    scene: &Scene,
+    anchor: Vec3,
+    terrain_height: impl Fn([f32; 3]) -> Option<f32>,
+    clear: impl Fn([f32; 3], [f32; 3]) -> bool,
+) -> anyhow::Result<(Camera, usize, usize, Vec3, f32)> {
+    use anyhow::Context;
+    let sun = Vec3::from(scene.environment.context("backlit view has no authored environment")?.sun_dir)
+        .normalize_or_zero();
+    anyhow::ensure!(sun.y > 0.0, "backlit view requires an above-horizon authored sun");
+    let mut best: Option<(f32, Camera, usize, usize, Vec3, f32)> = None;
+    for (index, instance) in scene.instances.iter().enumerate() {
+        let mesh = &scene.meshes[instance.mesh];
+        let transform = glam::Mat4::from_cols_array_2d(&instance.transform);
+        for (submesh_index, submesh) in mesh.submeshes.iter().enumerate() {
+            if !submesh.vegetation || !submesh.lighting_enabled || !submesh.fog_enabled
+                || submesh.depth_write == Some(false)
+                || (submesh.depth_write.is_none() && !matches!(submesh.blend, ao_scene::Blend::Opaque | ao_scene::Blend::AlphaTest)) {
+                continue;
+            }
+            let mut lo = Vec3::splat(f32::INFINITY);
+            let mut hi = Vec3::splat(f32::NEG_INFINITY);
+            for &vertex in &submesh.indices {
+                let point = transform.transform_point3(Vec3::from(mesh.vertices[vertex as usize].pos));
+                lo = lo.min(point);
+                hi = hi.max(point);
+            }
+            if !lo.is_finite() || !hi.is_finite() || hi.y - lo.y < 2.5 { continue; }
+            let canopy = Vec3::new((lo.x + hi.x) * 0.5, lo.y + (hi.y - lo.y) * 0.75, (lo.z + hi.z) * 0.5);
+            let distance = canopy.distance_squared(anchor);
+            if distance > 80.0 * 80.0 || best.as_ref().is_some_and(|best| distance >= best.0) { continue; }
+            for offset in [4.0, 8.0, 12.0] {
+                let mut eye = canopy - sun * offset;
+                let Some(ground) = terrain_height(eye.to_array()) else { continue; };
+                eye.y = ground + 1.8;
+                let camera = Camera::look_at(eye, canopy);
+                let alignment = camera.forward().dot(sun);
+                if !eye.is_finite() || alignment < 0.6 || !clear(eye.to_array(), canopy.to_array()) { continue; }
+                best = Some((distance, camera, index, submesh_index, canopy, alignment));
+                break;
+            }
+        }
+    }
+    best.map(|(_, camera, index, submesh, canopy, alignment)| (camera, index, submesh, canopy, alignment))
+        .context("no nearby native canopy has a grounded, unobstructed toward-sun camera")
+}
+
+#[test]
+fn graphics_fixture_backlit_view_requires_native_canopy_ground_and_los() {
+    let mut material = ao_scene::Submesh::new(vec![0, 1], None);
+    material.vegetation = true;
+    let mut scene = Scene {
+        environment: Some(ao_scene::Environment {
+            sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 0.0, fog_end: 100.0,
+            ambient: [0.0; 3], sun_color: [1.0; 3],
+            sun_dir: [std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2, 0.0],
+            sun_specular: 1.0,
+        }),
+        meshes: vec![ao_scene::Mesh {
+            vertices: vec![
+                ao_scene::Vertex { pos: [-1.0, 2.0, -1.0], ..Default::default() },
+                ao_scene::Vertex { pos: [1.0, 6.0, 1.0], ..Default::default() },
+            ],
+            submeshes: vec![material],
+        }],
+        instances: vec![ao_scene::Instance { mesh: 0, transform: ao_scene::IDENTITY }],
+        ..Default::default()
+    };
+    let (camera, instance, submesh, canopy, alignment) = graphics_fixture_backlit_camera(
+        &scene, Vec3::ZERO, |_| Some(0.0), |_, _| true).unwrap();
+    assert_eq!(instance, 0);
+    assert_eq!(submesh, 0);
+    assert_eq!(canopy, Vec3::new(0.0, 5.0, 0.0));
+    assert_eq!(camera.pos.y, 1.8);
+    assert!(alignment >= 0.6);
+    assert!(graphics_fixture_backlit_camera(&scene, Vec3::ZERO, |_| None, |_, _| true).is_err());
+    assert!(graphics_fixture_backlit_camera(&scene, Vec3::ZERO, |_| Some(0.0), |_, _| false).is_err());
+    scene.instances[0].transform = glam::Mat4::from_translation(Vec3::new(20.0, 10.0, 30.0)).to_cols_array_2d();
+    let (_, _, _, transformed, _) = graphics_fixture_backlit_camera(
+        &scene, Vec3::ZERO, |_| Some(10.0), |_, _| true).unwrap();
+    assert_eq!(transformed, Vec3::new(20.0, 15.0, 30.0));
+    scene.instances[0].transform = ao_scene::IDENTITY;
+    scene.meshes[0].submeshes[0].lighting_enabled = false;
+    assert!(graphics_fixture_backlit_camera(&scene, Vec3::ZERO, |_| Some(0.0), |_, _| true).is_err());
+    scene.meshes[0].submeshes[0].lighting_enabled = true;
+    scene.meshes[0].submeshes[0].fog_enabled = false;
+    assert!(graphics_fixture_backlit_camera(&scene, Vec3::ZERO, |_| Some(0.0), |_, _| true).is_err());
+    scene.meshes[0].submeshes[0].fog_enabled = true;
+    scene.meshes[0].submeshes[0].depth_write = Some(false);
+    assert!(graphics_fixture_backlit_camera(&scene, Vec3::ZERO, |_| Some(0.0), |_, _| true).is_err());
+    scene.meshes[0].submeshes[0].depth_write = None;
+    scene.meshes[0].submeshes[0].vegetation = false;
+    assert!(graphics_fixture_backlit_camera(&scene, Vec3::ZERO, |_| Some(0.0), |_, _| true).is_err());
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GraphicsFixtureSequence {
+    interaction: bool,
+    start: f32,
+    dt: f32,
+    count: usize,
+}
+
+fn graphics_fixture_sequence(
+    mode: Option<&str>, start: Option<&str>, dt: Option<&str>, count: Option<&str>,
+) -> anyhow::Result<Option<GraphicsFixtureSequence>> {
+    use anyhow::ensure;
+    let Some(mode) = mode else {
+        ensure!(start.is_none() && dt.is_none() && count.is_none(),
+            "AOMAC_GFX_SEQUENCE_START/DT/COUNT require AOMAC_GFX_SEQUENCE");
+        return Ok(None);
+    };
+    ensure!(matches!(mode, "stationary" | "interaction"),
+        "AOMAC_GFX_SEQUENCE must be stationary or interaction");
+    let start = start.unwrap_or("2").parse::<f32>()?;
+    let dt = dt.unwrap_or("0.5").parse::<f32>()?;
+    let count = count.unwrap_or("6").parse::<usize>()?;
+    ensure!(start.is_finite() && (0.0..=10.0).contains(&start),
+        "AOMAC_GFX_SEQUENCE_START must be finite seconds in 0..=10");
+    ensure!(dt.is_finite() && (0.05..=2.0).contains(&dt),
+        "AOMAC_GFX_SEQUENCE_DT must be finite sample spacing in 0.05..=2 seconds");
+    ensure!((5..=8).contains(&count), "AOMAC_GFX_SEQUENCE_COUNT must be 5..=8");
+    Ok(Some(GraphicsFixtureSequence { interaction: mode == "interaction", start, dt, count }))
+}
+
+fn graphics_fixture_sequence_position(
+    root: Vec3,
+    progress: f32,
+    terrain_height: impl Fn([f32; 3]) -> Option<f32>,
+) -> anyhow::Result<Vec3> {
+    use anyhow::Context;
+    // Cross the selected native shrub, leave its bend radius in the first half,
+    // then remain admitted at the departure position while its history rebounds.
+    let mut point = root + Vec3::X * (-3.0 + 6.0 * (progress * 2.0).clamp(0.0, 1.0));
+    point.y = terrain_height(point.to_array()).context("sequence path has no terrain height")?;
+    anyhow::ensure!(point.is_finite(), "sequence path has invalid terrain height");
+    Ok(point)
+}
+
+#[test]
+fn graphics_fixture_sequence_controls_and_grounded_rebound() {
+    assert_eq!(graphics_fixture_sequence(None, None, None, None).unwrap(), None);
+    let defaults = graphics_fixture_sequence(Some("stationary"), None, None, None).unwrap().unwrap();
+    assert_eq!((defaults.start, defaults.dt, defaults.count, defaults.interaction), (2.0, 0.5, 6, false));
+    let interaction = graphics_fixture_sequence(Some("interaction"), Some("0"), Some("2"), Some("8")).unwrap().unwrap();
+    assert!(interaction.interaction);
+    for (mode, start, dt, count) in [
+        (None, Some("1"), None, None),
+        (Some("wind"), None, None, None),
+        (Some("stationary"), Some("NaN"), None, None),
+        (Some("stationary"), Some("-1"), None, None),
+        (Some("stationary"), Some("11"), None, None),
+        (Some("stationary"), None, Some("inf"), None),
+        (Some("stationary"), None, Some("0"), None),
+        (Some("stationary"), None, Some("3"), None),
+        (Some("stationary"), None, None, Some("4")),
+        (Some("stationary"), None, None, Some("9")),
+        (Some("stationary"), None, None, Some("six")),
+    ] {
+        assert!(graphics_fixture_sequence(mode, start, dt, count).is_err());
+    }
+    let ground = |point: [f32; 3]| Some(point[0] * 0.1);
+    let root = Vec3::new(30.0, 0.0, -20.0);
+    let start = graphics_fixture_sequence_position(root, 0.0, ground).unwrap();
+    let contact = graphics_fixture_sequence_position(root, 0.25, ground).unwrap();
+    let leave = graphics_fixture_sequence_position(root, 0.5, ground).unwrap();
+    let rebound = graphics_fixture_sequence_position(root, 1.0, ground).unwrap();
+    assert_eq!(contact.x, root.x);
+    assert!((contact.x - start.x - 3.0).abs() < 0.001);
+    assert!((leave.x - contact.x - 3.0).abs() < 0.001);
+    assert_eq!(leave, rebound);
+    assert_eq!(contact.y, contact.x * 0.1);
+    assert!(graphics_fixture_sequence_position(root, 0.0, |_| None).is_err());
+    assert!(graphics_fixture_sequence_position(root, 0.0, |_| Some(f32::NAN)).is_err());
 }
 
 fn graphics_fixture_newland_camera(terrain_height: impl Fn([f32; 3]) -> Option<f32>) -> anyhow::Result<Camera> {
@@ -761,14 +1118,14 @@ fn graphics_fixture_snapshot_keys_share_only_matching_playfield_and_time() -> an
     for (_, pf, time, _) in &views {
         *keys.entry((*pf, time.to_bits())).or_default() += 1;
     }
-    assert_eq!(views.len(), 18);
+    assert_eq!(views.len(), 19);
     assert_eq!(keys.len(), 9);
     assert_eq!(keys[&(4582, 2648.69_f32.to_bits())], 4);
     assert_eq!(keys[&(800, 0.0_f32.to_bits())], 4);
     assert_eq!(keys[&(800, 3240.0_f32.to_bits())], 2);
     assert_eq!(keys[&(127, 3240.0_f32.to_bits())], 1);
     for time in [3240.0_f32, 4860.0, 0.0] {
-        assert_eq!(keys[&(566, time.to_bits())], 1);
+        assert_eq!(keys[&(566, time.to_bits())], if time == 3240.0 { 2 } else { 1 });
     }
     Ok(())
 }
