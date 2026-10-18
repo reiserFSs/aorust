@@ -792,3 +792,322 @@ fn empty_actor_frames_encode_no_dynamic_passes_and_arrival_loss_remain_exact() {
     assert!(patch_light(&renderer, &departed, static_shadow) + 9 * 3 * 8 < patch_light(&renderer, &unshadowed, static_shadow),
         "omitting the empty actor layer also erased unrelated static world occlusion");
 }
+
+fn scrolling_actor_model(blend: ao_scene::Blend) -> Scene {
+    let key = ao_scene::TextureKey { rdb_type: 0, id: 719 };
+    let mut mesh = quad(0.0, 0.0, -5.5, 0.25, 0.35);
+    mesh.submeshes[0].texture = Some(key);
+    mesh.submeshes[0].blend = blend;
+    mesh.submeshes[0].uv_scroll = [0.5, 0.0];
+    let mut scene = Scene { meshes: vec![mesh], ..Default::default() };
+    scene.textures.insert(key, ao_scene::Texture {
+        width: 2, height: 1, rgba: vec![255, 32, 16, 255, 16, 64, 255, 0],
+        source: ao_scene::TextureSource::Generated,
+    });
+    scene
+}
+
+#[test]
+fn carried_opaque_rgb_scroll_and_effect_time_settle_to_zero_world_passes() {
+    let mut scene = scene();
+    let mut lamp = scene.lights.remove(0);
+    lamp.owner = Some(7);
+    let mut renderer = renderer(&scene);
+    renderer.set_enhanced_settings(EnhancedSettings {
+        local_light_shadows: true, point_shadow_count: 1, ..Default::default()
+    });
+    renderer.add_actor_model(7, &scrolling_actor_model(ao_scene::Blend::Opaque));
+    renderer.set_actors(vec![actor(7, 1.5)]);
+    renderer.set_dynamic_lights(&[lamp]);
+    let capture = Capture::new(&renderer);
+    capture.frame(&mut renderer);
+    assert!(caster_instances(&renderer, false) > 0, "owned source never drew real world depth");
+    for _ in 0..32 {
+        renderer.time += 1.0 / 60.0;
+        capture.frame(&mut renderer);
+    }
+    let mut shadowed = Vec::new();
+    for frame in 0..12 {
+        renderer.time += 1.0 / 60.0;
+        let rgb = if frame % 2 == 0 { [0.05; 3] } else { [0.2; 3] };
+        let mut owner = actor(7, 1.5);
+        owner.rendering_effect_time = renderer.time;
+        owner.emissive = Some(rgb);
+        owner.specular = Some(rgb);
+        owner.specular_power = Some(4.0 + frame as f32);
+        owner.part_materials = vec![ao_scene::ActorMaterialOverride {
+            emissive: Some(rgb), specular: Some(rgb), ..Default::default()
+        }];
+        renderer.set_actors(vec![owner]);
+        lamp.color = if frame % 2 == 0 { [0.35; 3] } else { [0.5; 3] };
+        renderer.set_dynamic_lights(&[lamp]);
+        shadowed = capture.frame(&mut renderer);
+        assert_eq!(renderer.point_shadows.as_ref().unwrap().static_face_mask, 0,
+            "opaque RGB-only UV drift, positive overrides or an unused effect timer encoded static depth passes");
+        assert_eq!(scheduled(&renderer, false), [false; 6]);
+        assert_eq!(caster_instances(&renderer, false), 0,
+            "settled carried source still submitted real world geometry");
+    }
+    assert!(metadata(&renderer)[128..].as_chunks::<36>().0.iter().take(6)
+        .all(|face| f32::from_bits(face[32]) == 1.0),
+        "zero-work owned fixture was not actually admitted");
+    renderer.set_enhanced_settings(EnhancedSettings::default());
+    let unshadowed = capture.frame(&mut renderer);
+    let static_shadow = Vec3::new(-2.0, -2.0, -8.0);
+    assert!(patch_light(&renderer, &shadowed, static_shadow) + 9 * 3 * 8
+        < patch_light(&renderer, &unshadowed, static_shadow),
+        "zero carried world passes erased positive static occlusion");
+}
+
+#[test]
+fn primary_alpha_scroll_and_uv_mutations_invalidate_owner_admission_potential() {
+    let mut renderer = renderer(&scene());
+    renderer.add_actor_model(7, &scrolling_actor_model(ao_scene::Blend::AlphaTest));
+    renderer.set_actors(vec![actor(7, 1.5)]);
+    let capture = Capture::new(&renderer);
+    capture.frame(&mut renderer);
+    let capsules = [[0.0, 0.0, 0.0, f32::INFINITY]];
+    let initial = renderer.point_owner_occluder_hash(Vec3::ZERO, &capsules);
+    renderer.time += 0.25;
+    assert_ne!(initial, renderer.point_owner_occluder_hash(Vec3::ZERO, &capsules),
+        "actual alpha-tested scrolling texture no longer invalidates current primary admission potential");
+    let scrolled = renderer.point_owner_occluder_hash(Vec3::ZERO, &capsules);
+    let mut changed = actor(7, 1.5);
+    changed.part_uvs = vec![[1.0, 1.0, 0.5, 0.0]];
+    renderer.set_actors(vec![changed.clone()]);
+    assert_ne!(scrolled, renderer.point_owner_occluder_hash(Vec3::ZERO, &capsules),
+        "alpha coverage UV mutation was omitted from primary admission dependencies");
+    let remapped = renderer.point_owner_occluder_hash(Vec3::ZERO, &capsules);
+    changed.part_materials = vec![ao_scene::ActorMaterialOverride {
+        alpha: Some(0.25), ..Default::default()
+    }];
+    renderer.set_actors(vec![changed]);
+    assert_ne!(remapped, renderer.point_owner_occluder_hash(Vec3::ZERO, &capsules),
+        "primary alpha override mutation was mistaken for an RGB-only material change");
+    let mut glow = scrolling_actor_model(ao_scene::Blend::AlphaTest);
+    glow.meshes[0].submeshes[0].glow_mask = true;
+    renderer.add_actor_model(7, &glow);
+    renderer.set_actors(vec![actor(7, 1.5)]);
+    capture.frame(&mut renderer);
+    let constant_alpha = renderer.point_owner_occluder_hash(Vec3::ZERO, &capsules);
+    renderer.time += 0.25;
+    assert_eq!(constant_alpha, renderer.point_owner_occluder_hash(Vec3::ZERO, &capsules),
+        "glow-mask texture alpha used only as RGB illumination dirtied primary coverage");
+    let mut skinned = actor(7, 1.5);
+    let mut vertices = glow.meshes[0].vertices.clone();
+    vertices[0].pos[0] += 0.125;
+    skinned.skin = Some(std::sync::Arc::new(vertices.clone()));
+    renderer.set_actors(vec![skinned]);
+    let retained = renderer.point_owner_occluder_hash(Vec3::ZERO, &capsules);
+    renderer.set_actors(vec![actor(7, 1.5)]);
+    assert_eq!(retained, renderer.point_owner_occluder_hash(Vec3::ZERO, &capsules),
+        "submitting None forgot the actual retained GPU skin used by primary admission");
+    vertices[0].pos[0] += 0.125;
+    let mut reposed = actor(7, 1.5);
+    reposed.skin = Some(std::sync::Arc::new(vertices));
+    renderer.set_actors(vec![reposed]);
+    assert_ne!(retained, renderer.point_owner_occluder_hash(Vec3::ZERO, &capsules),
+        "actual retained GPU skin mutation failed to invalidate primary admission potential");
+}
+
+#[test]
+fn carried_point_faces_rasterize_at_128_near_and_64_beyond_fifteen_metres() {
+    let scene = Scene {
+        meshes: vec![quad(0.0, 0.0, -8.0, 32.0, 32.0)],
+        instances: vec![Instance { mesh: 0, transform: IDENTITY }],
+        lights: vec![Light {
+            pos: [0.0; 3], color: [0.5; 3], range: 100.0, owner: Some(7), ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut renderer = renderer(&scene);
+    renderer.set_enhanced_settings(EnhancedSettings {
+        local_light_shadows: true, point_shadow_count: 1, ..Default::default()
+    });
+    renderer.add_actor_model(7, &Scene {
+        meshes: vec![quad(0.0, 0.0, -5.5, 1.0, 1.0)], ..Default::default()
+    });
+    renderer.set_actors(vec![actor(7, 0.0)]);
+    let mut capture = Capture::new(&renderer);
+    for (distance, size) in [(0.0, 128usize), (20.0, 64)] {
+        capture.camera = Camera::look_at(Vec3::new(0.0, 0.0, distance), Vec3::new(0.0, 0.0, -8.0));
+        for _ in 0..6 { capture.frame(&mut renderer); }
+        let state = metadata(&renderer);
+        for face in 0..6 {
+            assert_eq!(f32::from_bits(state[128 + face * 36 + 32]), 1.0,
+                "adaptive carried light was not admitted by actual primary geometry");
+            assert_eq!(f32::from_bits(state[128 + face * 36 + 33]), size as f32 / 256.0);
+        }
+        let depth = negative_z_depth(&renderer);
+        assert_eq!(depth.iter().filter(|&&value| value > 0.0 && value < 1.0).count(), size * size,
+            "carried face metadata did not match actual world raster work");
+        for y in 0..256 {
+            for x in 0..256 {
+                let value = depth[y * 256 + x];
+                if x < size && y < size {
+                    assert!(value > 0.0 && value < 1.0, "carried effective face contains a depth hole");
+                } else {
+                    assert_eq!(value, 1.0, "carried reduced face retained depth outside its viewport");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn carried_motion_accumulates_from_last_trigger_then_refreshes_two_stored_faces() {
+    let mut scene = scene();
+    let mut lamp = scene.lights.remove(0);
+    lamp.owner = Some(7);
+    let mut renderer = renderer(&scene);
+    renderer.set_enhanced_settings(EnhancedSettings {
+        local_light_shadows: true, point_shadow_count: 1, ..Default::default()
+    });
+    add_actors(&mut renderer, vec![actor(7, 1.5)]);
+    renderer.set_dynamic_lights(&[lamp]);
+    let capture = Capture::new(&renderer);
+    for _ in 0..32 {
+        renderer.time += 1.0 / 60.0;
+        capture.frame(&mut renderer);
+    }
+    assert!(negative_z_depth(&renderer).iter().any(|&depth| depth > 0.0 && depth < 1.0),
+        "carried movement fixture never populated actual world depth");
+    let origin = lamp.pos[0];
+    let mut previous = metadata(&renderer);
+    for trigger in [0.0, 0.21] {
+        // Every individual step is below 0.2m, including the triggering step.
+        // Resetting the baseline per frame would therefore never refresh.
+        for offset in [0.05, 0.10, 0.15, 0.19] {
+            lamp.pos[0] = origin + trigger + offset;
+            renderer.set_dynamic_lights(&[lamp]);
+            renderer.time += 1.0 / 60.0;
+            capture.frame(&mut renderer);
+            assert_eq!(scheduled(&renderer, false), [false; 6],
+                "carried world cache refreshed before cumulative motion exceeded 0.2m");
+            assert_eq!(caster_instances(&renderer, false), 0);
+            let current = metadata(&renderer);
+            for face in 0..6 {
+                let start = 128 + face * 36;
+                assert_eq!(previous[start..start + 16], current[start..start + 16],
+                    "subthreshold motion paired retained depth with a new projection");
+            }
+            previous = current;
+        }
+        lamp.pos[0] = origin + trigger + 0.21;
+        renderer.set_dynamic_lights(&[lamp]);
+        let mut visited = [false; 6];
+        for _ in 0..3 {
+            renderer.time += 1.0 / 60.0;
+            capture.frame(&mut renderer);
+            let updates = scheduled(&renderer, false);
+            assert_eq!(updates.into_iter().filter(|&updated| updated).count(), 2,
+                "cumulative carried motion exceeded or stalled the normal two-face budget");
+            let current = metadata(&renderer);
+            for (face, updated) in updates.into_iter().enumerate() {
+                let start = 128 + face * 36;
+                if updated {
+                    assert!(!visited[face], "carried round robin repeated a face before covering the cube");
+                    assert_ne!(previous[start..start + 16], current[start..start + 16],
+                        "triggered carried face kept its old projection");
+                    visited[face] = true;
+                } else {
+                    assert_eq!(previous[start..start + 16], current[start..start + 16],
+                        "unrendered carried depth was paired with the current light position");
+                }
+            }
+            previous = current;
+        }
+        assert_eq!(visited, [true; 6]);
+        renderer.time += 1.0 / 60.0;
+        capture.frame(&mut renderer);
+        assert_eq!(scheduled(&renderer, false), [false; 6], "carried trigger did not drain to a cache hit");
+    }
+}
+
+#[test]
+fn carried_far_primary_animation_omits_world_passes_but_capsule_entry_revokes_and_restores() {
+    let mut scene = scene();
+    let mut lamp = scene.lights.remove(0);
+    lamp.owner = Some(7);
+    let key = ao_scene::TextureKey { rdb_type: 0, id: 720 };
+    let mut occluder = quad(0.0, 0.0, -3.0, 8.0, 8.0);
+    occluder.submeshes[0].texture = Some(key);
+    occluder.submeshes[0].blend = ao_scene::Blend::AlphaTest;
+    occluder.submeshes[0].uv_scroll = [0.5, 0.0];
+    let mut liquid = occluder.clone();
+    liquid.submeshes[0].blend = ao_scene::Blend::AlphaBlend;
+    liquid.submeshes[0].liquid = true;
+    scene.meshes.extend([occluder, liquid]);
+    scene.instances.extend([
+        Instance { mesh: 2, transform: Mat4::from_translation(Vec3::new(100.0, 0.0, 0.0)).to_cols_array_2d() },
+        Instance { mesh: 3, transform: Mat4::from_translation(Vec3::new(-100.0, 0.0, 0.0)).to_cols_array_2d() },
+    ]);
+    // Fully covered texels make entry deterministically occlude the owner;
+    // the authored alpha-test/scroll still requires current primary proof.
+    scene.textures.insert(key, ao_scene::Texture {
+        width: 2, height: 1, rgba: vec![255, 32, 16, 255, 16, 64, 255, 255],
+        source: ao_scene::TextureSource::Generated,
+    });
+    let mut renderer = renderer(&scene);
+    renderer.set_enhanced_settings(EnhancedSettings {
+        local_light_shadows: true, point_shadow_count: 1, ..Default::default()
+    });
+    add_actors(&mut renderer, vec![actor(7, 1.5)]);
+    renderer.set_dynamic_lights(&[lamp]);
+    let capture = Capture::new(&renderer);
+    // Empty near-mesh placeholders retain their GPU vertices. Only the two
+    // distinct far meshes are re-uploaded/revisioned by the real repose API.
+    let mut posed = Scene {
+        meshes: vec![Mesh::default(), Mesh::default(), scene.meshes[2].clone(), scene.meshes[3].clone()],
+        instances: scene.instances.clone(), ..Default::default()
+    };
+    let mut admitted = Vec::new();
+    for _ in 0..32 {
+        renderer.time += 1.0 / 60.0;
+        admitted = capture.frame(&mut renderer);
+    }
+    assert!(caster_instances(&renderer, true) == 0
+        && metadata(&renderer)[128..].as_chunks::<36>().0.iter().take(6)
+            .all(|face| f32::from_bits(face[32]) == 1.0),
+        "far-animation fixture did not settle an actually admitted carried cube");
+    for frame in 0..12 {
+        renderer.time += 1.0 / 60.0;
+        posed.instances[2].transform = Mat4::from_translation(Vec3::new(100.0 + frame as f32, 0.0, 0.0)).to_cols_array_2d();
+        posed.instances[3].transform = Mat4::from_translation(Vec3::new(-100.0 - frame as f32, 0.0, 0.0)).to_cols_array_2d();
+        posed.meshes[2].vertices[0].pos[0] += 0.001;
+        posed.meshes[3].vertices[0].pos[0] -= 0.001;
+        renderer.repose(&posed);
+        assert_eq!(admitted, capture.frame(&mut renderer),
+            "offscreen distant primary animation changed an admitted carried receiver");
+        assert_eq!(renderer.point_shadows.as_ref().unwrap().static_face_mask, 0,
+            "far alpha-scroll/liquid time or world reposing dirtied unrelated carried world passes");
+        assert_eq!(scheduled(&renderer, false), [false; 6]);
+        assert_eq!(caster_instances(&renderer, false), 0);
+    }
+    // Move the very same authored alpha-scrolling primary occluder into the
+    // eye-to-owner capsule, without changing actor records or source identity.
+    posed.instances[2].transform = IDENTITY;
+    renderer.repose(&posed);
+    renderer.time += 1.0 / 60.0;
+    let blocked = capture.frame(&mut renderer);
+    renderer.set_dynamic_lights(&[Light { color: [0.0; 3], ..lamp }]);
+    assert_eq!(blocked, capture.frame(&mut renderer),
+        "current primary occlusion failed to revoke the hidden owner's light/shadow signal");
+    renderer.set_dynamic_lights(&[lamp]);
+    capture.frame(&mut renderer);
+    posed.instances[2].transform = Mat4::from_translation(Vec3::new(100.0, 0.0, 0.0)).to_cols_array_2d();
+    renderer.repose(&posed);
+    renderer.time += 1.0 / 60.0;
+    let restored = capture.frame(&mut renderer);
+    assert_eq!(scheduled(&renderer, false), [true; 6],
+        "mature owner restoration after capsule exit did not immediately render all six world faces");
+    assert!(caster_instances(&renderer, false) > 0,
+        "restored carried source did not rasterize real world occlusion");
+    assert_eq!(admitted, restored,
+        "capsule exit restarted mature light fading or retained the occluder's private shadow history");
+    renderer.set_enhanced_settings(EnhancedSettings::default());
+    let unshadowed = capture.frame(&mut renderer);
+    assert!(patch_light(&renderer, &restored, Vec3::new(-2.0, -2.0, -8.0)) + 9 * 3 * 8
+        < patch_light(&renderer, &unshadowed, Vec3::new(-2.0, -2.0, -8.0)),
+        "far-animation/capsule regression never preserved positive world-shadow geometry");
+}

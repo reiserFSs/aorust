@@ -713,6 +713,55 @@ pub(super) fn select_benders(
 }
 
 impl super::Renderer {
+    /// Conservative primary-geometry dependency signature, not CPU owner admission.
+    pub(crate) fn point_grass_admission_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let settings = self.enhanced_settings();
+        let (Some(grass), Some(ground)) = (&self.grass, &self.ground) else { return 0; };
+        if !settings.ground_grass || settings.grass_density <= 0.0 || settings.grass_distance <= 0.0 || !grass.has_draws() {
+            return 0;
+        }
+        let mut hash = std::hash::DefaultHasher::new();
+        // Hash exactly the retained uniform upload; disabled trails are not read.
+        let params = bytemuck::bytes_of(&grass.params);
+        let size = if grass.params.trail_origin[3] > 0.0 { params.len() } else { std::mem::offset_of!(Params, trails) };
+        hash.write(&params[..size]);
+        // Wind and recovery advance independently of Renderer::time, including
+        // between preparation and the next primary draw.
+        ((grass.wind_phase / 0.05) as f32).to_bits().hash(&mut hash);
+        hash.write(bytemuck::cast_slice(&grass.filtered_wind));
+        if settings.grass_trails {
+            grass.trails.origin.hash(&mut hash);
+            for source in &grass.trails.sources {
+                source.cells.len().hash(&mut hash);
+                for cell in &source.cells {
+                    cell.grid.hash(&mut hash);
+                    hash.write(bytemuck::bytes_of(&cell.bend));
+                }
+            }
+        }
+        // ponytail: global grass signature; spatially restrict cells only if
+        // owned-light grass invalidation becomes a measured bottleneck.
+        hash.write(bytemuck::cast_slice(&grass.cells));
+        for visible in &grass.visible {
+            visible.len().hash(&mut hash);
+            hash.write(bytemuck::cast_slice(visible));
+        }
+        grass.band_strides.hash(&mut hash);
+        ground.detail.selection_key().hash(&mut hash);
+        hash.write(&ground.green.layers);
+        for draw in &grass.draws {
+            (draw.batch, draw.band, draw.slots.start, draw.slots.end).hash(&mut hash);
+            let batch = &grass.batches[draw.batch];
+            let patch = &ground.detail.patches()[batch.patch];
+            (batch.patch, batch.submesh).hash(&mut hash);
+            self.point_mesh_revisions.get(patch.mesh).hash(&mut hash);
+            ground.materials[patch.mesh].is_some().hash(&mut hash);
+            self.gpu.opaque.get(ground.draws[batch.patch][batch.submesh]).is_some().hash(&mut hash);
+        }
+        // Reserve zero for the inactive path, not a possible hasher output.
+        hash.finish().max(1)
+    }
     /// Advance only Enhanced grass with real frame seconds, once per frontend frame.
     /// Stalls are bounded independently of native animation and game-day clocks.
     pub fn advance_grass_wind(&mut self, dt: f32) {
@@ -902,6 +951,36 @@ impl super::Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn primary_grass_uniform_hash_tracks_wind_benders_and_trail_recovery() {
+        use std::hash::Hasher;
+        let signature = |params: &Params| {
+            let bytes = bytemuck::bytes_of(params);
+            let size = if params.trail_origin[3] > 0.0 { bytes.len() } else { std::mem::offset_of!(Params, trails) };
+            let mut hash = std::hash::DefaultHasher::new();
+            hash.write(&bytes[..size]);
+            hash.finish()
+        };
+        let mut params: Params = bytemuck::Zeroable::zeroed();
+        let initial = signature(&params);
+        assert_eq!(initial, signature(&params));
+        params.wind_time[2] = advance_wind_phase(0.0, 0.1) as f32 / 0.05;
+        assert_ne!(initial, signature(&params));
+        let phase = signature(&params);
+        params.wind[0] = 0.85;
+        assert_ne!(phase, signature(&params));
+        let wind = signature(&params);
+        params.benders[0] = [1.0, 0.0, 2.0, 1.0];
+        params.limits[3] = 1.0;
+        assert_ne!(wind, signature(&params));
+        let no_trails = signature(&params);
+        params.trails[0] = [0.3, 0.1, 0.0, 0.5];
+        assert_eq!(no_trails, signature(&params), "disabled trails are not sampled");
+        params.trail_origin[3] = 1.0;
+        let before_recovery = signature(&params);
+        params.trails[0][3] *= (-0.1_f32 / 1.5).exp();
+        assert_ne!(before_recovery, signature(&params));
+    }
     #[test]
     fn grass_trails_recover_without_stationary_repainting() {
         let mut grid = TrailGrid::default();

@@ -259,6 +259,8 @@ struct Draw {
     origin: [f32; 3],
     projection_pass: bool,
     vegetation: bool,
+    /// This draw's sampled alpha coverage changes with simulation time.
+    time_alpha: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -766,10 +768,8 @@ pub struct Renderer {
     point_program: point_shadows::Compiled,
     /// Static geometry writes are invisible to matrix-only point-cache signatures.
     point_world_revision: u64,
-    /// Uploaded world materials whose sampled alpha coverage changes with the simulation clock.
-    point_world_time_dependent: bool,
-    /// Primary admission also reads blended/liquid alpha coverage for owned lights.
-    point_primary_time_dependent: bool,
+    /// Per-mesh geometry writes keep unrelated point-light caches independent.
+    point_mesh_revisions: Vec<u64>,
     ambient_occlusion: Option<ambient_occlusion::AmbientOcclusion>,
     contact_shadows: Option<contact_shadows::ContactShadows>,
     atmosphere: Option<atmosphere::Atmosphere>,
@@ -1279,8 +1279,7 @@ impl Renderer {
             queue,
             format,
             point_world_revision: 0,
-            point_world_time_dependent: false,
-            point_primary_time_dependent: false,
+            point_mesh_revisions: Vec::new(),
             enhanced_settings: EnhancedSettings::default(),
             weather_input: WeatherInput::default(),
             rain_wet: None,
@@ -2034,6 +2033,8 @@ impl Renderer {
     /// Replaces the GPU-side scene.
     pub fn upload(&mut self, scene: &Scene) {
         self.reset_post_history();
+        self.point_mesh_revisions.clear();
+        self.point_mesh_revisions.resize(scene.meshes.len(), 0);
         self.material_reflections = None;
         self.foliage_detail_state = foliage_detail::State::default();
         self.sky_dot_counter = 0.0;
@@ -2165,8 +2166,6 @@ impl Renderer {
         let (mut opaque, mut blended, mut liquid) = (vec![], vec![], vec![]);
         let mut ground_materials: Vec<Vec<usize>> = scene.meshes.iter().map(|m| vec![usize::MAX; m.submeshes.len()]).collect();
         let mut ground_texture_materials = HashMap::new();
-        let mut time_dependent = false;
-        let mut primary_time_dependent = false;
         for (mi, mesh) in scene.meshes.iter().enumerate() {
             let list = std::mem::take(&mut by_mesh[mi]);
             let range = insts.len()..insts.len() + list.len();
@@ -2200,14 +2199,13 @@ impl Renderer {
                     // Glow-mask mode replaces sampled texture alpha with constant one.
                     let alpha_time_dependent = (s.blend == Blend::AlphaTest || s.alpha_test.is_some() || s.sprite_alpha_test)
                         && !(s.glow_mask && !s.prelit) && (s.uv_scroll != [0.0; 2] || s.liquid);
-                    time_dependent |= alpha_time_dependent && !s.liquid && !blended_material(s.blend)
-                        && !scene.ground_detail.iter().any(|patch| patch.mesh == mi)
-                        && self.shadow_pipelines.pipelines.get(&(false, world_material_pipe(s), false)).is_some_and(Option::is_some);
-                    primary_time_dependent |= alpha_time_dependent
+                    // sun_shadows::pipeline_key makes every static-depth slot primary-eligible:
+                    // opaque/cutout, no depth flip, effects 0/2/3/7/8/9/11 all write primary depth.
+                    let time_alpha = alpha_time_dependent
                         && self.shadow_pipelines.pipelines.get(&(false, world_material_pipe(s), true)).is_some_and(Option::is_some);
                     let d = Draw { mesh: mi, first_index: first, count, mat, pipe: world_material_pipe(s),
                         priority: s.render_priority, node: s.render_node, origin: s.render_origin, projection_pass: s.projection_pass,
-                        vegetation };
+                        vegetation, time_alpha };
                     if s.liquid {
                         liquid.push(d)
                     } else if blended_material(s.blend) {
@@ -2293,8 +2291,6 @@ impl Renderer {
         // Keep VisualWater's style order (water, acid, lava, star, shallow), including both coplanar passes.
         self.gpu = Gpu { meshes, inst_bufs, mats, opaque, blended, liquid, insts, mesh_range, radius, grid };
         self.material_bindings = material_bindings;
-        self.point_world_time_dependent = time_dependent;
-        self.point_primary_time_dependent = primary_time_dependent;
         self.foliage = foliage::Foliage::default();
         self.canopy_leaves.upload(&self.device, scene, &self.gpu);
         self.drawn_visuals.retain(|key, _| matches!(key, VisualKey::Actor(..)));
@@ -2423,7 +2419,7 @@ impl Renderer {
                 let pipe = sky_material_pipe(s);
                 draws.push(Draw { mesh: mi, first_index: first, count, mat, pipe,
                     priority: s.render_priority, node: None, origin: s.render_origin, projection_pass: s.projection_pass,
-                    vegetation: false });
+                    vegetation: false, time_alpha: false });
             }
             let ibytes = (indices.len() * 4) as u64;
             let (ib, created) = ensure_buf(&self.device, old_ib, &mut self.sky.index_capacity[mi], ibytes, wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST, "sky indices");
@@ -2623,10 +2619,13 @@ impl Renderer {
             let binding = MaterialBinding { base: view.clone(), env: view.clone(), uniform, source: material.clone() };
             self.gpu.mats[*mat] = self.material_bind_group(&binding);
             self.material_bindings[*mat] = binding;
+            if !changed {
+                self.point_world_revision = self.point_world_revision.checked_add(1).expect("point world revision exhausted");
+            }
+            for draw in [&self.gpu.opaque, &self.gpu.blended, &self.gpu.liquid].into_iter().flatten().filter(|draw| draw.mat == *mat) {
+                self.point_mesh_revisions[draw.mesh] = self.point_world_revision;
+            }
             changed = true;
-        }
-        if changed {
-            self.point_world_revision = self.point_world_revision.checked_add(1).expect("point world revision exhausted");
         }
     }
 
@@ -2704,6 +2703,9 @@ impl Renderer {
         }
         if changed {
             self.point_world_revision = self.point_world_revision.checked_add(1).expect("point world revision exhausted");
+            for (revision, (_, sphere)) in self.point_mesh_revisions.iter_mut().zip(&bounds) {
+                if sphere.is_some() { *revision = self.point_world_revision; }
+            }
         }
     }
 

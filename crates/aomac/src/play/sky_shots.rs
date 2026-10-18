@@ -650,7 +650,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     }
                     return Ok((raw, lens, counts.0, counts.1, actual_msaa));
                 }
-                let lightbar = matches!(name.as_str(), "borealis-lightbar-night" | "borealis-lightbar-night-close");
+                let lightbar = matches!(name.as_str(), "borealis-lightbar-night" | "borealis-lightbar-night-close" | "newland-lightbar-night");
                 let authored_actor = name.starts_with("icc-actor-") || lightbar;
                 if let Some((interaction_start, interaction_end)) = interaction_path {
                     let mut avatar = super::avatar::Avatar::new(&store, &dir, 25988, &actor,
@@ -677,7 +677,22 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     }
                     let mut avatar = super::avatar::Avatar::new(&store, &dir, 25988, &appearance,
                         ao_formats::character::actor::ActorAssets::new(&store)?)?;
-                    if lightbar { avatar.set_transform([679.6, 72.8, -482.7], 0.0); }
+                    if name == "newland-lightbar-night" {
+                        let position = graphics_fixture_newland_lightbar_position(|point| collision.borrow().terrain_height(point))?;
+                        avatar.set_transform(position, 0.0);
+                        let lights: Vec<_> = avatar.lights().collect();
+                        ensure!(lights.len() == 1 && lights[0].owner == Some(25988), "Newland fixture requires exactly one native player-owned Light Bar light");
+                        let carried_distance = Vec3::from(lights[0].pos).distance(fixed.pos);
+                        ensure!(lights[0].range > 0.1 && lights[0].color.iter().any(|channel| *channel > 0.0), "native Light Bar is not a shadow candidate");
+                        let nearest_unowned = scene.lights.iter().filter(|light| light.owner.is_none()
+                            && light.range > 0.1 && light.color.iter().any(|channel| *channel > 0.0))
+                            .map(|light| Vec3::from(light.pos).distance(fixed.pos)).fold(f32::INFINITY, f32::min);
+                        ensure!(carried_distance < nearest_unowned, "native nearest-light ranking would not select the Newland carried fixture: carried={carried_distance}, unowned={nearest_unowned}");
+                        if measure {
+                            std::fs::write(out.join(format!("{name}-lightbar.txt")),
+                                format!("actor_id=25988\nmount=5\nmesh=26163\nfield=0\nbyte=0\nscene_position={position:?}\nyaw=0\npose=idle\npose_time=0\nlight={:?}\ncarried_distance={carried_distance}\nnearest_native_unowned_distance={nearest_unowned}\nnative_unowned_lights_retained=true\nadmission=current_native_gpu_owner_proof\n", lights[0]))?;
+                        }
+                    } else if lightbar { avatar.set_transform([679.6, 72.8, -482.7], 0.0); }
                     else if !authored_actor {
                         avatar.set_transform((fixed.pos + fixed.forward() * 12.0).to_array(), 0.0);
                     }
@@ -734,6 +749,15 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     off.wait_for_pipeline_warmup();
                 }
                 let raw = off.rgba(&shot, &list)?;
+                if name == "newland-lightbar-night" && profile == "local-shadows-one" {
+                    ensure!(off.point_shadow_owner_is_selected(25988)?,
+                        "Newland carried-light timing requires actual current GPU owner admission and a selected cube for Testy/25988");
+                    if measure {
+                        let mut report = std::fs::OpenOptions::new().append(true).open(out.join(format!("{name}-lightbar.txt")))?;
+                        std::io::Write::write_all(&mut report,
+                            b"gpu_current_primary_owner_admitted=true\ngpu_selected_cube_owner=25988\ngpu_owner_selection_verified_before_timing=true\n")?;
+                    }
+                }
                 if !sky_pixels.is_empty() {
                     let report = off.sky_pixel_probe(17, &sky_pixels, scene, None)?;
                     std::fs::write(out.join(format!("{name}-sky-{}.txt", if measure { "first" } else { "repeat" })), report)?;
@@ -900,6 +924,8 @@ fn graphics_fixture_views(actor: &ao_net::n3::dynel::SimpleCharFullUpdate) -> Ve
         views.push((format!("newland-{light}"), 566, time,
             Camera::look_at([414.0, 2.5, -320.0].into(), [440.0, 1.0, -335.0].into())));
     }
+    views.push(("newland-lightbar-night".into(), 566, 0.0,
+        Camera::look_at([414.0, 2.5, -320.0].into(), [440.0, 1.0, -335.0].into())));
     views.push(("newland-backlit-day".into(), 566, 3240.0,
         Camera::look_at([414.0, 2.5, -320.0].into(), [440.0, 1.0, -335.0].into())));
     for (name, pf, eye, at) in [
@@ -1467,6 +1493,13 @@ fn graphics_fixture_newland_camera(terrain_height: impl Fn([f32; 3]) -> Option<f
     Ok(Camera::look_at(eye.into(), at.into()))
 }
 
+fn graphics_fixture_newland_lightbar_position(terrain_height: impl Fn([f32; 3]) -> Option<f32>) -> anyhow::Result<[f32; 3]> {
+    use anyhow::Context;
+    let mut position = [417.0, 0.0, -321.75];
+    position[1] = terrain_height(position).context("Newland Light Bar feet have no terrain height")?;
+    Ok(position)
+}
+
 fn graphics_fixture_interaction_path(
     camera: Camera,
     endpoint: Option<Vec3>,
@@ -1663,6 +1696,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
         "shadows" => settings.sun_shadows = true,
         "clustered" => settings.clustered_lighting = true,
         "local-shadows" => settings.local_light_shadows = true,
+        "local-shadows-one" => { settings.local_light_shadows = true; settings.point_shadow_count = 1; }
         "local-shadows-clustered" => { settings.clustered_lighting = true; settings.local_light_shadows = true; }
         "moon-shadows" => { settings.night_mode = ao_render::NightMode::Moonlit; settings.moon_shadows = true; }
         "moonlit" => settings.night_mode = ao_render::NightMode::Moonlit,
@@ -1806,7 +1840,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             grass_density: 1.0, grass_distance: 50.0, sun_boost: 0.5, grade_strength: 0.8, contact_strength: 0.4,
             ..Default::default()
         },
-        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|clustered|local-shadows|local-shadows-clustered|moonlit|moon-shadows|moon-volumetric-shafts|moon-cloud-gap-shafts|dark-night|specular|lighting|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before|foliage-edges|foliage-sway|foliage-push|foliage-leaves|foliage-flutter|foliage-falling|grass-trails|foliage-subdivision|foliage-translucency|foliage-lod|all-foliage|all-foliage-shadows|water|water-waves|water-ripples|water-refraction|water-reflections|water-foam|water-wakes|waterfalls|underwater|water-caustics|water-sun-glint"),
+        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|clustered|local-shadows|local-shadows-one|local-shadows-clustered|moonlit|moon-shadows|moon-volumetric-shafts|moon-cloud-gap-shafts|dark-night|specular|lighting|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before|foliage-edges|foliage-sway|foliage-push|foliage-leaves|foliage-flutter|foliage-falling|grass-trails|foliage-subdivision|foliage-translucency|foliage-lod|all-foliage|all-foliage-shadows|water|water-waves|water-ripples|water-refraction|water-reflections|water-foam|water-wakes|waterfalls|underwater|water-caustics|water-sun-glint"),
     }
     Ok(settings)
 }
@@ -2031,7 +2065,7 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
     let actor = graphics_fixture_actor().unwrap();
     assert_eq!(actor.name, "Testy");
     let views = graphics_fixture_views(&actor);
-    assert_eq!(views.iter().map(|view| &view.0).collect::<std::collections::HashSet<_>>().len(), 28);
+    assert_eq!(views.iter().map(|view| &view.0).collect::<std::collections::HashSet<_>>().len(), 29);
     let waterfall = views.iter().find(|view| view.0 == "pleasant-meadows-waterfall-native-authored").unwrap();
     assert_eq!((waterfall.1, waterfall.2), (630, 2648.69));
     for (light, expected_time) in [("day", 3240.0), ("dusk", 4860.0), ("night", 0.0)] {
@@ -2041,6 +2075,19 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
         assert_eq!(newland.3.pos, city.pos);
         assert_eq!((newland.3.yaw, newland.3.pitch, newland.3.roll), (city.yaw, city.pitch, city.roll));
     }
+    let lightbar = views.iter().find(|view| view.0 == "newland-lightbar-night").unwrap();
+    let night = views.iter().find(|view| view.0 == "newland-night").unwrap();
+    assert_eq!((lightbar.1, lightbar.2), (566, 0.0));
+    assert_eq!(lightbar.3.pos, night.3.pos);
+    assert_eq!((lightbar.3.yaw, lightbar.3.pitch, lightbar.3.roll), (night.3.yaw, night.3.pitch, night.3.roll));
+    assert_eq!(graphics_fixture_settings("local-shadows-one").unwrap(), ao_render::EnhancedSettings {
+        local_light_shadows: true, point_shadow_count: 1, ..ao_render::EnhancedSettings::default()
+    });
+    assert_eq!(graphics_fixture_newland_lightbar_position(|point| {
+        assert_eq!(point, [417.0, 0.0, -321.75]);
+        Some(25.0)
+    }).unwrap(), [417.0, 25.0, -321.75]);
+    assert!(graphics_fixture_newland_lightbar_position(|_| None).is_err());
     assert_eq!(views.iter().filter(|view| view.0.starts_with("icc-actor-")).count(), 1);
     assert!(views.iter().filter(|view| view.1 == 4582).all(|view| view.0.ends_with("-authored") && view.2 == 2648.69));
     let beach = views.iter().find(|view| view.0 == "icc-shadow-edges-authored").unwrap();

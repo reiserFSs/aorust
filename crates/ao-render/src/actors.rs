@@ -363,11 +363,11 @@ impl Renderer {
                     }
                     draws.push(Draw { mesh: i, first_index: first, count, mat, pipe,
                         priority: s.render_priority, node: s.render_node, origin: s.render_origin, projection_pass: s.projection_pass,
-                        vegetation: false });
+                        vegetation: false, time_alpha: false });
                     if let Some((emat, epipe)) = env {
                         draws.push(Draw { mesh: i, first_index: first, count, mat: emat, pipe: epipe,
                             priority: s.render_priority, node: s.render_node, origin: s.render_origin, projection_pass: s.projection_pass,
-                            vegetation: false });
+                            vegetation: false, time_alpha: false });
                     }
                 }
                 let ibytes = (indices.len() * 4) as u64;
@@ -490,11 +490,11 @@ impl Renderer {
                 }
                 draws.push(Draw { mesh: meshes.len(), first_index: first, count, mat, pipe,
                     priority: s.render_priority, node: s.render_node, origin: s.render_origin, projection_pass: s.projection_pass,
-                    vegetation: false });
+                    vegetation: false, time_alpha: false });
                 if let Some((emat, epipe)) = env {
                     draws.push(Draw { mesh: meshes.len(), first_index: first, count, mat: emat, pipe: epipe,
                         priority: s.render_priority, node: s.render_node, origin: s.render_origin, projection_pass: s.projection_pass,
-                        vegetation: false });
+                        vegetation: false, time_alpha: false });
                 }
             }
             let index_capacity = ((indices.len() * 4) as u64).next_power_of_two().max(1);

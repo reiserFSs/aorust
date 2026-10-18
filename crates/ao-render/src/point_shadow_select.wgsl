@@ -42,7 +42,6 @@ fn select_cubes() {
     let count = min(bitcast<u32>(pool[322u].x), 64u);
     let limit = min(u32(params.timing.y), 16u);
     let step = max(params.timing.x, 0.0);
-    let world_hash = u32(params.cache.y) | (u32(params.cache.w) << 16u);
     var wanted: array<u32, 16>;
     var scores: array<f32, 16>;
     var chosen: array<u32, 16>;
@@ -145,10 +144,28 @@ fn select_cubes() {
         }
         metadata.lights[slot] = light;
         let d = distance(light.xyz, params.eye.xyz);
-        let ratio = select(select(0.25,0.5,d<80.0),1.0,d<30.0);
+        let unowned_ratio = select(select(0.25,0.5,d<80.0),1.0,d<30.0);
+        let ratio = select(unowned_ratio,select(0.25,0.5,d<15.0),owned);
         let cold = states[slot].clock.w == 0.0;
-        let changed_light = any(states[slot].light != light);
+        // Compare to the last cache trigger, not last frame: small movement accumulates.
+        let moved = select(any(states[slot].light.xyz != light.xyz),distance(states[slot].light.xyz,light.xyz)>0.2,owned);
+        let changed_light = moved || states[slot].light.w != light.w;
         let changed_size = states[slot].cache.w != bitcast<u32>(ratio);
+        let cache_trigger = cold || changed_light || changed_size;
+        let cache_light = select(states[slot].light,light,cache_trigger);
+        let motion_margin = select(0.0,0.2,owned);
+        var world_hash = 2166136261u;
+        // Only this currently admitted source's possible casters affect its cache.
+        // CPU hidden-owner supersets can add work, never change visible schedules.
+        for (var i=0u;i<u32(params.timing.w);i++) {
+            let c=casters[i];
+            if distance(c.sphere.xyz,cache_light.xyz)>cache_light.w+c.sphere.w+motion_margin { continue; }
+            world_hash=(world_hash^c.key.x)*16777619u;
+            world_hash=(world_hash^c.key.y)*16777619u;
+            world_hash=(world_hash^c.draw.x)*16777619u;
+            world_hash=(world_hash^c.draw.y)*16777619u;
+            world_hash=(world_hash^c.draw.z)*16777619u;
+        }
         let previous_membership_second = u32(states[slot].clock.y) | (u32(states[slot].clock.z) << 16u);
         let membership_changed = states[slot].cache.z != membership || previous_membership_second != membership_second;
         let refresh_epoch=floor(max(params.cache.z,0.0)/120.0);
@@ -185,7 +202,7 @@ fn select_cubes() {
         if cold { states[slot].progress.y=0u; }
         if membership_changed { states[slot].progress.y=0u; }
         actor_mask &= u32(params.schedule.w);
-        states[slot].light=light;
+        if cache_trigger { states[slot].light=light; }
         states[slot].cache=vec4<u32>(world_hash,actor_pose,membership,bitcast<u32>(ratio));
         states[slot].clock.w=1.0;
         states[slot].clock.y=f32(membership_second & 65535u);

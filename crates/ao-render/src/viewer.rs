@@ -1439,6 +1439,10 @@ impl Offscreen {
     pub fn read_shadow_gpu_ms(&mut self) -> Result<Option<f64>> { self.r.read_shadow_gpu_ms() }
     pub fn shadow_resident_bytes(&self) -> u64 { self.r.shadow_resident_bytes() }
     pub fn shadow_static_command_counts(&self) -> (usize, usize) { self.r.shadow_static_command_counts() }
+    /// Diagnostic readback only: current GPU owner admission and selected point-shadow cube.
+    pub fn point_shadow_owner_is_selected(&mut self, owner: u32) -> Result<bool> {
+        self.r.point_shadow_owner_is_selected(owner)
+    }
     pub fn gpu_allocated_bytes(&self) -> Option<usize> { native_gpu_allocated_bytes(&self.r) }
 
     /// Starts a fresh measured interval without rebuilding the renderer or its resources.

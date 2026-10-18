@@ -4,7 +4,7 @@ use super::*;
 use crate::sun_shadows::{ShadowUniform, SunShadows};
 #[path = "point_cache.rs"]
 mod point_cache;
-pub(crate) use point_cache::CacheCaster;
+pub(crate) use point_cache::{CacheCaster, capsule_relevant};
 
 const CUBES: usize = 16;
 const RESOLUTION: u32 = 256;
@@ -187,6 +187,33 @@ impl Renderer {
             self.point_shadows.as_ref().and_then(|points| points.receiver.as_ref()).expect("local receiver prepared before world")
         } else { &self.sun_shadows.as_ref().expect("directional receiver prepared before world").receiver }
     }
+
+    /// Explicit fixture diagnostic; never consulted by rendering or admission.
+    pub fn point_shadow_owner_is_selected(&self, owner: u32) -> anyhow::Result<bool> {
+        let Some(points) = self.point_shadows.as_ref().filter(|points| points.local_resources) else { return Ok(false); };
+        let size = (CUBES * 96) as u64;
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("explicit selected point-owner proof"), size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(&points.state, 0, &readback, 0, size);
+        self.queue.submit([encoder.finish()]);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        readback.slice(..).map_async(wgpu::MapMode::Read, move |result| { let _ = sender.send(result); });
+        self.device.poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|error| anyhow::anyhow!("point-owner diagnostic poll: {error}"))?;
+        receiver.recv()??;
+        let mapped = readback.slice(..).get_mapped_range();
+        // select_cubes first resolves every incumbent against THIS frame's GPU
+        // primary-owner-admitted pool, clearing identity immediately if absent.
+        // Thus an owned selected identity also proves current primary admission.
+        let selected = bytemuck::cast_slice::<u8, u32>(&mapped).as_chunks::<24>().0.iter().take(points.count)
+            .any(|state| state[0] != 0 && state[1] == u32::MAX && state[2] == owner);
+        drop(mapped);
+        readback.unmap();
+        Ok(selected)
+    }
     pub(crate) fn encode_point_shadows(&mut self, encoder: &mut wgpu::CommandEncoder, cam: &Camera, shadows: &mut SunShadows, admission_planes: [f32; 3]) {
         if !self.enhanced_settings.needs_admitted_lights() { self.point_shadows = None; return; }
         let local = self.enhanced_settings.local_light_shadows;
@@ -221,9 +248,8 @@ impl Renderer {
         if local {
             self.prepare_point_static(shadows);
             points.casters.clear();
-            let world_hash = self.point_static_casters(shadows, &mut points.casters);
-            let fingerprint = self.point_dispatch_inputs(cam, &mut points, world_hash, admission_planes);
-            points.static_face_mask = points.dispatch.mask(fingerprint, self.time);
+            let selection_inputs = self.point_dispatch_inputs(cam, &mut points, admission_planes);
+            self.point_static_casters(shadows, &mut points.casters, &points.dispatch.possible_lights);
             points.dynamic_world.clear();
             if self.enhanced_settings.foliage_push {
                 let dynamic_world = &mut points.dynamic_world;
@@ -235,14 +261,19 @@ impl Renderer {
                     false
                 });
             }
-            let possible_lights = &points.dispatch.possible_lights;
-            let possible = |caster: &CacheCaster| possible_lights.iter().any(|light| {
-                Vec3::from_slice(&caster.sphere[..3]).distance(Vec3::from_slice(&light[..3])) <= caster.sphere[3] + light[3]
-            });
-            points.casters.retain(possible);
-            points.dynamic_world.retain(possible);
+            let fingerprint = point_cache::world_fingerprint(selection_inputs, &points.casters, self.time);
+            points.static_face_mask = points.dispatch.mask(fingerprint, self.time);
             points.static_caster_count = points.casters.len();
             self.point_actor_casters(shadows, &mut points.casters);
+            let static_count = points.static_caster_count;
+            let mut index = 0;
+            points.casters.retain(|caster| {
+                let keep = index < static_count || points.dispatch.possible_lights.iter().any(|light| {
+                    !(light.owned && caster.key[2] != 0) && point_cache::sphere_possible(caster.sphere, light, false)
+                });
+                index += 1;
+                keep
+            });
             points.casters.append(&mut points.dynamic_world);
             let potential_dynamic = points.casters.len() > points.static_caster_count;
             points.actor_face_mask = if potential_dynamic || points.had_dynamic_casters { 63 } else { 0 };
@@ -265,7 +296,7 @@ impl Renderer {
             }
             let params = [cam.pos.extend(points.static_face_mask as f32).to_array(),
                 [elapsed / FADE_SECONDS, count as f32, (points.face_stride / 16) as f32, points.static_caster_count as f32],
-                [points.casters.len() as f32, (world_hash & 65535) as f32, self.time, (world_hash >> 16) as f32],
+                [points.casters.len() as f32, 0.0, self.time, 0.0],
                 [points.dispatch.normal_mask as f32, u8::from(points.dispatch.restoration_possible) as f32,
                     u8::from(points.dispatch.allocation_cold) as f32, points.actor_face_mask as f32]];
             self.queue.write_buffer(&points.params, 0, bytemuck::cast_slice(&params));
@@ -319,9 +350,11 @@ impl Renderer {
                 pass.set_bind_group(3, &points.groups[layer], &[]);
                 if actor {
                     self.draw_point_actors(&mut pass, shadows, &points.indirect, base + 20, &points.casters);
-                    self.draw_point_static(&mut pass, shadows, &points.indirect, base + 20, &points.casters, 2);
+                    self.draw_point_static(&mut pass, shadows, &points.indirect, base + 20, &points.casters,
+                        point_cache::FaceDraw { kind: 2, face: layer % 6, lights: &points.dispatch.possible_lights });
                 } else {
-                    self.draw_point_static(&mut pass, shadows, &points.indirect, base + 20, &points.casters, 0);
+                    self.draw_point_static(&mut pass, shadows, &points.indirect, base + 20, &points.casters,
+                        point_cache::FaceDraw { kind: 0, face: layer % 6, lights: &points.dispatch.possible_lights });
                 }
             }
         }

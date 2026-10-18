@@ -50,8 +50,59 @@ impl Renderer {
         }
     }
 
+    /// Potential primary owner bounds only; admission always remains a current GPU decision.
+    pub(crate) fn point_owner_capsules(&self, owners: &[u32], out: &mut Vec<[f32; 4]>) {
+        out.clear();
+        let mut frame_index = 0;
+        for item in &self.act.items {
+            if !owners.contains(&item.actor)
+                || item.native_shadow_source.is_some() || !matches!(item.rendering_effect, 0 | 2) { continue; }
+            while frame_index < self.act.frames.len() && self.act.frames[frame_index].id != item.actor {
+                frame_index += 1;
+            }
+            let Some(frame) = self.act.frames.get(frame_index) else {
+                out.push([0.0, 0.0, 0.0, f32::INFINITY]);
+                break;
+            };
+            let model = &self.act.models[&item.model];
+            let Some(mesh) = model.meshes[item.mesh].as_ref() else { continue; };
+            if !mesh.draws.iter().any(|draw| {
+                let priority = actor_priority(item.priority.or(visual_priority(draw, actor_visual_key(item, draw), &self.drawn_visuals)),
+                    item.faded, item.rendering_effect, blended_pipe(draw.pipe));
+                let slot = mesh_effect_pipe(if item.faded { faded_pipe(draw.pipe) } else { draw.pipe },
+                    item.rendering_effect, draw.projection_pass);
+                matches!(priority, 0..=7 | 10)
+                    && self.shadow_pipelines.pipelines.get(&(true, slot, true)).is_some_and(Option::is_some)
+            }) { continue; }
+            let base = Mat4::from_cols_array_2d(&frame.transform);
+            let transform = frame.parts.get(item.mesh).map_or(base, |part| base * Mat4::from_cols_array_2d(part));
+            out.push(self.point_actor_bounds(item, mesh, transform));
+        }
+    }
+
+    fn point_actor_bounds(&self, item: &Item, mesh: &ModelMesh, transform: Mat4) -> [f32; 4] {
+        let actor = self.act.actors.get(&item.actor).filter(|_| item.mesh == 0);
+        let skin_bounds = actor.filter(|a| a.vb.is_some()).and_then(|a| a.skin.as_ref().and(a.skin_bounds));
+        let (center, radius) = if actor.is_some_and(|a| a.vb.is_some() && a.skin.is_none()) {
+            // The retained native palette may extend beyond the authored bind bounds.
+            let scale_bound = (transform.x_axis.truncate().length_squared()
+                + transform.y_axis.truncate().length_squared() + transform.z_axis.truncate().length_squared()).sqrt();
+            (transform.transform_point3(mesh.sphere.0), (mesh.sphere.1 + POSE_MARGIN) * scale_bound)
+        } else {
+            let (center, half) = skin_bounds.unwrap_or(mesh.bounds);
+            let extent = transform.x_axis.truncate().abs() * half.x
+                + transform.y_axis.truncate().abs() * half.y + transform.z_axis.truncate().abs() * half.z;
+            (transform.transform_point3(center), extent.length())
+        };
+        if !center.is_finite() || !radius.is_finite() || radius < 0.0 {
+            [0.0, 0.0, 0.0, f32::INFINITY]
+        } else {
+            [center.x, center.y, center.z, radius]
+        }
+    }
+
     /// Conservative CPU work signature, never a substitute for current GPU owner admission.
-    pub(crate) fn point_owner_occluder_hash(&self) -> u64 {
+    pub(crate) fn point_owner_occluder_hash(&self, eye: Vec3, capsules: &[[f32; 4]]) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hash = std::hash::DefaultHasher::new();
         let mut frame_index = 0;
@@ -65,8 +116,12 @@ impl Renderer {
             let Some(frame) = self.act.frames.get(frame_index) else { break; };
             let model = &self.act.models[&item.model];
             let Some(mesh) = model.meshes[item.mesh].as_ref() else { continue; };
+            let base = Mat4::from_cols_array_2d(&frame.transform);
+            let transform = frame.parts.get(item.mesh).map_or(base, |part| base * Mat4::from_cols_array_2d(part));
+            if !crate::point_shadows::capsule_relevant(eye, self.point_actor_bounds(item, mesh, transform), capsules) { continue; }
             let mut draw_hash = std::hash::DefaultHasher::new();
             let mut draw_count = 0u64;
+            let mut alpha_scroll = false;
             for draw in &mesh.draws {
                 let priority = actor_priority(item.priority.or(visual_priority(draw, actor_visual_key(item, draw), &self.drawn_visuals)),
                     item.faded, item.rendering_effect, blended_pipe(draw.pipe));
@@ -75,6 +130,9 @@ impl Renderer {
                     item.rendering_effect, draw.projection_pass);
                 if !self.shadow_pipelines.pipelines.get(&(true, slot, true)).is_some_and(Option::is_some) { continue; }
                 (draw.count, draw.first_index, draw.mat, slot, draw.node, priority).hash(&mut draw_hash);
+                alpha_scroll |= mesh.submesh_mats.iter().zip(&model.topology[item.mesh].1).any(|((mat, _, _), part)| {
+                    *mat == draw.mat && point_alpha_scroll(part)
+                });
                 draw_count += 1;
             }
             if draw_count == 0 { continue; }
@@ -84,20 +142,10 @@ impl Renderer {
             frame.parts.get(item.mesh).is_some().hash(&mut hash);
             if let Some(part) = frame.parts.get(item.mesh) { hash.write(bytemuck::bytes_of(part)); }
             frame.alpha.to_bits().hash(&mut hash);
-            frame.character.hash(&mut hash);
-            frame.emissive.map(|rgb| rgb.map(f32::to_bits)).hash(&mut hash);
-            frame.specular.map(|rgb| rgb.map(f32::to_bits)).hash(&mut hash);
-            frame.specular_power.map(f32::to_bits).hash(&mut hash);
             frame.rendering_effect.hash(&mut hash);
-            frame.rendering_effect_time.to_bits().hash(&mut hash);
             frame.part_uvs.get(item.mesh).map(|uv| uv.map(f32::to_bits)).hash(&mut hash);
             let material = frame.part_materials.get(item.mesh);
-            material.is_some().hash(&mut hash);
-            if let Some(material) = material {
-                material.alpha.map(f32::to_bits).hash(&mut hash);
-                material.emissive.map(|rgb| rgb.map(f32::to_bits)).hash(&mut hash);
-                material.specular.map(|rgb| rgb.map(f32::to_bits)).hash(&mut hash);
-            }
+            material.and_then(|material| material.alpha).map(f32::to_bits).hash(&mut hash);
             // Use the actual retained GPU pose inputs, including when this frame submits None.
             // Neither pointer identities nor per-material repeated skin hashing are needed.
             if item.mesh == 0 {
@@ -116,7 +164,7 @@ impl Renderer {
                     }
                 }
             }
-            if model.topology[item.mesh].1.iter().any(|part| part.uv_scroll != [0.0; 2]) {
+            if alpha_scroll {
                 self.time.to_bits().hash(&mut hash);
             }
         }
@@ -142,45 +190,29 @@ impl Renderer {
             let base = Mat4::from_cols_array_2d(&frame.transform);
             let transform = frame.parts.get(item.mesh).map_or(base, |part| base * Mat4::from_cols_array_2d(part));
             let actor = self.act.actors.get(&item.actor).filter(|_| item.mesh == 0);
-            let skin_bounds = actor.filter(|a| a.vb.is_some()).and_then(|a| a.skin.as_ref().and(a.skin_bounds));
-            let (center, radius) = if actor.is_some_and(|a| a.vb.is_some() && a.skin.is_none()) {
-                // The retained native palette may extend beyond the authored bind bounds.
-                let scale_bound = (transform.x_axis.truncate().length_squared()
-                    + transform.y_axis.truncate().length_squared() + transform.z_axis.truncate().length_squared()).sqrt();
-                (transform.transform_point3(mesh.sphere.0), (mesh.sphere.1 + POSE_MARGIN) * scale_bound)
-            } else {
-                let (center, half) = skin_bounds.unwrap_or(mesh.bounds);
-                let extent = transform.x_axis.truncate().abs() * half.x
-                    + transform.y_axis.truncate().abs() * half.y + transform.z_axis.truncate().abs() * half.z;
-                (transform.transform_point3(center), extent.length())
-            };
+            let [x, y, z, radius] = self.point_actor_bounds(item, mesh, transform);
+            let center = Vec3::new(x, y, z);
             let material = frame.part_materials.get(item.mesh);
-            let color = |value: Option<[f32; 3]>| {
-                let rgb = value.unwrap_or([0.0; 3]);
-                [rgb[0], rgb[1], rgb[2], if value.is_some() { 1.0 } else { 0.0 }]
-            };
             let mut instance_transform = transform.to_cols_array_2d();
             instance_transform[0][3] = material.and_then(|m| m.alpha).unwrap_or(frame.alpha).min(1.0) - 1.0;
-            let instance = ActorInstance {
-                transform: instance_transform,
-                emissive: color(material.and_then(|m| m.emissive).or(frame.emissive)),
-                specular: color(material.and_then(|m| m.specular).or(frame.specular)),
-                power: [frame.specular_power.unwrap_or(0.0), if frame.specular_power.is_some() { 1.0 } else { 0.0 },
-                    frame.rendering_effect as f32, frame.rendering_effect_time],
-                uv: frame.part_uvs.get(item.mesh).copied().unwrap_or([1.0, 1.0, 0.0, 0.0]),
-                character: u32::from(frame.character),
-            };
+            let uv = frame.part_uvs.get(item.mesh).copied().unwrap_or([1.0, 1.0, 0.0, 0.0]);
             // Hash retained values, never Arc addresses, frame positions or ephemeral proof groups.
             // The potentially large CPU skin/native palette is hashed once per body, not per draw.
             let mut pose = std::hash::DefaultHasher::new();
-            pose.write(bytemuck::bytes_of(&instance));
+            pose.write(bytemuck::bytes_of(&instance_transform));
+            pose.write(bytemuck::bytes_of(&uv));
             model.point_cache_revision.hash(&mut pose);
-            if let Some(actor) = actor {
-                if let Some(skin) = &actor.skin { pose.write(bytemuck::cast_slice(skin.as_slice())); }
-                if let Some(native) = &actor.pose { pose.write(bytemuck::cast_slice(native.palette.as_slice())); }
-            }
-            if model.topology[item.mesh].1.iter().any(|part| part.uv_scroll != [0.0; 2]) {
-                self.time.to_bits().hash(&mut pose);
+            if let Some(actor) = actor.filter(|actor| actor.vb.is_some()) {
+                actor.skin.is_some().hash(&mut pose);
+                if let Some(skin) = &actor.skin {
+                    skin.len().hash(&mut pose);
+                    pose.write(bytemuck::cast_slice(skin.as_slice()));
+                }
+                actor.pose.is_some().hash(&mut pose);
+                if let Some(native) = &actor.pose {
+                    native.palette.len().hash(&mut pose);
+                    pose.write(bytemuck::cast_slice(native.palette.as_slice()));
+                }
             }
             for (draw_index, draw) in mesh.draws.iter().enumerate() {
                 if !matches!(actor_priority(item.priority.or(visual_priority(draw, actor_visual_key(item, draw), &self.drawn_visuals)),
@@ -192,6 +224,11 @@ impl Renderer {
                 let stable_part = part.finish() as u32;
                 let mut draw_pose = pose.clone();
                 (stable_part, draw.count, draw.first_index).hash(&mut draw_pose);
+                if mesh.submesh_mats.iter().zip(&model.topology[item.mesh].1).any(|((mat, _, _), part)| {
+                    *mat == draw.mat && point_alpha_scroll(part)
+                }) {
+                    self.time.to_bits().hash(&mut draw_pose);
+                }
                 out.push(crate::point_shadows::CacheCaster {
                     sphere: [center.x, center.y, center.z, radius],
                     draw: [draw.count, draw.first_index, index as u32, group],
@@ -254,4 +291,10 @@ impl Renderer {
             }
         }
     }
+}
+
+/// Only sampled alpha can make primary/depth coverage change as the texture scrolls.
+fn point_alpha_scroll(part: &ao_scene::Submesh) -> bool {
+    (part.blend == Blend::AlphaTest || part.alpha_test.is_some() || part.sprite_alpha_test)
+        && !(part.glow_mask && !part.prelit) && part.uv_scroll != [0.0; 2]
 }

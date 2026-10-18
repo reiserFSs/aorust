@@ -2351,6 +2351,52 @@ Lighting profiles are `clustered`, `local-shadows` (independent of clustering),
 `local-shadows-clustered`, `moonlit`, `moon-shadows`, `dark-night`, `specular`
 and `lighting`; the last combines the four lighting switches and Moonlit.
 
+The exact one-carried-light night view is `newland-lightbar-night`, with profile
+`local-shadows-one` (only local light shadows enabled, `point_shadow_count=1`;
+no clustering, moon override, post effects, or lamp-intensity changes).
+It reuses `newland-night`'s pf566 authored clock `0`, day zero, clear weather,
+and grounded street camera: eye `[414, terrain(414,-320)+2.5, -320]`,
+target `[440, terrain(440,-335)+1, -335]`. No sun/moon direction is invented.
+The captured Testy appearance equips native mount 5, mesh 26163, field 0, byte 0;
+feet are `[417, terrain(417,-321.75), -321.75]`, yaw 0, native idle pose at time 0.
+The real mounted light retains owner 25988 and uses current native GPU primary-owner
+admission, not a fabricated unowned lamp or forced shadow selection.
+All native unowned lamps remain. The fixture rejects anything other than one native
+owned mounted light and requires it to be nearer the camera than every eligible
+native unowned lamp, so the existing nearest-distance ranking selects it naturally.
+`newland-lightbar-night-lightbar.txt` records the resolved pose, light and distances.
+For `local-shadows-one`, both independent time-zero captures additionally require
+diagnostic readback proving owner 25988 has current GPU primary admission and a
+selected point-shadow cube, and record that proof before timing starts. The CPU
+nearest-light precondition alone is not accepted as positive selection evidence.
+Faithful retains the same actor/light inputs but has no cube-selection assertion.
+Selecting `faithful` builds the identical actor/light/scene snapshot; only Enhanced
+settings change. Time-zero captures precede timing; the stationary timing pass then
+advances effects by exactly 1/60 s for 120 warmup + 600 measured frames.
+
+Run the following under the shared GPU timing lock, from the private worktree,
+after building the test executable normally. Use a new output root per ABBA run:
+
+```sh
+export CARGO_TARGET_DIR=/tmp/ParLight/target
+unset AOMAC_GFX_OWN_AVATAR AOMAC_GFX_TIMING_PAN AOMAC_GFX_FEATURE
+unset AOMAC_GFX_SEQUENCE AOMAC_GFX_SEQUENCE_START AOMAC_GFX_SEQUENCE_DT AOMAC_GFX_SEQUENCE_COUNT
+phase=0
+for profile in local-shadows-one faithful faithful local-shadows-one; do
+  AOMAC_GFX_OUT="/tmp/ParLight/newland-carried-night-abba/phase-$phase-$profile" \
+  AOMAC_GFX_VIEW=newland-lightbar-night AOMAC_GFX_SETTINGS="$profile" \
+  AOMAC_GFX_MSAA=4 AOMAC_GFX_FRAME_TIMING=1 AOMAC_GFX_PNG_ONLY=1 \
+  cargo test --release -p aomac graphics_offline_fixture -j 2 -- \
+    --ignored --nocapture --test-threads=1
+  phase=$((phase + 1))
+done
+```
+
+Compare only `newland-lightbar-night-frame-gpu.txt` across ABBA phases, not faithful's
+additional camera-pan report. Requested and actual MSAA must both be 4; unsupported
+4× fails instead of silently clamping. Existing views/profiles retain their defaults.
+
+
 Moonlit mesh and actor receivers use the same collision-baked native ground
 openness lattice as terrain, exposed independently of each material's textures.
 Four quantized native lattice corners per cell preserve the terrain's bilinear

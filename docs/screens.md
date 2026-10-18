@@ -810,9 +810,23 @@ source/ranking/owner-admission changes permit the CPU to encode six faces, but
 the GPU uses all six only for mature cold-slot restoration; existing dirty
 cubes still use the globally aligned pair. Source/ranking/admission changes
 retain conservative work through the finite native departure-fade interval.
-A conservative caster broadphase includes the nearest 64 unowned candidate
-light volumes (ties included) plus every owned candidate volume; GPU admission
-still exclusively determines actual lights and geometry. Actor culling dispatches
+The conservative caster broadphase uses the active cube budget `N`: unowned
+sources within `D_N / 0.8` are possible incumbents, with ties included. Sources
+that leave that envelope retain their current volumes through departure fade
+and three face-drain frames (frozen time never expires the fade). All owned
+candidate volumes remain possible before GPU proof. CPU face-frustum/radius
+tests further omit impossible draw commands without omitting dirty clears.
+GPU admission still exclusively determines actual lights and geometry.
+Static per-mesh geometry/material revisions and pose/time keys are hashed again
+for each currently selected GPU source, so hidden-owned CPU supersets cannot
+change a visible cube's dirty schedule.
+Owned-light admission dependencies are restricted conservatively to capsules
+from the camera to the owner's current primary geometry bounds: only world or
+actor occluders intersecting those capsules contribute pose, alpha-scroll, and
+foliage-wind dependencies. Enhanced grass retains a conservative current-state
+dependency. Unrelated distant liquid animation, movers, RGB, and effect clocks
+therefore do not keep static passes alive. No CPU result admits an actor.
+Actor culling dispatches
 only dynamic-layer descriptors. With no conservative actor/push-vegetation
 descriptors, it omits actor culling and all actor passes; transition from possible
 casters to none performs one six-face clear first. Possible casters retain all
@@ -826,10 +840,14 @@ policy; its global pre-cap admission issue is owned separately by foliage.
 Sway-only vegetation hashes the actual independent foliage wind state, while
 alpha-scrolling cutouts hash effect time; pure RGB/flicker changes do not dirty
 depth. GPU indexed indirect commands additionally reject radius/frustum misses
-without vertex work. Near lamps
-(camera distance below 30) rasterize at 256², medium (below 80) at 128², and distant
-at 64² in bounded 256² array layers. Receiver metadata stores independent static
-and actor matrices and valid resolution per face; sampling combines both depths.
+without vertex work. Unowned lamps keep 256² below 30 camera-distance units,
+128² below 80, and 64² beyond. Carried lights use 128² below 15 and 64² beyond;
+their movement accumulates against the last cache-trigger position until it
+exceeds 0.2 units, rather than resetting the comparison every frame. Range,
+caster, admission and resolution changes still invalidate independently.
+Receiver light positions remain current, and every rendered face retains its
+actual projection. All resolutions occupy bounded 256² array layers; sampling
+combines independent static and actor matrices/depths.
 
 Opaque/cutout loaded statics obey the existing hidden/native-visual admission
 rules. Actor casters reuse the directional shadow pass's current-pose buffers
