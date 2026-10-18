@@ -46,6 +46,15 @@ the Variables category, never persisted in any prefs file:
   are not additive or exclusive per-feature costs. Fused shader work remains
   in the World/shared interval. Pending samples and unsupported/unavailable
   GPU timing are shown explicitly; GPU timestamps are not replaced with CPU timings.
+  On Metal tile GPUs, overlapping pipeline stages and profiling-induced pass
+  splits can inflate these spans dramatically: they must not rank effects by
+  exclusive or marginal cost. The Modern ICC 1920×1200/4× diagnostic recorded
+  approximately 300 ms summed pass spans versus an uninstrumented 600-frame
+  whole-frame p50/p95 of 16.227/16.845 ms. Evidence:
+  `~/aomac-handoff/gfx/parity/Presets/modern-icc-passcost/`.
+  Use whole-frame GPU timestamps with leave-one-out ABBA comparisons for
+  marginal feature costs; the overlay remains useful for identifying active
+  passes and unavailable samples.
 - **Log Slow Frames** (`AomacSlowFrameLog`): enables the viewer's slow-frame
   diagnostics without saving that choice.
 
@@ -55,7 +64,7 @@ and user bindings take precedence over colliding chords. These are opt-in
 aomac diagnostics, not claims about retail GUI behavior. Their upstream
 reference is ao-vk `proxy/ddraw/rvk_ddraw.cpp` (edge-triggered Ctrl+Shift
 controls and slow-frame logging); unlike ao-vk's profiling sweep, this overlay
-reports timestamp costs without toggling individual features.
+reports pass intervals without toggling individual features.
 The six-slot timestamp ring never waits for GPU completion on the frame thread.
 On Metal, submitted-work callbacks precede a separate resolve/readback submission;
 resolving inside the timed encoder produced unavailable samples in the actual
@@ -1439,6 +1448,10 @@ pinch zoom, widescreen camera FOV, text preferences or session diagnostics/suspe
 | Classic+ | Sun shadows, AO, contact shadows, HDR, grading, bloom, clustered local lighting, authored material specular and local light shadows only; no added grass, sky, water or foliage content. Sun boost 0.15, grade 0.25, bloom 0.2, AO strength 0.6, contact strength 0.4; 4× MSAA and 8× anisotropy. |
 | Modern | Recommended materials/reflections, night/local lighting, weather/clouds, water, foliage/grass and grading effects, with TAA + CAS sharpening and 4× MSAA. FXAA, cinematic depth of field/motion blur and user LUTs remain off. Registry quality defaults, Moonlit night, night tint 0.15, vignette 0.1; 16× anisotropy. |
 | Ultra | Same effects as Modern, plus 4096 shadow map, 8 point shadows, AO radius 2.5 / strength 1.8, grass density 2 / distance 180 m, High cloud/water quality; same MSAA and anisotropy. Cinematic effects and user LUTs remain opt-in. |
+
+Screen-space indirect light remains **off in both Modern and Ultra** and is available as
+a manual, budget-dependent opt-in. It is not included merely because Ultra raises quality:
+preset inclusion requires measured performance within the scene budget.
 
 Night modes are mutually exclusive, so Modern/Ultra select Moonlit rather than Dark.
 FXAA, depth of field, motion blur and zone LUTs can be enabled manually. Zone LUTs and side-loaded material

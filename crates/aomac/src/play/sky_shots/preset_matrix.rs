@@ -4,6 +4,8 @@ use super::super::{dvalue::DValues, enhanced::{GraphicsPreset, apply_preset}};
 use anyhow::{Context, ensure};
 use std::fmt::Write;
 
+mod marginal;
+
 const SIZE: (u32, u32) = (1920, 1200);
 const VIEWS: [&str; 4] = ["icc-landmark-authored", "borealis-foliage-sun-high", "borealis-foliage-night", "newland-day"];
 const PRESETS: [GraphicsPreset; 4] = GraphicsPreset::ALL;

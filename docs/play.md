@@ -151,7 +151,12 @@ Enhanced effects, the GPU cost overlay and slow-frame logging. Ctrl+Shift+E
 suspends/restores effects without changing their saved settings; Ctrl+Shift+O
 toggles the GPU overlay. The overlay uses the existing GUI font and reports
 rolling GPU pass measurements, not CPU encoding estimates or an automatic
-effect-disable sweep. Slow-frame logging reports frames over 50 ms with their
+effect-disable sweep. These Metal tile-GPU spans are nonexclusive and profiling
+can perturb pass boundaries: do not sum or rank them as exclusive effect costs.
+For example, the profiled intervals totaled roughly 300 ms while Modern ICC's
+unprofiled whole-frame measurement was 16.227 ms. Use the leave-one-out
+`graphics_preset_marginal_costs` fixture below for combined-effect decisions.
+Slow-frame logging reports frames over 50 ms with their
 wall-clock timestamp and CPU wall stage breakdown, excluding harness pacing.
 The master affects all `EnhancedSettings` visual effects, not display, input,
 text or texture-quality preferences. Their selected values remain in force.
@@ -752,6 +757,63 @@ must equal absence, unfogged red/green body colours must differ, and fully fogge
 red/green bodies must be identical. No full RGBA files or frame PNG sequences are
 retained; output is capped at 100 MB per invocation. `status.txt` distinguishes
 completed numerical checks from still-unexercised human visual acceptance.
+
+#### Whole-frame Modern marginal costs
+
+`graphics_preset_marginal_costs` measures **A=Modern, B=Modern with one exact
+graphical Bool disabled**, in ABBA order. Each of the four legs has 120 warmup
+frames and 240 whole-frame GPU timestamp samples at 1920×1200, actual 4× MSAA,
+16× anisotropy and Modern texture policy. There are no photos or timing-budget
+assertions. It reuses the snapshot cameras, collision/sky-open bake and grass
+exposure; settings switch synchronously. Renderers are reused except when
+changing better mip filtering, which requires fresh texture uploads per leg.
+
+Build once (outside the GPU lease), then run the executable printed by Cargo:
+
+```sh
+CARGO_TARGET_DIR=/tmp/Presets/target cargo test --profile fast -p aomac -j 2 \
+  graphics_preset_marginal --no-run
+
+# Acquire /tmp/aomac-gputime.lock first, as above; release within five minutes.
+AOMAC_AUDIO_MUTE=1 \
+AOMAC_GFX_OUT=/tmp/Presets/marginal-icc-ao-contact-NEW \
+AOMAC_GFX_VIEW=icc-landmark-authored \
+AOMAC_GFX_EFFECTS=AomacAmbientOcclusion,AomacContactShadows \
+  /absolute/path/printed/by/cargo/aomac-<hash> \
+  graphics_preset_marginal_costs --ignored --nocapture --test-threads=1
+```
+
+`AOMAC_GFX_OUT` is required and must not exist. `AOMAC_GFX_VIEW` accepts only
+`icc-landmark-authored` or `newland-day`; omitted means both. Batch a small set
+per lease with comma-separated **exact DValue keys** in `AOMAC_GFX_EFFECTS`;
+unknown/non-Bool/nongraphical keys, duplicates, empty entries and effects already
+off in Modern are rejected. Any registered graphical Bool that Modern enables
+can be isolated, including `AomacBetterMipFiltering`. This is leave-one-out,
+not a standalone on/off benchmark and not an additive allocation of frame cost.
+
+The default 16 controls are `AomacAmbientOcclusion`, `AomacContactShadows`,
+`AomacVolumetricClouds`, `AomacWaterReflections`, `AomacWaterRefraction`,
+`AomacGroundGrass`, `AomacFoliageLeaves`, `AomacMaterialReflections`,
+`AomacEnvironmentProbe`, `AomacSunShadows`, `AomacTaa`, `AomacEmissiveBloom`,
+`AomacCloudShadows`, `AomacVolumetricShafts`, `AomacClusteredLighting` and
+`AomacLocalLightShadows`. Each toggles one Bool only. Four legs per effect
+means 64 legs for one view or 128 for both; explicitly selecting two effects
+and one view runs eight legs. Split defaults across acquisitions, never exceed
+the five-minute lease, and wait three minutes before reacquiring.
+
+`frames.csv` retains every unsorted measured sample; `summary.csv` records each
+leg's actual sample count, actual MSAA, texture policy and nearest-rank p50/p95.
+Both and the provenance/settings `manifest.txt` checkpoint after each leg.
+`deltas.csv` checkpoints after each completed effect with
+**mean(A-leg p50) − mean(B-leg p50)**; positive means disabling that effect
+reduced whole-frame GPU cost in this scene, not that its pass owns that time.
+`status.txt` distinguishes complete, running/interrupted and failed runs.
+The game clock/weather remain frozen while effect simulation advances 1/60 s;
+renderer time continues across reused legs and resets on texture-policy rebuilds.
+Per-pass profiling stays disabled. `AOMAC_SHADER_DIR` has the same optional
+override semantics as the existing fixture; preserve that directory with the
+reported provenance when using an override.
+
 
 ## Deterministic offline graphics fixture
 

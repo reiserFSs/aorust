@@ -61,7 +61,7 @@ pub(super) fn apply_preset(d: &mut DValues, preset: GraphicsPreset) {
         d.set_raw("AomacVignette", Variant::Float(0.1));
         d.set_raw("AomacSceneryDistance", Variant::Float(1.0));
         // TAA + CAS is the recommended temporal path; cinematic/user-asset effects stay opt-in.
-        for name in ["AomacFxaa", "AomacDepthOfField", "AomacZoneLut"] {
+        for name in ["AomacFxaa", "AomacDepthOfField", "AomacZoneLut", "AomacIndirectLight"] {
             d.set_raw(name, Variant::Bool(false));
         }
         d.set_raw("AomacMotionBlur", Variant::Float(0.0));
@@ -494,14 +494,16 @@ mod tests {
         assert!(!d.flag("AomacDepthOfField") && !d.flag("AomacZoneLut"));
         assert_eq!(d.get_f32("AomacMotionBlur"), Some(0.0));
         let modern = d.enhanced_settings();
+        assert!(!modern.indirect_light, "indirect light requires a measured budget before preset inclusion");
         apply_preset(&mut d, GraphicsPreset::Ultra);
         let ultra = d.enhanced_settings();
         for control in controls().into_iter().filter(|control|
             graphical(control.name) && matches!(control.kind, ControlKind::Check)) {
-            let expected = !matches!(control.name, "AomacFxaa" | "AomacDepthOfField" | "AomacZoneLut");
+            let expected = !matches!(control.name, "AomacFxaa" | "AomacDepthOfField" | "AomacZoneLut" | "AomacIndirectLight");
             assert_eq!(d.flag(control.name), expected, "{}", control.name);
         }
         assert_eq!(ultra.motion_blur, 0.0);
+        assert!(!ultra.indirect_light, "Ultra also keeps indirect light opt-in");
         assert!(ultra.shadow_map_size > modern.shadow_map_size);
         assert!(ultra.ao_radius > modern.ao_radius && ultra.ao_strength > modern.ao_strength);
         assert!(ultra.grass_density > modern.grass_density && ultra.grass_distance > modern.grass_distance);
