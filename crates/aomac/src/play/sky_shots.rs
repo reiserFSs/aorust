@@ -879,15 +879,21 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
         "ao" => settings.ambient_occlusion = true,
         "bloom" => settings.emissive_bloom = true,
         "grass" => settings.ground_grass = true,
+        "foliage-edges" => settings.foliage_edges = true,
         "foliage-sway" => settings.foliage_sway = true,
         "foliage-push" => settings.foliage_push = true,
         "foliage-subdivision" => settings.foliage_subdivision = true,
+        "foliage-translucency" => settings.foliage_translucency = true,
+        "foliage-lod" => settings.foliage_lod = true,
         "all-foliage" | "all-foliage-shadows" => {
             settings.sun_shadows = profile == "all-foliage-shadows";
             settings.ground_grass = true;
+            settings.foliage_edges = true;
             settings.foliage_sway = true;
             settings.foliage_push = true;
             settings.foliage_subdivision = true;
+            settings.foliage_translucency = true;
+            settings.foliage_lod = true;
         }
         "hdr" => settings.hdr = true,
         "hdr-bloom" => { settings.hdr = true; settings.emissive_bloom = true; }
@@ -941,7 +947,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             grass_density: 1.0, grass_distance: 50.0, sun_boost: 0.5, grade_strength: 0.8, contact_strength: 0.4,
             ..Default::default()
         },
-        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before|foliage-sway|foliage-push|foliage-subdivision|all-foliage|all-foliage-shadows"),
+        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before|foliage-edges|foliage-sway|foliage-push|foliage-subdivision|foliage-translucency|foliage-lod|all-foliage|all-foliage-shadows"),
     }
     Ok(settings)
 }
@@ -1011,9 +1017,10 @@ fn graphics_fixture_foliage_profiles_are_independent() {
         )+};
     }
     check!(
-        "foliage-sway" => foliage_sway,
+        "foliage-edges" => foliage_edges, "foliage-sway" => foliage_sway,
         "foliage-push" => foliage_push, "foliage-subdivision" => foliage_subdivision,
-        );
+        "foliage-translucency" => foliage_translucency, "foliage-lod" => foliage_lod,
+    );
     assert_eq!(graphics_fixture_settings("all-foliage-shadows").unwrap(),
         ao_render::EnhancedSettings { sun_shadows: true, ..all });
     assert!(!all.sun_shadows && !all.hdr

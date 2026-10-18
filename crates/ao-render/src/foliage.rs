@@ -133,6 +133,7 @@ mod tests {
             let mut source = crate::enhanced_shader::source(shadows, true, true, true);
             append_shader(&mut source);
             crate::foliage_detail::append_shader(&mut source, true, true);
+            crate::foliage_edges::append(&mut source);
             assert!(source.contains("max(vertex.fog, vertex_fog("), "motion must not reduce native fog extinction");
             let errors = renderer.device.push_error_scope(wgpu::ErrorFilter::Validation);
             let _shader = renderer.device.create_shader_module(wgpu::ShaderModuleDescriptor {

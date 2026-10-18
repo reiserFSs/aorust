@@ -14,9 +14,12 @@ pub struct EnhancedSettings {
     pub ambient_occlusion: bool,
     pub emissive_bloom: bool,
     pub ground_grass: bool,
+    pub foliage_edges: bool,
     pub foliage_sway: bool,
     pub foliage_push: bool,
     pub foliage_subdivision: bool,
+    pub foliage_translucency: bool,
+    pub foliage_lod: bool,
     /// HDR scene + tonemap/grade/dither present; daylight sun and mild outdoor sky fill.
     pub hdr: bool,
     pub grading_enabled: bool,
@@ -76,8 +79,8 @@ impl Default for EnhancedSettings {
             grading_enabled: false, zone_lut: false, vignette: 0.0, contrast: 1.0, saturation: 1.0, warmth: 0.5,
             night_cool: 0.0,
             taa: false, fxaa: false, cas: false, cas_strength: 0.5, motion_blur: 0.0, depth_of_field: false, dof_aperture: 2.0, dof_max_radius: 8.0,
-            foliage_sway: false, foliage_push: false,
-            foliage_subdivision: false,
+            foliage_edges: false, foliage_sway: false, foliage_push: false,
+            foliage_subdivision: false, foliage_translucency: false, foliage_lod: false,
             shadow_map_size: 2048, shadow_strength: 0.45, shadow_softness: 1.5, ao_radius: 1.75, ao_strength: 1.5, bloom_strength: 0.6,
             grass_density: 1.0, grass_distance: 160.0, sun_boost: 0.6, grade_strength: 0.8, contact_strength: 0.8,
         }
@@ -94,7 +97,8 @@ impl EnhancedSettings {
     }
 
     pub fn foliage_enabled(self) -> bool {
-        self.foliage_sway || self.foliage_push || self.foliage_subdivision
+        self.foliage_edges || self.foliage_sway || self.foliage_push
+            || self.foliage_subdivision || self.foliage_translucency || self.foliage_lod
     }
 
     pub fn interaction_enabled(self) -> bool {
@@ -197,9 +201,10 @@ mod tests {
             )+};
         }
         check!(
-            foliage_sway => false, foliage_push => true,
+            foliage_edges => false, foliage_sway => false, foliage_push => true,
             foliage_subdivision => true,
-            );
+            foliage_translucency => false, foliage_lod => false,
+        );
         assert!(EnhancedSettings { ground_grass: true, ..defaults }.interaction_enabled());
     }
 

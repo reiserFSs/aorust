@@ -11,7 +11,7 @@ pub(super) struct Key {
     ao: bool,
     bloom: bool,
     sun_mask: bool,
-    foliage: [bool; 3],
+    foliage: [bool; 6],
     pub msaa: u32,
 }
 
@@ -20,7 +20,7 @@ impl Key {
         Self { shadows: settings.sun_shadows || settings.moon_shadows, ao: settings.ambient_occlusion,
             moon_shadows: settings.moon_shadows, night_mode: settings.night_mode,
             bloom: settings.emissive_bloom, sun_mask: settings.needs_sun_mask(), msaa,
-            foliage: [settings.foliage_sway, settings.foliage_push, settings.foliage_subdivision] }
+            foliage: [settings.foliage_edges, settings.foliage_sway, settings.foliage_push, settings.foliage_subdivision, settings.foliage_translucency, settings.foliage_lod] }
     }
     fn enhanced(self) -> bool { self.shadows || self.ao || self.bloom || self.sun_mask || self.night_mode != super::NightMode::AsGame || self.foliage.iter().any(|&v| v) }
 }
@@ -144,8 +144,9 @@ impl Request {
             } else { source };
             if self.settings.foliage_enabled() {
                 super::foliage::append_shader(&mut source);
-                super::foliage_detail::append_shader(&mut source, false, false);
+                super::foliage_detail::append_shader(&mut source, self.settings.foliage_translucency, self.settings.foliage_lod);
             }
+            if self.settings.foliage_edges { super::foliage_edges::append(&mut source); }
             self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("Enhanced world"), source: wgpu::ShaderSource::Wgsl(source.into()),
             })
@@ -171,6 +172,7 @@ impl Request {
             frame_compiles: self.frame_compiles.clone(), frame_thread: self.frame_thread,
         });
         let (mut pipes, mut actor_pipes, mut ground_pipes) = build_pipelines();
+        if self.settings.foliage_edges { super::foliage_edges::extend(&mut pipes); }
         pipes.prepare_all(&|spec| compile.pipeline(spec, false));
         actor_pipes.prepare_all(&|spec| compile.pipeline(spec, false));
         ground_pipes.prepare_all(&|spec| compile.pipeline(spec, false));

@@ -86,6 +86,10 @@ impl Spec {
                 };
                 (if effect == 17 { "fs_lava_crust" } else { "fs_lava" }, Some(wgpu::BlendState { color: component, alpha: component }), true)
             },
+            18 => ("fs_foliage_blend_core", None, true),
+            19 => ("fs_foliage_blend_soft", Some(wgpu::BlendState::ALPHA_BLENDING), false),
+            20 => ("fs_foliage_sprite_core", None, true),
+            21 => ("fs_foliage_sprite_soft", Some(wgpu::BlendState::ALPHA_BLENDING), false),
             _ => (fs, state, depth_write),
         };
         Descriptor {
@@ -95,7 +99,7 @@ impl Spec {
             points: effect == 14,
             cull: !two_sided && !matches!(effect, 1 | 4..=6),
             // Randy 10041f98 and DS 1006c61d retain LESSEQUAL.
-            compare: if effect == 2 { wgpu::CompareFunction::LessEqual } else { compare.unwrap_or(if sky { wgpu::CompareFunction::Always } else if env || matches!(effect, 0..=7 | 10 | 12 | 13 | 15..=17) { wgpu::CompareFunction::LessEqual } else { wgpu::CompareFunction::Less }) },
+            compare: if effect == 2 { wgpu::CompareFunction::LessEqual } else { compare.unwrap_or(if sky { wgpu::CompareFunction::Always } else if env || matches!(effect, 0..=7 | 10 | 12 | 13 | 15..=21) { wgpu::CompareFunction::LessEqual } else { wgpu::CompareFunction::Less }) },
             bias: effect == 7,
         }
     }
@@ -113,6 +117,7 @@ impl From<Vec<Slot>> for Pipelines {
 }
 impl Pipelines {
     pub fn len(&self) -> usize { self.0.len() }
+    pub fn push(&mut self, slot: Slot) { self.0.push(slot); }
     pub fn prepare_all<F: Fn(Spec) -> RenderPipeline>(&mut self, compile: &F) {
         let mut prepared: HashMap<Descriptor, usize> = HashMap::new();
         for index in 0..self.len() {

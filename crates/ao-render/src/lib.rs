@@ -33,6 +33,7 @@ mod native_ground;
 mod native_texture;
 mod native_liquid;
 mod pipelines;
+mod foliage_edges;
 mod foliage;
 mod foliage_detail;
 use pipelines::{Pipelines, Slot as PipelineSlot, Spec as PipelineSpec};
@@ -2581,6 +2582,10 @@ impl Renderer {
                     }
                 }
             };
+            // Native viewport clears are ordered actor commands. Keep the entire
+            // frame native if any are present rather than replaying soft pixels
+            // against a depth buffer from a different native clear interval.
+            let split_foliage = self.enhanced_settings.foliage_edges && self.screen.depth_clears.is_empty();
             let world_phase = |pass: &mut wgpu::RenderPass, priority: i32| {
                 pass.set_bind_group(0, &self.globals_bg, &[]);
                 // Grass replaces group 3; restore the shared receiver at phase entry.
@@ -2594,7 +2599,24 @@ impl Renderer {
                     let last = self.sorted.partition_point(|command| command.0 <= priority);
                     for &(_, _, list, di, vi) in &self.sorted[first..last] {
                         let d = &[&self.gpu.opaque, &self.gpu.blended, &self.gpu.liquid][list as usize][di];
-                        draw(pass, d, vi..vi + 1, false);
+                        let core = (split_foliage && d.vegetation)
+                            .then(|| foliage_edges::pipeline(&self.world.pipes, d.pipe, false)).flatten();
+                        if let Some(pipe) = core {
+                            draw(pass, &Draw { pipe, ..*d }, vi..vi + 1, false);
+                        } else {
+                            draw(pass, d, vi..vi + 1, false);
+                        }
+                    }
+                    if split_foliage {
+                        // Replay only the complementary soft coverage, preserving
+                        // native relative order and never crossing a priority.
+                        for &(_, _, list, di, vi) in &self.sorted[first..last] {
+                            let d = &[&self.gpu.opaque, &self.gpu.blended, &self.gpu.liquid][list as usize][di];
+                            if !d.vegetation { continue; }
+                            if let Some(pipe) = foliage_edges::pipeline(&self.world.pipes, d.pipe, true) {
+                                draw(pass, &Draw { pipe, ..*d }, vi..vi + 1, false);
+                            }
+                        }
                     }
                 }
                 calls.set(calls.get() + self.draw_actors(pass, priority));
