@@ -44,6 +44,8 @@ pub use gpu_stats::FrameGpuTimer;
 mod enhanced_settings;
 pub use enhanced_settings::{EnhancedSettings, NightMode};
 mod enhanced;
+mod clustered_lighting;
+mod authored_specular;
 mod enhanced_shader;
 mod moon_shadows;
 mod moon_exposure;
@@ -52,7 +54,9 @@ mod shader_source;
 mod ambient_occlusion;
 mod sky_probe;
 mod sun_shadows;
+mod point_shadows;
 mod shadow_pass;
+mod shadow_coverage;
 #[cfg(test)]
 mod shadow_tests;
 #[cfg(test)]
@@ -211,6 +215,7 @@ struct Globals {
     sky_counter: [f32; 4],
     /// Pairs of toward-light direction / gamma diffuse+specular colour.
     directional: [[f32; 4]; 16],
+    /// Shared Enhanced authored-moon direction and gamma-space illumination.
     moon_direction: [f32; 4],
     moon_g: [f32; 4],
     foliage_wind: [f32; 4],
@@ -373,6 +378,7 @@ const MAX_DYN_LIGHTS: usize = 16;
 /// Static light grid: dense 3D cells, each listing up to `CELL_LIGHTS` lights whose sphere touches it.
 struct LightGrid {
     zones: Vec<Option<u32>>, // statel zone per light (`Light::zone`), same order as `lights`
+    owners: Vec<Option<u32>>,
     lights: Vec<[f32; 4]>, // 4 per light: (pos, range), (colour, cos(phi/2) | 2 = no cone), (atten0..2, cos(theta/2)), (axis, 0)
     cells: Vec<[u32; 2]>,  // (first index, count)
     idx: Vec<u32>,
@@ -385,7 +391,7 @@ impl LightGrid {
     fn new(lights: &[ao_scene::Light]) -> Self {
         let lights: Vec<_> = lights.iter().filter(|l| l.range > 0.0 && l.pos.iter().all(|v| v.is_finite())).collect();
         if lights.is_empty() {
-            return Self { zones: vec![], lights: vec![[0.0; 4]; 4], cells: vec![[0, 0]], idx: vec![0], origin: Vec3::ZERO, cell: 1.0, dims: [0; 3] };
+            return Self { zones: vec![], owners: vec![], lights: vec![[0.0; 4]; 4], cells: vec![[0, 0]], idx: vec![0], origin: Vec3::ZERO, cell: 1.0, dims: [0; 3] };
         }
         let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         for l in &lights {
@@ -442,7 +448,7 @@ impl LightGrid {
             idx.push(0);
         }
         let gl = lights.iter().flat_map(|l| pack_light(l)).collect();
-        Self { zones: lights.iter().map(|l| l.zone).collect(), lights: gl, cells, idx, origin: lo, cell, dims }
+        Self { zones: lights.iter().map(|l| l.zone).collect(), owners: lights.iter().map(|l| l.owner).collect(), lights: gl, cells, idx, origin: lo, cell, dims }
     }
 }
 
@@ -700,6 +706,7 @@ pub struct Renderer {
     bloom_pipelines: bloom::BloomPipelines,
     grade_pipelines: grade::GradePipelines,
     shadow_pipelines: std::sync::Arc<sun_shadows::Compiled>,
+    point_program: point_shadows::Compiled,
     ambient_occlusion: Option<ambient_occlusion::AmbientOcclusion>,
     contact_shadows: Option<contact_shadows::ContactShadows>,
     atmosphere: Option<atmosphere::Atmosphere>,
@@ -714,6 +721,7 @@ pub struct Renderer {
     cpu_timings: Option<FrameCpuTimings>,
     pub stats: FrameStats,
     sun_shadows: Option<sun_shadows::SunShadows>,
+    point_shadows: Option<point_shadows::PointShadows>,
     shadow_sun: Option<[f32; 3]>,
     shadow_moon: Option<ao_scene::MoonSource>,
     moon_exposure: moon_exposure::MoonExposure,
@@ -784,6 +792,11 @@ pub struct Renderer {
     light_idx_buf: wgpu::Buffer,
     light_base: Vec<[f32; 4]>,
     light_zones: Vec<Option<u32>>,
+    static_owners: Vec<Option<u32>>,
+    cluster_frame: clustered_lighting::Frame,
+    cluster_programs: clustered_lighting::Programs,
+    dynamic_owners: Vec<Option<u32>>,
+    dynamic_packed: Vec<[f32; 4]>,
     /// Per-frame moving lights (worn/attached item lights such as the Light Bar), see [`Renderer::set_dynamic_lights`]:
     /// a small fixed-capacity storage buffer rewritten every frame, separate from the static `light_buf`/grid so an
     /// actor's own light moving every frame never rebuilds the whole scene's light grid.
@@ -902,7 +915,8 @@ fn compile_pipeline(
     let pipelines::Descriptor { fs, vs, state, depth_write, compare, actor, holo, points, cull, bias } = spec.descriptor();
     let f4 = |o| wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: o, shader_location: 4 + (o / 16) as u32 };
     let inst_attrs = [f4(0), f4(16), f4(32), f4(48)];
-    let actor_attrs = [f4(0), f4(16), f4(32), f4(48), f4(64), f4(80), f4(96), f4(112)];
+    let actor_attrs = [f4(0), f4(16), f4(32), f4(48), f4(64), f4(80), f4(96), f4(112),
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint32, offset: 128, shader_location: 13 }];
     let vert_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
         let target = wgpu::ColorTargetState { format, blend: state, write_mask: wgpu::ColorWrites::ALL };
         let auxiliary = wgpu::ColorTargetState { format: enhanced::AUX, blend: state, write_mask: wgpu::ColorWrites::ALL };
@@ -1101,7 +1115,7 @@ impl Renderer {
         };
         let storage_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding,
-            visibility: wgpu::ShaderStages::VERTEX,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
             count: None,
         };
@@ -1165,8 +1179,10 @@ impl Renderer {
         let bloom_pipelines = bloom::BloomPipelines::new(&device);
         let grade_pipelines = grade::GradePipelines::new(&device, format, enhanced_pipelines.source_layout());
         let shadow_pipelines = std::sync::Arc::new(sun_shadows::Compiled::new(&device, &g_layout, &tex_layout));
+        let point_program = point_shadows::Compiled::new(&device);
         let ambient_occlusion = Some(ambient_occlusion::AmbientOcclusion::new(&device, format));
         let contact_shadows = Some(contact_shadows::ContactShadows::new(&device, format));
+        let cluster_programs = clustered_lighting::Programs::new(&device);
         let mut r = Self {
             device,
             queue,
@@ -1189,6 +1205,7 @@ impl Renderer {
             bloom_pipelines,
             grade_pipelines,
             shadow_pipelines,
+            point_program,
             ambient_occlusion,
             contact_shadows,
             atmosphere: None,
@@ -1216,6 +1233,7 @@ impl Renderer {
             actor_visual_retirements: Vec::new(),
             heat_haze: Default::default(),
             sun_shadows: None,
+            point_shadows: None,
             shadow_sun: None,
             shadow_moon: None,
             moon_exposure: Default::default(),
@@ -1267,6 +1285,11 @@ impl Renderer {
             light_idx_buf,
             light_base: vec![],
             light_zones: vec![],
+            static_owners: vec![],
+            cluster_frame: Default::default(),
+            cluster_programs,
+            dynamic_owners: vec![],
+            dynamic_packed: vec![],
             dyn_light_buf,
             dyn_light_count: 0,
             frame: 0,
@@ -1475,7 +1498,10 @@ impl Renderer {
             || previous.needs_sun_mask() != settings.needs_sun_mask();
         self.enhanced_settings = settings;
         self.moon_exposure.sync(&self.device, settings.night_mode == NightMode::Moonlit);
-        if previous.night_mode != settings.night_mode { self.sun_shadows = None; }
+        if previous.night_mode != settings.night_mode {
+            self.sun_shadows = None;
+            self.point_shadows = None;
+        }
         if previous.taa != settings.taa || previous.motion_blur != settings.motion_blur {
             self.reset_post_history();
         }
@@ -1496,6 +1522,14 @@ impl Renderer {
             self.motion_vectors = None;
             self.motion_programs = None;
         }
+        if previous.needs_admitted_lights() && !settings.needs_admitted_lights() {
+            self.cluster_frame = Default::default();
+            self.dyn_light_buf = make_dyn_light_buffer(&self.device);
+            self.dyn_light_count = self.dyn_light_count.min(MAX_DYN_LIGHTS as i32);
+            let count = (self.dyn_light_count as usize * 4).min(self.dynamic_packed.len());
+            if count > 0 { self.queue.write_buffer(&self.dyn_light_buf, 0, bytemuck::cast_slice(&self.dynamic_packed[..count])); }
+            self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &self.light_buf, &self.light_cells_buf, &self.light_idx_buf, &self.dyn_light_buf, &self.sampler, &self.clamp_sampler);
+        }
         if !settings.ground_grass || settings.grass_density <= 0.0 { self.grass = None; }
         if !settings.ambient_occlusion {
             self.ambient_occlusion.as_mut().expect("startup AO pipelines").release_targets();
@@ -1503,7 +1537,9 @@ impl Renderer {
         if !settings.contact_shadows {
             self.contact_shadows.as_mut().expect("startup contact pipelines").release_targets();
         }
-        if !settings.sun_shadows && !settings.moon_shadows && !settings.volumetric_shafts && settings.night_mode != NightMode::Moonlit { self.sun_shadows = None; }
+        if !settings.sun_shadows && !settings.moon_shadows && !settings.volumetric_shafts && !settings.needs_admitted_lights()
+            && settings.night_mode != NightMode::Moonlit { self.sun_shadows = None; }
+        if !settings.needs_admitted_lights() { self.point_shadows = None; }
         self.release_disabled_atmosphere(settings);
         if changed_frame {
             self.reset_post_history();
@@ -1600,6 +1636,7 @@ impl Renderer {
         self.moon_exposure = moon_exposure::MoonExposure::from_scene(scene);
         self.moon_exposure.sync(&self.device, self.enhanced_settings.night_mode == NightMode::Moonlit);
         self.sun_shadows = None;
+        self.point_shadows = None;
         self.sky.clouds.clear();
         self.release_atmosphere_targets();
         self.atmosphere_base_height = scene.ground_detail.iter()
@@ -1819,8 +1856,12 @@ impl Renderer {
         (self.light_buf, self.light_cells_buf, self.light_idx_buf) = light_storage_buffers(&self.device, &grid);
         self.dyn_light_buf = make_dyn_light_buffer(&self.device);
         self.dyn_light_count = 0;
+        self.dynamic_packed.clear();
+        self.dynamic_owners.clear();
+        self.cluster_frame = Default::default();
         self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &self.light_buf, &self.light_cells_buf, &self.light_idx_buf, &self.dyn_light_buf, &self.sampler, &self.clamp_sampler);
         self.light_zones = grid.zones.clone();
+        self.static_owners = grid.owners;
         self.light_base = grid.lights.clone();
         let grid = ([grid.origin.x, grid.origin.y, grid.origin.z, grid.cell], [grid.dims[0], grid.dims[1], grid.dims[2], 0]);
         // Keep VisualWater's style order (water, acid, lava, star, shallow), including both coplanar passes.
@@ -2264,16 +2305,18 @@ impl Renderer {
 
     /// Per-frame moving point/spot lights (worn/attached item lights, e.g. the Light Bar's embedded `RLight_t`,
     /// `mesh.rs::decode_mesh_lights`, tracked to its attractor bone every frame): affects terrain, statics and actors
-    /// through the same `vertex_lights` D3D7 formula as the static light grid, capped at [`MAX_DYN_LIGHTS`] (far above
-    /// the handful of simultaneously worn light items expected live). Call once per frame before [`Renderer::render`];
+    /// through the native D3D7 formula. Faithful transport retains [`MAX_DYN_LIGHTS`];
+    /// Enhanced lighting/shadows upload every candidate for GPU owner admission before selection. Call before [`Renderer::render`];
     /// an empty slice turns dynamic lighting off again (e.g. the item unequipped or its wearer out of view).
     pub fn set_dynamic_lights(&mut self, lights: &[ao_scene::Light]) {
-        let n = lights.len().min(MAX_DYN_LIGHTS);
-        self.dyn_light_count = n as i32;
-        if n > 0 {
-            let packed: Vec<[f32; 4]> = lights[..n].iter().flat_map(pack_light).collect();
-            self.queue.write_buffer(&self.dyn_light_buf, 0, bytemuck::cast_slice(&packed));
-        }
+        let n = if self.enhanced_settings.needs_admitted_lights() { lights.len() } else { lights.len().min(MAX_DYN_LIGHTS) };
+        self.dyn_light_count = n.min(MAX_DYN_LIGHTS) as i32;
+        self.dynamic_packed.clear();
+        self.dynamic_packed.extend(lights[..n].iter().flat_map(pack_light));
+        self.dynamic_owners.clear();
+        self.dynamic_owners.extend(lights[..n].iter().map(|light| light.owner));
+        let prefix = self.dyn_light_count as usize * 4;
+        if prefix > 0 { self.queue.write_buffer(&self.dyn_light_buf, 0, bytemuck::cast_slice(&self.dynamic_packed[..prefix])); }
     }
 
     pub fn set_screen_effects(&mut self,layers:Vec<ScreenLayer>,fog_disabled:bool) {
@@ -2545,8 +2588,9 @@ impl Renderer {
             });
             pass.set_bind_group(0, &self.globals_bg, &[]);
             // Sky, ground and actors retain this receiver across pipeline changes.
-            if self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows || self.enhanced_settings.night_mode == NightMode::Moonlit {
-                pass.set_bind_group(3, &self.sun_shadows.as_ref().expect("shadow maps prepared before world").receiver, &[]);
+            if self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows || self.enhanced_settings.needs_admitted_lights()
+                || self.enhanced_settings.night_mode == NightMode::Moonlit {
+                pass.set_bind_group(3, self.shadow_receiver(), &[]);
             }
             let (pipe, mesh, mat) = (std::cell::Cell::new(usize::MAX), std::cell::Cell::new((false, usize::MAX, false)), std::cell::Cell::new((false, usize::MAX)));
             let draw = |pass: &mut wgpu::RenderPass, d: &Draw, insts: std::ops::Range<u32>, sky: bool| {
@@ -2595,8 +2639,9 @@ impl Renderer {
             let world_phase = |pass: &mut wgpu::RenderPass, priority: i32| {
                 pass.set_bind_group(0, &self.globals_bg, &[]);
                 // Grass replaces group 3; restore the shared receiver at phase entry.
-                if self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows || self.enhanced_settings.night_mode == NightMode::Moonlit {
-                    pass.set_bind_group(3, &self.sun_shadows.as_ref().expect("shadow maps prepared before world").receiver, &[]);
+                if self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows || self.enhanced_settings.needs_admitted_lights()
+                    || self.enhanced_settings.night_mode == NightMode::Moonlit {
+                    pass.set_bind_group(3, self.shadow_receiver(), &[]);
                 }
                 pipe.set(usize::MAX); mesh.set((false, usize::MAX, false)); mat.set((false, usize::MAX));
                 if let Some(inst) = inst_buf {

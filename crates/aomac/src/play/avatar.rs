@@ -975,6 +975,7 @@ impl Avatar {
         self.rig.mount_lights(&self.current_parts.borrow()).into_iter().map(|light| ao_scene::Light {
             pos: self.transform.transform_point3(Vec3::from(light.pos)).to_array(),
             spot: light.spot.map(|spot| ao_scene::Spot { dir: self.transform.transform_vector3(Vec3::from(spot.dir)).to_array(), ..spot }),
+            owner: Some(self.id),
             ..light
         })
     }
@@ -982,7 +983,7 @@ impl Avatar {
     /// The actor to draw this frame (GPU-skinned pose, never frustum culled).
     pub fn frame(&self) -> ActorFrame {
         self.refresh_pose();
-        ActorFrame { id: self.id, model: MODEL_KEY, transform: self.transform.to_cols_array_2d(), parts: self.current_parts.borrow().clone(), part_attractors: self.rig.part_attractors(), skin_pose: self.current_palette.borrow().as_ref().map(Arc::clone), always: true, alpha: 1.0, ..Default::default() }
+        ActorFrame { id: self.id, model: MODEL_KEY, character: true, transform: self.transform.to_cols_array_2d(), parts: self.current_parts.borrow().clone(), part_attractors: self.rig.part_attractors(), skin_pose: self.current_palette.borrow().as_ref().map(Arc::clone), always: true, alpha: 1.0, ..Default::default() }
     }
 
     /// Native camera selection against the current own body pose, not mounted meshes.

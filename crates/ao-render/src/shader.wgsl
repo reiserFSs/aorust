@@ -18,8 +18,8 @@ struct G {
     dyn_info: vec4<i32>,   // x = moving light count, y = extra directional count
     sky_counter: vec4<f32>, // x = DotStars Counter += .01 per FXS frame, independent of time/dt
     directional: array<vec4<f32>, 16>, // toward-light direction / gamma colour pairs
-    moon_direction: vec4<f32>,
-    moon_g: vec4<f32>,
+    moon_direction: vec4<f32>, // shared authored moon, w = Moonlit enabled
+    moon_g: vec4<f32>, // gamma illumination, w = ambient dark-night attenuation
 }
 struct Mat {
     color: vec4<f32>,

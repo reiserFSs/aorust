@@ -48,33 +48,72 @@ pub(super) fn source(scene: &ao_scene::Scene) -> Option<ao_scene::MoonSource> {
 }
 
 pub(super) fn shader(mut source: String, shadows: bool, moonlit: bool) -> String {
+    let packed = source.contains("@location(4) light: vec4<f32>");
+    let clustered = source.contains("fn clustered_receiver(");
     if source.contains("struct ShadowFrame {") {
         source = source.replace("sun_visibility(", "authored_sun_visibility(")
             .replace("fn authored_sun_visibility(", "fn sun_visibility(");
-        source.push_str("\nfn authored_sun_visibility(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>) -> f32 {\n    if shadow_frame.moon_direction.w > 0.0 { return 1.0; }\n    return sun_visibility(world, normal, pixel);\n}\n");
+        let reset = if source.contains("var<private> enhanced_sun_visibility:") { "enhanced_sun_visibility = 1.0; " } else { "" };
+        source.push_str(&format!("\nfn authored_sun_visibility(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>) -> f32 {{\n    if shadow_frame.moon_direction.w > 0.0 {{ {reset}return 1.0; }}\n    return sun_visibility(world, normal, pixel);\n}}\n"));
     }
     for name in ["fs_opaque", "fs_fade_opaque", "fs_fade_test", "fs_test", "fs_blend", "fs_ground_fused", "fs_ground_shadow", "fs_ground_simple"] {
         let ground = name.starts_with("fs_ground");
         for input in ["i", "surface"] {
-            source = source.replace(&format!("    let beauty = enhanced_original_{name}({input});"),
-                &format!("    let moon_receiver = authored_moon_receiver({input}, i.n, {ground});\n    let beauty = enhanced_original_{name}(moon_receiver);"));
+            let original = format!("    let beauty = enhanced_original_{name}({input});");
+            if !clustered {
+                source = source.replace(&original,
+                    &format!("    let moon_receiver = authored_moon_receiver({input}, i.n, {ground});\n    let beauty = enhanced_original_{name}(moon_receiver);"));
+            }
         }
     }
     source = source.replace("ground_palette(i)", "(ground_palette(i) * (1.0 - g.moon_g.w))");
     let mut moon = crate::shader_source::load("moon_shadows.wgsl", include_str!("moon_shadows.wgsl")).into_owned();
+    if packed {
+        for field in ["light", "dlight"] {
+            moon = moon.replace(&format!("input.{field}"), &format!("input.{field}.xyz"));
+            moon = moon.replace(&format!("receiver.{field} = {field};"),
+                &format!("receiver.{field} = vec4<f32>({field}, input.{field}.w);"));
+        }
+    }
+    if clustered {
+        let original = "fn clustered_night_light(i: VOut, normal: vec3<f32>, ground: bool, light: vec3<f32>, retained: vec3<f32>) -> vec3<f32> {\n    return light;\n}";
+        let replacement = "fn clustered_night_light(i: VOut, normal: vec3<f32>, ground: bool, light: vec3<f32>, retained: vec3<f32>) -> vec3<f32> {\n    if mat.emissive.w > 1.5 { return light; }\n    return light - max(light - retained, vec3<f32>(0.0)) * g.moon_g.w + authored_moon_add(i, normal);\n}";
+        source = source.replace(original, replacement);
+    }
     if moonlit { crate::moon_exposure::append_shader(&mut source); }
     else { moon = moon.replace("enhanced_sky_open(input.wpos)", "0.0"); }
     let visibility = if shadows && moonlit {
         source.push_str("\nfn authored_moon_visibility(input: VOut) -> f32 {\n    if shadow_frame.moon_direction.w <= 0.0 { return 1.0; }\n    return sun_visibility(input.wpos, input.n, input.clip.xy);\n}\n");
         "authored_moon_visibility(input)"
     } else { "1.0" };
-    source.push_str(&moon.replace("MOON_VISIBILITY", visibility));
+    let raw_specular = shadows && moonlit && source.contains("struct ShadowFrame {")
+        && source.contains("fn authored_ggx(");
+    let specular_visibility = if raw_specular {
+        "select(visibility, enhanced_sun_visibility, shadow_frame.moon_direction.w > 0.0)"
+    } else { "visibility" };
+    let raw_reset = if raw_specular { "enhanced_sun_visibility = 1.0;" } else { "" };
+    source.push_str(&moon.replace("MOON_RAW_RESET", raw_reset)
+        .replace("MOON_SPEC_VISIBILITY", specular_visibility)
+        .replace("MOON_VISIBILITY", visibility));
     source
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_consumers_do_not_require_the_hdr_private_cache() {
+        let source = crate::enhanced_shader::source(crate::EnhancedSettings {
+            sun_shadows: true, ..Default::default()
+        });
+        let source = source.lines()
+            .filter(|line| !line.contains("var<private> enhanced_sun_visibility:"))
+            .collect::<Vec<_>>().join("\n");
+        let generated = shader(source, true, true);
+        assert!(!generated.contains("enhanced_sun_visibility"),
+            "native foliage consumers have no Enhanced HDR output cache");
+    }
+
     #[test]
     fn authored_pose_phase_and_daylight_control_energy() {
         let mut scene = ao_scene::Scene {
@@ -111,18 +150,39 @@ mod tests {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let renderer = crate::Renderer::new(&instance, None).expect("night shader regression requires GPU");
         for moonlit in [false, true] {
-            for flags in 0..16 {
-                let shadows = flags & 1 != 0;
-                let original = crate::enhanced_shader::source(crate::EnhancedSettings {
-                    sun_shadows: shadows, ambient_occlusion: flags & 2 != 0, emissive_bloom: flags & 4 != 0,
-                    hdr: flags & 8 != 0,
-                    night_mode: if moonlit { crate::NightMode::Moonlit } else { crate::NightMode::Dark },
-                    ..Default::default()
-                });
-                let generated = shader(original, shadows, moonlit);
-                let _ = renderer.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("independent night modes"), source: wgpu::ShaderSource::Wgsl(generated.into()),
-                });
+            for flags in 0..128 {
+                for moon_shadows in [false, true] {
+                    let shadows = flags & 1 != 0 || moon_shadows;
+                    let original = crate::enhanced_shader::source(crate::EnhancedSettings {
+                        sun_shadows: flags & 1 != 0, moon_shadows,
+                        ambient_occlusion: flags & 2 != 0, emissive_bloom: flags & 4 != 0,
+                        hdr: flags & 8 != 0, material_specular: flags & 16 != 0,
+                        clustered_lighting: flags & 32 != 0, local_light_shadows: flags & 64 != 0,
+                        night_mode: if moonlit { crate::NightMode::Moonlit } else { crate::NightMode::Dark },
+                        ..Default::default()
+                    });
+                    let generated = shader(original, moon_shadows, moonlit);
+                    assert!(generated.contains("@location(14) sun_share:"));
+                    if flags & 0x70 != 0 {
+                        assert!(generated.contains("receiver.light = vec4<f32>(light, input.light.w)"));
+                    }
+                    if shadows {
+                        assert!(generated.contains("if shadow_frame.moon_direction.w > 0.0 { enhanced_sun_visibility = 1.0; return 1.0; }"),
+                            "moon maps cannot darken the sunlight HDR eligibility cache");
+                    }
+                    if flags & (32 | 64) != 0 {
+                        assert!(generated.contains("+ authored_moon_add(i, normal)"));
+                    } else {
+                        assert!(generated.contains("authored_moon_receiver(i, i.n,") || generated.contains("authored_moon_receiver(surface, i.n,"));
+                    }
+                    let moon_add = generated.split("fn authored_moon_add(").nth(1).unwrap().split("\n}").next().unwrap();
+                    assert!(!moon_add.contains("terrain_sky_open"), "ordinary receivers cannot reach the ground-only bind group");
+                    assert_eq!(generated.contains("@group(3) @binding(7)"), moonlit);
+                    let _ = renderer.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("composed independent night modes"),
+                        source: wgpu::ShaderSource::Wgsl(generated.into()),
+                    });
+                }
             }
         }
     }

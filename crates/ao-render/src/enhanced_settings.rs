@@ -1,6 +1,7 @@
 //! Opt-in, aomac-only graphics settings. All effects default off.
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Independent night aesthetics; the default retains the authored game lighting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum NightMode {
     #[default]
     AsGame,
@@ -51,7 +52,13 @@ pub struct EnhancedSettings {
     pub volumetric_clouds: bool,
     pub cloud_shadows: bool,
     pub sky_discs: bool,
+    pub material_specular: bool,
+    pub clustered_lighting: bool,
     pub moon_shadows: bool,
+    pub local_light_shadows: bool,
+    pub point_shadow_count: u32,
+    pub lamp_intensity: f32,
+    pub carried_light_intensity: f32,
     pub night_mode: NightMode,
     pub moon_intensity: f32,
     pub dark_night_strength: f32,
@@ -79,7 +86,10 @@ impl Default for EnhancedSettings {
             sun_shadows: false, ambient_occlusion: false, emissive_bloom: false, ground_grass: false, hdr: false, contact_shadows: false,
             height_haze: false, land_haze: false, valley_mist: false, volumetric_shafts: false,
             cloud_gap_shafts: false, volumetric_clouds: false, cloud_shadows: false, sky_discs: false,
-            moon_shadows: false, night_mode: NightMode::AsGame, moon_intensity: 1.0, dark_night_strength: 0.6,
+            material_specular: false, clustered_lighting: false, moon_shadows: false, local_light_shadows: false,
+            point_shadow_count: 4,
+            lamp_intensity: 1.0, carried_light_intensity: 1.0,
+            night_mode: NightMode::AsGame, moon_intensity: 1.0, dark_night_strength: 0.6,
             grading_enabled: false, zone_lut: false, vignette: 0.0, contrast: 1.0, saturation: 1.0, warmth: 0.5,
             night_cool: 0.0,
             taa: false, fxaa: false, cas: false, cas_strength: 0.5, motion_blur: 0.0, depth_of_field: false, dof_aperture: 2.0, dof_max_radius: 8.0,
@@ -97,8 +107,13 @@ impl EnhancedSettings {
         self.sun_shadows || self.ambient_occlusion || self.emissive_bloom || self.ground_grass || self.needs_grade() || self.contact_shadows
             || self.height_haze || self.land_haze || self.valley_mist || self.volumetric_shafts
             || self.cloud_gap_shafts || self.volumetric_clouds || self.cloud_shadows || self.sky_discs
-            || self.moon_shadows || self.night_mode != NightMode::AsGame || self.foliage_enabled()
-            || self.post_enabled()
+            || self.material_specular || self.clustered_lighting || self.moon_shadows || self.local_light_shadows
+            || self.night_mode != NightMode::AsGame || self.foliage_enabled() || self.post_enabled()
+    }
+
+    /// Enhanced local-light consumers require current-frame owner admission before any source cap.
+    pub(crate) fn needs_admitted_lights(self) -> bool {
+        self.clustered_lighting || self.local_light_shadows || self.material_specular
     }
 
     pub fn foliage_enabled(self) -> bool {
@@ -135,6 +150,9 @@ impl EnhancedSettings {
         let defaults = Self::default();
         Self {
             shadow_map_size: self.shadow_map_size.clamp(256, 4096),
+            point_shadow_count: self.point_shadow_count.clamp(1, 16),
+            lamp_intensity: finite(self.lamp_intensity, 4.0, defaults.lamp_intensity),
+            carried_light_intensity: finite(self.carried_light_intensity, 4.0, defaults.carried_light_intensity),
             moon_intensity: finite(self.moon_intensity, 4.0, defaults.moon_intensity),
             dark_night_strength: finite(self.dark_night_strength, 1.0, defaults.dark_night_strength),
             shadow_strength: finite(self.shadow_strength, 1.0, defaults.shadow_strength),
@@ -221,18 +239,24 @@ mod tests {
         assert!(!defaults.any_enabled());
         assert_eq!(defaults.bloom_strength, 0.6);
         assert_eq!(defaults.clamped(), defaults);
-        for mask in 0..(1 << 15) {
+        assert_eq!(defaults.point_shadow_count, 4);
+        for (input, expected) in [(0, 1), (1, 1), (4, 4), (16, 16), (u32::MAX, 16)] {
+            assert_eq!(EnhancedSettings { point_shadow_count: input, ..defaults }.clamped().point_shadow_count, expected);
+        }
+        for mask in 0..(1 << 18) {
             let settings = EnhancedSettings {
                 sun_shadows: mask & 1 != 0, ambient_occlusion: mask & 2 != 0,
                 emissive_bloom: mask & 4 != 0, ground_grass: mask & 8 != 0, hdr: mask & 16 != 0, contact_shadows: mask & 32 != 0,
                 height_haze: mask & 64 != 0, land_haze: mask & 128 != 0, valley_mist: mask & 256 != 0,
                 volumetric_shafts: mask & 512 != 0, cloud_gap_shafts: mask & 1024 != 0,
                 volumetric_clouds: mask & 2048 != 0, cloud_shadows: mask & 4096 != 0, sky_discs: mask & 8192 != 0,
-                moon_shadows: mask & 16384 != 0,
+                moon_shadows: mask & 16384 != 0, material_specular: mask & 32768 != 0,
+                clustered_lighting: mask & 65536 != 0, local_light_shadows: mask & 131072 != 0,
                 ao_strength: 0.0, bloom_strength: 0.0, grass_density: 0.0, sun_boost: 0.0, grade_strength: 0.0, contact_strength: 0.0, ..defaults
             };
             assert_eq!(settings.any_enabled(), mask != 0);
             assert_eq!(settings.needs_sun_mask(), mask & (16 | 32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192) != 0);
+            assert_eq!(settings.needs_admitted_lights(), mask & (32768 | 65536 | 131072) != 0);
         }
         assert_eq!(EnhancedSettings { sun_boost: 9.0, ..defaults }.clamped().sun_boost, 0.6);
         for night_mode in [NightMode::Moonlit, NightMode::Dark] {
@@ -256,6 +280,7 @@ mod tests {
             assert_eq!(EnhancedSettings {
                 shadow_strength: invalid, shadow_softness: invalid, ao_radius: invalid, ao_strength: invalid, bloom_strength: invalid,
                 moon_intensity: invalid, dark_night_strength: invalid,
+                lamp_intensity: invalid, carried_light_intensity: invalid,
                 grass_density: invalid, grass_distance: invalid, sun_boost: invalid, grade_strength: invalid, contact_strength: invalid, ..defaults
             }.clamped(), defaults);
         }

@@ -32,10 +32,14 @@ fn shadow_vertex(v: VIn, uv: vec2<f32>, id: u32, matrix: mat4x4<f32>, fogged: bo
     return o;
 }
 @vertex fn vs_shadow_static(v: VIn) -> ShadowVertex {
-    return shadow_vertex(v, v.uv, 0u, shadow_frame.matrices[shadow_frame.control.x], false);
+    var o = shadow_vertex(v, v.uv, 0u, shadow_frame.matrices[shadow_frame.control.x], false);
+    if shadow_frame.control.z != 0u { o.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0); }
+    return o;
 }
-@vertex fn vs_shadow_actor(v: VIn, @location(11) uv: vec4<f32>, @location(12) id: u32) -> ShadowVertex {
-    return shadow_vertex(v, v.uv * uv.xy + uv.zw, id, shadow_frame.matrices[shadow_frame.control.x], false);
+@vertex fn vs_shadow_actor(v: VIn, @location(11) uv: vec4<f32>, @location(12) id: u32, @location(13) character: u32) -> ShadowVertex {
+    var o = shadow_vertex(v, v.uv * uv.xy + uv.zw, id, shadow_frame.matrices[shadow_frame.control.x], false);
+    if shadow_frame.control.z != 0u || (shadow_frame.control.w != 0u && character != 0u) { o.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0); }
+    return o;
 }
 @vertex fn vs_shadow_primary_static(v: VIn, @builtin(instance_index) id: u32) -> ShadowVertex {
     return shadow_vertex(v, v.uv, 0x80000000u | (id + 1u), g.vp, false);

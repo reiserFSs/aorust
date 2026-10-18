@@ -50,6 +50,18 @@ crates/ao-render/src/sun_shadows.wgsl follows the algorithm of
 rvk/shaders/ffp_main.glsl), MIT licensed. The WGSL is an independent
 reimplementation of the algorithm, not copied source.
 
+Local point/spot shadow cubes
+============================
+
+crates/ao-render/src/point_shadows.rs, point_shadow_select.wgsl and
+point_shadows.wgsl port the cube face-axis projection, major-axis perspective
+depth reconstruction and distance-ranked 0.8 incumbent hysteresis from ao-vk's rvk/pointshadow.cpp:
+https://github.com/wannabuh/ao-vk/blob/a0dc47ea2c853d26a4491d5a25ef0331f714b6ce/rvk/pointshadow.cpp
+The MIT license and Copyright (c) 2026 wannabuh notice above apply.
+This renderer uses current-frame GPU actor admission and exact carried-light
+actor ownership instead of ao-vk's remembered casters/carrier heuristics.
+
+
 HDR tonemap, grade and dither
 ======================
 
@@ -137,3 +149,26 @@ Native resource-name classification, current-frame source admission/revocation,
 world-anchored stabilized wind, unchanged original canopy coverage and bounded
 native topology refinement are specific to this renderer. No client assets are
 redistributed.
+
+Enhanced authored-material specular
+==================================
+
+crates/ao-render/src/authored_specular.wgsl ports PbrSpecular (GGX distribution,
+height-correlated Smith visibility, Schlick Fresnel and the game's pi-scaled
+light units) from ao-vk rvk/shaders/lighting.glsl at commit
+a0dc47ea2c853d26a4491d5a25ef0331f714b6ce:
+https://github.com/wannabuh/ao-vk/blob/a0dc47ea2c853d26a4491d5a25ef0331f714b6ce/rvk/shaders/lighting.glsl
+Copyright (c) 2026 wannabuh, distributed under the MIT License reproduced above.
+Authored shininess conversion and derivative normal-variance AA are this
+project's adaptations; no invented material or environment-reflection assets
+are used.
+
+Enhanced moonlight
+==================
+
+The optional moon-shadow path shares the directional blocker-search and
+Vogel-disk filter adapted from ao-vk's rvk/shaders/ffp_main.glsl
+(https://github.com/wannabuh/ao-vk), credited above under Soft sun-shadow filter.
+Copyright (c) 2026 wannabuh, under the MIT License; the complete copyright,
+permission and warranty notice reproduced above applies. Native moon tracks,
+fog extinction and current-frame actor admission remain this renderer's inputs.

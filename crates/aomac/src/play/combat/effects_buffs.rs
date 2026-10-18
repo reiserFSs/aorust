@@ -27,7 +27,7 @@ enum Native {
     Splash(legacy300x::Splash), WaterRipples(legacy300x::WaterRipples), CrazyCone(legacy300x::CrazyCone),
     LavaBall(lavaball::LavaBallEffect),
     GroundRing(legacy301x::GroundRing), Bubble(legacy301x::Bubble), Delay(legacy301x::Delay),
-    Shadow {effect:legacy300x::Shadow,indices:Vec<u32>,count:usize},
+    Shadow {effect:legacy300x::Shadow,indices:Vec<u32>,count:usize,source_actor:Option<u32>},
     Vein(vein::Vein),
     Font(legacy_buffs::Font), Fence(legacy_buffs::Fence), Notum(legacy_buffs::Notum),
     Hexagram(legacy_sprites::Hexagram), Drips(legacy_sprites::Drips),
@@ -70,7 +70,7 @@ impl Buff {
             3012=>{let mut n=legacy301x::GroundRing::new(t,source)?;n.configure(c);Native::GroundRing(n)},
             3016=>{let mut n=legacy301x::Bubble::new(t,source)?;n.configure(c);if c.source_nonvisual {n.invalidate_source();}Native::Bubble(n)},
             3013=>Native::Delay(legacy301x::Delay::new(t,source,c,crt)?),
-            3008=>{let mut effect=legacy300x::Shadow::new(t,source)?;effect.configure(c);Native::Shadow {effect,indices:Vec::new(),count:0}},
+            3008=>{let mut effect=legacy300x::Shadow::new(t,source)?;effect.configure(c);Native::Shadow {effect,indices:Vec::new(),count:0,source_actor:None}},
             3014=>Native::Vein(vein::Vein::new(t,source,c)?),
             2014=>Native::Font(legacy_buffs::Font::new(t,source,c)?),
             2012=>{let (store,pfid)=resources.ok_or_else(||anyhow::anyhow!("Fence requires actual playfield boundary resource"))?;Native::Fence(legacy_buffs::Fence::new(t,source,store,pfid)?)},
@@ -100,6 +100,7 @@ impl Buff {
     }
     pub(super) fn identity(&self)->Option<(u32,u32)> {match &self.native {Native::Shield(n)=>Some(n.identity()),Native::Highlight(n)=>Some(n.identity()),_=>self.config.source_identity}}
     pub(super) fn texture_clamp(&self)->bool {self.texture_clamp}
+    pub(super) fn native_shadow_source(&self)->Option<u32> {match &self.native {Native::Shadow {source_actor,..}=>*source_actor,_=>None}}
     pub(super) fn needs_source_mesh(&self)->bool {match &self.native {Native::Shield(_)|Native::Highlight(_)|Native::Deformer {..}|Native::Shadow {..}=>true,Native::Shield2 {effect,..}=>effect.mech_resource().is_none(),Native::Stars(n)=>n.needs_source_geometry(),_=>false}}
     pub(super) fn needs_source_pose(&self)->bool {match &self.native {
         Native::Shield(_)|Native::Shadow {..}=>true,
@@ -129,7 +130,7 @@ impl Buff {
             self.source_ready=true;
             return Ok(false);
         }
-        if let Native::Shadow {effect,..}=&mut self.native {effect.prepare_source(scene,actor)?;self.source_ready=true;return Ok(false);}
+        if let Native::Shadow {effect,source_actor,..}=&mut self.native {effect.prepare_source(scene,actor)?;*source_actor=Some(actor.id);self.source_ready=true;return Ok(false);}
         if let Native::Shield2 {effect,..}=&self.native {if effect.is_surface_stopped() {self.source_ready=true;return Ok(false);}}
         let Some(vertices)=actor.skin.as_deref() else {return Ok(false)};
         let Some(mesh)=scene.meshes.first() else {return Ok(false)};
@@ -183,7 +184,7 @@ impl Buff {
     pub(super) fn morph_actor(&self,id:u32,model:u64)->Option<ActorFrame> {
         let Native::Deformer {effect,visual:Some(visual),..}=&self.native else {return None};
         let (vertices,parts)=visual.pose(effect);
-        Some(ActorFrame { id,model,transform:self.source.to_cols_array_2d(), skin: Some(std::sync::Arc::new(vertices)), parts,alpha:effect.morph_alpha(),always:true,..Default::default() })
+        Some(ActorFrame { id,model,character:self.config.source_identity.is_some_and(|(kind,_)|kind==crate::play::dynels::CHAR_KIND as u32),transform:self.source.to_cols_array_2d(), skin: Some(std::sync::Arc::new(vertices)), parts,alpha:effect.morph_alpha(),always:true,..Default::default() })
     }
     pub(super) fn set_environment_position(&mut self,position:Vec3) {if let Native::Native301722(n)=&mut self.native {n.set_environment_position(position);}}
     pub(super) fn set_visible(&mut self,visible:bool) {match &mut self.native {Native::Spiral(n)=>n.set_visible(visible),Native::Native301722(n)=>n.set_source_visible(visible),_=>{}}}
@@ -348,7 +349,7 @@ impl Buff {
             Native::Vein(n)=>n.vertices(time,camera,right,up),
             Native::GroundRing(n)=>{let terrain=terrain.ok_or_else(||anyhow::anyhow!("GroundRing requires actual terrain locator"))?;n.vertices(terrain)},
             Native::Bubble(n)=>n.vertices(right,up),
-            Native::Shadow {effect,indices,count}=>{
+            Native::Shadow {effect,indices,count,..}=>{
                 let terrain=terrain.ok_or_else(||anyhow::anyhow!("Shadow requires actual terrain locator"))?;
                 if let Some((vertices,new_indices))=effect.geometry(terrain)? {*indices=new_indices;*count=vertices.len();Ok(Some(vec![vertices]))}
                 else {indices.clear();*count=0;Ok(Some(Vec::new()))}
@@ -402,6 +403,17 @@ mod tests {
         Ok(())
     }
     use super::*;
+    #[test]
+    fn native_shadow_owner_uses_submitted_actor_not_dynel_instance() -> Result<()> {
+        let (mut gc,mut ds,mut crt)=(R250::new(7),R250::new(8),CrtRand::new(1));
+        let mut buff=Buff::new(&Template {kind:3008,words:Vec::new()},Mat4::IDENTITY,Vec3::ZERO,0,
+            EffectConfig {source_identity:Some((50000,7)),..Default::default()},
+            &mut gc,&mut ds,&mut crt,None,None)?;
+        assert_eq!(buff.native_shadow_source(),None);
+        buff.prepare_source(&Scene::default(),&ActorFrame {id:0x4000_0007,..Default::default()},&mut crt)?;
+        assert_eq!(buff.native_shadow_source(),Some(0x4000_0007));
+        Ok(())
+    }
     #[test]
     fn authored_mech_shield_follows_live_source_transform() -> Result<()> {
         let mut words=vec![0;27];words[8]=20.0f32.to_bits();words[12]=50;words[19]=1;words[20]=5;

@@ -697,6 +697,7 @@ pub fn decode_mesh_lights(store: &RecordStore, rdb_type: u32, id: u32, offset: [
                     atten: if att == [0.0; 3] { [f32::MIN_POSITIVE, 0.0, 0.0] } else { att },
                     spot,
                     zone: None,
+                    owner: None,
                 });
             }
         }

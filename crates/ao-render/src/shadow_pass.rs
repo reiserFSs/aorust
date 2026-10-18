@@ -69,15 +69,21 @@ impl Renderer {
     pub(crate) fn encode_enhanced_shadows(&mut self, encoder: &mut wgpu::CommandEncoder, cam: &Camera, size: (u32, u32), env: Environment, far: f32) {
         self.shadow_timer_pending = false;
         if !self.enhanced_settings.sun_shadows && !self.enhanced_settings.moon_shadows
-            && !self.enhanced_settings.volumetric_shafts && self.enhanced_settings.night_mode != NightMode::Moonlit {
+            && !self.enhanced_settings.volumetric_shafts && !self.enhanced_settings.needs_admitted_lights()
+            && self.enhanced_settings.night_mode != NightMode::Moonlit {
             self.sun_shadows = None;
+            self.point_shadows = None;
             return;
         }
         let directional = self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows || self.enhanced_settings.volumetric_shafts;
-        let resource_size = if directional { size } else { (1, 1) };
+        let admission = directional || self.enhanced_settings.needs_admitted_lights();
+        // Moon illumination alone needs only the openness binding, not maps or a primary prepass.
+        let resource_size = if admission { size } else { (1, 1) };
         let resolution = if directional { self.enhanced_settings.shadow_map_size.clamp(256, 4096) } else { 1 };
         let mut shadows = self.sun_shadows.take().filter(|s| s.size == resource_size && s.resolution == resolution)
             .unwrap_or_else(|| SunShadows::new(self, resource_size, resolution));
+        shadows.sun_replacement_active = false;
+        shadows.native_fog_end = env.fog_end;
         let sun = (self.enhanced_settings.sun_shadows || self.enhanced_settings.volumetric_shafts)
             .then_some(self.shadow_sun).flatten().map(Vec3::from);
         let mut strength = sun.map_or(0.0, |direction| crate::sun_shadows::horizon_fade(direction.normalize().y))
@@ -87,35 +93,23 @@ impl Renderer {
             .then(|| self.enhanced_moonlight()).flatten().filter(|_| strength <= 0.0);
         let direction = moon.map(|(direction, _)| Vec3::from(direction)).or(sun);
         if let Some((direction, _)) = moon { strength = crate::sun_shadows::horizon_fade(Vec3::from(direction).normalize().y); }
-        if !directional { strength = 0.0; }
-        if strength <= 0.0 {
-            shadows.update(&self.queue, &CascadeFrame { uniform: bytemuck::Zeroable::zeroed() });
-            self.sun_shadows = Some(shadows);
-            return;
-        }
         let aspect = size.0 as f32 / size.1.max(1) as f32;
-        // Local fog changes with the eye; using it to fit cascades rescales the
-        // entire texel grid while walking. Keep the fit/splits camera-independent.
+        // Fit is independent of local eye fog: only receiver reach changes.
         let shadow_far = self.lens.far.unwrap_or(180.0).min(180.0).max(self.lens.near + 0.01);
         let receiver_far = far.min(env.fog_end).min(shadow_far);
-        let Some(mut frame) = CascadeFrame::new(cam.pos, cam.forward(), cam.up(), self.lens.vertical_fov(aspect),
-            aspect, self.lens.near, shadow_far, direction.expect("positive authored directional strength"), resolution) else {
-            shadows.update(&self.queue, &CascadeFrame { uniform: bytemuck::Zeroable::zeroed() });
-            self.sun_shadows = Some(shadows);
-            return;
-        };
-        frame.uniform.forward[3] = strength * self.enhanced_settings.shadow_strength.clamp(0.0, 1.0);
-        frame.uniform.eye[3] = receiver_far;
-        frame.uniform.control[1] = self.enhanced_settings.shadow_softness.clamp(0.0, 4.0).to_bits();
-        if let Some((direction, budget)) = moon {
-            frame.uniform.moon_direction = Vec3::from(direction).normalize().extend(1.0).to_array();
-            frame.uniform.moon_budget = [budget[0], budget[1], budget[2], 0.0];
+        let mut frame = direction.filter(|_| strength > 0.0).and_then(|direction|
+            CascadeFrame::new(cam.pos, cam.forward(), cam.up(), self.lens.vertical_fov(aspect),
+                aspect, self.lens.near, shadow_far, direction, resolution));
+        if let Some(frame) = frame.as_mut() {
+            frame.uniform.forward[3] = strength * self.enhanced_settings.shadow_strength.clamp(0.0, 1.0);
+            frame.uniform.eye[3] = receiver_far;
+            frame.uniform.control[1] = self.enhanced_settings.shadow_softness.clamp(0.0, 4.0).to_bits();
+            if let Some((direction, budget)) = moon {
+                frame.uniform.moon_direction = Vec3::from(direction).normalize().extend(1.0).to_array();
+                frame.uniform.moon_budget = [budget[0], budget[1], budget[2], 0.0];
+            }
         }
-        shadows.update(&self.queue, &frame);
-        // The primary pass uses only the native visible list. Cascades also
-        // admit loaded static geometry in their bounded light volumes.
-        self.prepare_actor_shadows(&mut shadows);
-        self.prepare_static_shadow_casters(&mut shadows, &frame);
+        if admission { self.prepare_actor_shadows(&mut shadows); } else { shadows.actor_ids.clear(); shadows.actor_groups.clear(); }
         if !shadows.actor_ids.is_empty() {
             let timestamp_writes = self.shadow_timestamp(false);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -134,6 +128,15 @@ impl Renderer {
             self.draw_actor_shadows(&mut pass, &shadows, true);
         }
         shadows.encode_actor_visibility(encoder);
+        self.encode_point_shadows(encoder, cam, &mut shadows);
+        let Some(mut frame) = frame else {
+            shadows.update(&self.queue, &CascadeFrame { uniform: bytemuck::Zeroable::zeroed() });
+            self.sun_shadows = Some(shadows);
+            return;
+        };
+        frame.include_caster_depth(self.gpu.insts.iter().filter(|instance| !instance.hidden).map(|instance| (instance.center, instance.radius)));
+        shadows.update(&self.queue, &frame);
+        self.prepare_static_shadow_casters(&mut shadows, &frame);
         for layer in 0..CASCADES {
             let timestamp_writes = self.shadow_timestamp(layer == CASCADES - 1);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -151,10 +154,11 @@ impl Renderer {
             self.draw_actor_shadows(&mut pass, &shadows, false);
             self.draw_canopy_leaf_shadows(&mut pass, &shadows);
         }
+        shadows.sun_replacement_active = self.enhanced_settings.sun_shadows && moon.is_none() && frame.uniform.forward[3] > 0.0;
         self.sun_shadows = Some(shadows);
     }
 
-    fn prepare_static_shadow_casters(&self, shadows: &mut SunShadows, frame: &CascadeFrame) {
+    pub(crate) fn prepare_static_shadow_casters(&self, shadows: &mut SunShadows, frame: &CascadeFrame) {
         let planes = frame.uniform.matrices.map(|matrix| frustum_planes(&Mat4::from_cols_array_2d(&matrix)));
         shadows.static_commands.clear();
         let mut changed = shadows.static_transforms.len() != self.gpu.insts.len();
@@ -163,7 +167,7 @@ impl Renderer {
             shadows.static_transforms.extend(self.gpu.insts.iter().map(|instance| instance.m));
         }
         for (index, draw) in self.gpu.opaque.iter().enumerate() {
-            if draw.count == 0 || self.ground.as_ref().is_some_and(|ground| ground.materials[draw.mesh].is_some()) { continue; }
+            if draw.count == 0 { continue; }
             for slot in self.gpu.mesh_range[draw.mesh].clone() {
                 let instance = &self.gpu.insts[slot];
                 if instance.hidden || (!self.spaceships_shown && self.spaceship_slots[slot])
@@ -171,7 +175,7 @@ impl Renderer {
                     || self.movers.iter().any(|run| run.slot == slot) { continue; }
                 let key = draw.node.map(|(node, _)| VisualKey::World(slot, node));
                 if visual_priority(draw, key, &self.drawn_visuals).is_some_and(|priority| priority < 0) { continue; }
-                if planes.iter().any(|planes| planes.iter().all(|plane| plane.dot(instance.center.extend(1.0)) >= -instance.radius)) {
+                if crate::shadow_coverage::admits_sphere(&planes, instance.center, instance.radius) {
                     if shadows.static_transforms[slot] != instance.m {
                         shadows.static_transforms[slot] = instance.m;
                         changed = true;
@@ -197,7 +201,7 @@ impl Renderer {
         }
     }
 
-    fn draw_static_shadows(&self, pass: &mut wgpu::RenderPass, shadows: &SunShadows, primary: bool) {
+    pub(crate) fn draw_static_shadows(&self, pass: &mut wgpu::RenderPass, shadows: &SunShadows, primary: bool) {
         let Some(instances) = (if primary { self.gpu.inst_bufs.get(self.frame) } else { shadows.static_instances.as_ref() }) else { return; };
         pass.set_vertex_buffer(1, instances.slice(..));
         let (mut pipe, mut mesh, mut mat) = (None, None, None);

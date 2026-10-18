@@ -1,6 +1,9 @@
 // Surface lighting changes before the native material/fog equation; admission,
 // authored normals, alpha and fog extinction remain native.
+// Shared pre-cosine energy: GGX consumes the same roof and cascade sample.
+var<private> enhanced_moon_radiance: vec3<f32> = vec3<f32>(0.0);
 fn authored_moon_add(input: VOut, authored_normal: vec3<f32>) -> vec3<f32> {
+    enhanced_moon_radiance = vec3<f32>(0.0);
     if g.moon_direction.w <= 0.0 || native_unlit() || mat.emissive.w > 1.5 || (input.effect & 0x7fffffffu) != 0u {
         return vec3<f32>(0.0);
     }
@@ -9,10 +12,15 @@ fn authored_moon_add(input: VOut, authored_normal: vec3<f32>) -> vec3<f32> {
     // One global copy of the native lattice serves both materials and terrain.
     let exposed = enhanced_sky_open(input.wpos);
     let cosine = max(dot(authored_normal / normal_length, g.moon_direction.xyz), 0.0);
-    return g.moon_g.rgb * cosine * exposed * MOON_VISIBILITY;
+    MOON_RAW_RESET
+    let visibility = MOON_VISIBILITY;
+    let energy = g.moon_g.rgb * exposed;
+    enhanced_moon_radiance = energy * MOON_SPEC_VISIBILITY;
+    return energy * visibility * cosine;
 }
 fn authored_moon_receiver(input: VOut, authored_normal: vec3<f32>, ground: bool) -> VOut {
     var receiver = input;
+    enhanced_moon_radiance = vec3<f32>(0.0);
     if native_unlit() || mat.emissive.w > 1.5 || (input.effect & 0x7fffffffu) != 0u { return receiver; }
     var light = input.light;
     var dlight = input.dlight;

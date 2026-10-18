@@ -15,13 +15,15 @@ fn shader_source() -> std::borrow::Cow<'static, str> {
 }
 
 pub(crate) fn receiver_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let mut entries = receiver_entries().to_vec();
+    entries.push(exposure_entry());
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("sun shadow receiver"),
-        entries: &receiver_entries(),
+        entries: &entries,
     })
 }
 
-pub(crate) fn receiver_entries() -> [wgpu::BindGroupLayoutEntry; 4] {
+pub(crate) fn receiver_entries() -> [wgpu::BindGroupLayoutEntry; 3] {
     [
             wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform,
@@ -31,10 +33,13 @@ pub(crate) fn receiver_entries() -> [wgpu::BindGroupLayoutEntry; 4] {
                     view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }, count: None },
             wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison), count: None },
-            wgpu::BindGroupLayoutEntry { binding: 7, visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false, min_binding_size: None }, count: None },
     ]
+}
+
+pub(crate) fn exposure_entry() -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry { binding: 7, visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false, min_binding_size: None }, count: None }
 }
 
 pub(super) fn horizon_fade(elevation: f32) -> f32 {
@@ -114,10 +119,14 @@ impl CascadeFrame {
             forward: forward.extend(horizon_fade(authored_sun.y)).to_array(), control: [0; 4],
             moon_direction: [0.0; 4], moon_budget: [0.0; 4] } })
     }
+    pub(crate) fn include_caster_depth(&mut self, casters: impl Clone + Iterator<Item = (Vec3, f32)>) {
+        for matrix in &mut self.uniform.matrices {
+            *matrix = crate::shadow_coverage::include_caster_depth(Mat4::from_cols_array_2d(matrix), casters.clone()).to_cols_array_2d();
+        }
+    }
 }
 
 pub(crate) struct SunShadows {
-    pub coverage_uniform: ShadowUniform,
     pub receiver: wgpu::BindGroup,
     pub grass_receiver: Option<wgpu::BindGroup>,
     array: wgpu::TextureView,
@@ -130,6 +139,9 @@ pub(crate) struct SunShadows {
     pub primary_ids: wgpu::TextureView,
     pub size: (u32, u32),
     pub resolution: u32,
+    pub sun_replacement_active: bool,
+    pub coverage_uniform: ShadowUniform,
+    pub native_fog_end: f32,
     pub compiled: std::sync::Arc<Compiled>,
     /// Current-frame union-of-cascades casters, in original draw/instance order.
     pub static_commands: Vec<(usize, std::ops::Range<u32>)>,
@@ -139,15 +151,16 @@ pub(crate) struct SunShadows {
     pub actor_ids: Vec<u32>,
     pub actor_groups: std::collections::HashMap<u32, u32>,
     pub actor_ids_buffer: wgpu::Buffer,
-    actor_visibility: wgpu::Buffer,
+    pub(crate) actor_visibility: wgpu::Buffer,
     actor_capacity: usize,
     visibility_group: wgpu::BindGroup,
     uniforms: [wgpu::Buffer; CASCADES],
+    exposure: wgpu::Buffer,
 }
 /// Size-independent shadow programs, shared by every runtime target allocation.
 pub(crate) struct Compiled {
     pub pipelines: std::collections::HashMap<(bool, usize, bool), Option<crate::pipeline_creation::RenderPipeline>>,
-    pub(super) caster_layout: wgpu::BindGroupLayout,
+    pub(crate) caster_layout: wgpu::BindGroupLayout,
     visibility_layout: wgpu::BindGroupLayout,
     visibility_pipeline: crate::pipeline_creation::ComputePipeline,
 }
@@ -276,8 +289,9 @@ impl SunShadows {
         let cascade_groups = caster_groups(device, caster_layout, &uniforms, &actor_visibility);
         let visibility_group = visibility_group(device, visibility_layout, &primary_ids, &actor_visibility);
         Self { receiver, grass_receiver: None, array, sampler, cascade_groups, layers, _maps: maps,
-            coverage_uniform: ShadowUniform::zeroed(),
-            primary_depth, primary_ids, size, resolution, uniforms, compiled,
+            primary_depth, primary_ids, size, resolution, uniforms, compiled, exposure,
+            sun_replacement_active: false, coverage_uniform: ShadowUniform::zeroed(),
+            native_fog_end: f32::INFINITY,
             static_commands: Vec::new(), static_transforms: Vec::new(),
             static_instances: None, static_capacity: 0, actor_ids: Vec::new(), actor_groups: Default::default(),
             actor_ids_buffer, actor_visibility, actor_capacity, visibility_group }
@@ -333,6 +347,22 @@ impl SunShadows {
             + (std::mem::size_of::<ShadowUniform>() * CASCADES) as u64
             + (self.static_capacity * 64) as u64
             + ((self.actor_capacity * 2 + 1) * 4) as u64
+    }
+    pub(crate) fn point_receiver(&self, device: &wgpu::Device, points: &crate::point_shadows::PointShadows) -> wgpu::BindGroup {
+        device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
+            label: Some("directional and local shadow receivers"),
+            layout: &crate::point_shadows::receiver_layout(device),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.uniforms[0].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.array) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: self.actor_visibility.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&points.array) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&points.sampler) },
+                wgpu::BindGroupEntry { binding: 6, resource: points.metadata.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: self.exposure.as_entire_binding() },
+            ],
+        })
     }
 }
 
@@ -410,7 +440,7 @@ pub(crate) fn compile_pipeline(
     let vertices = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
     let instances = wgpu::vertex_attr_array![4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4];
     let actors = wgpu::vertex_attr_array![4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4,
-        8 => Float32x4, 9 => Float32x4, 10 => Float32x4, 11 => Float32x4];
+        8 => Float32x4, 9 => Float32x4, 10 => Float32x4, 11 => Float32x4, 13 => Uint32];
     let actor_ids = wgpu::vertex_attr_array![12 => Uint32];
     let buffers = [
         wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Vertex, attributes: &vertices },

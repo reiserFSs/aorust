@@ -12,17 +12,22 @@ pub(super) struct Key {
     bloom: bool,
     sun_mask: bool,
     foliage: [bool; 6],
+    material_specular: bool,
+    clustered_lighting: bool,
+    local_light_shadows: bool,
     pub msaa: u32,
 }
 
 impl Key {
     pub(super) fn of(settings: EnhancedSettings, msaa: u32) -> Self {
-        Self { shadows: settings.sun_shadows || settings.moon_shadows, ao: settings.ambient_occlusion,
+        Self { shadows: settings.sun_shadows, ao: settings.ambient_occlusion,
             moon_shadows: settings.moon_shadows, night_mode: settings.night_mode,
+            material_specular: settings.material_specular, clustered_lighting: settings.clustered_lighting,
+            local_light_shadows: settings.local_light_shadows,
             bloom: settings.emissive_bloom, sun_mask: settings.needs_sun_mask(), msaa,
             foliage: [settings.foliage_edges, settings.foliage_sway, settings.foliage_push, settings.foliage_subdivision, settings.foliage_translucency, settings.foliage_lod] }
     }
-    fn enhanced(self) -> bool { self.shadows || self.ao || self.bloom || self.sun_mask || self.night_mode != super::NightMode::AsGame || self.foliage.iter().any(|&v| v) }
+    fn enhanced(self) -> bool { self.shadows || self.moon_shadows || self.ao || self.bloom || self.sun_mask || self.material_specular || self.clustered_lighting || self.local_light_shadows || self.night_mode != super::NightMode::AsGame || self.foliage.iter().any(|&v| v) }
 }
 
 pub(super) struct Pipes {
@@ -151,8 +156,11 @@ impl Request {
                 label: Some("Enhanced world"), source: wgpu::ShaderSource::Wgsl(source.into()),
             })
         });
-        let shadow_layout = (self.key.shadows || self.settings.night_mode == super::NightMode::Moonlit)
-            .then(|| super::sun_shadows::receiver_layout(&self.device));
+        let shadow_layout = if self.settings.needs_admitted_lights() {
+            Some(super::point_shadows::receiver_layout(&self.device))
+        } else {
+            (self.key.shadows || self.key.moon_shadows || self.settings.night_mode == super::NightMode::Moonlit).then(|| super::sun_shadows::receiver_layout(&self.device))
+        };
         let mut ordinary = vec![Some(&self.g_layout), Some(&self.tex_layout)];
         let mut holo = vec![Some(&self.g_layout), Some(&self.tex_layout), Some(&self.holo_layout)];
         if let Some(shadow_layout) = shadow_layout.as_ref() {
@@ -231,6 +239,46 @@ impl Pending {
 mod tests {
     use super::*;
     use crate::Renderer;
+
+    #[test]
+    fn independent_lighting_switches_have_distinct_shader_keys() {
+        let mut keys = Vec::new();
+        for night_mode in [crate::NightMode::AsGame, crate::NightMode::Moonlit, crate::NightMode::Dark] {
+            for flags in 0..256 {
+                let settings = EnhancedSettings {
+                    sun_shadows: flags & 1 != 0, moon_shadows: flags & 2 != 0,
+                    ambient_occlusion: flags & 4 != 0, emissive_bloom: flags & 8 != 0,
+                    hdr: flags & 16 != 0, material_specular: flags & 32 != 0,
+                    clustered_lighting: flags & 64 != 0, local_light_shadows: flags & 128 != 0,
+                    night_mode, ..Default::default()
+                };
+                let key = Key::of(settings, 1);
+                assert!(!keys.contains(&key), "independent shader settings cannot alias in the cache");
+                keys.push(key);
+            }
+        }
+        let defaults = EnhancedSettings::default();
+        assert_ne!(Key::of(defaults, 1), Key::of(defaults, 4));
+        assert!(!Key::of(defaults, 1).enhanced());
+        for flags in 1..64 {
+            let settings = EnhancedSettings {
+                foliage_edges: flags & 1 != 0, foliage_sway: flags & 2 != 0,
+                foliage_push: flags & 4 != 0, foliage_subdivision: flags & 8 != 0,
+                foliage_translucency: flags & 16 != 0, foliage_lod: flags & 32 != 0,
+                ..defaults
+            };
+            let key = Key::of(settings, 1);
+            assert!(key.enhanced());
+            assert!(!keys.contains(&key), "independent foliage shader settings cannot alias");
+            keys.push(key);
+        }
+        assert_eq!(Key::of(defaults, 1), Key::of(EnhancedSettings {
+            shadow_map_size: 4096, point_shadow_count: 16,
+            lamp_intensity: 2.0, carried_light_intensity: 2.0, moon_intensity: 2.0,
+            dark_night_strength: 0.5, shadow_strength: 0.5, shadow_softness: 2.0,
+            ao_strength: 0.5, bloom_strength: 0.5, ..defaults
+        }, 1), "runtime strengths, texture dimensions and cube budgets do not change the shader layout");
+    }
 
     #[test]
     fn standalone_live_msaa_request_compiles_off_frame_thread_and_reuses_cache() {

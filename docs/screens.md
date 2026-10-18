@@ -754,11 +754,11 @@ the function (xrefs: only these two, plus the export table; no other client DLL 
 
 ## Optional Enhanced sun shadows
 
-`ao-render/src/sun_shadows.rs`, `shadow_pass.rs` and `shadow_actors.rs` implement an explicitly optional enhancement, not a reconstructed retail shadow algorithm. The default-off switch retains the faithful draw path. Three current-frame depth cascades use only the authored sun direction, world-basis texel snapping, 3×3 comparison filtering and overlap/far fades. No synthetic moon direction or night illumination is added.
+`ao-render/src/sun_shadows.rs`, `shadow_pass.rs` and `shadow_actors.rs` implement an explicitly optional enhancement, not a reconstructed retail shadow algorithm. The default-off switch retains the faithful draw path. Three current-frame depth cascades use the authored sun direction, world-basis texel snapping, comparison filtering and overlap/far fades. The independent Moonlit night mode derives adjustable energy from the authored moon pose/phase and sky; optional moon shadows reuse these cascades only when the selected source is the moon. No opposite-sun or guessed moon pose is used.
 
 Loaded opaque/cutout static geometry inside the cascade light volumes and admitted, non-faded native actor parts cast. A current-frame depth-tested actor-ID image is reduced to a visibility mask: an actor needs at least one visible primary pixel before any of its parts enter a cascade. An actor hidden by an opaque wall cannot leave a shadow; body/head/weapon self-occlusion cannot punch camera-dependent holes in a visible actor's shadow. No actor visibility history is retained. The same current skinned vertex buffers feed both passes. Terrain keeps its original baked palette; shadow receiving removes only its live directional-light share, not the baked shade or ambient/local illumination. The enhancement never adds illumination. `shadow_tests::hidden_actor_present_absent_images_are_identical` is a headless raw-image fairness regression.
 
-Fully fogged actor pixels do not seed admission, so an actor hidden by the original fog cannot disclose itself through a nearer ground shadow. Native material/mode-2 no-fog authoring is preserved. At night or without an authored sun budget, neither caster passes nor PCF lookups run.
+Fully fogged actor pixels do not seed admission, so an actor hidden by the original fog cannot disclose itself through a nearer ground shadow. Native material/mode-2 no-fog authoring is preserved. Sun caster passes and PCF lookups close when its authored sun budget is absent; Moonlit mode may independently select an above-horizon authored moon, with the same current-frame actor admission and unchanged fog extinction.
 
 Horizon fading uses the normalized authored sun elevation: full shadow strength at 4°, smoothly decreasing to zero at 0°. A low but still positive sun keeps casting while its authored directional-light share is nonzero; no positive-elevation cutoff suppresses long sunset shadows.
 
@@ -770,4 +770,81 @@ Temporal stability uses rotation-invariant cascade bounding spheres and a world-
 The separate receiver limit retains a smooth fade over its final 10% when it ends before the stable cascade envelope; native no-fog materials must not reveal a hard shadow cutoff.
 
 `shadow_temporal_tests::temporal_shadow_world_receivers_remain_stable` renders 90 consecutive shadowed/reference pairs in each of three cases: orbit/walk through a local fog volume, stationary advancing sun/time, and a moving CPU-skinned actor. World-projected ground masks remove legitimate fog attenuation and exclude analytic shadow/geometry boundaries from interior assertions; edges are measured separately. On the synthetic fixture the orbit edge mean/max changed from 0.005759/0.149346 to 0.001045/0.015771; advancing-sun edge mean/max from 0.000109/0.118988 to 0.000079/0.042913. Static interior samples above two intensity codes: zero in every case. Returning to the first state after each sequence changed zero pixels. This does not explain the separately reported one-pixel Borealis foliage first-frame nondeterminism: cascade layers already clear every submitted frame, and static caching retains transforms, not depth images.
+
+## Optional Enhanced local point/spot shadows
+
+`AomacLocalLightShadows` / `EnhancedSettings.local_light_shadows` is independent
+of sun/moon shadows and clustered lighting, and defaults off. The implementation
+in `ao-render/src/point_shadows.rs`, `point_shadow_select.wgsl` and
+`point_shadows.wgsl` supports one to sixteen 256² depth cubes (six faces each).
+`AomacPointShadowCount` defaults to four: 24 actual face passes / 6 MiB of depth
+maps, with sixteen / 96 passes / 24 MiB available. GPU primary-owner admission
+precedes both the 64-light pool and the cube budget; a hidden owner cannot evict
+a visible lamp. GPU ranking gives retained sources the ao-vk 0.8 distance-key
+preference. Exact owner ID plus per-owner light ordinal preserves cube identity
+when unrelated actor or producer order changes.
+
+Initial scene lamps start fully visible; genuinely new source appearances fade
+over 0.25 seconds of renderer simulation time. Source birth age covers every
+current native candidate before either capacity cap, so an existing lamp
+restored after a now-hidden owner frees capacity does not retain a fade deficit.
+Frozen captures never advance fades. Face matrices and ownership/empty flags are
+generated on GPU; current loaded static ranges are submitted without inferring
+GPU visibility on CPU. Every active face is redrawn from the current frame;
+there is no cached geometry or historical pose.
+
+Opaque/cutout loaded statics obey the existing hidden/native-visual admission
+rules. Actor casters reuse the directional shadow pass's current-pose buffers
+and GPU primary-visible identity reduction, without CPU readback. Carried lights
+carry the exact actor identity from `Avatar::lights` / remote mounted-light
+submission. An owner absent from the primary-visible reduction cannot emit a
+shadow (or an override light). Carried lights do not cast character silhouettes
+or shadow character receivers; static lamps may shadow admitted characters.
+`ActorFrame.character` is explicit, Default-false provenance: native SimpleChar /
+avatar submissions and character-source morphs set it, while doors, dynamic
+props and effect meshes remain non-characters. Every body/head/mounted part of a
+character inherits the same flag. CAT skinning, actor-buffer membership, mesh
+size and position are not character heuristics.
+
+The actor instance's native 128-byte transform/material/UV prefix is unchanged;
+a typed `Uint32` character attribute at location 13 follows it (132-byte stride).
+The faithful shader ignores that attribute. Enhanced receivers set the existing
+flat character marker only for true character inputs, and an owned cube's caster
+flag clips only character parts. Admitted dynamic doors and props therefore
+continue both casting and receiving carried-light shadows.
+
+The admitted pool's packed light axis.w lane carries the one-based cube slot in
+its low five integer bits. Negative values additionally encode the exact primary
+actor group as `-(32 * (group + 1) + slot)`; group zero is unadmitted. The cube
+receiver reconstructs perspective depth from the largest absolute
+light-to-receiver component and comparison-filters only that light's local share.
+With local shadows alone, the generated vertex/fragment evaluators consume the
+same admitted pool while retaining the native eight-light-per-receiver limit;
+clustered lighting independently removes that limit up to the 64-source pool.
+The faithful shader and native alpha/fog equations remain unchanged.
+
+Standalone Material Specular also requires the GPU-admitted light pool and
+current-frame primary-owner proof, even with local/clustered shadows off.
+`EnhancedSettings::needs_admitted_lights` centralizes that resource contract.
+Specular-only keeps native Gouraud-style diffuse and the eight-light limit,
+filtering its vertex-light inputs before either native or 64-source caps; only
+specular is evaluated per pixel. It does not enable clustered per-pixel diffuse
+reconstruction or light-intensity overrides. Leaving all three consumers disabled
+releases the shared pool/admission targets and restores the native moving buffer.
+
+`specular_admission_tests::standalone_ggx_hidden_owners_cannot_emit_or_evict_visible_highlights`
+uses a black diffuse / authored-specular receiver and a white character control.
+It compares hidden-source absence/presence, 65 hidden moving sources before a
+visible lamp, the static sixteen-entry cell-cap boundary, an actual admitted
+highlight, all-off image restoration and shared GPU pool release.
+
+Regression coverage includes actual receiver darkening, all-off roundtrip,
+unknown-owner neutrality, hidden sources inserted before a visible carried
+source, stable GPU cube identity/fade under dense-ID and producer reordering,
+immediate static-shadow restoration after an owner hides, the sixteen-cube cap,
+cube projection depth and the generated shader option matrix. A separate real
+GPU character/door fixture toggles classification on identical geometry to check
+character-only caster/receiver exclusions, unchanged all-off image bytes and
+all-off restoration; ABI assertions retain every native prefix offset.
+
 

@@ -78,6 +78,7 @@ pub(super) struct ActorInstance {
     specular: [f32; 4],
     power: [f32; 4],
     uv: [f32; 4],
+    character: u32,
 }
 
 struct ModelMesh {
@@ -135,6 +136,8 @@ struct Item {
     faded: bool,
     rendering_effect: u32,
     priority: Option<i32>,
+    native_shadow_source: Option<u32>,
+    native_shadow_receiver: Option<(Vec3, f32)>,
 }
 
 fn bounds_depth((center, half): (Vec3, Vec3), transform: Mat4, eye: Vec3, forward: Vec3) -> f32 {
@@ -625,6 +628,7 @@ impl Renderer {
     /// Frustum-culls the submitted actors, fills the instance buffer; called by `render` before the pass.
     pub(crate) fn prepare_actors(&mut self, cam: Vec3, forward: Vec3, planes: &[Vec4; 6]) {
         let grass_enabled = self.enhanced_settings().ground_grass;
+        let sun_enabled = self.enhanced_settings().sun_shadows;
         let layer = &mut self.act;
         layer.items.clear();
         let mut xf: Vec<ActorInstance> = vec![];
@@ -652,8 +656,8 @@ impl Renderer {
                 }
                 let bucket = f.render_bucket.filter(|b| (0..=1800).contains(b))
                     .unwrap_or_else(|| render_bucket(m.w_axis.truncate().distance(cam)));
-                let fog_depth = if mi == 0 && grass_enabled {
-                    let bounds = if let Some(actor) = layer.actors.get(&f.id).filter(|actor| actor.vb.is_some()) {
+                let fog_depth = if (mi == 0 && grass_enabled) || sun_enabled {
+                    let bounds = if let Some(actor) = layer.actors.get(&f.id).filter(|actor| mi == 0 && actor.vb.is_some()) {
                         actor.skin.as_ref().and(actor.skin_bounds)
                     } else { Some(mesh.bounds) };
                     // Native CAT vertices live on the GPU. Keep the conservative pose
@@ -664,7 +668,16 @@ impl Renderer {
                         (c - cam).dot(forward) - (mesh.sphere.1 + margin) * support
                     }, |bounds| bounds_depth(bounds, m, cam, forward))
                 } else { f32::NEG_INFINITY };
-                layer.items.push(Item { actor: f.id, model: f.model, mesh: mi, fog_depth, bucket, faded: alpha < 1.0, rendering_effect: f.rendering_effect, priority });
+                let native_shadow_receiver = f.native_shadow_source.filter(|_| sun_enabled).map(|_| {
+                    // Native blobs have CPU-projected, terrain-warped vertices;
+                    // their receiver can lie far from the owning actor's origin.
+                    let (center, half) = layer.actors.get(&f.id).filter(|actor| mi == 0 && actor.vb.is_some())
+                        .and_then(|actor| actor.skin_bounds).unwrap_or(mesh.bounds);
+                    let extent = m.x_axis.truncate().abs() * half.x
+                        + m.y_axis.truncate().abs() * half.y + m.z_axis.truncate().abs() * half.z;
+                    (m.transform_point3(center), extent.length())
+                });
+                layer.items.push(Item { actor: f.id, model: f.model, mesh: mi, fog_depth, bucket, faded: alpha < 1.0, rendering_effect: f.rendering_effect, priority, native_shadow_source: f.native_shadow_source, native_shadow_receiver });
                 // m0.w carries `alpha - 1` to the shader (the affine matrix' unused column element)
                 let mut a = m.to_cols_array_2d();
                 a[0][3] = alpha.min(1.0) - 1.0;
@@ -678,6 +691,7 @@ impl Renderer {
                     specular: color(material.and_then(|m|m.specular).or(f.specular)),
                     power: [f.specular_power.unwrap_or(0.0), if f.specular_power.is_some() { 1.0 } else { 0.0 }, f.rendering_effect as f32, f.rendering_effect_time],
                     uv: f.part_uvs.get(mi).copied().unwrap_or([1.0, 1.0, 0.0, 0.0]),
+                    character: u32::from(f.character),
                 });
             }
         }
@@ -741,6 +755,7 @@ impl Renderer {
             let one=|pass:&mut wgpu::RenderPass,i:usize| {
                 if buf.is_none() {return}
                 let it = &layer.items[i];
+                if it.native_shadow_source.is_some_and(|source| self.replaces_native_shadow(source, it.native_shadow_receiver)) { return; }
                 let model = &layer.models[&it.model];
                 let Some(mesh) = model.meshes[it.mesh].as_ref() else { return };
                 let own = (it.mesh == 0).then(|| layer.actors.get(&it.actor)?.vb.as_ref()).flatten();
@@ -983,6 +998,17 @@ pub(super) fn bucket_order(priority_a: i32, bucket_a: i32, priority_b: i32, buck
 #[cfg(test)]
 mod tests {
     #[test]
+    fn actor_character_metadata_preserves_the_native_instance_prefix() {
+        assert_eq!(std::mem::offset_of!(super::ActorInstance, transform), 0);
+        assert_eq!(std::mem::offset_of!(super::ActorInstance, emissive), 64);
+        assert_eq!(std::mem::offset_of!(super::ActorInstance, specular), 80);
+        assert_eq!(std::mem::offset_of!(super::ActorInstance, power), 96);
+        assert_eq!(std::mem::offset_of!(super::ActorInstance, uv), 112);
+        assert_eq!(std::mem::offset_of!(super::ActorInstance, character), 128);
+        assert_eq!(std::mem::size_of::<super::ActorInstance>(), 132);
+        assert!(!ao_scene::ActorFrame::default().character);
+    }
+    #[test]
     fn mesh_delta_state_pipeline_modes_preserve_material_states() {
         for pipe in 0..MESH_EFFECT_STRIDE {
             for projection_pass in [false, true] {
@@ -1003,7 +1029,7 @@ mod tests {
             view_of: HashMap::new(), textures: vec![], identities: HashMap::new(),
             topology: vec![(0, vec![ao_scene::Submesh::new(vec![], None)])], native_skin: None });
         layer.items.push(Item { actor: 7, model: 1, mesh: 0, fog_depth: 9.0,
-            bucket: 0, faded: false, rendering_effect: 0, priority: None });
+            bucket: 0, faded: false, rendering_effect: 0, priority: None, native_shadow_source: None, native_shadow_receiver: None });
         let camera = Camera::look_at(Vec3::ZERO, -Vec3::Z);
         let ids = |layer: &ActorLayer, end| layer.enhanced_grass_actor_ids(end).collect::<Vec<_>>();
         assert_eq!(ids(&layer, 20.0), [7], "positive control: a drawn opaque body bends");
@@ -1423,7 +1449,7 @@ mod tests {
             layer.models.entry(model).or_insert_with(|| Model { meshes: vec![], mats: vec![], holo: None, views: vec![], view_of: HashMap::new(), textures: vec![], identities: HashMap::new(), topology: vec![], native_skin: None });
             layer.actors.insert(id, ActorGpu { vb: None, seen: 1, model, skin: None, skin_bounds: None, pose: None });
             layer.frames.push(ActorFrame { id, model, skin: Some(std::sync::Arc::new(vec![ao_scene::Vertex::default()])), ..Default::default() });
-            layer.items.push(Item { actor: id, model, mesh: 0, fog_depth: 0.0, bucket: 0, faded: false, rendering_effect: 0, priority: None });
+            layer.items.push(Item { actor: id, model, mesh: 0, fog_depth: 0.0, bucket: 0, faded: false, rendering_effect: 0, priority: None, native_shadow_source: None, native_shadow_receiver: None });
         }
         for key in [7, 7, 99] {
             layer.remove_model(key);

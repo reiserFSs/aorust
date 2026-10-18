@@ -3662,7 +3662,7 @@ impl Dynels {
             let (s, cs) = scene_yaw(c.pose.yaw).sin_cos();
             let k = c.scale;
             let transform = [[cs * k, 0.0, -s * k, 0.0], [0.0, k, 0.0, 0.0], [s * k, 0.0, cs * k, 0.0], [p[0], p[1], p[2], 1.0]];
-            let actor = ActorFrame { id: *id as u32, model: c.key, transform, parts: c.parts.clone(), part_attractors: rig.part_attractors(), skin_pose: c.current_palette.as_ref().map(Arc::clone), always: false, alpha: 1.0, ..Default::default() };
+            let actor = ActorFrame { id: *id as u32, model: c.key, character: true, transform, parts: c.parts.clone(), part_attractors: rig.part_attractors(), skin_pose: c.current_palette.as_ref().map(Arc::clone), always: false, alpha: 1.0, ..Default::default() };
             // Worn/attached item lights (the Light Bar's embedded `RLight_t` and similar, `mesh.rs::decode_mesh_lights`):
             // actor-relative from `ActorRig::mount_lights`, placed in the world by this dynel's own transform, the same
             // way `ActorFrame::transform` places its mesh vertices (`vertex_lights` in the shader then lights terrain,
@@ -3670,7 +3670,7 @@ impl Dynels {
             for l in rig.mount_lights(&c.parts) {
                 let point = |p: [f32; 3]| -> [f32; 3] { std::array::from_fn(|j| p[0] * transform[0][j] + p[1] * transform[1][j] + p[2] * transform[2][j] + transform[3][j]) };
                 let dir = |d: [f32; 3]| -> [f32; 3] { std::array::from_fn(|j| d[0] * transform[0][j] + d[1] * transform[1][j] + d[2] * transform[2][j]) };
-                host.dynamic_lights.push(ao_scene::Light { pos: point(l.pos), spot: l.spot.map(|s| ao_scene::Spot { dir: dir(s.dir), ..s }), ..l });
+                host.dynamic_lights.push(ao_scene::Light { pos: point(l.pos), spot: l.spot.map(|s| ao_scene::Spot { dir: dir(s.dir), ..s }), owner: Some(*id as u32), ..l });
             }
             if let Some(effects) = &mut self.effects {
                 let identity = (CHAR_KIND as u32, *id as u32);
@@ -4816,7 +4816,7 @@ mod tests {
                 writeln!(csv, "{frame_no},{:.6},{:#x},{:.6},{:.6},{:.6},{head:.7},{step:.7},{layers}", dt * 1000.0, c.anim, c.clip_ms, c.clip_rate, c.body_delay_ms).unwrap();
                 if let Some(scene) = &scene {
                     let actor = ActorFrame {
-                        id: who as u32, model: key, transform: glam::Mat4::from_scale(glam::Vec3::splat(c.scale)).to_cols_array_2d(),
+                        id: who as u32, model: key, character: true, transform: glam::Mat4::from_scale(glam::Vec3::splat(c.scale)).to_cols_array_2d(),
                         parts, part_attractors: rig.part_attractors(), skin: Some(Arc::new(vertices.clone())), alpha: 1.0, always: true, ..Default::default()
                     };
                     let png = output.join(format!("remote-current-{frame_no:04}.png"));

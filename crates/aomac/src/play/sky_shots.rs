@@ -725,6 +725,9 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
             }
             writeln!(manifest, "view={name} pf={pf} time={time} camera={fixed:?} lens={lens:?} meshes={meshes} instances={instances} raw_bytes={} repeat_differing_bytes={repeat_differences}", raw.len())?;
             writeln!(manifest, "{name} environment={:?} ground_light={:?} sun_authored={} daylight={:?}", scene.environment, scene.ground_light, scene.sun_authored, scene.daylight)?;
+            if settings.night_mode == ao_render::NightMode::Moonlit {
+                writeln!(manifest, "{name} enhanced_moon_sources={:?}", scene.moons)?;
+            }
             std::fs::write(out.join("manifest.txt"), &manifest)?;
             ensure!(repeat_differences == 0, "{name}: independent captures differ in {repeat_differences} bytes");
             if let Some(base) = &baseline {
@@ -1266,6 +1269,15 @@ fn graphics_offline_night_preserves_fog_and_hidden_actor_isolation() -> anyhow::
         ao_scene::crt_srand(1);
         let (mut scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
         ensure!(scene.daylight == Some(0.0), "{name}: not an authored-night snapshot");
+        let environment = scene.environment.as_mut().context("night environment missing")?;
+        environment.fog_start = -2.0;
+        environment.fog_end = -1.0;
+        scene.fog_model = None;
+        // This controlled extinction fixture tests fogged surfaces, not authored
+        // no-fog materials, whose visible surface illumination may change.
+        for mesh in &mut scene.meshes {
+            for material in &mut mesh.submeshes { material.fog_enabled = true; }
+        }
         let collision = ao_formats::playfield::collision::Collision::load(&store, pf)?;
         super::player::bake_sky_open(&collision, &mut scene);
         let fixed = if pf == 566 {
@@ -1279,7 +1291,9 @@ fn graphics_offline_night_preserves_fog_and_hidden_actor_isolation() -> anyhow::
         // Keep real captured body geometry but remove material fog exemptions and textures:
         // two saturated body colours provide a positive control for the extinction comparison.
         let render = |profile: &str, fog: bool, body: u8| -> anyhow::Result<Vec<u8>> {
-            let settings = graphics_fixture_settings(profile)?;
+            let mut settings = graphics_fixture_settings(profile)?;
+            if settings.night_mode == ao_render::NightMode::Moonlit { settings.moon_intensity = 4.0; }
+            if settings.night_mode == ao_render::NightMode::Dark { settings.dark_night_strength = 1.0; }
             let mut snapshot = scene.clone();
             snapshot.fog_model = None;
             let environment = snapshot.environment.as_mut().context("night fixture has no authored environment")?;
@@ -1327,7 +1341,7 @@ fn graphics_offline_night_preserves_fog_and_hidden_actor_isolation() -> anyhow::
             }
             off.rgba(&shot, &list)
         };
-        for profile in ["faithful", "grass", "all-no-bloom", "all-foliage"] {
+        for profile in ["faithful", "grass", "all-no-bloom", "all-foliage", "moonlit", "moon-shadows", "dark-night", "lighting"] {
             let absent = render(profile, false, 0)?;
             let hidden = render(profile, false, 1)?;
             ensure!(absent == hidden, "{name}/{profile}: zero-alpha non-admitted body or its bender changed the image");
@@ -1354,9 +1368,14 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
         "faithful" => {}
         "neutral" => { settings.ground_grass = true; settings.grass_density = 0.0; }
         "shadows" => settings.sun_shadows = true,
-        "moonlit" => settings.night_mode = ao_render::NightMode::Moonlit,
+        "clustered" => settings.clustered_lighting = true,
+        "local-shadows" => settings.local_light_shadows = true,
+        "local-shadows-clustered" => { settings.clustered_lighting = true; settings.local_light_shadows = true; }
         "moon-shadows" => { settings.night_mode = ao_render::NightMode::Moonlit; settings.moon_shadows = true; }
+        "moonlit" => settings.night_mode = ao_render::NightMode::Moonlit,
         "dark-night" => settings.night_mode = ao_render::NightMode::Dark,
+        "specular" => settings.material_specular = true,
+        "lighting" => { settings.clustered_lighting = true; settings.local_light_shadows = true; settings.moon_shadows = true; settings.material_specular = true; settings.night_mode = ao_render::NightMode::Moonlit; }
         // Pre-soft-shadow look: 1024 maps, hard 3x3 PCF, full-strength shadow.
         "shadows-hard" => {
             settings.sun_shadows = true;
@@ -1447,7 +1466,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             grass_density: 1.0, grass_distance: 50.0, sun_boost: 0.5, grade_strength: 0.8, contact_strength: 0.4,
             ..Default::default()
         },
-        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before|foliage-edges|foliage-sway|foliage-push|foliage-leaves|foliage-flutter|foliage-falling|grass-trails|foliage-subdivision|foliage-translucency|foliage-lod|all-foliage|all-foliage-shadows"),
+        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|clustered|local-shadows|local-shadows-clustered|moonlit|moon-shadows|dark-night|specular|lighting|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before|foliage-edges|foliage-sway|foliage-push|foliage-leaves|foliage-flutter|foliage-falling|grass-trails|foliage-subdivision|foliage-translucency|foliage-lod|all-foliage|all-foliage-shadows"),
     }
     Ok(settings)
 }
@@ -1548,6 +1567,15 @@ fn graphics_fixture_foliage_profiles_are_independent() {
 #[test]
 fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
     assert!(!graphics_fixture_settings("faithful").unwrap().any_enabled());
+    for name in ["clustered", "local-shadows", "local-shadows-clustered", "moonlit", "moon-shadows", "dark-night", "specular", "lighting"] {
+        assert!(graphics_fixture_settings(name).unwrap().any_enabled());
+    }
+    let local = graphics_fixture_settings("local-shadows").unwrap();
+    assert!(local.local_light_shadows && !local.clustered_lighting && !local.material_specular);
+    let combined = graphics_fixture_settings("local-shadows-clustered").unwrap();
+    assert!(combined.local_light_shadows && combined.clustered_lighting);
+    assert_eq!(graphics_fixture_settings("moonlit").unwrap().night_mode, ao_render::NightMode::Moonlit);
+    assert_eq!(graphics_fixture_settings("dark-night").unwrap().night_mode, ao_render::NightMode::Dark);
     let neutral = graphics_fixture_settings("neutral").unwrap();
     assert!(neutral.any_enabled() && neutral.grass_density == 0.0);
     let atmosphere_flags = |s: ao_render::EnhancedSettings| [

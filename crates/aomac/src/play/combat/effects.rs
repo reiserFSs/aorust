@@ -1274,7 +1274,7 @@ impl Renderer {
                         let skin:Vec<_>=groups.into_iter().flatten().collect();
                         if !skin.is_empty() {
                             let model=if buff.needs_private_model() {0xfac2_0000_0000_0000|u64::from(effect.actor)}else{effect.model_key};
-                            host.actors.push(ActorFrame { id:effect.actor,model,transform:IDENTITY, skin: Some(std::sync::Arc::new(skin)), always:true,alpha:1.0,priority:buff.priority().or_else(||native_priority(template.kind)),render_bucket:buff.render_bucket(),..Default::default() });
+                            host.actors.push(ActorFrame { id:effect.actor,model,transform:IDENTITY, skin: Some(std::sync::Arc::new(skin)), always:true,alpha:1.0,priority:buff.priority().or_else(||native_priority(template.kind)),render_bucket:buff.render_bucket(),native_shadow_source:buff.native_shadow_source(),..Default::default() });
                         }
                         return true;
                     },

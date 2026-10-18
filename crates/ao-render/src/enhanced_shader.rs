@@ -5,8 +5,12 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
     let ao = settings.ambient_occlusion;
     let bloom = settings.emissive_bloom;
     let hdr = settings.needs_sun_mask();
-    // Night receivers also need native directional shares for Dark mode.
-    let sun_shares = shadows || hdr || settings.night_mode != crate::NightMode::AsGame;
+    let material_specular = settings.material_specular;
+    let clustered_lighting = settings.clustered_lighting;
+    let local_light_shadows = settings.local_light_shadows;
+    let night = settings.night_mode != crate::NightMode::AsGame;
+    // HDR and night receivers need the native directional shares independently.
+    let sun_shares = shadows || hdr || night;
     let mut source = crate::shader_source::load("shader.wgsl", include_str!("shader.wgsl")).into_owned();
     source = source.replace("    @location(12) env_uv: vec2<f32>,", "    @location(12) env_uv: vec2<f32>,\n    @location(13) ao_info: vec3<f32>,\n    @location(14) sun_share: vec3<f32>,\n    @location(15) sun_spec_share: vec3<f32>,");
     source = source.replace("    var o: VOut;", "    var o: VOut;\n    o.ao_info = vec3<f32>(0.0);\n    o.sun_share = vec3<f32>(0.0);\n    o.sun_spec_share = vec3<f32>(0.0);");
@@ -95,7 +99,7 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
     source = source.replace("sun_visibility(i.wpos)", "sun_visibility(i.wpos, i.n, i.clip.xy)");
     if shadows {
         append_shadow_receiver(&mut source, 0);
-        if hdr {
+        if hdr || material_specular {
             // HDR eligibility uses actual light visibility, not the artistic shade floor.
             // Capture before the final mix: beauty retains its native Enhanced shadow strength.
             source = source.replace(
@@ -142,6 +146,9 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
             source = source.replace(&format!(", o.{field}.w)"), ", 0.0)");
         }
     }
+    if clustered_lighting || local_light_shadows { crate::clustered_lighting::apply(&mut source); }
+    if material_specular { crate::authored_specular::append(&mut source, settings.night_mode == crate::NightMode::Moonlit); }
+    if settings.needs_admitted_lights() { crate::point_shadows::apply_shader(&mut source, local_light_shadows, clustered_lighting); }
     source
 }
 
@@ -399,12 +406,14 @@ fn enhanced_original_fs_ground_shadow(i: VOut) -> vec4<f32> {{
     fn enhanced_shader_validates_on_gpu() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let renderer = crate::Renderer::new(&instance, None).expect("Enhanced WGSL requires offscreen GPU");
-        for flags in 0..16 {
+        for flags in 0..128 {
             let (shadows, ao, bloom, hdr) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0, flags & 8 != 0);
             let _shader = renderer.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("Enhanced ambient/emissive/shadow syntax regression"),
                 source: wgpu::ShaderSource::Wgsl(super::source(crate::EnhancedSettings {
-                    sun_shadows: shadows, ambient_occlusion: ao, emissive_bloom: bloom, hdr, ..Default::default()
+                    sun_shadows: shadows, ambient_occlusion: ao, emissive_bloom: bloom, hdr,
+                    material_specular: flags & 16 != 0, clustered_lighting: flags & 32 != 0,
+                    local_light_shadows: flags & 64 != 0, ..Default::default()
                 }).into()),
             });
         }

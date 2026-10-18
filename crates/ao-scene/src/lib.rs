@@ -258,6 +258,8 @@ pub struct Light {
     /// Statel zone the light belongs to (`Scene::statel_lod`): it only shines while [`StatelLod::lights_active`] holds for
     /// that zone's level. `None` = always on.
     pub zone: Option<u32>,
+    /// Exact current character actor identity for carried lights; never inferred from position.
+    pub owner: Option<u32>,
 }
 
 /// Root directional FXS light (DisplaySystem1005bdad); direction points toward the light.
@@ -388,6 +390,9 @@ pub struct ActorFrame {
     pub id: u32,
     /// Key given to `Renderer::add_actor_model`.
     pub model: u64,
+    /// Native character visual (SimpleChar/avatar, including its body and mounts).
+    /// Dynamic props, doors and effect visuals are not characters merely because they use ActorFrame.
+    pub character: bool,
     /// Actor to world transform (position, heading, scale).
     pub transform: [[f32; 4]; 4],
     /// Per model mesh: transform relative to `transform` (rigid mounts: head, weapons); missing entries = identity.
@@ -431,6 +436,8 @@ pub struct ActorFrame {
     /// Explicit native render-list distance bucket; `None` computes it from the visual's world origin.
     /// Native3015 screen-position mode uses bucket 100, not a 100-metre distance.
     pub render_bucket: Option<i32>,
+    /// Owning actor of a native Shadow3008 visual; only a valid enhanced sun replacement hides it.
+    pub native_shadow_source: Option<u32>,
 }
 
 impl Default for ActorFrame {
@@ -438,6 +445,7 @@ impl Default for ActorFrame {
         Self {
             id: 0,
             model: 0,
+            character: false,
             transform: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
             parts: Vec::new(),
             part_uvs: Vec::new(),
@@ -455,6 +463,7 @@ impl Default for ActorFrame {
             priority: None,
             part_priorities: Vec::new(),
             render_bucket: None,
+            native_shadow_source: None,
         }
     }
 }

@@ -988,12 +988,13 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
     let _ = std::fs::remove_dir_all(&tmp);
     let mut d = DValues::new(&tmp);
     let names = ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows",
+        "AomacMaterialSpecular", "AomacClusteredLighting", "AomacMoonShadows", "AomacLocalLightShadows",
         "AomacHeightHaze", "AomacLandHaze", "AomacValleyMist", "AomacVolumetricShafts",
-        "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs", "AomacMoonShadows"];
+        "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs"];
     assert_eq!(d.enhanced_settings(), EnhancedSettings::default());
     d.open_user(&tmp, "account", 7);
-    // Retain the original combinations, then cover each atmosphere switch and all-on.
-    for mask in (0..64).chain((6..names.len()).map(|bit| 1 << bit)).chain(std::iter::once((1 << names.len()) - 1)) {
+    // Retain every lighting combination, then each atmosphere switch and all-on.
+    for mask in (0..1024).chain((10..names.len()).map(|bit| 1 << bit)).chain(std::iter::once((1 << names.len()) - 1)) {
         for (bit, name) in names.iter().enumerate() {
             assert!(d.persists(name));
             d.set(name, Variant::Bool(mask & (1 << bit) != 0));
@@ -1001,16 +1002,28 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
         let expected = EnhancedSettings {
             sun_shadows: mask & 1 != 0, ambient_occlusion: mask & 2 != 0,
             emissive_bloom: mask & 4 != 0, ground_grass: mask & 8 != 0, hdr: mask & 16 != 0, contact_shadows: mask & 32 != 0,
-            height_haze: mask & 64 != 0, land_haze: mask & 128 != 0, valley_mist: mask & 256 != 0,
-            volumetric_shafts: mask & 512 != 0, cloud_gap_shafts: mask & 1024 != 0,
-            volumetric_clouds: mask & 2048 != 0, cloud_shadows: mask & 4096 != 0, sky_discs: mask & 8192 != 0,
-            moon_shadows: mask & 16384 != 0, ..Default::default()
+            material_specular: mask & 64 != 0, clustered_lighting: mask & 128 != 0,
+            moon_shadows: mask & 256 != 0, local_light_shadows: mask & 512 != 0,
+            height_haze: mask & 1024 != 0, land_haze: mask & 2048 != 0, valley_mist: mask & 4096 != 0,
+            volumetric_shafts: mask & 8192 != 0, cloud_gap_shafts: mask & 16384 != 0,
+            volumetric_clouds: mask & 32768 != 0, cloud_shadows: mask & 65536 != 0, sky_discs: mask & 131072 != 0,
+            ..Default::default()
         };
         assert_eq!(d.enhanced_settings(), expected);
         d.save_user();
         let mut again = DValues::new(&tmp);
         again.open_user(&tmp, "other-account", 99);
         assert_eq!(again.enhanced_settings(), expected);
+    }
+    assert_eq!(d.get_i64("AomacPointShadowCount"), Some(4));
+    assert!(d.persists("AomacPointShadowCount"));
+    for count in [1, 4, 16] {
+        d.set("AomacPointShadowCount", Variant::Int(count));
+        assert_eq!(d.enhanced_settings().point_shadow_count, count as u32);
+        d.save_user();
+        let mut again = DValues::new(&tmp);
+        again.open_user(&tmp, "account", 7);
+        assert_eq!(again.enhanced_settings().point_shadow_count, count as u32);
     }
     for mode in 0..=2 {
         d.set("AomacNightMode", Variant::Int(mode));
@@ -1029,6 +1042,7 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
     for (name, value) in [
         ("AomacShadowStrength", 0.4), ("AomacShadowSoftness", 2.0), ("AomacAoRadius", 2.0), ("AomacAoStrength", 0.5), ("AomacBloomStrength", 0.25),
         ("AomacGrassDensity", 1.5), ("AomacGrassDistance", 35.0), ("AomacSunBoost", 0.5), ("AomacGrade", 0.5), ("AomacContactStrength", 0.7),
+        ("AomacLampIntensity", 2.0), ("AomacCarriedLightIntensity", 1.5),
     ] {
         assert!(d.persists(name));
         d.set(name, Variant::Float(value));
@@ -1041,6 +1055,7 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
         assert_eq!(option.value(&d), option.value(&defaults), "{} was not restored", option.var);
     }
     assert!(!d.enhanced_settings().any_enabled());
+    assert_eq!(d.get_i64("AomacPointShadowCount"), Some(4));
     d.save_user();
     let mut again = DValues::new(&tmp);
     again.open_user(&tmp, "account", 7);
@@ -1094,6 +1109,7 @@ fn enhanced_post_controls_persist_and_restore_independently() {
 fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
     let Some(mut r) = Rig::new() else { return };
     for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows",
+        "AomacMaterialSpecular", "AomacClusteredLighting", "AomacMoonShadows", "AomacLocalLightShadows",
         "AomacHeightHaze", "AomacLandHaze", "AomacValleyMist", "AomacVolumetricShafts",
         "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs",
         "AomacFoliageEdges", "AomacFoliageSway", "AomacFoliagePush", "AomacFoliageLeaves", "AomacFoliageFlutter",
@@ -1113,20 +1129,31 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
     for (name, value) in [
         ("AomacShadowStrength", 0.4), ("AomacShadowSoftness", 2.0), ("AomacAoRadius", 2.5), ("AomacAoStrength", 0.5), ("AomacBloomStrength", 0.25),
         ("AomacGrassDensity", 1.5), ("AomacGrassDistance", 35.0), ("AomacSunBoost", 0.5), ("AomacGrade", 0.5), ("AomacContactStrength", 0.7),
+        ("AomacLampIntensity", 2.0), ("AomacCarriedLightIntensity", 1.5),
+        ("AomacMoonIntensity", 2.5), ("AomacDarkNightStrength", 0.75),
     ] {
         let view = r.show(name);
         let event = Event::SliderChanged { window: r.win(), view, value, final_change: true };
         assert!(r.opt.event(&mut r.gui, &event, &mut r.d));
         assert_eq!(r.d.get_f32(name), Some(value as f32));
     }
+    let view = r.show("AomacNightMode");
+    r.click(&format!("{view}_1"));
+    assert_eq!(r.d.enhanced_settings().night_mode, ao_render::NightMode::Moonlit);
+    let view = r.show("AomacPointShadowCount");
+    let event = Event::SliderChanged { window: r.win(), view, value: 16.0, final_change: true };
+    assert!(r.opt.event(&mut r.gui, &event, &mut r.d));
+    assert_eq!(r.d.enhanced_settings().point_shadow_count, 16);
     let selected = r.opt.win.as_ref().unwrap().selected;
     r.click(&format!("restore_original_graphics_{selected}"));
     assert_eq!(r.d.get_i64("AomacEdgeSmoothing"), Some(0));
+    assert_eq!(r.d.enhanced_settings().point_shadow_count, 4);
     let defaults = DValues::new(&ao_gui::client_dir());
     for option in super::super::enhanced::pages().iter().flat_map(Page::opts) {
         assert_eq!(option.value(&r.d), option.value(&defaults), "{} was not restored", option.var);
     }
     for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows",
+        "AomacMaterialSpecular", "AomacClusteredLighting", "AomacMoonShadows", "AomacLocalLightShadows",
         "AomacHeightHaze", "AomacLandHaze", "AomacValleyMist", "AomacVolumetricShafts",
         "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs",
         "AomacFoliageEdges", "AomacFoliageSway", "AomacFoliagePush", "AomacFoliageLeaves", "AomacFoliageFlutter",
@@ -1141,7 +1168,7 @@ fn enhanced_page_restore_changes_only_its_page_and_restore_all_resets_every_page
     let Some(mut r) = Rig::new() else { return };
     let defaults = DValues::new(&ao_gui::client_dir());
     let pages = super::super::enhanced::pages();
-    assert_eq!(pages.len(), 8);
+    assert_eq!(pages.len(), super::super::enhanced::PageId::ALL.len());
     for page in &pages {
         // Change every page, so a page reset cannot accidentally pass by resetting everything.
         for option in pages.iter().flat_map(Page::opts) {
@@ -1173,7 +1200,7 @@ fn enhanced_page_restore_changes_only_its_page_and_restore_all_resets_every_page
 #[test]
 fn enhanced_subpage_bounds_and_scrolling_at_large_minimum_and_small_sizes() {
     let pages = super::super::enhanced::pages();
-    assert_eq!(pages.len(), 8);
+    assert_eq!(pages.len(), super::super::enhanced::PageId::ALL.len());
     for (idx, page) in pages.iter().enumerate() {
         let source = page_xml(page, idx, &mut 0);
         assert!(!source.contains("aomac-only additions"));

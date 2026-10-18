@@ -1209,9 +1209,9 @@ The single grass pipeline and optional canopy sprigs consume the published
 Grass retains native per-corner lamp/Gouraud lighting and baked root openness;
 sprigs reuse the shared moon receiver and native exposure lattice. Their night
 vertex output carries the receiver's required `sun_share` lane initialized to zero:
-sprigs always take its non-ground branch, preserving native alpha and fog. The expanded
-admitted-light pool and point-shadow consumers are a separate, explicitly
-coordinated lighting integration after that producer is published.
+sprigs always take its non-ground branch, preserving native alpha and fog.
+The expanded admitted-light pool and point-shadow consumers share the lighting
+integration described below.
 Canopy auxiliary masks keep zero added directional energy but retain native fog
 in blue and beauty coverage in alpha, matching post-processing's mask contract.
 Procedural surfaces without a native motion-raster owner retain reactive motion
@@ -1221,10 +1221,13 @@ a revoked character's bend or trail.
 The ignored headless regression
 `graphics_offline_night_preserves_fog_and_hidden_actor_isolation` uses
 `borealis-foliage-night` and `newland-night`, at 1920×1200 and MSAA one, with
-`faithful`, `grass`, `all-no-bloom` and `all-foliage`. A zero-alpha captured
+`faithful`, `grass`, `all-no-bloom`, `all-foliage`, `moonlit`, `moon-shadows`,
+`dark-night` and `lighting`. A zero-alpha captured
 character and its actor-tagged bender must produce exactly the absent image.
 Two saturated, untextured captured-body colour probes must differ without fog
 (the non-vacuous control), then become byte-identical with full native fog.
+Moonlit probes use 4× moon intensity (with and without moon shadows); Dark uses
+full dark-night strength. These are runnable regressions, not a new execution claim.
 The probes preserve geometry and explicitly enable material fog; this does not
 change the native exemptions for real authored fog-disabled materials.
 PNG pairs and `night-fog-admission.txt` record the comparisons; `status=pass`
@@ -1365,6 +1368,26 @@ from those bounds would not establish pixel identity. Primary actor-admission
 draws retain their original order and draw granularity. World/actor sun receiver
 bindings are shared across pipeline changes and restored at world-phase entry
 after grass uses its own receiver layout.
+
+Sun cascades admit loaded static geometry, including terrain patches, by their
+light volume rather than the camera-visible instance list. Their depth range
+expands for loaded caster spheres overlapping the existing cascade XY footprint:
+low-sun mountain occluders no longer disappear at the receiver distance limit.
+This leaves the snapped XY grid, receiver splits, fog cutoff and the existing
+smooth horizon fade (zero at the horizon, full at four degrees) unchanged.
+Terrain uses the current native ground-detail indices for both receiving and casting.
+
+Native `Shadow3008` geometry (Gamecode `100ece3a`/`100ecee4`/`100ecb6b`,
+DisplaySystem `1001e75d`/`1001e90e`) carries its owning actor ID into the renderer.
+Only a live sun replacement covering an eligible caster and its terrain receiver
+removes its native blob; missing/zero-strength sun, unavailable terrain receiver
+coverage and all-off faithful rendering keep native shadows.
+Non-admitted owners cannot disclose themselves through enhanced blobs. Moon and
+point-light shadow maps do not count as a sun replacement.
+`shadow_coverage` unit regressions cover off-camera volume admission, expanded
+mountain depth without XY movement, and receiver validity; the headless
+`hidden_actor_present_absent_images_are_identical` regression also checks blob
+replacement, missing-sun fallback and faithful-off preservation.
 
 ## Optional material-ground grass
 
@@ -1784,6 +1807,118 @@ threshold of about 29.3 m. The far-hill speck regression still passes:
 These are paired whole-frame GPU medians, not an isolated grass draw timestamp
 or a guarantee about tail latency.
 
+### Authored material specular
+
+Enhanced's independent **Authored Material Specular (GGX + AA)** switch
+(`AomacMaterialSpecular`, default false) replaces only authored material
+specular with per-pixel GGX, height-correlated Smith visibility and Schlick
+Fresnel from ao-vk commit `a0dc47ea2c853d26a4491d5a25ef0331f714b6ce`,
+`rvk/shaders/lighting.glsl::PbrSpecular` (MIT; see `THIRD_PARTY`).
+Existing specular RGB and shininess, including actor overrides, determine F0
+and roughness; normal derivatives widen the lobe to reduce specular aliasing.
+No default dielectric, metallic classification or environment reflection is
+invented. Prelit/unlit surfaces, visual effects and unauthored materials keep
+their native result. Authored GGX highlights can brighten both day and night
+under the Enhanced lighting policy; receiver shadows remain applied, and the
+native fog/blend equation and source admission are unchanged. Standalone GGX
+uses the GPU-admitted 64-source pool with the native eight-light budget for
+Gouraud diffuse, filtering source ownership before consuming a light slot.
+Per-pixel diffuse is enabled only by clustered lighting or local shadows.
+The shared admission resources are required even when those switches are off.
+In Moonlit mode, GGX receives the same per-receiver pre-cosine moon radiance as
+diffuse: intensity, roof exposure and selected moon-shadow visibility are
+sampled once by the moon helper and reused, not queried again by specular.
+As Game has no moon-specular branch or cached moon radiance.
+All-off uses the original shader, not a multiplied-by-zero GGX path.
+
+The independent **Moon Shadows**, **Local Light Shadows** and **Clustered
+Local Lighting** switches default false (`AomacMoonShadows`,
+`AomacLocalLightShadows`, `AomacClusteredLighting`). Lamp and carried-light
+intensity sliders default 1 and are bounded 0–4; Restore All returns every
+registered Enhanced control, including these sliders, to its default.
+**Point Shadow Count** (`AomacPointShadowCount`) defaults to 4, bounded 1–16.
+Carried-light cubes exclude native characters from casting and receiving their
+point shadows, not every dynamic actor: moving doors and other non-character
+props still cast and receive. Static lamp cubes retain normal character shadows.
+
+**Night Lighting** (`AomacNightMode`) is independent of shadows and defaults to
+**As Game** (0). **Moonlit** (1) adds cool surface illumination from the strongest
+above-horizon authored Moon1/2/3 pose. Its reflected phase uses the angle to the
+actual authored sun, fades through native `CurrentDayIntensity` and the horizon,
+and takes its tint/energy from the night sky plus an explicitly Enhanced art-tuned
+cool floor (gamma RGB 0.075/0.09/0.12). This is not native disc `SpaceLight`
+reinterpreted as a retail world-light budget. The same chosen direction and
+intensity-scaled energy are shared with atmosphere effects.
+**Moon Intensity** (`AomacMoonIntensity`) defaults to 1, range 0–4.
+Moonlit works with **Moon Shadows** disabled; enabling that independent switch
+uses the directional cascades and their existing current-frame actor admission.
+Illumination is admitted only on collision-proven exposed terrain/receivers;
+unknown exposure and roofed cells fail closed. Native material alpha, geometry,
+fog blending and extinction are unchanged.
+
+**Dark** (2) removes ambient/diffuse night light without reducing local lamps or
+authored emission. **Dark Night Strength** (`AomacDarkNightStrength`) defaults to
+0.6, range 0–1. Restore Original Graphics returns the mode to As Game and disables
+shadow/effect switches while retaining intensity/quality preferences.
+The replaced brightness-ceiling regression is
+`graphics_offline_night_preserves_fog_and_hidden_actor_isolation` (ignored
+installed-client fixture). It compares saturated captured-body colour probes
+in Newland/Borealis nights, including Moonlit at 4× and Dark at full strength:
+unfogged colours must differ, fully fogged colours must be byte-identical, and
+zero-alpha actor/bender submissions must equal absence. Night brightening is
+allowed; actor shadow admission coverage in `ao-render::shadow_tests` remains
+binding. No new build or render evidence is claimed for this merge.
+
+
+### Clustered local light override
+
+`AomacClusteredLighting` is independently opt-in and defaults off. All
+statel-LOD-admitted static and submitted moving native Light/Spot candidates
+reach a GPU selector **after** current-frame owner visibility. Only then are
+the nearest 64 selected: a hidden owner cannot occupy capacity, evict the 64th
+visible lamp, or change cluster bounds. Every Enhanced local-light evaluator,
+including the native eight-light Gouraud variant, consumes this same admitted
+pool rather than the faithful 16-moving-light prefix. Enhanced candidate input
+is not truncated at 16. Lamp and character-carried intensity controls scale
+their corresponding override source colours.
+
+The renderer reuses the existing world-space sphere/cell clustering design,
+with at most 512 spatial cells, a bounded GPU output packet and reusable input
+storage. The fixed output packet is 538,672 bytes (about 526 KiB); candidate
+input grows with the native submitted source count and is reused between frames.
+Point-shadow source fades track native birth age before visibility and capacity
+selection: first-snapshot lights start mature; later arrivals fade over 0.25 s,
+even while outside the selected pool. Retired sources retain no birth history.
+A fragment looks up its cell's source list; it does not scan a screen/depth cluster
+hierarchy or switch a strongest-eight set across a triangle. Native attenuation
+coefficients and spot inner/outer cones are unchanged; only the final pixel
+footprint inside a range boundary receives a conservative smooth coverage ramp.
+Directional diffuse stays Gouraud-interpolated. Native material specular is
+re-evaluated for the same admitted local sources; the independent GGX option
+can replace that BRDF. Prelit receivers preserve their baked colour plus native
+0.8 ambient base and replace only the local contribution; water and special
+effect lighting remain authored. Texture-alpha self illumination is applied
+after local redistribution. Directional shadows subtract once, and Moonlit/Dark
+composition runs after local recomputation without suppressing admitted lamps.
+The native fog equation, alpha coverage and blend ordering remain.
+
+Enhanced override lamps may brighten night surfaces, per the 2026-10-18 user
+policy. Actor-owned lights require current-frame GPU owner visibility admission;
+non-admitted or occluded owners cannot illuminate other receivers. The original
+static grid, eight-light vertex evaluation and 16-moving-light faithful transport
+remain unchanged when clustered lighting, local shadows and authored specular
+are all off. Disabling all three releases candidate/output buffer growth and
+scratch storage through the shared `needs_admitted_lights` predicate.
+
+Focused checks (not run by the implementation worker):
+`cargo test --profile fast -p ao-render clustered_lighting -j 2`.
+The focused GPU controls additionally exercise hidden-source top-64 eviction,
+hidden-first-16 moving sources, an unchanged faithful transport prefix,
+alpha-mask self illumination, and single directional-shadow subtraction on ground,
+with numerical positive controls.
+Integration also needs the Enhanced shader-combination matrix, faithful raw-RGBA
+identity captures, and paired hidden-owner-present/absent plus fog fixtures.
+
 ### ICC beach shadow edges
 
 Use `AOMAC_GFX_VIEW=icc-shadow-edges-authored` with
@@ -1824,4 +1959,19 @@ screenshot readback. It warms 120 frames, records 600 samples, and writes
 `<view>-frame-gpu.txt` with the profile and nearest-rank p50/p95/p99 in
 milliseconds. Acquire the shared GPU timing lock before timing; do not run
 concurrent captures or GPU tests.
+
+`AOMAC_GFX_MSAA=4` selects the requested 1920×1200, 4× MSAA lighting
+measurement configuration; the default remains 1 for existing byte-comparison
+fixtures. The manifest and GPU timing report retain requested and actual sample
+counts, and each view rejects adapter clamping before capture.
+Lighting profiles are `clustered`, `local-shadows` (independent of clustering),
+`local-shadows-clustered`, `moonlit`, `moon-shadows`, `dark-night`, `specular`
+and `lighting`; the last combines the four lighting switches and Moonlit.
+
+Moonlit mesh and actor receivers use the same collision-baked native ground
+openness lattice as terrain, exposed independently of each material's textures.
+Four quantized native lattice corners per cell preserve the terrain's bilinear
+interpolation and fail closed for absent cells, invalid mapping and roofed ground.
+The GPU storage resource exists only in Moonlit mode; retained source data lets
+changing the night option rebuild it without reloading the zone.
 

@@ -75,6 +75,23 @@ fn hidden_actor_present_absent_images_are_identical() {
     write_evidence(&[("absent", &absent), ("hidden", &hidden), ("visible", &visible)], (width, height));
     assert_ne!(absent, visible, "control actor must actually enter the visible image");
     assert_eq!(renderer.sun_shadows.as_ref().unwrap().actor_ids, [1, 1], "body and camera-hidden rigid part must share actor admission");
+    let blob = ao_scene::ActorFrame { id: 2, model: 1, native_shadow_source: Some(1),
+        transform: Mat4::from_translation(Vec3::new(4.0, 0.0, 2.0)).to_cols_array_2d(), ..Default::default() };
+    renderer.set_actors(vec![visible_actor.clone(), blob.clone()]);
+    assert_eq!(visible, capture(&mut renderer), "native blob remained beside a valid sun replacement");
+    renderer.shadow_sun = None;
+    renderer.set_actors(vec![visible_actor.clone()]);
+    let no_sun = capture(&mut renderer);
+    renderer.set_actors(vec![visible_actor.clone(), blob.clone()]);
+    assert_ne!(no_sun, capture(&mut renderer), "missing sun replacement incorrectly removed the native blob");
+    renderer.shadow_sun = Some([-0.8, 0.5, -0.3]);
+    renderer.set_enhanced_settings(EnhancedSettings {sun_shadows: true, shadow_strength: 0.0, ..Default::default()});
+    renderer.set_actors(vec![visible_actor.clone()]);
+    let zero_strength = capture(&mut renderer);
+    renderer.set_actors(vec![visible_actor.clone(), blob.clone()]);
+    assert_ne!(zero_strength, capture(&mut renderer), "zero-strength replacement incorrectly removed the native blob");
+    renderer.set_enhanced_settings(EnhancedSettings {sun_shadows: true, ..Default::default()});
+    renderer.set_actors(vec![visible_actor.clone()]);
     // This receiver lies outside both the wall and the actor's camera silhouette.
     let aspect = width as f32 / height as f32;
     let projection = Mat4::perspective_rh(renderer.lens.vertical_fov(aspect), aspect, renderer.lens.near,
@@ -125,6 +142,10 @@ fn hidden_actor_present_absent_images_are_identical() {
     renderer.set_enhanced_settings(EnhancedSettings::default());
     capture(&mut renderer);
     assert!(renderer.sun_shadows.is_none(), "off switch retains shadow resources");
+    renderer.set_actors(vec![ao_scene::ActorFrame { id: 1, model: 1, ..Default::default() }]);
+    let faithful_without_blob = capture(&mut renderer);
+    renderer.set_actors(vec![ao_scene::ActorFrame { id: 1, model: 1, ..Default::default() }, blob]);
+    assert_ne!(faithful_without_blob, capture(&mut renderer), "all-off faithful path removed its native blob");
 }
 
 #[test]
@@ -250,6 +271,9 @@ fn grass_pixels_receive_sun_shadows_and_ao_without_emission() {
     let shadows = EnhancedSettings { sun_shadows: true, ..grass };
     let shadow_bare = capture(&mut renderer, EnhancedSettings { grass_density: 0.0, ..shadows });
     let shadow_blades = capture(&mut renderer, shadows);
+    assert!(renderer.sun_shadows.as_ref().unwrap().static_commands.iter()
+        .any(|(draw, range)| renderer.gpu.opaque[*draw].mesh == 0 && !range.is_empty()),
+        "native terrain was excluded from the sun caster volume");
     assert!(darkened_blades(&shadow_blades, &shadow_bare) > 8, "caster did not darken actual grass pixels");
     let ao = EnhancedSettings { ambient_occlusion: true, ao_radius: 2.0, ..grass };
     let ao_bare = capture(&mut renderer, EnhancedSettings { grass_density: 0.0, ..ao });
@@ -644,6 +668,10 @@ fn moonlit_hidden_and_nonadmitted_actors_leave_no_shadow_signal() {
     };
     let absent = capture(&mut renderer);
     assert!(renderer.enhanced_shadow_moonlight().is_some(), "fixture needs active Moon maps");
+    let shadows = renderer.sun_shadows.as_ref().expect("moon cascade targets");
+    assert!(shadows.coverage_uniform.moon_budget[..3].iter().any(|&value| value > 0.0),
+        "fixture has no active authored moon illumination");
+    assert!(!shadows.sun_replacement_active, "moon incorrectly replaced native sun blobs");
     let body = ao_scene::ActorFrame {id: 1, model: 1, ..Default::default()};
     for actor in [
         body.clone(),
