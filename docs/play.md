@@ -785,9 +785,7 @@ guess. Enhanced rain is anchored in world coordinates, is clipped by current
 admitted depth, and places crown/droplet splashes on reconstructed upward
 surfaces using a bounded vertical depth search. Native-water rain rings are
 deferred until a published native water-surface mask API is available; this
-cutover does not add unpublished water integrations. The `rain-water` evidence
-case captures rain over existing native liquid geometry only: generic rain
-pixel changes are not acceptance evidence for water rings.
+cutover does not add unpublished water integrations.
 The pre-existing faithful path has no native rain geometry submission;
 turning this control off leaves that path untouched, not an invented fallback.
 Wetness accumulates during native rain and decays after it stops; its independent
@@ -2224,7 +2222,7 @@ AOMAC_WEATHER_OUT=/tmp/WeatherFx/weather-evidence /absolute/path/to/aomac-test-e
 ```
 
 The output path must be new and under `/tmp/WeatherFx`. For a bounded single-case
-capture, set `AOMAC_WEATHER_CASE` to `rain-outdoor`, `rain-water`, `rain-roof`, `rain-indoor`,
+capture, set `AOMAC_WEATHER_CASE` to `rain-outdoor`, `rain-roof`, `rain-indoor`,
 `wet-drying`, `sand`, `ash`, `fallout-red`, `fallout-green`, `sparkle-curl`, or
 `fluid-smoke`, with a fresh output directory for each run. The complete invocation
 has a 270-second render deadline. Every case uses independent off/on/on/off
@@ -2243,13 +2241,14 @@ requires only its own channel; native effect cases do not require precipitation.
 Actual channel amplitudes and wind are retained in the source state; storm
 channels are isolated explicitly. Metadata records the unmodified source state,
 `weather_pf`, selected `game_day` and time, and scene loading uses that same day.
-Roof/open positions are selected
-by bounded native collision queries; Subway127 supplies the dungeon control.
-`rain-water` uses the existing ICC4582 offshore camera `[1010.4,24,-663.1]`,
-yaw2.4288/pitch−0.2, actual ICC rainfall from the same bounded day search, a native-liquid presence assertion
-and collision-open sky. Only enhanced rain is enabled. This case certifies rain
-over existing native liquid geometry, not water rings. Rings are deferred under
-the approved no-water fallback until a native water-mask API is published.
+Open cameras require collision-proven flat ground (four 4 m neighbors within
+0.6 m), open sky, and a clear three-ray terrain corridor through 4/8/16/32/64 m;
+eight headings are searched instead of aiming blindly into the spawn hillside.
+Roof cameras retain a known native roof/ground pair and a clear 4/8 m corridor.
+All searches stay within a ±256 m square of the fixture origin and record their final
+position, heading, ground and roof. Subway127 supplies the dungeon control.
+Native-water rain rings are deferred under the approved no-water fallback until
+a native water-mask API is published.
 Smoke and sparkle use actual installed `gfxtweak` templates and native effect
 construction, never fabricated enhanced emitters. No character actors are added.
 

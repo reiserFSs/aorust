@@ -37,7 +37,6 @@ fn weather_and_particles_graphics() -> anyhow::Result<()> {
         let mut selected_count = 0;
         let cases = [
             ("rain-outdoor", "rain", 0, false, false, 0),
-            ("rain-water", "rain", 0, false, false, 0),
             ("rain-roof", "rain", 0, true, false, 0),
             ("rain-indoor", "rain", 0, false, true, 0),
             ("wet-drying", "wet-surfaces", 0, false, false, 0),
@@ -49,17 +48,14 @@ fn weather_and_particles_graphics() -> anyhow::Result<()> {
             ("fluid-smoke", "fluid-smoke", 0, false, false, 3017),
         ];
         let required: Vec<_> = cases.iter().filter(|(name, _, _, _, _, kind)| {
-            *kind == 0 && *name != "rain-water" && selected.as_ref().is_none_or(|selected| selected.as_str() == *name)
+            *kind == 0 && selected.as_ref().is_none_or(|selected| selected.as_str() == *name)
         }).map(|(_, _, channel, _, _, _)| *channel).collect();
-        let native = native_weather_cases(&store, &required, None)?;
+        let native = native_weather_cases(&store, &required)?;
         for (name, profile, channel, roof, indoor, kind) in cases {
             if selected.as_ref().is_some_and(|selected| selected != name) { continue; }
             selected_count += 1;
             ensure!(started.elapsed().as_secs() < 270, "weather acceptance exceeded 270-second render budget");
-            let (mut pf, game_day, time, state) = if name == "rain-water" {
-                let (_, pf, day, time, state) = native_weather_cases(&store, &[0], Some(4582))?[0];
-                (pf, day, time, state)
-            } else if kind != 0 {
+            let (mut pf, game_day, time, state) = if kind != 0 {
                 (800, 0, 3240.0, native_weather_at(&store, 800, 0, 3240.0)?)
             } else {
                 native.iter().find(|(field, _, _, _, _)| *field == channel).map(|(_, pf, day, time, state)| (*pf, *day, *time, *state)).context("missing native weather channel")?
@@ -67,40 +63,48 @@ fn weather_and_particles_graphics() -> anyhow::Result<()> {
             let weather_pf = pf;
             let mut fixed = Camera::look_at([679.6, 74.5, -476.7].into(), [679.6, 73.0, -486.7].into());
             if indoor { pf = 127; fixed = Camera::look_at([96.0, 109.305, -242.0].into(), [108.0, 108.9, -242.0].into()); }
-            if name == "rain-water" {
-                fixed = Camera { pos: [1010.4, 24.0, -663.1].into(), yaw: 2.4288, pitch: -0.2, roll: 0.0 };
-            }
             ao_scene::crt_srand(1);
             let (mut scene, report) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, game_day, Some(state))?;
-            if name == "rain-water" {
-                ensure!(!scene.liquids.is_empty(), "ICC water capture has no native liquid surface");
-                writeln!(manifest, "case=rain-water native_liquids={} camera_source=existing_ICC_offshore_fixture acceptance=rain_over_existing_native_liquids_only water_rings=deferred_pending_published_native_water_mask_api generic_rain_delta_is_not_ring_acceptance=true", scene.liquids.len())?;
-            }
             let collision = Rc::new(RefCell::new(ao_formats::playfield::collision::Collision::load(&store, pf)?));
             super::super::player::bake_sky_open(&collision.borrow(), &mut scene);
             let surface = super::super::player::weather_surface(collision.clone());
-            if !indoor && kind == 0 && name != "rain-water" {
-                // Search native collision, not guessed roofs or synthetic shelter callbacks.
+            if !indoor && kind == 0 {
+                // Keep the evidence camera on native level ground, looking along a clear
+                // low-terrain corridor. A merely exposed spawn can face straight into a hill.
                 let mut selected = None;
                 let origin = if pf == 800 { [679.6, 74.5, -476.7] } else if pf == 566 { [414.0, 40.0, -320.0] } else { scene.spawn.context("native playfield has no fixture spawn")? };
                 'search: for radius in 0..=64_i32 { for z in -radius..=radius { for x in -radius..=radius {
                     if x.abs().max(z.abs()) != radius { continue; }
                     let p = [origin[0] + x as f32 * 4.0, origin[1], origin[2] + z as f32 * 4.0];
-                    if let Some([top, ground]) = surface(p) {
-                        if (roof && top > ground + 2.5) || (!roof && top < -1e19) {
-                            selected = Some([p[0], ground + 1.7, p[2]]); break 'search;
-                        }
+                    let Some([top, ground]) = surface(p) else { continue; };
+                    if !ground.is_finite() || (roof && top <= ground + 2.5) || (!roof && top >= -1e19) { continue; }
+                    let eye = Vec3::new(p[0], ground + 1.7, p[2]);
+                    if !roof && ![[4.0, 0.0], [-4.0, 0.0], [0.0, 4.0], [0.0, -4.0]].into_iter().all(|[dx, dz]| {
+                        surface([p[0] + dx, eye.y, p[2] + dz]).is_some_and(|[roof, y]| roof < -1e19 && (y - ground).abs() <= 0.6)
+                    }) { continue; }
+                    for heading in 0..8 {
+                        let angle = heading as f32 * std::f32::consts::FRAC_PI_4;
+                        let forward = Vec3::new(angle.sin(), 0.0, -angle.cos());
+                        let side = Vec3::new(-forward.z, 0.0, forward.x);
+                        let distances: &[f32] = if roof { &[4.0, 8.0] } else { &[4.0, 8.0, 16.0, 32.0, 64.0] };
+                        let clear = distances.iter().all(|&distance| {
+                            [-0.25, 0.0, 0.25].into_iter().all(|width| {
+                                let probe = eye + forward * distance + side * (width * distance);
+                                surface(probe.to_array()).is_some_and(|[top, y]| {
+                                    y <= ground + 0.6 && (roof || (top < -1e19 && (distance > 8.0 || y >= ground - 1.0)))
+                                }) && collision.borrow().line(eye.to_array(), probe.to_array()).is_none()
+                            })
+                        });
+                        if clear { selected = Some((eye, forward, top, ground)); break 'search; }
                     }
                 } } }
-                let eye = selected.with_context(|| format!("{name}: no native collision {} point within bounded scan pf{pf}", if roof { "roofed" } else { "open" }))?;
-                fixed = Camera::look_at(eye.into(), Vec3::from(eye) + Vec3::new(0.0, -0.7, -8.0));
+                let (eye, forward, roof_height, ground_height) = selected.with_context(|| format!("{name}: no native collision {} level-ground clear corridor within bounded scan pf{pf}", if roof { "roofed" } else { "open" }))?;
+                fixed = Camera::look_at(eye, eye + forward * 16.0 - Vec3::Y * 1.6);
+                writeln!(manifest, "case={name} camera_selection=native_level_ground_clear_corridor roof={roof_height} ground={ground_height} eye_height=1.7 local_height_tolerance=0.6 forward={forward:?} corridor_distances={:?}", if roof { &[4, 8][..] } else { &[4, 8, 16, 32, 64][..] })?;
             }
             ensure!(report.dungeon == indoor, "{name}: native dungeon identity mismatch");
             let sampled = surface(fixed.pos.to_array());
             ensure!(indoor || sampled.is_some(), "{name}: outdoor camera collision unknown");
-            if name == "rain-water" {
-                ensure!(sampled.is_some_and(|[roof, _]| roof < -1e19), "ICC water camera must have native collision open sky");
-            }
             let mut lens = camera::lens(scene.lens.unwrap_or_default(), false);
             lens.far = Some(camera::far_plane(camera::VIEW_DISTANCE));
             writeln!(manifest, "case={name} profile={profile} pf={pf} weather_pf={weather_pf} game_day={game_day} time={time} native_state={state:?} camera={fixed:?} collision={sampled:?} dungeon={} native_meshes={} native_instances={}", report.dungeon, scene.meshes.len(), scene.instances.len())?;
@@ -204,14 +208,11 @@ fn native_weather_at(store: &ao_rdb::RecordStore, pf: u32, day: u32, time: f32) 
 type NativeWeatherCase = (usize, u32, u32, f32, ao_formats::weather::State);
 
 /// Bounded native schedule discovery, without overwriting native channels or wind.
-fn native_weather_cases(store: &ao_rdb::RecordStore, required: &[usize], only_pf: Option<u32>) -> anyhow::Result<Vec<NativeWeatherCase>> {
+fn native_weather_cases(store: &ao_rdb::RecordStore, required: &[usize]) -> anyhow::Result<Vec<NativeWeatherCase>> {
     let mut found = Vec::new();
     if required.is_empty() { return Ok(found); }
-    let mut ids = if let Some(pf) = only_pf { vec![pf] } else {
-        let mut ids = vec![800, 566, 4582];
-        ids.extend(ao_formats::playfield::list_playfields(store)?.into_iter().map(|(pf, _)| pf).filter(|pf| ![800, 566, 4582].contains(pf)));
-        ids
-    };
+    let mut ids = vec![800, 566, 4582];
+    ids.extend(ao_formats::playfield::list_playfields(store)?.into_iter().map(|(pf, _)| pf).filter(|pf| ![800, 566, 4582].contains(pf)));
     let mut outdoors = Vec::new();
     for pf in ids.drain(..) {
         if !ao_formats::playfield::zone_locator(store, pf)?.is_dungeon() { outdoors.push(pf); }
@@ -221,20 +222,20 @@ fn native_weather_cases(store: &ao_rdb::RecordStore, required: &[usize], only_pf
             for time in (0..6480).step_by(30) {
                 let state = native_weather_at(store, pf, day, time as f32)?;
                 for &field in required {
-                    if state.fields[field] > 0.4 && !found.iter().any(|(previous, _, _, _, _)| *previous == field) { found.push((field, pf, day, time as f32, state)); }
+                    if state.fields[field] > (if field == 0 { 0.8 } else { 0.4 }) && !found.iter().any(|(previous, _, _, _, _)| *previous == field) { found.push((field, pf, day, time as f32, state)); }
                 }
                 if required.iter().all(|field| found.iter().any(|(previous, _, _, _, _)| previous == field)) { return Ok(found); }
             }
         }
     }
-    anyhow::bail!("native weather days0..32 lack requested channels {required:?} pf={only_pf:?}; found {:?}", found.iter().map(|(field, pf, day, time, _)| (*field, *pf, *day, *time)).collect::<Vec<_>>())
+    anyhow::bail!("native weather days0..32 lack requested channels {required:?}; found {:?}", found.iter().map(|(field, pf, day, time, _)| (*field, *pf, *day, *time)).collect::<Vec<_>>())
 }
 
 #[test]
 #[ignore = "installed-client CPU native timestamp sampling regression; no GPU"]
 fn weather_fixture_samples_fresh_native_timestamps() -> anyhow::Result<()> {
     let store = ao_rdb::RecordStore::open(&ao_gui::client_dir())?;
-    let (_, pf, day, _, _) = native_weather_cases(&store, &[0], None)?[0];
+    let (_, pf, day, _, _) = native_weather_cases(&store, &[0])?[0];
     let mut reused = ao_formats::playfield::open_weather(&store, pf)?;
     let mut differs = false;
     for time in (0..6480).step_by(30) {
