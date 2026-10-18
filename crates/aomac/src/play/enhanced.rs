@@ -51,6 +51,10 @@ pub(super) struct Control {
 }
 
 impl Control {
+    pub fn session_only(&self) -> bool {
+        matches!(self.name, "AomacEnhancedSuspended" | "AomacEffectGpuOverlay" | "AomacSlowFrameLog")
+    }
+
     fn check(page: PageId, section: &'static str, name: &'static str, label: &'static str) -> Self {
         Self { page, section, name, label, kind: ControlKind::Check, default: Variant::Bool(false), min: None, max: None }
     }
@@ -168,6 +172,9 @@ pub(super) fn controls() -> Vec<Control> {
         Control::check(Camera, "Depth of Field", "AomacDepthOfField", "Depth of Field"),
         Control::slider(Camera, "Depth of Field", "AomacDofAperture", "Depth of Field Aperture", "%.2f", 2.0, 0.0, 8.0),
         Control::slider(Camera, "Depth of Field", "AomacDofMaxRadius", "Depth of Field Max Radius", "%.2f px", 8.0, 0.0, 16.0),
+        Control::check(Performance, "Session Controls", "AomacEnhancedSuspended", "Disable All Enhanced Effects (Ctrl+Shift+E, session only)"),
+        Control::check(Performance, "Session Controls", "AomacEffectGpuOverlay", "Effect GPU Costs (Ctrl+Shift+O, session only)"),
+        Control::check(Performance, "Session Controls", "AomacSlowFrameLog", "Log Slow Frames (session only)"),
         Control::radio(Performance, "Interface", "AomacInterfaceScale", "Interface Scale", &[("Auto (retail-equivalent)", 0), ("1x", 1), ("2x", 2), ("3x", 3)], 0, 0, 3),
         Control::check(Performance, "Interface", "AomacBorderlessFullscreen", "Instant Fullscreen (skip animation, hide menu bar/dock)"),
         Control { page: Performance, section: "Text", name: "ChatFontSize", label: "Chat Font Size", kind: ControlKind::Slider { format: "%.0f pt", scale: 0.1 }, default: Variant::Int(140), min: Some(Variant::Int(50)), max: Some(Variant::Int(480)) },
@@ -282,7 +289,10 @@ mod tests {
         let mut loaded = values();
         assert!(loaded.load_config(&saved, CAT_MAIN, false));
         for control in &controls {
-            assert_eq!(loaded.get(control.name), Some(&changed(control)));
+            let expected = if control.session_only() { control.default.clone() } else { changed(control) };
+            assert_eq!(loaded.get(control.name), Some(&expected));
+            assert_eq!(loaded.persists(control.name), !control.session_only());
+            if control.session_only() { assert!(!saved.contains(control.name)); }
         }
         for page in PageId::ALL {
             for control in &controls {

@@ -1,5 +1,6 @@
 //! Optional UNORM boundary. Keep native per-draw saturation and quantization;
 //! auxiliary float masks never change the faithful colour target's blend semantics.
+use crate::effect_gpu::EffectPassEncoder as _;
 use crate::{gpu_stats::{GpuStatsExt, TextureViewStatsExt}, DEPTH};
 use crate::pipeline_creation::RenderPipeline;
 pub(super) const AUX: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -77,7 +78,7 @@ impl EnhancedFrame {
     }
     pub fn resolve_depth(&self, enc: &mut wgpu::CommandEncoder) {
         let Some((pipe, bg)) = &self.depth_resolve else { return; };
-        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let mut pass = enc.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Enhanced depth resolve"), color_attachments: &[],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &self.resolved_depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None,
@@ -86,7 +87,7 @@ impl EnhancedFrame {
         pass.set_pipeline(pipe); pass.set_bind_group(0, bg, &[]); pass.draw(0..3, 0..1);
     }
     pub fn composite(&self, enc: &mut wgpu::CommandEncoder, output: &wgpu::TextureView, input: Option<&wgpu::BindGroup>, timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>) {
-        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let mut pass = enc.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Enhanced native colour presentation"), color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: output, resolve_target: None, depth_slice: None,
                 ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },

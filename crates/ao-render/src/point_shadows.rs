@@ -287,7 +287,7 @@ impl Renderer {
             }
             encoder.clear_buffer(&points.indirect, 0, None);
             {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("GPU admitted cube ranking"), timestamp_writes: None });
+                let mut pass = encoder.begin_effect_compute_pass(&wgpu::ComputePassDescriptor { label: Some("GPU admitted cube ranking"), timestamp_writes: None });
                 pass.set_pipeline(&self.point_program.pipeline);
                 pass.set_bind_group(0, points.selection.as_ref().expect("cube selection bindings"), &[]);
                 pass.dispatch_workgroups(1, 1, 1);
@@ -306,7 +306,7 @@ impl Renderer {
                 let face_mask = if actor { points.actor_face_mask } else { points.static_face_mask };
                 if (face_mask & (1 << (layer % 6))) == 0 { continue; }
                 let view = if actor { &points.actor_faces[layer - points.faces.len()] } else { &points.faces[layer] };
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("cached admitted local shadow face"), color_attachments: &[],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view,
                         depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }), stencil_ops: None }),

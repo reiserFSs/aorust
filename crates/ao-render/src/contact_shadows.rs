@@ -3,6 +3,7 @@
 //! Weak night/dusk directional light remains eligible; native fog and mapped-shadow attenuation stay in the mask.
 //! A finite 3x3 march-phase tile is averaged over a full period using symmetric tangent-plane rejection,
 //! including at upsampling; sloping surfaces stay smooth without mixing foreground/background silhouettes.
+use crate::effect_gpu::EffectPassEncoder as _;
 use crate::gpu_stats::GpuStatsExt;
 use crate::pipeline_creation::RenderPipeline;
 use glam::{Mat4, Vec3};
@@ -123,7 +124,7 @@ impl ContactShadows {
             ("contact shadow bilateral blur", &self.blur, &targets.blur_bind, &targets.filtered, wgpu::LoadOp::Clear(wgpu::Color::BLACK)),
             ("contact shadow upsample/darken", &self.composite, &targets.raw_bind, colour, wgpu::LoadOp::Load),
         ] {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(label), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: output, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load, store: wgpu::StoreOp::Store } })],
                 depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
             });

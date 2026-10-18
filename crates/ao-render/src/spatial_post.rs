@@ -1,6 +1,7 @@
 //! Opt-in display-space spatial effects, after tonemapping and before the HUD.
 //! Algorithms adapted from ao-vk (MIT, Copyright (c) 2026 wannabuh).
 //! See THIRD_PARTY. All samples come exclusively from the current visible frame.
+use crate::effect_gpu::EffectPassEncoder as _;
 use crate::gpu_stats::{GpuStatsExt, TextureViewStatsExt};
 use crate::pipeline_creation::RenderPipeline;
 
@@ -160,8 +161,8 @@ impl SpatialPost {
         let mut result = None;
         for (index, pass) in frame.passes.iter().enumerate() {
             let Some(pass) = pass else { continue; };
-            let mut render = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Spatial post"), color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            let mut render = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(["motion blur", "depth of field", "FXAA", "CAS"][index]), color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &pass.output, resolve_target: None, depth_slice: None,
                     ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
                 })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,

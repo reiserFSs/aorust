@@ -1,4 +1,5 @@
 //! Opt-in local lighting: 64 admitted sources in bounded world-space clusters.
+use crate::effect_gpu::EffectPassEncoder as _;
 use glam::Vec3;
 use crate::gpu_stats::GpuStatsExt;
 
@@ -195,7 +196,7 @@ impl crate::Renderer {
         let gpu = self.cluster_frame.gpu.as_ref().expect("admitted light resources");
         self.queue.write_buffer(&gpu.input, 0, bytes);
         let timestamp_writes = self.gpu_timer.as_mut().filter(|timer| !timer.is_recording()).map(crate::FrameGpuTimer::begin_compute_pass);
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("admitted local light selection and spatial clusters"), timestamp_writes });
+        let mut pass = encoder.begin_effect_compute_pass(&wgpu::ComputePassDescriptor { label: Some("admitted local light selection and spatial clusters"), timestamp_writes });
         pass.set_pipeline(&self.cluster_programs.pipeline);
         pass.set_bind_group(0, &gpu.bind, &[]);
         pass.dispatch_workgroups(1, 1, 1);

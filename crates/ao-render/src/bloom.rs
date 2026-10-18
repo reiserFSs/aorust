@@ -1,4 +1,5 @@
 //! Current-frame bloom: authored emission always, plus (HDR only) highlights above white. No history.
+use crate::effect_gpu::EffectPassEncoder as _;
 use crate::gpu_stats::{GpuStatsExt, TextureViewStatsExt};
 use crate::pipeline_creation::RenderPipeline;
 
@@ -60,7 +61,7 @@ impl Pass {
     }
     fn encode(&self, encoder: &mut wgpu::CommandEncoder, pipeline: &wgpu::RenderPipeline,
         timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>) {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Bounded emissive bloom"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &self.target, resolve_target: None, depth_slice: None,
                 ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })],

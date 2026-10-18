@@ -113,7 +113,7 @@ impl Simulation {
         if !programs.ready() { return false; }
         let count = self.vertex_count / 6;
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("bounded native effect GPU simulation"), timestamp_writes: None });
+            let mut pass = encoder.begin_effect_compute_pass(&wgpu::ComputePassDescriptor { label: Some(if self.smoke { "Fluid smoke" } else { "Spell particles" }), timestamp_writes: None });
             let mut dispatch = |stage: usize, side: usize| { pass.set_pipeline(&programs.stages[stage]); pass.set_bind_group(0, &self.groups[side], &[]); pass.dispatch_workgroups(count.div_ceil(64), 1, 1); };
             if !self.stepping {
                 dispatch(if self.smoke { 6 } else { 1 }, 0);

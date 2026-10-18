@@ -25,6 +25,49 @@ still lay out the client. Repeated unchanged text/visibility updates likewise
 leave child geometry intact. Regression:
 `gui::clip_tests::unchanged_updates_and_moves_preserve_child_layout`.
 
+### Enhanced session diagnostics (aomac extension)
+
+The declarative `play/enhanced.rs` registry places three default-off, session-only
+controls on **Enhanced → Performance → Session Controls**. They are DValues in
+the Variables category, never persisted in any prefs file:
+
+- **Disable All Enhanced Effects** (`AomacEnhancedSuspended`), also
+  **Ctrl+Shift+E**: temporarily uses faithful visual-effect defaults
+  (`EnhancedSettings`) without modifying any individual feature preference.
+  A second press restores the selected effect set. Display, input, text and
+  texture-quality settings remain unchanged: this includes anisotropic
+  filtering, MSAA, improved mip filtering, extended scenery distance,
+  widescreen FOV, smooth text, interface scaling, borderless fullscreen,
+  pinch zoom and retail Chat Font Size. A small GUI-font notice appears
+  for 2.5 seconds on disable/restore.
+- **Effect GPU Costs** (`AomacEffectGpuOverlay`), also **Ctrl+Shift+O**:
+  displays rolling GPU pass intervals in milliseconds and sample counts using
+  the normal GUI font. Intervals may overlap or include dependency waits and
+  are not additive or exclusive per-feature costs. Fused shader work remains
+  in the World/shared interval. Pending samples and unsupported/unavailable
+  GPU timing are shown explicitly; GPU timestamps are not replaced with CPU timings.
+- **Log Slow Frames** (`AomacSlowFrameLog`): enables the viewer's slow-frame
+  diagnostics without saving that choice.
+
+The hotkeys act on nonrepeat physical key presses only while in world, outside
+text input and after the options key-capture path. Existing native fixed keys
+and user bindings take precedence over colliding chords. These are opt-in
+aomac diagnostics, not claims about retail GUI behavior. Their upstream
+reference is ao-vk `proxy/ddraw/rvk_ddraw.cpp` (edge-triggered Ctrl+Shift
+controls and slow-frame logging); unlike ao-vk's profiling sweep, this overlay
+reports timestamp costs without toggling individual features.
+The six-slot timestamp ring never waits for GPU completion on the frame thread.
+On Metal, submitted-work callbacks precede a separate resolve/readback submission;
+resolving inside the timed encoder produced unavailable samples in the actual
+headless GUI probe. The 120-sample rolling windows include zero-cost frames for
+previously observed cached passes, with GUI and world batches kept separate.
+Busy slots skip samples rather than stalling rendering; settings/quality changes
+discard old pending samples.
+Regressions: `enhanced_runtime_hotkeys_preserve_preferences_and_restore_effects`,
+`enhanced_hotkeys_yield_to_text_input_and_native_fixed_keys`, and the declarative
+registry's `registry_is_unique_complete_resettable_and_persistent`.
+
+
 ### GUI view lifetime
 
 Native ownership rule (not a retail layout/behaviour claim): `Tree` retains stable
@@ -1454,7 +1497,12 @@ is admitted into persistent probe history.
 
 Both viewers request a background world-pipeline variant and keep drawing the previous settings
 until it is ready. Variants are keyed by shadows, AO, bloom, sun-mask and clamped MSAA;
-the active set and three cached sets are retained, so a warm toggle reuses its pipelines.
+the active set and three inactive sets are retained, plus the faithful baseline
+at the requested native MSAA quality. A worker warms a missing native baseline
+alongside Enhanced/water variants; the extra pin does not evict a warmed
+water/cloud attachment pair. While a higher native quality is still warming,
+the master switch immediately uses the faithful variant at the current actual
+sample count, then finishes that quality change asynchronously.
 `Host::enhanced` supplies the pending frontend settings to grass inputs. Fixtures retain the
 synchronous `Host::enhanced_settings` / `Renderer::set_enhanced_settings` path.
 Viewers settle completed variants before checking render targets, keeping attachment sample

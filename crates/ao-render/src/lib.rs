@@ -56,6 +56,9 @@ use pipelines::{Pipelines, Slot as PipelineSlot, Spec as PipelineSpec};
 mod heat_haze;
 mod gpu_stats;
 pub use gpu_stats::FrameGpuTimer;
+mod effect_gpu;
+pub use effect_gpu::EffectGpuCost;
+use effect_gpu::EffectPassEncoder;
 mod enhanced_settings;
 pub use enhanced_settings::{EnhancedSettings, NightMode};
 mod enhanced;
@@ -778,6 +781,8 @@ pub struct Renderer {
     sky_disc_transforms: Vec<[[f32; 4]; 4]>,
     sky_disc_sources: sky_discs::DiscSources,
     gpu_timer: Option<FrameGpuTimer>,
+    effect_profiler: Option<std::cell::RefCell<effect_gpu::EffectGpuProfiler>>,
+    effect_costs: Vec<EffectGpuCost>,
     cpu_timings: Option<FrameCpuTimings>,
     pub stats: FrameStats,
     sun_shadows: Option<sun_shadows::SunShadows>,
@@ -1310,6 +1315,8 @@ impl Renderer {
             sky_disc_transforms: Vec::new(),
             sky_disc_sources: sky_discs::DiscSources::default(),
             gpu_timer: None,
+            effect_profiler: None,
+            effect_costs: Vec::new(),
             cpu_timings: None,
             grass: None,
             foliage: foliage::Foliage::default(),
@@ -1714,59 +1721,127 @@ impl Renderer {
     }
 
     fn request_world(&mut self, key: variant::Key, settings: EnhancedSettings, defer: bool) {
-        // A shader-equivalent switch (e.g. HDR -> HDR + cloud shadows) still
-        // needs both attachment shapes warmed before water can enter the view.
+        let cached = |renderer: &Self, key| renderer.world_key == key
+            || renderer.world_variants.iter().any(|(candidate, _)| *candidate == key);
+        let faithful = variant::Key::of(EnhancedSettings::default(),
+            self.clamp_msaa(self.requested_msaa, EnhancedSettings::default()));
         let companion = key.with_water_cloud(!key.water_cloud);
-        let water_pair_cached = !settings.cloud_shadows || self.world_key == companion
-            || self.world_variants.iter().any(|(cached, _)| *cached == companion);
-        if key == self.world_key && water_pair_cached {
-            self.pending_world = None;
-            if self.enhanced_settings != settings { self.apply_enhanced_settings(settings); }
-            return;
+
+        // A quality increase may still be warming its native baseline. Master
+        // off removes effects now at the current sample count, then finishes the
+        // requested native quality asynchronously without reverting the request.
+        if !settings.any_enabled() && !cached(self, key) {
+            let fallback = variant::Key::of(EnhancedSettings::default(), self.world.msaa);
+            if cached(self, fallback) {
+                if self.world_key != fallback {
+                    self.install_world(fallback, Default::default(), settings);
+                } else if self.enhanced_settings != settings {
+                    self.apply_enhanced_settings(settings);
+                }
+            }
         }
-        if let Some(index) = self.world_variants.iter().position(|(cached, _)| water_pair_cached && *cached == key) {
-            let world = self.world_variants.remove(index).1;
-            self.install_world(key, (world, None), settings);
-            return;
+
+        let world_cached = cached(self, key);
+        let water_cached = !settings.cloud_shadows || cached(self, companion);
+        let baseline_cached = cached(self, faithful);
+        // Cached effects can restore immediately even while a newly requested
+        // native sample count is still compiling in the companion worker.
+        if world_cached && water_cached {
+            if key != self.world_key {
+                self.install_world(key, Default::default(), settings);
+            } else if self.enhanced_settings != settings {
+                self.apply_enhanced_settings(settings);
+            }
+            if baseline_cached {
+                self.pending_world = None;
+                return;
+            }
         }
-        if let Some(pending) = self.pending_world.as_mut().filter(|pending| pending.key == key && (!settings.cloud_shadows || pending.settings.cloud_shadows)) {
+        if let Some(pending) = self.pending_world.as_mut().filter(|pending|
+            (world_cached || pending.supplies(key))
+                && (water_cached || pending.supplies(companion))
+                && (baseline_cached || pending.supplies(faithful))) {
+            // Retargeting preserves the in-flight native companion across an
+            // off/restore roundtrip; tagged results cannot install stale effects.
+            pending.key = key;
             pending.settings = settings;
             if !defer { self.await_enhanced_world(); }
             return;
         }
         let request = variant::Request::new(
             &self.device, &self.shader, self.format, (&self.g_layout, &self.tex_layout, &self.holo_layout),
-            key, settings,
-            &self.world_compiles, &self.world_frame_compiles);
+            key, settings, &self.world_compiles, &self.world_frame_compiles)
+            .build_only(!world_cached, !water_cached, (!baseline_cached).then_some(faithful));
         if defer {
-            self.pending_world = Some(request.spawn(key, settings));
+            self.pending_world = Some(request.spawn());
         } else {
-            let world = request.spawn(key, settings).wait();
+            self.pending_world = None;
+            let world = request.spawn().wait();
             self.install_world(key, world, settings);
         }
     }
 
-    fn install_world(&mut self, key: variant::Key, (world, companion): variant::Built, settings: EnhancedSettings) {
-        self.pending_world = None;
-        let previous = std::mem::replace(&mut self.world, world);
-        let previous_key = std::mem::replace(&mut self.world_key, key);
-        if previous.msaa != self.world.msaa {
-            self.release_effect_targets();
-            self.enhanced_frame = None;
-            self.bloom = None;
-            self.grade = None;
-        }
-        if let Some((companion_key, companion)) = companion {
+    fn install_world(&mut self, key: variant::Key, mut built: variant::Built, settings: EnhancedSettings) {
+        let world = if let Some(index) = built.iter().position(|world| world.as_ref().is_some_and(|(candidate, _)| *candidate == key)) {
+            built[index].take().map(|(_, world)| world)
+        } else if key != self.world_key {
+            let index = self.world_variants.iter().position(|(candidate, _)| *candidate == key)
+                .expect("installed world was built or retained while its companions warmed");
+            Some(self.world_variants.remove(index).1)
+        } else { None };
+        let world_changed = world.is_some();
+        let previous_water = (world_changed && self.enhanced_settings.cloud_shadows)
+            .then(|| self.world_key.with_water_cloud(!self.world_key.water_cloud));
+        let previous = world.map(|world| {
+            let previous = std::mem::replace(&mut self.world, world);
+            let previous_key = std::mem::replace(&mut self.world_key, key);
+            if previous.msaa != self.world.msaa {
+                if let Some(profiler) = &mut self.effect_profiler { profiler.get_mut().reset_averages(); }
+                self.effect_costs.clear();
+                self.release_effect_targets();
+                self.enhanced_frame = None;
+                self.bloom = None;
+                self.grade = None;
+            }
+            (previous_key, previous)
+        });
+        for (companion_key, companion) in built.into_iter().flatten() {
             self.world_variants.retain(|(cached, _)| *cached != companion_key);
             self.world_variants.push((companion_key, companion));
         }
-        self.world_variants.push((previous_key, previous));
-        while self.world_variants.len() > WORLD_VARIANT_CACHE { self.world_variants.remove(0); }
-        self.apply_enhanced_settings(settings);
+        // Treat both halves of a water/cloud world as recently used. Returning
+        // to native must not evict the companion needed by an immediate restore.
+        for companion in [settings.cloud_shadows.then(|| key.with_water_cloud(!key.water_cloud)), previous_water].into_iter().flatten() {
+            if let Some(index) = self.world_variants.iter().position(|(cached, _)| *cached == companion) {
+                let companion = self.world_variants.remove(index);
+                self.world_variants.push(companion);
+            }
+        }
+        if let Some(previous) = previous { self.world_variants.push(previous); }
+        let faithful = variant::Key::of(EnhancedSettings::default(),
+            self.clamp_msaa(self.requested_msaa, EnhancedSettings::default()));
+        // Pin requested native quality, or the current-quality fallback until
+        // that baseline finishes warming. Pins add to the three inactive slots,
+        // so a faithful return never evicts a warmed water/cloud pair.
+        let baseline_ready = self.world_key == faithful
+            || self.world_variants.iter().any(|(cached, _)| *cached == faithful);
+        let pin = if baseline_ready { faithful }
+            else { variant::Key::of(EnhancedSettings::default(), self.world.msaa) };
+        let pinned = usize::from(self.world_variants.iter().any(|(cached, _)| *cached == pin));
+        while self.world_variants.len() > WORLD_VARIANT_CACHE + pinned {
+            let evict = self.world_variants.iter().position(|(cached, _)| *cached != pin)
+                .expect("a bounded variant cache has an unpinned entry");
+            self.world_variants.remove(evict);
+        }
+        if world_changed || self.enhanced_settings != settings { self.apply_enhanced_settings(settings); }
     }
 
     fn apply_enhanced_settings(&mut self, settings: EnhancedSettings) {
         let previous = self.enhanced_settings;
+        if previous != settings {
+            if let Some(profiler) = &mut self.effect_profiler { profiler.get_mut().reset_averages(); }
+            self.effect_costs.clear();
+        }
         let changed_frame = previous.any_enabled() != settings.any_enabled()
             || previous.ambient_occlusion != settings.ambient_occlusion
             || previous.emissive_bloom != settings.emissive_bloom
@@ -1889,12 +1964,50 @@ impl Renderer {
     /// Explicit offline instrumentation; disabled by default and owns no resources then.
     /// After each render, read the result before encoding another timed frame.
     pub fn set_gpu_timing(&mut self, enabled: bool) -> Result<()> {
+        anyhow::ensure!(!enabled || self.effect_profiler.is_none(), "offline frame timing and live per-effect profiling must be sampled separately");
         if enabled && self.shadow_timer.is_some() { return Err(anyhow!("frame and shadow GPU timing must be sampled separately")); }
         self.gpu_timer = if enabled { Some(FrameGpuTimer::new(&self.device, &self.queue)?) } else { None };
         Ok(())
     }
     pub fn read_frame_gpu_ms(&mut self) -> Result<Option<f64>> {
         self.gpu_timer.as_mut().map(|timer| timer.read_ms(&self.device, &self.queue)).transpose()
+    }
+
+    /// Live, actual-pass GPU profiling. Off by default; never waits for a GPU
+    /// readback. Disabling releases its fixed ring and resets rolling averages.
+    pub fn set_effect_gpu_profiling(&mut self, enabled: bool) -> Result<()> {
+        if enabled == self.effect_profiler.is_some() { return Ok(()); }
+        anyhow::ensure!(!enabled || (self.gpu_timer.is_none() && self.shadow_timer.is_none()),
+            "live per-effect profiling and offline GPU timers must be sampled separately");
+        self.effect_profiler = if enabled {
+            Some(std::cell::RefCell::new(effect_gpu::EffectGpuProfiler::new(&self.device, &self.queue)?))
+        } else { None };
+        self.effect_costs.clear();
+        Ok(())
+    }
+
+    /// A 120-sample rolling mean of completed batches, summed over all actual
+    /// passes for each logical effect. Busy GPU readback slots skip sampling.
+    pub fn effect_gpu_costs(&self) -> &[EffectGpuCost] { &self.effect_costs }
+
+    pub fn poll_effect_gpu_costs(&mut self) {
+        if let Some(profiler) = &mut self.effect_profiler {
+            let profiler = profiler.get_mut();
+            profiler.poll(&self.device, &self.queue);
+            self.effect_costs.clone_from(&profiler.costs);
+        }
+    }
+
+    /// Scopes auxiliary submissions without changing encoder ownership. The
+    /// built-in GuiRenderer already uses this wrapper and reports label GUI.
+    pub fn profile_gui_draw<R>(&self, encoder: &mut wgpu::CommandEncoder,
+        draw: impl FnOnce(&mut wgpu::CommandEncoder) -> R) -> R {
+        let guard = self.effect_profiler.as_ref().and_then(|profiler| profiler.borrow_mut().begin(true));
+        let result = draw(encoder);
+        if let (Some(profiler), Some(guard)) = (&self.effect_profiler, guard) {
+            profiler.borrow_mut().finish(guard);
+        }
+        result
     }
 
     /// No clock reads or timing allocations while disabled (the default).
@@ -2691,6 +2804,8 @@ impl Renderer {
     /// Draws one frame into `resolve` (a view of the output texture).
     pub fn render(&mut self, resolve: &wgpu::TextureView, t: &Targets, cam: &Camera) -> wgpu::SubmissionIndex {
         let _compile_scope = pipeline_creation::FrameGuard::enter();
+        self.poll_effect_gpu_costs();
+        let effect_guard = self.effect_profiler.as_ref().and_then(|profiler| profiler.borrow_mut().begin(false));
         let timed = self.cpu_timings.is_some();
         let prepare_start = timed.then(std::time::Instant::now);
         let mut cpu = FrameCpuTimings::default();
@@ -2797,9 +2912,9 @@ impl Renderer {
         let water_cloud = self.enhanced_settings.cloud_shadows && self.sorted.iter().any(|draw| draw.2 == 2);
         let key = variant::Key::of(self.enhanced_settings, self.world.msaa).with_water_cloud(water_cloud);
         if key != self.world_key {
-            let pending = self.pending_world.take();
-            self.request_world(key, self.enhanced_settings, false);
-            self.pending_world = pending;
+            // Both water shapes were warmed before effects became active. This
+            // visibility-only swap must not await a cold native-quality request.
+            self.install_world(key, Default::default(), self.enhanced_settings);
         }
         let grass_start = timed.then(std::time::Instant::now);
         self.prepare_enhanced_grass(cam, vp, env.fog_end.max(env.fog_start + 1e-3), 0.5 * t.size.1 as f32 / (0.5 * self.lens.vertical_fov(aspect)).tan());
@@ -2918,6 +3033,10 @@ impl Renderer {
         let enhanced_frame = self.enhanced_frame.as_ref();
         let world_target = enhanced_frame.map_or(world_resolve, |frame| &frame.colour);
         let msaa_target = enhanced_frame.and_then(|frame| frame.msaa.as_ref().and_then(|views| views[0].as_ref())).or(t.msaa.as_ref().filter(|_| enhanced_frame.is_none()));
+        let split_grass_cost = effect_guard.is_some() && self.grass.is_some();
+        let split_canopy_cost = effect_guard.is_some()
+            && (self.enhanced_settings.foliage_leaves || self.enhanced_settings.foliage_flutter || self.enhanced_settings.foliage_falling);
+        let split_effect_cost = split_grass_cost || split_canopy_cost;
         let mut attachments = [
             Some(wgpu::RenderPassColorAttachment { view: msaa_target.unwrap_or(world_target), resolve_target: if isolate_sky { None } else { msaa_target.map(|_| world_target) }, depth_slice: None,
                 ops: wgpu::Operations { load: wgpu::LoadOp::Clear(framebuffer_clear(env.sky_color)), store: if msaa_target.is_some() { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store } } }),
@@ -2929,18 +3048,21 @@ impl Renderer {
             enhanced_frame.and_then(|frame| frame.attachment(6)),
         ];
         if isolate_sky { attachments[0].as_mut().unwrap().ops.store = wgpu::StoreOp::Store; }
+        if split_effect_cost {
+            for attachment in attachments.iter_mut().flatten() { attachment.ops.store = wgpu::StoreOp::Store; }
+        }
         let final_world = enhanced_frame.is_none() && self.heat_haze.source().is_none() && self.screen.layers.is_empty();
         let timestamps = self.gpu_timer.as_mut().and_then(|timer| {
             if timer.is_recording() { final_world.then(|| timer.end_pass()) } else { Some(timer.begin_pass(final_world)) }
         }).map(|writes| (writes.beginning_of_pass_write_index, writes.end_of_pass_write_index));
         let timestamp_queries = self.gpu_timer.as_ref().map(|timer| timer.query_set());
         {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = enc.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &attachments[..if isolate_sky { 1 } else { enhanced_frame.map_or(1, enhanced::EnhancedFrame::target_count) }],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: enhanced_frame.map_or(&t.depth, |frame| &frame.depth),
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: if isolate_sky || enhanced_frame.is_some() { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: if split_effect_cost || isolate_sky || enhanced_frame.is_some() { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),
                     stencil_ops: None,
                 }),
                 timestamp_writes: timestamps.and_then(|(begin, end)| {
@@ -3071,14 +3193,14 @@ impl Renderer {
                 drop(pass);
                 let beauty = attachments[0].as_mut().unwrap();
                 beauty.ops.load = wgpu::LoadOp::Load;
-                beauty.ops.store = if msaa_target.is_some() { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store };
+                beauty.ops.store = if msaa_target.is_some() && !split_effect_cost { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store };
                 beauty.resolve_target = msaa_target.map(|_| world_target);
-                pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                pass = enc.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("native world after beauty-only sky"),
                     color_attachments: &attachments[..enhanced_frame.map_or(1, enhanced::EnhancedFrame::target_count)],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                         view: enhanced_frame.map_or(&t.depth, |frame| &frame.depth),
-                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: if enhanced_frame.is_some() { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: if split_effect_cost || enhanced_frame.is_some() { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),
                         stencil_ops: None,
                     }),
                     timestamp_writes: timestamps.and_then(|(_, end)| end.map(|index| wgpu::RenderPassTimestampWrites {
@@ -3109,12 +3231,30 @@ impl Renderer {
                     }
                 }
             }
+            if split_grass_cost {
+                drop(pass);
+                pass = effect_gpu::resume_world_pass(&mut enc, "Enhanced grass",
+                    &attachments[..enhanced_frame.map_or(1, enhanced::EnhancedFrame::target_count)],
+                    enhanced_frame.map_or(&t.depth, |frame| &frame.depth));
+            }
             let grass_start = timed.then(std::time::Instant::now);
             calls.set(calls.get() + self.draw_enhanced_grass(&mut pass));
             if let Some(start) = grass_start { cpu.grass_encode_ms = start.elapsed().as_secs_f64() * 1000.0; }
+            if split_grass_cost {
+                drop(pass);
+                pass = effect_gpu::resume_world_pass(&mut enc, "profiled world continuation",
+                    &attachments[..enhanced_frame.map_or(1, enhanced::EnhancedFrame::target_count)],
+                    enhanced_frame.map_or(&t.depth, |frame| &frame.depth));
+            }
             // Existing native list order; list 4 remains the liquid list.
             for priority in [1, 2, 3, 4, 5, 6, 10, 7] {
                 world_phase(&mut pass, priority);
+            }
+            if split_canopy_cost {
+                drop(pass);
+                pass = effect_gpu::resume_world_pass(&mut enc, "Enhanced canopy leaves",
+                    &attachments[..enhanced_frame.map_or(1, enhanced::EnhancedFrame::target_count)],
+                    enhanced_frame.map_or(&t.depth, |frame| &frame.depth));
             }
             calls.set(calls.get() + self.draw_canopy_leaves(&mut pass) as usize);
         }
@@ -3161,6 +3301,9 @@ impl Renderer {
         self.drawn_visuals.extend(self.pending_visuals.get_mut().drain());
         self.stats = FrameStats { instances: self.vis.len(), draw_calls: calls.get() };
         let finish_start = timed.then(std::time::Instant::now);
+        if let (Some(profiler), Some(guard)) = (&self.effect_profiler, effect_guard) {
+            profiler.borrow_mut().finish(guard);
+        }
         let commands = enc.finish();
         if let Some(start) = finish_start { cpu.finish_ms = start.elapsed().as_secs_f64() * 1000.0; }
         let submit_start = timed.then(std::time::Instant::now);

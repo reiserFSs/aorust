@@ -1,5 +1,6 @@
 //! Opt-in waterfall-foot mist from exact steep-liquid records, never emissive.
 //! Scene-lit alpha blending retains resolved-depth occlusion and native fog extinction.
+use crate::effect_gpu::EffectPassEncoder as _;
 use glam::{Mat4, Vec3};
 use crate::{gpu_stats::GpuStatsExt, pipeline_creation::RenderPipeline, water_dynamics::SprayRecord};
 
@@ -106,7 +107,7 @@ impl WaterSpray {
             });
             self.depth_bind = Some((resolved_depth.clone(), bind));
         }
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("waterfall foot spray and mist"), color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: colour, resolve_target: None, depth_slice: None,
                 ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },

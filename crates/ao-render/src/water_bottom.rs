@@ -1,4 +1,5 @@
 //! Actor-free current-camera bottom depth, using native world buffers and materials.
+use crate::effect_gpu::EffectPassEncoder as _;
 use super::{pipeline_creation::{self, RenderPipeline}, pipelines::{Pipelines, Spec}, Blend, Gpu, GroundRun};
 use std::{collections::HashMap, ops::Range};
 
@@ -77,7 +78,7 @@ impl WaterBottom {
     pub(super) fn encode(&self, encoder: &mut wgpu::CommandEncoder, depth_target: &wgpu::TextureView,
         globals_bg: &wgpu::BindGroup, gpu: &Gpu, vis_range: &[Range<u32>], frame: usize,
         pipes: &Pipelines, ground: Option<&GroundRun>, timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>) {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("actor-free static water bottom"), color_attachments: &[],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth_target,

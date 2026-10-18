@@ -48,7 +48,8 @@ pub(super) struct Pipes {
     pub depth_clear_pipe: super::pipeline_creation::RenderPipeline,
     pub grass: super::grass::Compiled,
 }
-pub(super) type Built = (Pipes, Option<(Key, Pipes)>);
+/// Fixed primary, water-shape, and faithful-native slots; no companion allocation.
+pub(super) type Built = [Option<(Key, Pipes)>; 3];
 
 impl Pipes {
     pub(super) fn is_ready(&self) -> bool {
@@ -121,6 +122,9 @@ pub(super) struct Request {
     holo_layout: wgpu::BindGroupLayout,
     key: Key,
     settings: EnhancedSettings,
+    build_world: bool,
+    build_water: bool,
+    baseline: Option<Key>,
     compiles: Arc<AtomicU64>,
     frame_compiles: Arc<AtomicU64>,
     frame_thread: std::thread::ThreadId,
@@ -137,26 +141,39 @@ impl Request {
         Self {
             device: device.clone(), native: native.clone(), format,
             g_layout: layouts.0.clone(), tex_layout: layouts.1.clone(), holo_layout: layouts.2.clone(),
-            key, settings,
+            key, settings, build_world: true, build_water: settings.cloud_shadows, baseline: None,
             compiles: compiles.clone(),
             frame_compiles: frame_compiles.clone(), frame_thread: std::thread::current().id(),
         }
     }
 
-    pub(super) fn build(&self) -> Built {
-        let pipes = self.prepare();
+    pub(super) fn build_only(mut self, world: bool, water: bool, baseline: Option<Key>) -> Self {
+        self.build_world = world;
+        self.build_water = water && self.settings.cloud_shadows;
+        self.baseline = baseline.filter(|key| *key != self.key);
+        self
+    }
+
+    fn warm_companion(&self, key: Key, settings: EnhancedSettings) -> (Key, Pipes) {
+        let mut request = Self::new(&self.device, &self.native, self.format,
+            (&self.g_layout, &self.tex_layout, &self.holo_layout), key, settings,
+            &self.compiles, &self.frame_compiles);
+        request.frame_thread = self.frame_thread;
+        let pipes = request.prepare();
         pipes.warm();
-        let companion = self.settings.cloud_shadows.then(|| {
-            let mut request = Self::new(&self.device, &self.native, self.format,
-                (&self.g_layout, &self.tex_layout, &self.holo_layout),
-                self.key.with_water_cloud(!self.key.water_cloud), self.settings,
-                &self.compiles, &self.frame_compiles);
-            request.frame_thread = self.frame_thread;
-            let companion = request.prepare();
-            companion.warm();
-            (request.key, companion)
+        (key, pipes)
+    }
+
+    pub(super) fn build(&self) -> Built {
+        let pipes = self.build_world.then(|| {
+            let pipes = self.prepare();
+            pipes.warm();
+            (self.key, pipes)
         });
-        (pipes, companion)
+        let water = self.build_water.then(|| self.warm_companion(
+            self.key.with_water_cloud(!self.key.water_cloud), self.settings));
+        let baseline = self.baseline.map(|key| self.warm_companion(key, EnhancedSettings::default()));
+        [pipes, water, baseline]
     }
 
     pub(super) fn prepare(&self) -> Pipes {
@@ -231,9 +248,12 @@ impl Request {
             pipes, actor_pipes, ground_pipes, depth_clear_pipe, grass }
     }
 
-    pub(super) fn spawn(self, key: Key, settings: EnhancedSettings) -> Pending {
+    pub(super) fn spawn(self) -> Pending {
+        let (key, settings) = (self.key, self.settings);
+        let build_keys = [self.build_world.then_some(key),
+            self.build_water.then_some(key.with_water_cloud(!key.water_cloud)), self.baseline];
         let worker = spawn_compile_worker("enhanced world variant", move || self.build());
-        Pending { key, settings, worker: Some(worker) }
+        Pending { key, settings, build_keys, worker: Some(worker) }
     }
 }
 
@@ -241,10 +261,12 @@ impl Request {
 pub(super) struct Pending {
     pub key: Key,
     pub settings: EnhancedSettings,
+    build_keys: [Option<Key>; 3],
     worker: Option<std::thread::JoinHandle<Built>>,
 }
 
 impl Pending {
+    pub(super) fn supplies(&self, key: Key) -> bool { self.build_keys.contains(&Some(key)) }
     pub(super) fn poll(&mut self) -> Option<Built> {
         self.worker.as_ref().expect("pending worker").is_finished().then(|| self.wait())
     }
@@ -260,6 +282,219 @@ impl Pending {
 mod tests {
     use super::*;
     use crate::Renderer;
+
+    #[test]
+    fn water_visibility_keeps_cold_native_companion_pending_without_frame_work() {
+        use ao_scene::{liquid::{SourceTriangle, Surface}, Blend, Instance, Mesh, Scene, Submesh, Vertex, IDENTITY};
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut r = Renderer::new(&instance, None).expect("pending native/water regression requires GPU");
+        r.wait_for_pipeline_warmup();
+        if !r.msaa_supported.contains(&8) { return; }
+        assert!(r.auxiliary_msaa.sample_count_supported(4));
+        assert!(r.water_cloud_msaa.sample_count_supported(4));
+        r.auxiliary_msaa.remove(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X8);
+        let vertices = [[-20.0, 0.0, -20.0], [20.0, 0.0, -20.0], [20.0, 0.0, 20.0], [-20.0, 0.0, 20.0]]
+            .map(|pos| Vertex { pos, normal: [0.0, 1.0, 0.0], ..Default::default() });
+        let indices = vec![0, 1, 2, 0, 2, 3];
+        let surface = Surface::new(0, 0, indices.as_chunks::<3>().0.iter().map(|triangle| SourceTriangle {
+            kind: 0x80ff_ffff, vertices: std::array::from_fn(|index| vertices[triangle[index] as usize]),
+        }).collect()).expect("native liquid visibility fixture");
+        let first = Submesh { liquid: true, two_sided: true, blend: Blend::AlphaBlend,
+            base_color: [0.2, 0.4, 0.6, 0.5], ..Submesh::new(indices, None) };
+        let mut second = first.clone();
+        second.indices.iter_mut().for_each(|index| *index += 4);
+        r.upload(&Scene {
+            meshes: vec![Mesh { vertices: vertices.into_iter().cycle().take(8).collect(), submeshes: vec![first, second] }],
+            instances: vec![Instance { mesh: 0, transform: IDENTITY }], liquids: vec![surface],
+            water_light: Some(([0.3; 3], [0.0, 1.0, 0.0])),
+            environment: Some(crate::default_environment(100.0)), ..Default::default()
+        });
+        let settings = EnhancedSettings { cloud_shadows: true, ..Default::default() };
+        r.set_world_options(Some(4), None, Some(settings));
+        r.await_enhanced_world();
+        r.wait_for_pipeline_warmup();
+        let visible = crate::Camera::look_at(crate::Vec3::new(0.0, 10.0, 0.0), crate::Vec3::new(0.0, 0.0, -0.1));
+        let away = crate::Camera::look_at(crate::Vec3::new(0.0, 10.0, 100.0), crate::Vec3::new(0.0, 10.0, 200.0));
+        let output = r.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pending native quality and water shape"), size: wgpu::Extent3d { width: 32, height: 32, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: r.format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+        });
+        let view = output.create_view(&Default::default());
+        let targets = crate::Targets::new(&r, 32, 32);
+        r.render(&view, &targets, &visible);
+        r.render(&view, &targets, &away);
+        let frame_compiles = r.frame_thread_compiles();
+        let world_frame_compiles = r.world_frame_thread_compiles();
+        let frame_waits = r.frame_pipeline_waits();
+        r.set_world_options(Some(8), None, None);
+        let native = Key::of(EnhancedSettings::default(), 8);
+        let pending = r.pending_world.as_ref().expect("native 8x must remain pending");
+        assert_eq!(pending.build_keys, [None, None, Some(native)]);
+        let worker = pending.worker.as_ref().unwrap().thread().id();
+        for (camera, water) in [(&visible, true), (&away, false), (&visible, true)] {
+            r.render(&view, &targets, camera);
+            assert_eq!(r.world_key.water_cloud, water, "fixture must exercise both cached water shapes");
+            let pending = r.pending_world.as_ref().expect("water visibility consumed the pending quality worker");
+            assert_eq!(pending.worker.as_ref().unwrap().thread().id(), worker);
+            assert_eq!(pending.build_keys, [None, None, Some(native)]);
+            assert!(!r.world_variants.iter().any(|(key, _)| *key == native),
+                "render synchronously warmed/installed native 8x instead of leaving it to frame-boundary settlement");
+            assert_eq!(r.msaa_samples(), 4);
+            assert_eq!(r.requested_msaa, 8);
+        }
+        assert_eq!(r.frame_thread_compiles(), frame_compiles);
+        assert_eq!(r.world_frame_thread_compiles(), world_frame_compiles);
+        assert_eq!(r.frame_pipeline_waits(), frame_waits);
+        r.await_enhanced_world();
+    }
+
+    #[test]
+    fn cold_enhanced_four_samples_warms_native_return_before_installing() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut r = Renderer::new(&instance, None).expect("native-baseline regression requires GPU");
+        r.wait_for_pipeline_warmup();
+        assert!(r.msaa_supported.contains(&4), "native-baseline regression requires native 4x");
+        assert!(r.auxiliary_msaa.sample_count_supported(4), "native-baseline regression requires auxiliary 4x");
+        let faithful = EnhancedSettings::default();
+        let ao = EnhancedSettings { ambient_occlusion: true, ..faithful };
+        let native = Key::of(faithful, 4);
+        let enhanced = Key::of(ao, 4);
+        let frame_compiles = r.world_frame_thread_compiles();
+        r.set_world_options(Some(4), None, Some(ao));
+        let pending = r.pending_world.as_ref().expect("cold Enhanced/native pair must compile on a worker");
+        assert!(pending.supplies(enhanced));
+        assert!(pending.supplies(native), "first Enhanced 4x request skipped its native return");
+        assert_eq!(r.msaa_samples(), 1, "cold request must preserve the active world");
+        r.await_enhanced_world();
+        assert_eq!(r.world_key, enhanced);
+        assert!(r.world_variants.iter().any(|(key, world)| *key == native && world.is_ready()));
+        let compiles = r.world_pipeline_compiles();
+        let _frame = crate::pipeline_creation::FrameGuard::enter();
+        for settings in [faithful, ao, faithful, ao] {
+            r.request_enhanced_settings(settings);
+            assert!(r.pending_world.is_none(), "master 4x roundtrip waited for a worker");
+            assert_eq!(r.requested_msaa, 4);
+            assert_eq!(r.msaa_samples(), 4);
+            assert_eq!(r.enhanced_settings(), settings);
+        }
+        assert_eq!(r.world_pipeline_compiles(), compiles);
+        assert_eq!(r.world_frame_thread_compiles(), frame_compiles);
+    }
+
+    #[test]
+    fn unchanged_enhanced_key_warms_native_eight_and_master_switch_retargets_worker() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut r = Renderer::new(&instance, None).expect("native-quality regression requires GPU");
+        r.wait_for_pipeline_warmup();
+        // This scenario needs real native 8x support; never advertise fabricated
+        // device capabilities just to make an 8x pipeline test run on a 4x GPU.
+        if !r.msaa_supported.contains(&8) { return; }
+        assert!(r.auxiliary_msaa.sample_count_supported(4));
+        r.auxiliary_msaa.remove(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X8);
+        let faithful = EnhancedSettings::default();
+        let ao = EnhancedSettings { ambient_occlusion: true, ..faithful };
+        r.set_world_options(Some(4), None, Some(ao));
+        r.await_enhanced_world();
+        let enhanced = r.world_key;
+        assert_eq!(enhanced.msaa, 4);
+        let native = Key::of(faithful, 8);
+        let frame_compiles = r.world_frame_thread_compiles();
+        r.set_world_options(Some(8), None, None);
+        let pending = r.pending_world.as_ref().expect("same Enhanced key must still warm cold native 8x");
+        assert_eq!(pending.key, enhanced);
+        assert_eq!(pending.build_keys, [None, None, Some(native)], "same-key request recompiled warm Enhanced pipelines");
+        let worker = pending.worker.as_ref().unwrap().thread().id();
+        let adjusted = EnhancedSettings { ao_strength: 0.5, ..ao };
+        // Even if the worker finishes quickly, nothing settles it in this loop.
+        // Master off/restore must apply immediately before native 8x installs.
+        for settings in [faithful, adjusted, faithful, adjusted] {
+            r.set_world_options(None, None, Some(settings));
+            assert_eq!(r.enhanced_settings(), settings, "master switch retained effects while native quality warmed");
+            assert_eq!(r.msaa_samples(), 4, "pending native quality changed the active sample count");
+            assert_eq!(r.requested_msaa, 8, "master switch erased requested native quality");
+            assert_eq!(r.pending_world.as_ref().unwrap().worker.as_ref().unwrap().thread().id(), worker,
+                "master switch restarted the in-flight native companion");
+        }
+        r.await_enhanced_world();
+        assert_eq!(r.world_key, enhanced, "native companion completion replaced restored effects");
+        assert_eq!(r.enhanced_settings(), adjusted);
+        assert!(r.world_variants.iter().any(|(key, world)| *key == native && world.is_ready()));
+        let compiles = r.world_pipeline_compiles();
+        let _frame = crate::pipeline_creation::FrameGuard::enter();
+        for (settings, samples) in [(faithful, 8), (adjusted, 4), (faithful, 8), (adjusted, 4)] {
+            r.request_enhanced_settings(settings);
+            assert!(r.pending_world.is_none(), "warm native 8x / Enhanced 4x switch must be immediate");
+            assert_eq!(r.msaa_samples(), samples);
+            assert_eq!(r.requested_msaa, 8);
+            assert_eq!(r.enhanced_settings(), settings);
+        }
+        assert_eq!(r.world_pipeline_compiles(), compiles);
+        assert_eq!(r.world_frame_thread_compiles(), frame_compiles);
+    }
+
+    #[test]
+    fn cold_enhanced_request_preserves_requested_native_eight_for_master_return() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut r = Renderer::new(&instance, None).expect("cold native-quality regression requires GPU");
+        r.wait_for_pipeline_warmup();
+        if !r.msaa_supported.contains(&8) { return; }
+        assert!(r.auxiliary_msaa.sample_count_supported(4));
+        r.auxiliary_msaa.remove(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X8);
+        let faithful = EnhancedSettings::default();
+        let ao = EnhancedSettings { ambient_occlusion: true, ..faithful };
+        r.set_world_options(Some(8), None, Some(ao));
+        let pending = r.pending_world.as_ref().expect("cold Enhanced 4x/native 8x pair must warm together");
+        assert!(pending.supplies(Key::of(ao, 4)));
+        assert!(pending.supplies(Key::of(faithful, 8)));
+        r.await_enhanced_world();
+        assert_eq!(r.msaa_samples(), 4);
+        let compiles = r.world_pipeline_compiles();
+        let frame_compiles = r.world_frame_thread_compiles();
+        let _frame = crate::pipeline_creation::FrameGuard::enter();
+        for (settings, samples) in [(faithful, 8), (ao, 4), (faithful, 8), (ao, 4)] {
+            r.request_enhanced_settings(settings);
+            assert!(r.pending_world.is_none(), "cold-start companion was not ready for master return");
+            assert_eq!(r.enhanced_settings(), settings);
+            assert_eq!(r.msaa_samples(), samples);
+            assert_eq!(r.requested_msaa, 8);
+        }
+        assert_eq!(r.world_pipeline_compiles(), compiles);
+        assert_eq!(r.world_frame_thread_compiles(), frame_compiles);
+    }
+
+    #[test]
+    fn session_master_faithful_variant_survives_cache_churn() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut r = Renderer::new(&instance, None).expect("variant-cache regression requires GPU");
+        r.wait_for_pipeline_warmup();
+        let faithful = EnhancedSettings::default();
+        let variants = [
+            EnhancedSettings { sun_shadows: true, ..faithful },
+            EnhancedSettings { ambient_occlusion: true, ..faithful },
+            EnhancedSettings { emissive_bloom: true, ..faithful },
+            EnhancedSettings { sun_shadows: true, ambient_occlusion: true, ..faithful },
+            EnhancedSettings { emissive_bloom: true, ambient_occlusion: true, ..faithful },
+        ];
+        for samples in [1, 4] {
+            r.set_msaa_samples(samples);
+            for settings in variants { r.set_enhanced_settings(settings); }
+            assert_eq!(r.world_variant_cache_len(), super::super::WORLD_VARIANT_CACHE + 1);
+            let native = Key::of(faithful, samples);
+            assert!(r.world_variants.iter().any(|(key, _)| *key == native), "cache churn evicted the current native quality pin");
+            let compiled = r.world_pipeline_compiles();
+            let frame_compiled = r.world_frame_thread_compiles();
+            let _frame = crate::pipeline_creation::FrameGuard::enter();
+            for settings in [faithful, *variants.last().unwrap(), faithful] {
+                r.request_enhanced_settings(settings);
+                assert!(r.pending_world.is_none(), "master roundtrip must install a warm variant immediately");
+                assert_eq!(r.enhanced_settings(), settings);
+                assert_eq!(r.msaa_samples(), samples);
+            }
+            assert_eq!(r.world_pipeline_compiles(), compiled);
+            assert_eq!(r.world_frame_thread_compiles(), frame_compiled);
+        }
+    }
 
     #[test]
     fn independent_lighting_switches_have_distinct_shader_keys() {
@@ -325,6 +560,7 @@ mod tests {
         draw(&mut r);
         let world_frame_compiles = r.world_frame_thread_compiles();
         let total_frame_compiles = r.frame_thread_compiles();
+        r.effect_costs.push(crate::EffectGpuCost { label: "World", average_ms: 9.0, samples: 120 });
         let _frame = crate::pipeline_creation::FrameGuard::enter();
         r.set_world_options(Some(samples), None, None);
         assert!(r.pending_world.is_some(), "a cold standalone MSAA option must spawn a worker");
@@ -343,6 +579,7 @@ mod tests {
         r.settle_enhanced_world();
         assert!(r.pending_world.is_none());
         assert_eq!(r.msaa_samples(), samples);
+        assert!(r.effect_costs.is_empty(), "MSAA-only installation must discard costs from the old sample count");
         draw(&mut r);
         assert_eq!(r.world_frame_thread_compiles(), world_frame_compiles, "MSAA install/first draw compiled world pipelines in frame");
         assert_eq!(r.frame_thread_compiles(), total_frame_compiles, "MSAA install/first draw created render or compute pipelines in frame");

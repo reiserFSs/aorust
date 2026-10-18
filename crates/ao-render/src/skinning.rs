@@ -116,7 +116,7 @@ impl Renderer {
         let has_dispatch = self.act.actors.values().any(|actor| actor.pose.as_ref().is_some_and(|p| p.pending && !p.palette.is_empty()));
         let mut pass = has_dispatch.then(|| {
             let timestamps = self.gpu_timer.as_mut().map(crate::FrameGpuTimer::begin_compute_pass);
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("CAT crowd skin"), timestamp_writes: timestamps });
+            let mut pass = encoder.begin_effect_compute_pass(&wgpu::ComputePassDescriptor { label: Some("CAT crowd skin"), timestamp_writes: timestamps });
             pass.set_pipeline(pipeline);
             pass
         });

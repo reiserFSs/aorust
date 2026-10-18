@@ -1,4 +1,5 @@
 //! Current-frame, bounded directional shadows. No history or simulation ownership.
+use crate::effect_gpu::EffectPassEncoder as _;
 use glam::{Mat4, Vec3};
 use super::{GpuStatsExt, TextureViewStatsExt};
 
@@ -326,7 +327,7 @@ impl SunShadows {
     pub fn encode_actor_visibility(&self, encoder: &mut wgpu::CommandEncoder) {
         if self.actor_ids.is_empty() { return; }
         encoder.clear_buffer(&self.actor_visibility, 0, None);
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        let mut pass = encoder.begin_effect_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("current-frame actor visibility reduction"), timestamp_writes: None,
         });
         pass.set_pipeline(&self.compiled.visibility_pipeline);

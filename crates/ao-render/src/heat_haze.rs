@@ -1,5 +1,6 @@
 //! Lava FX41 is VisualVolumetricFogSphere, not fire particles.
 //! DS10056a6a queues perturbations; 100590fe integrates a persistent60x30 UV grid.
+use crate::effect_gpu::EffectPassEncoder as _;
 use glam::{Mat4, Vec2, Vec3};
 use crate::{frustum_culls_sphere, frustum_planes, gpu_stats::GpuStatsExt};
 use crate::pipeline_creation::RenderPipeline;
@@ -125,7 +126,7 @@ impl HeatHaze {
         if !self.active { return; }
         let Some(gpu) = &self.gpu else { return; };
         let Some(target) = &gpu.target else { return; };
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("native FX41 resolved-color distortion"), color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: output, resolve_target: None, depth_slice: None,
                 ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },

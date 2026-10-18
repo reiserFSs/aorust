@@ -1,5 +1,6 @@
 //! Opt-in sand, ash and red/green fallout driven only by native weather f[3..=6].
 //! Procedural wrapped particle boxes adapt ao-vk rain.vert/rain_common.glsl (MIT).
+use crate::effect_gpu::EffectPassEncoder as _;
 use crate::{gpu_stats::GpuStatsExt, pipeline_creation::RenderPipeline};
 use glam::{Mat4, Vec3};
 
@@ -86,7 +87,7 @@ impl WeatherParticles {
             ] });
             self.bindings = Some((depth.clone(), shelter.clone(), bind));
         }
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("sand ash red green fallout"), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: colour, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
+        let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor { label: Some("sand ash red green fallout"), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: colour, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bindings.as_ref().unwrap().2, &[]);
         for (kind, strength) in intensity.into_iter().enumerate() {

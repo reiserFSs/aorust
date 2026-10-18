@@ -1,4 +1,5 @@
 //! Opt-in current-frame optics; faithful liquid draw and opacity remain untouched.
+use crate::effect_gpu::EffectPassEncoder as _;
 use crate::{gpu_stats::GpuStatsExt, pipeline_creation::RenderPipeline};
 use ao_scene::liquid::Surface;
 use glam::{Mat4, Vec3};
@@ -281,14 +282,14 @@ impl WaterOptics {
         let inputs = targets.inputs.as_ref().expect("prepared water input bindings");
         let attachment = |view| Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } });
         {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("exact water triangle mask"), color_attachments: &[attachment(&targets.position), attachment(&targets.normal)], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &targets.depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }), stencil_ops: None }), timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
+            let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor { label: Some("exact water triangle mask"), color_attachments: &[attachment(&targets.position), attachment(&targets.normal)], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &targets.depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }), stencil_ops: None }), timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
             pass.set_pipeline(&self.mask);
             pass.set_bind_group(0, &inputs.mask, &[]);
             pass.set_vertex_buffer(0, self.vertices.as_ref().expect("loaded water triangles").slice(..));
             pass.draw(0..self.vertex_count, 0..1);
         }
         for (label, pipeline, bind, output) in [("water optics", &self.composite, &inputs.composite, &targets.scratch), ("water optics copy back", &self.copy, &inputs.copy, colour)] {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some(label), color_attachments: &[attachment(output)], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
+            let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor { label: Some(label), color_attachments: &[attachment(output)], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, bind, &[]);
             pass.draw(0..3, 0..1);

@@ -1,5 +1,6 @@
 //! Optional celestial detail over the native sky. Admission is metadata-only; poses
 //! are the very matrices uploaded for the current native sky frame.
+use crate::effect_gpu::EffectPassEncoder as _;
 use std::collections::HashMap;
 use ao_scene::{Scene, TextureKey};
 use glam::{Mat4, Vec3};
@@ -195,7 +196,7 @@ impl SkyDiscs {
             ] });
             self.bindings.insert(*key, (depth.clone(), texture.clone(), directional_mask.clone(), bind));
         }
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("authored celestial detail"), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: colour, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
+        let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor { label: Some("authored celestial detail"), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: colour, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(0, self.vertices.as_ref().unwrap().slice(..));
         for (range, key) in &self.draws { pass.set_bind_group(0, &self.bindings[key].3, &[]); pass.draw(range.clone(), 0..1); }

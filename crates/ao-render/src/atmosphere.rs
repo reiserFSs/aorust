@@ -1,5 +1,6 @@
 //! Opt-in atmosphere layered over, never substituted for, native FogModel extinction.
 //! Ray-marched shafts use only the current admitted directional cascade maps.
+use crate::effect_gpu::EffectPassEncoder as _;
 use crate::{gpu_stats::GpuStatsExt, pipeline_creation::RenderPipeline};
 use crate::volumetric_clouds::CloudDensityLayer;
 use glam::{Mat4, Vec3};
@@ -189,7 +190,7 @@ impl Atmosphere {
         for (stage, output) in [(0, &t.half), (1, colour), (2, colour)] {
             if combined && stage == 2 { break; }
             let estimate = stage == 0;
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("layered atmosphere"),
+            let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor { label: Some("layered atmosphere"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: output, resolve_target: None, depth_slice: None,
                     ops: wgpu::Operations { load: if estimate { wgpu::LoadOp::Clear(wgpu::Color::WHITE) } else { wgpu::LoadOp::Load }, store: wgpu::StoreOp::Store } })],
                 depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });

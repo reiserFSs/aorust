@@ -1,5 +1,6 @@
 //! Bounded native-weather transmittance field shared by cloud shadows and shafts.
 //! Adapted from ao-vk cloud_shadow.frag (MIT); no actor or scene-depth inputs.
+use crate::effect_gpu::EffectPassEncoder as _;
 use crate::{gpu_stats::GpuStatsExt, pipeline_creation::RenderPipeline};
 use crate::volumetric_clouds::{CloudDensityLayer, CLOUD_DENSITY_WGSL};
 use glam::Vec3;
@@ -63,7 +64,7 @@ impl CloudShadows {
         let target = self.target.as_ref().expect("cloud map allocated");
         if self.key != Some(key) {
             queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("bounded cloud transmittance"), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &target.view, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
+            let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor { label: Some("bounded cloud transmittance"), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &target.view, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
             pass.set_pipeline(&self.pipeline); pass.set_bind_group(0, &target.bind, &[]); pass.draw(0..3, 0..1);
             self.key = Some(key);
         }

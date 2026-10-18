@@ -1,5 +1,6 @@
 //! World-anchored opt-in rain and collision-sheltered wet receivers.
 //! Rain anchoring/splash concepts adapted from ao-vk rvk/rain.cpp and rain.vert (MIT).
+use crate::effect_gpu::EffectPassEncoder as _;
 use crate::{gpu_stats::GpuStatsExt, pipeline_creation::RenderPipeline};
 use glam::{Mat4, Vec3};
 
@@ -93,7 +94,7 @@ impl RainWet {
             let bind = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("rain wet frame"), layout: &self.layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: self.params.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth) }, wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(mask) }, wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.shelter) }, wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(water) }, wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(normals) }] });
             self.bindings = Some(Bindings { depth: depth.clone(), mask: mask.clone(), water: water.clone(), normals: normals.clone(), bind });
         }
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("rain and wet receivers"), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: colour, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
+        let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor { label: Some("rain and wet receivers"), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: colour, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
         pass.set_bind_group(0, &self.bindings.as_ref().expect("rain inputs prepared").bind, &[]);
         if wet && self.wetness > 0.0 { pass.set_pipeline(&self.wet); pass.draw(0..3, 0..1); pass.set_pipeline(&self.sheen); pass.draw(0..3, 0..1); }
         if rain && input.rain > 0.0 {

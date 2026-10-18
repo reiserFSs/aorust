@@ -18,6 +18,9 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 mod raw_mouse;
 #[path = "window_prefs.rs"]
 mod window_prefs;
+#[path = "frame_diagnostics.rs"]
+mod frame_diagnostics;
+use frame_diagnostics::FrameDiagnostics;
 
 /// What a [`Frontend`] can ask of the window/renderer between frames.
 pub struct Host {
@@ -48,6 +51,17 @@ pub struct Host {
     pub enhanced_settings: Option<crate::EnhancedSettings>,
     /// Live option request: keep drawing the current variant until the worker finishes.
     pub enhanced_switch: Option<crate::EnhancedSettings>,
+    /// Session-only master switch; never rewrites individual feature preferences.
+    pub enhanced_suspended: bool,
+    /// Session-only GPU overlay and slow CPU-wall frame logging, both off by default.
+    pub effect_gpu_overlay: bool,
+    pub slow_frame_log: bool,
+    /// Prior completed rolling GPU samples, refreshed before each frontend frame.
+    pub effect_gpu_costs: Vec<crate::EffectGpuCost>,
+    pub effect_gpu_error: Option<String>,
+    enhanced_requested: Option<crate::EnhancedSettings>,
+    enhanced_runtime_suspended: bool,
+    effect_gpu_profiling_suppressed: bool,
     /// Root containing the user's day/night LUTs and optional per-playfield overrides.
     pub grade_lut_root: Option<std::path::PathBuf>,
     /// Actual own-character scene position, supplied every frame; never inferred from actor admission.
@@ -162,7 +176,47 @@ fn present_mode(wait: bool) -> wgpu::PresentMode {
 
 impl Host {
     /// Latest requested settings, with live options taking precedence over immediate fixture settings.
-    pub fn enhanced(&self) -> Option<crate::EnhancedSettings> { self.enhanced_switch.or(self.enhanced_settings) }
+    pub fn enhanced(&self) -> Option<crate::EnhancedSettings> {
+        if self.enhanced_suspended { Some(crate::EnhancedSettings::default()) }
+        else { self.enhanced_switch.or(self.enhanced_settings).or(self.enhanced_requested) }
+    }
+
+    fn take_enhanced_requests(&mut self) -> (Option<crate::EnhancedSettings>, Option<crate::EnhancedSettings>) {
+        let immediate = self.enhanced_settings.take();
+        let live = self.enhanced_switch.take();
+        if let Some(settings) = live.or(immediate) { self.enhanced_requested = Some(settings); }
+        let changed = self.enhanced_runtime_suspended != self.enhanced_suspended;
+        self.enhanced_runtime_suspended = self.enhanced_suspended;
+        if self.enhanced_suspended {
+            (None, Some(crate::EnhancedSettings::default()))
+        } else if changed {
+            (None, self.enhanced_requested)
+        } else { (immediate, live) }
+    }
+
+    fn apply_world_options(&mut self, renderer: &mut Renderer) {
+        let (immediate, live) = self.take_enhanced_requests();
+        renderer.set_world_options(self.msaa_samples.take(), immediate, live);
+        self.configure_gpu_diagnostics(renderer);
+    }
+
+    fn configure_gpu_diagnostics(&mut self, renderer: &mut Renderer) {
+        let enabled = (self.effect_gpu_overlay || self.slow_frame_log) && !self.effect_gpu_profiling_suppressed;
+        match renderer.set_effect_gpu_profiling(enabled) {
+            Ok(()) => self.effect_gpu_error = None,
+            Err(error) => self.effect_gpu_error = Some(error.to_string()),
+        }
+    }
+
+    fn refresh_gpu_diagnostics(&mut self, renderer: &mut Renderer) {
+        self.configure_gpu_diagnostics(renderer);
+        if self.effect_gpu_profiling_suppressed { return; }
+        if self.effect_gpu_overlay || self.slow_frame_log {
+            renderer.poll_effect_gpu_costs();
+            self.effect_gpu_costs.clear();
+            self.effect_gpu_costs.extend_from_slice(renderer.effect_gpu_costs());
+        } else { self.effect_gpu_costs.clear(); }
+    }
 
     pub fn bind_native_fog(&mut self,state:super::SharedNativeFog) {
         if self.native_fog.as_ref().is_some_and(|old|std::rc::Rc::ptr_eq(old,&state)){return;}
@@ -211,7 +265,14 @@ impl Host {
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
         let grade_lut_root = None;
-        Host { weather_input: Default::default(), post_focus: None, grade_lut_root, camera_underwater: None, enhanced_settings: None, enhanced_switch: None, grass_wind: [0.0; 3], grass_exposure: None, grass_benders: vec![], actor_visual_resets: vec![], actor_visual_retirements: vec![], pointer_warp: None, smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
+        let enhanced_suspended = false;
+        let effect_gpu_overlay = false;
+        let slow_frame_log = false;
+        let effect_gpu_costs = Vec::new();
+        let effect_gpu_error = None;
+        let enhanced_requested = None;
+        let enhanced_runtime_suspended = false;
+        Host { effect_gpu_profiling_suppressed: false, enhanced_suspended, effect_gpu_overlay, slow_frame_log, effect_gpu_costs, effect_gpu_error, enhanced_requested, enhanced_runtime_suspended, weather_input: Default::default(), post_focus: None, grade_lut_root, camera_underwater: None, enhanced_settings: None, enhanced_switch: None, grass_wind: [0.0; 3], grass_exposure: None, grass_benders: vec![], actor_visual_resets: vec![], actor_visual_retirements: vec![], pointer_warp: None, smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -702,7 +763,7 @@ impl State {
     }
 
     /// Runs the frontend; returns its draw list (`None` without a frontend). True in `.1` = quit.
-    fn run_gui(&mut self, dt: f32) -> (Option<ao_gui::DrawList>, bool) {
+    fn run_gui(&mut self, dt: f32, diagnostics: &mut FrameDiagnostics) -> (Option<ao_gui::DrawList>, bool) {
         self.flush_mouse(dt);
         let Some(g) = &mut self.gui else { return (None, false) };
         // audit item 2: live-apply a scale change from the Enhanced page without a restart.
@@ -719,8 +780,11 @@ impl State {
         let size = (self.config.width / g.scale, self.config.height / g.scale);
         self.renderer.visible_actor_ids(&mut g.host.previous_visible_actors);
         g.host.window_scale = g.scale;
+        g.host.refresh_gpu_diagnostics(&mut self.renderer);
+        diagnostics.mark(1);
         for event in self.renderer.take_mover_sounds() { g.frontend.mover_sound(event, &g.host); }
         let list = g.frontend.frame(dt, size, &mut g.host);
+        diagnostics.mark(2);
         if let Some(wait) = g.host.wait_for_vert_sync.take() {
             let mode = present_mode(wait && std::env::var_os("AOMAC_NOVSYNC").is_none());
             if self.config.present_mode != mode {
@@ -735,7 +799,7 @@ impl State {
         if let Some(level) = g.host.anisotropy.take() {
             self.renderer.set_anisotropy(level);
         }
-        self.renderer.set_world_options(g.host.msaa_samples.take(), g.host.enhanced_settings.take(), g.host.enhanced_switch.take());
+        g.host.apply_world_options(&mut self.renderer);
         if let Some(scene) = g.host.scene.take() {
             self.renderer.upload(&scene);
             self.speed = (self.renderer.radius() * 0.15).max(5.0);
@@ -760,6 +824,7 @@ impl State {
         if let Some(textures) = g.host.ground_textures.take() { self.renderer.refresh_ground_textures(&textures); }
         self.pending_screenshot = g.host.screenshot.take();
         g.host.apply_actors(&mut self.renderer);
+        diagnostics.mark(3);
         (Some(list), g.host.quit)
     }
 
@@ -805,6 +870,7 @@ impl State {
     fn frame(&mut self) -> bool {
         let _frame = crate::pipeline_creation::FrameGuard::enter();
         let now = Instant::now();
+        let mut diagnostics = FrameDiagnostics::new(self.gui.as_ref().is_some_and(|g| g.host.slow_frame_log));
         if self.perf {
             self.perf_gap = self.perf_gap.max((now - self.last).as_secs_f64());
         }
@@ -846,7 +912,7 @@ impl State {
             c.pos += (c.forward() * (k(KeyCode::KeyW) - k(KeyCode::KeyS)) + c.right() * (k(KeyCode::KeyD) - k(KeyCode::KeyA)) + Vec3::Y * up) * step;
         }
         self.raw_mouse.set_active(self.looking && self.focused && !self.fly());
-        let (gui_out, quit) = self.run_gui(dt);
+        let (gui_out, quit) = self.run_gui(dt, &mut diagnostics);
         self.renderer.settle_enhanced_world();
         if !self.targets.matches_renderer(&self.renderer) {
             self.targets = Targets::new(&self.renderer, self.config.width, self.config.height);
@@ -862,9 +928,11 @@ impl State {
         }
 
         if let Some(t) = work_start { self.perf_times[2] += t.elapsed().as_secs_f64(); }
+        diagnostics.mark(1);
         let acquire_start = self.perf.then(Instant::now);
         let acquired = self.surface.get_current_texture();
         if let Some(t) = acquire_start { self.perf_times[1] += t.elapsed().as_secs_f64(); }
+        diagnostics.mark(8);
         let frame = match acquired {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -883,15 +951,15 @@ impl State {
         let t0 = self.perf.then(Instant::now);
         let submission = self.renderer.render(&view, &self.targets, &self.cam);
         if let Some(t) = t0 { self.cpu += t.elapsed().as_secs_f32(); }
-        if let Some(path) = self.pending_screenshot.take() {
-            self.capture_screenshot(path, gui_out.clone());
-        }
+        diagnostics.mark(4);
+        let capture = self.pending_screenshot.take().map(|path| (path, gui_out.clone()));
         if let Some(list) = gui_out {
             let t = self.perf.then(Instant::now);
             let gview = crate::GuiRenderer::view(&frame.texture);
             self.paint_gui(list, &gview);
             if let Some(t) = t { self.perf_times[2] += t.elapsed().as_secs_f64(); }
         }
+        diagnostics.mark(5);
         if self.gui.as_ref().is_some_and(|g| g.host.mouse_lag_fix) {
             if let Some(previous) = self.previous_submission.take() {
                 if let Err(error) = self.renderer.device.poll(wgpu::PollType::Wait { submission_index: Some(previous), timeout: None }) {
@@ -906,11 +974,16 @@ impl State {
             let _ = self.renderer.device.poll(wgpu::PollType::Poll);
         }
         self.previous_submission = Some(submission);
+        diagnostics.mark(6);
         let present_start = self.perf.then(Instant::now);
         self.window.pre_present_notify();
         frame.present();
         if let Some(t) = present_start { self.perf_times[4] += t.elapsed().as_secs_f64(); }
+        diagnostics.mark(7);
+        if let Some(g) = &self.gui { diagnostics.finish(g.host.slow_frame_log, "windowed", &g.host.effect_gpu_costs); }
         self.finish_perf_frame(now);
+        // Capture/readback is explicit evidence work, not a slow gameplay frame.
+        if let Some((path, list)) = capture { self.capture_screenshot(path, list); }
 
         self.stat_frames += 1;
         let el = self.stat_t.elapsed().as_secs_f32();
@@ -1135,6 +1208,7 @@ pub struct Offscreen {
     live: Option<LiveRun>,
     perf: Option<OffscreenPerf>,
     fixed_camera: Option<Camera>,
+    diagnostic_wall_ms: [f64; 9],
 }
 
 // Bounded samples and a persistent attachment: no screenshot/readback or metrics allocation per frame.
@@ -1222,7 +1296,7 @@ impl Offscreen {
         let r = Renderer::new(&instance, None)?;
         let (targets, gr) = (Targets::new(&r, size.0, size.1), crate::GuiRenderer::new(&r, fe.gui()));
         let perf = std::env::var_os("AOMAC_PERF").map(|_| OffscreenPerf::new(&r, size));
-        Ok(Self { r, targets, gr, host: Host::headless(), size, live: None, perf, fixed_camera: None })
+        Ok(Self { r, targets, gr, host: Host::headless(), size, live: None, perf, fixed_camera: None, diagnostic_wall_ms: [0.0; 9] })
     }
 
     /// Headless capture without ambient performance environment configuration.
@@ -1230,7 +1304,7 @@ impl Offscreen {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let r = Renderer::new(&instance, None)?;
         let (targets, gr) = (Targets::new(&r, size.0, size.1), crate::GuiRenderer::new(&r, fe.gui()));
-        Ok(Self { r, targets, gr, host: Host::headless(), size, live: None, perf: None, fixed_camera: None })
+        Ok(Self { r, targets, gr, host: Host::headless(), size, live: None, perf: None, fixed_camera: None, diagnostic_wall_ms: [0.0; 9] })
     }
 
     /// Persistent frozen-snapshot timing, single-sample by default; explicit host quality still wins.
@@ -1252,6 +1326,22 @@ impl Offscreen {
         let perf = self.perf.as_ref().ok_or_else(|| anyhow::anyhow!("render_frozen requires a persistent evidence target"))?;
         self.r.render(&perf.view, &self.targets, &self.host.camera);
         Ok(())
+    }
+
+    /// Isolates actual GUI encoding/submission CPU wall time from preceding world work.
+    /// Evidence-only blocking boundary; the live profiler supplies rolling GUI GPU costs.
+    /// Does not update the frontend/world or allocate a capture target/readback.
+    pub fn render_gui_only_for_evidence(&mut self, fe: &dyn Frontend, list: &ao_gui::DrawList) -> Result<f64> {
+        let _frame = crate::pipeline_creation::FrameGuard::enter();
+        let perf = self.perf.as_ref().ok_or_else(|| anyhow::anyhow!("render_gui_only_for_evidence requires a persistent evidence target"))?;
+        self.r.device.poll(wgpu::PollType::wait_indefinitely())?;
+        self.host.refresh_gpu_diagnostics(&mut self.r);
+        let start = Instant::now();
+        self.gr.draw(&self.r, &perf.gui_view, self.size, 1, fe.gui(), list);
+        let cpu_ms = start.elapsed().as_secs_f64() * 1000.0;
+        self.r.device.poll(wgpu::PollType::wait_indefinitely())?;
+        self.host.refresh_gpu_diagnostics(&mut self.r);
+        Ok(cpu_ms)
     }
 
     /// Tests weather-off composition on the last native image, without rerasterizing
@@ -1288,6 +1378,21 @@ impl Offscreen {
     pub fn enhanced_target_bytes(&self) -> u64 { self.r.enhanced_target_bytes() }
     pub fn msaa_samples(&self) -> u32 { self.r.msaa_samples() }
     pub fn enhanced_settings(&self) -> crate::EnhancedSettings { self.r.enhanced_settings() }
+    /// Last actual frontend/world/GUI frame CPU wall milliseconds; excludes screenshot/readback.
+    /// Order: total, update, frontend, upload, render, gui, gpu_wait, present, acquire.
+    /// Enabled by `evidence_timing` (persistent attachment) or opt-in slow-frame logging.
+    pub fn diagnostic_frame_wall_ms(&self) -> [f64; 9] { self.diagnostic_wall_ms }
+    /// Nonblocking collection for harnesses after a completed actual Play + UI frame.
+    pub fn poll_effect_gpu_costs(&mut self) { self.host.refresh_gpu_diagnostics(&mut self.r); }
+    pub fn effect_gpu_costs(&self) -> &[crate::EffectGpuCost] { self.r.effect_gpu_costs() }
+    /// Separates overlay-visible whole-frame GPU measurements from pass profiling.
+    /// Disable before enabling the exclusive whole-frame timer; cached overlay samples remain visible.
+    pub fn set_effect_gpu_profiling_for_evidence(&mut self, enabled: bool) -> Result<()> {
+        let profiling = enabled && (self.host.effect_gpu_overlay || self.host.slow_frame_log);
+        self.r.set_effect_gpu_profiling(profiling)?;
+        self.host.effect_gpu_profiling_suppressed = !enabled;
+        Ok(())
+    }
     pub fn world_pipeline_compiles(&self) -> u64 { self.r.world_pipeline_compiles() }
     pub fn world_frame_thread_compiles(&self) -> u64 { self.r.world_frame_thread_compiles() }
     pub fn frame_thread_compiles(&self) -> u64 { self.r.frame_thread_compiles() }
@@ -1376,16 +1481,20 @@ impl Offscreen {
         if self.perf.as_ref().is_some_and(|p| p.count == p.samples.len()) { self.perf_report("interval"); }
         let start = self.perf.as_ref().map(|_| Instant::now());
         let cpu_start = start.map(|_| perf_thread_cpu());
+        let mut diagnostics = FrameDiagnostics::new(self.host.slow_frame_log || self.perf.is_some());
         self.r.time += dt;
         self.r.advance_grass_wind(dt);
         if let Some(sun) = LiveRun::advance(&mut self.live, &mut self.r, dt) { self.host.effect_sun_direction = Some(sun); }
         self.r.visible_actor_ids(&mut self.host.previous_visible_actors);
+        self.host.refresh_gpu_diagnostics(&mut self.r);
         let update_end = start.map(|_| Instant::now());
         let cpu_update = start.map(|_| perf_thread_cpu());
+        diagnostics.mark(1);
         for event in self.r.take_mover_sounds() { fe.mover_sound(event, &self.host); }
         let list = fe.frame(dt, self.size, &mut self.host);
         let frontend_end = start.map(|_| Instant::now());
         let cpu_frontend = start.map(|_| perf_thread_cpu());
+        diagnostics.mark(2);
         if let Some((quality, compressed, better_mips)) = self.host.texture_policy.take() {
             self.r.set_texture_policy(quality, compressed, better_mips);
         }
@@ -1395,7 +1504,7 @@ impl Offscreen {
         if let Some(samples) = self.perf.as_ref().and_then(|perf| perf.msaa) {
             self.host.msaa_samples = Some(samples);
         }
-        self.r.set_world_options(self.host.msaa_samples.take(), self.host.enhanced_settings.take(), self.host.enhanced_switch.take());
+        self.host.apply_world_options(&mut self.r);
         if let Some(scene) = self.host.scene.take() {
             self.r.upload(&scene);
         }
@@ -1423,19 +1532,23 @@ impl Offscreen {
         if let Some(textures) = self.host.ground_textures.take() { self.r.refresh_ground_textures(&textures); }
         self.host.apply_actors(&mut self.r);
         if let Some(camera) = self.fixed_camera { self.host.camera = camera; }
+        diagnostics.mark(3);
         if let Some(perf) = self.perf.as_mut() {
             let upload_end = Instant::now();
             let cpu_upload = perf_thread_cpu();
             self.r.render(&perf.view, &self.targets, &self.host.camera);
+            diagnostics.mark(4);
             let render_end = Instant::now();
             let cpu_render = perf_thread_cpu();
             self.gr.draw(&self.r, &perf.gui_view, self.size, 1, fe.gui(), &list);
+            diagnostics.mark(5);
             let gui_end = Instant::now();
             let cpu_gui = perf_thread_cpu();
             // This submission follows both 3D and GUI work. Bound the queue to one frame, like a
             // swapchain, rather than accumulating GPU work and deferred destruction in a tight loop.
             let submission = self.r.queue.submit([]);
             self.r.device.poll(wgpu::PollType::Wait { submission_index: Some(submission), timeout: None }).expect("offscreen performance GPU wait");
+            diagnostics.mark(6);
             let end = Instant::now();
             let cpu_end = perf_thread_cpu();
             let (start, update, frontend) = (start.unwrap(), update_end.unwrap(), frontend_end.unwrap());
@@ -1458,6 +1571,7 @@ impl Offscreen {
             self.r.queue.submit([]);
             let _ = self.r.device.poll(wgpu::PollType::Poll);
         }
+        self.diagnostic_wall_ms = diagnostics.finish(self.host.slow_frame_log, "offscreen", &self.host.effect_gpu_costs);
         if let Some(path) = self.host.screenshot.take() {
             if let Err(e) = self.png(fe, &list, &path) { eprintln!("screenshot: {}: {e}", path.display()); }
         }
@@ -1503,6 +1617,28 @@ impl Offscreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_suspend_preserves_requests_and_restores_via_worker() {
+        let mut host = Host::headless();
+        assert!(!host.enhanced_suspended && !host.effect_gpu_overlay && !host.slow_frame_log);
+        assert!(host.effect_gpu_costs.is_empty() && host.effect_gpu_error.is_none());
+        assert!(host.enhanced().is_none());
+        let settings = crate::EnhancedSettings { hdr: true, ..Default::default() };
+        host.enhanced_settings = Some(settings);
+        assert_eq!(host.take_enhanced_requests(), (Some(settings), None));
+        host.enhanced_suspended = true;
+        host.enhanced_settings = Some(settings);
+        assert_eq!(host.enhanced(), Some(crate::EnhancedSettings::default()));
+        assert_eq!(host.take_enhanced_requests(), (None, Some(crate::EnhancedSettings::default())));
+        let settings = crate::EnhancedSettings { ambient_occlusion: true, ..settings };
+        host.enhanced_switch = Some(settings);
+        assert_eq!(host.take_enhanced_requests(), (None, Some(crate::EnhancedSettings::default())));
+        host.enhanced_suspended = false;
+        assert_eq!(host.enhanced(), Some(settings));
+        assert_eq!(host.take_enhanced_requests(), (None, Some(settings)));
+        assert_eq!(host.take_enhanced_requests(), (None, None));
+    }
 
     #[test]
     fn evidence_timing_honors_explicit_msaa_across_frames() {

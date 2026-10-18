@@ -8,6 +8,7 @@
 //! `SRCALPHA / INVSRCALPHA` blend of the GUI works on the stored 8-bit values. World and GUI now share the UNORM gamma-space
 //! target, so the GUI leaves scene bytes untouched and blends straight alpha over them, without an output conversion.
 
+use crate::effect_gpu::EffectPassEncoder as _;
 use crate::Renderer;
 use ao_gui::{DrawCmd, DrawList, Gui};
 use bytemuck::{Pod, Zeroable};
@@ -351,8 +352,8 @@ impl GuiRenderer {
         r.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&Globals { screen: [size.0 as f32, size.1 as f32], _pad: [0.0; 2] }));
         let bgs: Vec<&wgpu::BindGroup> = self.batches.iter().map(|b| self.bind_groups.get(&b.1).expect("bind group cached above")).collect();
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gui") });
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+        r.profile_gui_draw(&mut enc, |enc| {
+            let mut pass = enc.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("gui"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: target, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }})],
                 depth_stencil_attachment: None,
@@ -375,7 +376,7 @@ impl GuiRenderer {
                 }
                 pass.draw(range, 0..1);
             }
-        }
+        });
         r.queue.submit([enc.finish()]);
         self.vb = Some(vb);
     }

@@ -1,5 +1,6 @@
 //! Primary-screen reflections; history contains static samples only, never actor/effect samples.
 use crate::{gpu_stats::GpuStatsExt, pipeline_creation::RenderPipeline};
+use crate::effect_gpu::EffectPassEncoder as _;
 use glam::{Mat4, Vec3};
 const PROBE: u32 = 128;
 #[repr(C)]
@@ -152,7 +153,7 @@ impl crate::Renderer {
     }
 }
 fn draw(enc:&mut wgpu::CommandEncoder, pipeline:&RenderPipeline, bg:&wgpu::BindGroup, output:&wgpu::TextureView, load:bool) {
-    let mut pass=enc.begin_render_pass(&wgpu::RenderPassDescriptor {label:Some("primary-only material reflections"),color_attachments:&[Some(wgpu::RenderPassColorAttachment {view:output,resolve_target:None,depth_slice:None,ops:wgpu::Operations {load:if load {wgpu::LoadOp::Load}else{wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)},store:wgpu::StoreOp::Store}})],depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None,multiview_mask:None});
+    let mut pass=enc.begin_effect_render_pass(&wgpu::RenderPassDescriptor {label:Some(if load {"Material reflections"} else {"Environment probe"}),color_attachments:&[Some(wgpu::RenderPassColorAttachment {view:output,resolve_target:None,depth_slice:None,ops:wgpu::Operations {load:if load {wgpu::LoadOp::Load}else{wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)},store:wgpu::StoreOp::Store}})],depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None,multiview_mask:None});
     pass.set_pipeline(pipeline);pass.set_bind_group(0,bg,&[]);pass.draw(0..3,0..1);
 }
 #[cfg(test)]

@@ -121,12 +121,12 @@ impl Visibility {
     }
     pub fn encode(&mut self, encoder: &mut wgpu::CommandEncoder, programs: &VisibilityPrograms, size: (u32, u32)) {
         if !self.rows.is_empty() {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("collect exact visible actor IDs"), timestamp_writes: None });
+            let mut pass = encoder.begin_effect_compute_pass(&wgpu::ComputePassDescriptor { label: Some("collect exact visible actor IDs"), timestamp_writes: None });
             pass.set_pipeline(&programs.collect); pass.set_bind_group(0, &self.group, &[]);
             pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
         }
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("compare exact visible actor IDs"), timestamp_writes: None });
+            let mut pass = encoder.begin_effect_compute_pass(&wgpu::ComputePassDescriptor { label: Some("compare exact visible actor IDs"), timestamp_writes: None });
             pass.set_pipeline(&programs.compare); pass.set_bind_group(0, &self.group, &[]);
             pass.dispatch_workgroups(self.capacity.div_ceil(64), 1, 1);
         }

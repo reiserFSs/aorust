@@ -6,6 +6,9 @@ use std::time::{Duration, Instant};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
 
+#[path = "infra_evidence.rs"]
+mod infra_evidence;
+
 #[derive(Default)]
 struct AllocationCounts {
     outstanding: AtomicI64,
@@ -2334,7 +2337,7 @@ fn enhanced_option_switch_reuses_compiled_variants() {
     }
 
     let warm_total_compiles = o.world_pipeline_compiles() - warm_compiles;
-    assert!(o.world_variant_cache_len() <= 3, "compiled combinations stay bounded");
+    assert!(o.world_variant_cache_len() <= 4, "three inactive combinations plus the faithful master-switch pin stay bounded");
     drop(o);
     drop(r);
 
@@ -2354,4 +2357,105 @@ fn enhanced_option_switch_reuses_compiled_variants() {
     assert_eq!(sync_compiles, warmed, "cold controls must compile the same full combination and pipeline slots");
     assert!(worst < 50.0, "no cold or warm switch frame may block: worst {worst:.2} ms");
     drop(control_r);
+}
+
+#[test]
+fn enhanced_runtime_hotkeys_preserve_preferences_and_restore_effects() {
+    use ao_render::KeyCode;
+    use super::super::dvalue::{CAT_CHAR, CAT_LOGIN, CAT_MAIN, CAT_VARIABLES, Variant};
+    let Some(mut r) = rig() else { return };
+    r.p.screen = Screen::InWorld;
+    r.p.gui.clear_focus();
+    r.p.hud = Some(super::super::hud::Hud::new(&mut r.p.gui, &r.p.dir, (1280, 800)).unwrap());
+    let d = &mut r.p.hud.as_mut().unwrap().dvalues;
+    d.set("AomacSunShadows", Variant::Bool(true));
+    d.set("AomacGroundGrass", Variant::Bool(true));
+    d.set("AomacTextureSharpening", Variant::Int(4));
+    d.set("AomacEdgeSmoothing", Variant::Int(1));
+    d.set("AomacBetterMipFiltering", Variant::Bool(true));
+    d.set("AomacSmoothText", Variant::Bool(true));
+    r.p.frame(0.0, (1280, 800), &mut r.host);
+    let d = &r.p.hud.as_ref().unwrap().dvalues;
+    let saved: Vec<_> = [CAT_VARIABLES, CAT_MAIN, CAT_LOGIN, CAT_CHAR].map(|cat| d.save_config(cat)).into();
+    let expected = d.enhanced_settings();
+    r.host.mods = ao_gui::Modifiers { ctrl: true, shift: true, alt: false };
+    let key = |code, repeat| ao_render::GameInput::Key { code, pressed: true, repeat };
+    r.p.game_input(key(KeyCode::KeyE, false), &mut r.host);
+    assert!(r.host.enhanced_suspended);
+    r.p.game_input(key(KeyCode::KeyE, true), &mut r.host);
+    assert!(r.host.enhanced_suspended, "OS repeats must not restore effects");
+    r.p.frame(0.016, (1280, 800), &mut r.host);
+    assert_eq!(r.host.enhanced(), Some(ao_render::EnhancedSettings::default()));
+    assert_eq!(r.host.anisotropy, Some(16), "master preserves texture quality");
+    assert_eq!(r.host.msaa_samples, Some(2), "master preserves display quality");
+    assert!(r.host.texture_policy.unwrap().2, "master preserves mip policy");
+    assert!(r.p.smooth_text, "master preserves text preferences");
+    assert!(r.p.enhanced_notice.is_some());
+    r.p.game_input(key(KeyCode::KeyO, false), &mut r.host);
+    assert!(r.host.effect_gpu_overlay);
+    r.p.game_input(key(KeyCode::KeyO, true), &mut r.host);
+    assert!(r.host.effect_gpu_overlay);
+    r.p.hud.as_mut().unwrap().dvalues.set("AomacSlowFrameLog", Variant::Bool(true));
+    r.p.frame(0.016, (1280, 800), &mut r.host);
+    assert!(r.host.slow_frame_log);
+    let d = &r.p.hud.as_ref().unwrap().dvalues;
+    assert_eq!(d.enhanced_settings(), expected, "suspension never writes feature choices");
+    for (cat, expected) in [CAT_VARIABLES, CAT_MAIN, CAT_LOGIN, CAT_CHAR].into_iter().zip(saved) {
+        assert_eq!(d.save_config(cat), expected, "session controls cannot enter any preference category");
+    }
+    r.p.game_input(key(KeyCode::KeyE, false), &mut r.host);
+    r.p.frame(0.016, (1280, 800), &mut r.host);
+    assert!(!r.host.enhanced_suspended);
+    assert_eq!(r.host.enhanced(), Some(expected));
+    assert_eq!(r.host.anisotropy, Some(16));
+    assert_eq!(r.host.msaa_samples, Some(2));
+    assert!(r.host.texture_policy.unwrap().2);
+    assert!(r.p.smooth_text);
+    r.p.game_input(key(KeyCode::KeyO, false), &mut r.host);
+    assert!(!r.host.effect_gpu_overlay);
+}
+
+#[test]
+fn enhanced_hotkeys_yield_to_text_input_and_native_fixed_keys() {
+    use ao_render::KeyCode;
+    let Some(mut r) = rig() else { return };
+    r.p.screen = Screen::InWorld;
+    r.p.hud = Some(super::super::hud::Hud::new(&mut r.p.gui, &r.p.dir, (1280, 800)).unwrap());
+    r.host.mods = ao_gui::Modifiers { ctrl: true, shift: true, alt: false };
+    let key = ao_render::GameInput::Key { code: KeyCode::KeyE, pressed: true, repeat: false };
+    // Exercise text-input exclusion with the real login editor.
+    r.p.gui.focus(r.p.login_w.unwrap(), "password");
+    assert!(r.p.gui.text_focused());
+    r.p.game_input(key, &mut r.host);
+    assert!(!r.host.enhanced_suspended);
+    r.p.gui.clear_focus();
+    let hud = r.p.hud.as_mut().unwrap();
+    let input = super::super::options::keys::key_input(super::super::controls::key_id(KeyCode::KeyE).unwrap(), r.host.mods);
+    hud.dvalues.prefs.set_int("KEY_COMMAND_START_CHAT_INPUT", input as i32, super::super::dvalue::Kind::Login);
+    hud.sync_keys();
+    r.p.game_input(key, &mut r.host);
+    assert!(!r.host.enhanced_suspended, "native fixed key owns a colliding chord");
+}
+
+#[test]
+fn enhanced_gpu_overlay_draws_gui_font_samples_and_unavailable_state() {
+    let Some(mut r) = rig() else { return };
+    r.p.screen = Screen::InWorld;
+    r.p.gui.clear_focus();
+    r.p.hud = Some(super::super::hud::Hud::new(&mut r.p.gui, &r.p.dir, (1280, 800)).unwrap());
+    r.p.hud.as_mut().unwrap().dvalues.set("AomacEffectGpuOverlay", super::super::dvalue::Variant::Bool(true));
+    r.host.effect_gpu_costs = vec![ao_render::EffectGpuCost { label: "Sun shadows", average_ms: 0.125, samples: 12 }];
+    for (error, text) in [
+        (None, "Sun shadows: 0.125 ms (12 samples)"),
+        (Some("timestamp queries unsupported".to_string()), "GPU timing unavailable: timestamp queries unsupported"),
+    ] {
+        r.host.effect_gpu_error = error;
+        let list = r.p.frame(0.0, (1280, 800), &mut r.host);
+        let mut expected = DrawList::default();
+        r.p.gui.text_cmds(FontId::Normal, "GPU pass intervals (rolling; may overlap)", 12, 36, 0xffffcc, 1.0, &mut expected);
+        let y = 36 + r.p.gui.font_height(FontId::Normal);
+        r.p.gui.text_cmds(FontId::Normal, text, 12, y, 0xffffcc, 1.0, &mut expected);
+        assert!(!expected.cmds.is_empty());
+        assert_eq!(format!("{:?}", &list.cmds[list.cmds.len() - expected.cmds.len()..]), format!("{:?}", expected.cmds));
+    }
 }

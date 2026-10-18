@@ -316,7 +316,7 @@ impl Renderer {
             }));
             motion.depth_input = Some(native_depth.clone());
         }
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("native admitted exact motion raster"),
             color_attachments: &[
                 Some(wgpu::RenderPassColorAttachment { view: motion.multisampled.as_ref().map_or(&motion.motion, |views| &views.0), resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 1.0, a: 1.0 }), store: wgpu::StoreOp::Store } }),
@@ -386,7 +386,7 @@ impl Renderer {
         }
         drop(pass);
         if let Some((_, pipeline)) = &motion.programs.resolve {
-            let mut resolve = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut resolve = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("nearest native sample exact motion resolve"), color_attachments: &[
                     Some(wgpu::RenderPassColorAttachment { view: &motion.motion, resolve_target: None, depth_slice: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } }),

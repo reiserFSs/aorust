@@ -1,5 +1,6 @@
 //! Enhanced HDR scene: authored-day sun brightening into RGBA16F, then tonemap + dither to the 8-bit output.
 //! Independent grading/LUT/vignette use the same present path, without enabling HDR exposure.
+use crate::effect_gpu::EffectPassEncoder as _;
 use crate::gpu_stats::GpuStatsExt;
 use crate::pipeline_creation::RenderPipeline;
 use crate::cube_lut::CubeLut;
@@ -129,7 +130,7 @@ impl Grade {
 
     fn pass(encoder: &mut wgpu::CommandEncoder, label: &str, pipeline: &wgpu::RenderPipeline, input: &wgpu::BindGroup, aux: &wgpu::BindGroup,
         target: &wgpu::TextureView, timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>) {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: target, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
             depth_stencil_attachment: None, timestamp_writes, occlusion_query_set: None, multiview_mask: None,
         });

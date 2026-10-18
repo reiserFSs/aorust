@@ -1,4 +1,5 @@
 //! Half-resolution diffuse-contact AO from current visible depth and grass porosity tags.
+use crate::effect_gpu::EffectPassEncoder as _;
 use crate::gpu_stats::GpuStatsExt;
 use crate::pipeline_creation::RenderPipeline;
 use glam::Mat4;
@@ -111,7 +112,7 @@ impl AmbientOcclusion {
                 2 => timer.as_deref_mut().map(|timer| timer.end_pass()),
                 _ => None,
             };
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(label), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: output, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load, store: wgpu::StoreOp::Store } })],
                 depth_stencil_attachment: None, timestamp_writes: timestamps, occlusion_query_set: None, multiview_mask: None,
             });

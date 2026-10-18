@@ -1,4 +1,5 @@
 //! Opt-in temporal colour history. Surface identity is checked at every reconstruction tap.
+use crate::effect_gpu::EffectPassEncoder as _;
 use crate::{gpu_stats::GpuStatsExt, pipeline_creation::RenderPipeline};
 use glam::{Mat4, Vec3};
 
@@ -88,7 +89,7 @@ impl Temporal {
         let bg=self.bindings[self.index].as_ref().expect("temporal inputs initialized");
         queue.write_buffer(&self.params,0,bytemuck::cast_slice(&[self.size.0 as f32,self.size.1 as f32,0.0,0.0,if self.valid {1.0}else{0.0},fog_color[0],fog_color[1],fog_color[2]]));
         let attachments=[&out.colour,&out.identity,&out.depth].map(|view|Some(wgpu::RenderPassColorAttachment {view,resolve_target:None,depth_slice:None,ops:wgpu::Operations {load:wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),store:wgpu::StoreOp::Store}}));
-        let mut pass=encoder.begin_render_pass(&wgpu::RenderPassDescriptor {label:Some("Enhanced TAA"),color_attachments:&attachments,depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None,multiview_mask:None});
+        let mut pass=encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {label:Some("Enhanced TAA"),color_attachments:&attachments,depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None,multiview_mask:None});
         pass.set_pipeline(&self.pipeline);pass.set_bind_group(0,bg,&[]);pass.draw(0..3,0..1);drop(pass);
         self.valid=true;self.index=1-self.index;
     }

@@ -1453,6 +1453,22 @@ impl Frontend for Play {
                 if open && !repeat && h.key_press(&mut self.gui, key, host.mods) {
                     return; // captured for a binding: the key does not act
                 }
+                let input = super::options::keys::key_input(key, host.mods);
+                let (bindings, fixed) = h.key_tables();
+                let native_bound = bindings.pairs().any(|(bound, _)| bound == input)
+                    || super::options::keys::FIXED.iter().any(|(name, _)| fixed.get(name) == input);
+                if open && !self.gui.text_focused() && host.mods.ctrl && host.mods.shift && !host.mods.alt
+                    && !native_bound && matches!(code, ao_render::KeyCode::KeyE | ao_render::KeyCode::KeyO) {
+                    if !repeat {
+                        let name = if code == ao_render::KeyCode::KeyE { "AomacEnhancedSuspended" } else { "AomacEffectGpuOverlay" };
+                        let enabled = !h.dvalues.flag(name);
+                        h.dvalues.set(name, super::dvalue::Variant::Bool(enabled));
+                        if code == ao_render::KeyCode::KeyE { self.enhanced_notice = Some((enabled, 2.5)); }
+                        host.enhanced_suspended = h.dvalues.flag("AomacEnhancedSuspended");
+                        host.effect_gpu_overlay = h.dvalues.flag("AomacEffectGpuOverlay");
+                    }
+                    return;
+                }
                 // `KEY_COMMAND_CHAT_HISTORY_PAGE_UP / DOWN` (`RepeatMode`, also while typing): a page through the chat history
                 let input = super::options::keys::key_input(key, host.mods);
                 let (up, down) = (h.key_tables().1.get("KEY_COMMAND_CHAT_HISTORY_PAGE_UP"), h.key_tables().1.get("KEY_COMMAND_CHAT_HISTORY_PAGE_DOWN"));
@@ -1487,6 +1503,11 @@ impl Frontend for Play {
             host.grass_benders.clear();
         }
         if let Some(hud) = self.hud.as_ref() {
+            let suspended = hud.dvalues.flag("AomacEnhancedSuspended");
+            if host.enhanced_suspended != suspended { self.enhanced_notice = Some((suspended, 2.5)); }
+            host.enhanced_suspended = suspended;
+            host.effect_gpu_overlay = hud.dvalues.flag("AomacEffectGpuOverlay");
+            host.slow_frame_log = hud.dvalues.flag("AomacSlowFrameLog");
             self.texture_quality = hud.dvalues.get_i64("DisplayOtherTextureQuality").unwrap_or(3) as i32;
             self.texture_compressed = hud.dvalues.flag("DisplayCompressedTextures");
             self.ground_texture_quality = hud.dvalues.get_i64("GroundTextureQuality").unwrap_or(2) as i32;
@@ -2131,6 +2152,35 @@ impl Frontend for Play {
             // `DisplaySystem+0x44 == 0`: the 3D world is not drawn, the GUI is (black behind it: [INFERENCE])
             let dst = [0.0, 0.0, self.size.0 as f32, self.size.1 as f32];
             list.cmds.splice(0..0, [DrawCmd::Clip(None), DrawCmd::Solid { dst, color: [0, 0, 0], alpha: 1.0 }]);
+        }
+        if let Some((suspended, remaining)) = self.enhanced_notice.as_mut() {
+            if *remaining > 0.0 {
+                let text = if *suspended { "Enhanced effects disabled" } else { "Enhanced effects restored" };
+                list.cmds.push(DrawCmd::Clip(None));
+                self.gui.text_cmds(FontId::Normal, text, 12, 12, 0xffffcc, 1.0, &mut list);
+                *remaining -= dt.max(0.0);
+            }
+        }
+        if host.effect_gpu_overlay {
+            use std::fmt::Write as _;
+            list.cmds.push(DrawCmd::Clip(None));
+            let mut y = 36;
+            self.gui.text_cmds(FontId::Normal, "GPU pass intervals (rolling; may overlap)", 12, y, 0xffffcc, 1.0, &mut list);
+            y += self.gui.font_height(FontId::Normal);
+            if let Some(error) = &host.effect_gpu_error {
+                self.enhanced_overlay_text.clear();
+                write!(&mut self.enhanced_overlay_text, "GPU timing unavailable: {error}").expect("writing to String cannot fail");
+                self.gui.text_cmds(FontId::Normal, &self.enhanced_overlay_text, 12, y, 0xffffcc, 1.0, &mut list);
+            } else if host.effect_gpu_costs.is_empty() {
+                self.gui.text_cmds(FontId::Normal, "Waiting for GPU timing samples", 12, y, 0xffffcc, 1.0, &mut list);
+            } else {
+                for cost in &host.effect_gpu_costs {
+                    self.enhanced_overlay_text.clear();
+                    write!(&mut self.enhanced_overlay_text, "{}: {:.3} ms ({} samples)", cost.label, cost.average_ms, cost.samples).expect("writing to String cannot fail");
+                    self.gui.text_cmds(FontId::Normal, &self.enhanced_overlay_text, 12, y, 0xffffcc, 1.0, &mut list);
+                    y += self.gui.font_height(FontId::Normal);
+                }
+            }
         }
         list
     }

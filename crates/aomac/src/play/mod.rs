@@ -172,6 +172,8 @@ struct Play {
     interface_scale: u8,
     /// Account-wide Enhanced text preference, also applied before a HUD exists.
     smooth_text: bool,
+    enhanced_notice: Option<(bool, f32)>,
+    enhanced_overlay_text: String,
     /// Texture colour depth is read once by native DisplaySystem construction.
     texture_resolution: i32,
     texture_quality: i32,
@@ -343,6 +345,8 @@ impl Play {
             wildlife_enabled: texture_values.flag("Wildlife"),
             interface_scale: texture_values.get_i64("AomacInterfaceScale").unwrap_or(0).clamp(0, 3) as u8,
             smooth_text: texture_values.flag("AomacSmoothText"),
+            enhanced_notice: None,
+            enhanced_overlay_text: String::new(),
             ground_texture_quality: texture_values.get_i64("GroundTextureQuality").unwrap_or(2) as i32,
             ground_texture_patches: Vec::new(),
             ground_texture_serial: 0,

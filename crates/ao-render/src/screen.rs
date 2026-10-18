@@ -107,7 +107,7 @@ impl ScreenPass {
     pub fn draw(&self,enc:&mut wgpu::CommandEncoder,resolve:&wgpu::TextureView,timestamps:Option<wgpu::RenderPassTimestampWrites<'_>>) {
         if self.layers.is_empty() {return;}
         let Some(gpu)=&self.gpu else {return};
-        let mut pass=enc.begin_render_pass(&wgpu::RenderPassDescriptor {label:Some("native viewport sprites"),color_attachments:&[Some(wgpu::RenderPassColorAttachment {view:resolve,resolve_target:None,depth_slice:None,ops:wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}})],depth_stencil_attachment:None,timestamp_writes:timestamps,occlusion_query_set:None,multiview_mask:None});
+        let mut pass=enc.begin_effect_render_pass(&wgpu::RenderPassDescriptor {label:Some("native viewport sprites"),color_attachments:&[Some(wgpu::RenderPassColorAttachment {view:resolve,resolve_target:None,depth_slice:None,ops:wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}})],depth_stencil_attachment:None,timestamp_writes:timestamps,occlusion_query_set:None,multiview_mask:None});
         for (index,layer) in self.layers.iter().enumerate() {
             pass.set_pipeline(&gpu.pipes[&blend_key(layer.source_blend,layer.destination_blend)]);pass.set_bind_group(0,&gpu.frames[index].1,&[]);
             for _ in 0..layer.repetitions {pass.draw(0..3,0..1);}

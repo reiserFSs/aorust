@@ -2,6 +2,7 @@
 //! ao-vk (MIT) cloud_layer.frag/cloud_resolve.frag/cloud_shadow.frag provide
 //! height profiles, erosion, extinction and rotation-only checker reprojection.
 //! Water scalar view changes rebind frame inputs without retiring cloud history.
+use crate::effect_gpu::EffectPassEncoder as _;
 use crate::{gpu_stats::GpuStatsExt, pipeline_creation::RenderPipeline};
 use ao_scene::cloud::CloudLayer;
 use glam::{Mat4, Vec3};
@@ -246,7 +247,7 @@ impl VolumetricClouds {
         Self::draw(encoder, &self.composite, &targets.binds[targets.current], colour, wgpu::LoadOp::Load);
     }
     fn draw(encoder: &mut wgpu::CommandEncoder, pipeline: &RenderPipeline, bind: &wgpu::BindGroup, output: &wgpu::TextureView, load: wgpu::LoadOp<wgpu::Color>) {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("native cloud atmosphere"), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: output, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load, store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
+        let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor { label: Some("native cloud atmosphere"), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: output, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load, store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
         pass.set_pipeline(pipeline); pass.set_bind_group(0, bind, &[]); pass.draw(0..3, 0..1);
     }
 }

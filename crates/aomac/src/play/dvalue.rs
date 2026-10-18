@@ -190,7 +190,8 @@ impl DValues {
         // Enhanced controls share their saved keys, defaults and bounds with the native pages.
         // ChatFontSize is retail-owned: its MainPrefs.xml registration is left untouched.
         for control in super::enhanced::controls().into_iter().filter(|control| control.name.starts_with("Aomac")) {
-            s.add(control.name, control.default, true, CAT_MAIN, control.min, control.max, false);
+            let session = control.session_only();
+            s.add(control.name, control.default, !session, if session { CAT_VARIABLES } else { CAT_MAIN }, control.min, control.max, false);
         }
         s
     }

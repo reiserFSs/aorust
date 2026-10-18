@@ -132,7 +132,8 @@ remains logic-only except explicit screenshots. No readback/PNG encoding occurs 
 frames. Reports include CPU **wall** durations and calling-thread CPU time from
 `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` (Darwin 16 / Linux 3). Thread CPU excludes
 descheduling, GPU time, and background asset/driver workers; it is not process-wide CPU.
-No GPU timestamp queries are used. Stage boundaries are:
+These CPU reports do not use GPU timestamp queries; the optional Enhanced GPU overlay
+described below measures separate GPU pass durations. Stage boundaries are:
 `update` = renderer sky advance/visibility, `frontend` = `Play::frame` (including simulation,
 asset completion and GUI layout), `upload` = host policies/scene/actor application,
 `render`/`gui` = command preparation and submission, `gpu_wait` = final submit/completion.
@@ -142,6 +143,69 @@ RSS comes from `ps` in KiB at report time. Metal `currentAllocatedSize` is nativ
 allocation in unified memory, **not dedicated VRAM**. Tracked creations/estimated created
 bytes are cumulative, not retained allocation; `AOMAC_GPU_STATS=1` optionally adds call-site
 creation logs. Unsupported native allocation/RSS observations are explicitly unavailable.
+
+### Enhanced runtime diagnostics
+
+The Enhanced **Performance** page exposes session-only controls for suspending
+Enhanced effects, the GPU cost overlay and slow-frame logging. Ctrl+Shift+E
+suspends/restores effects without changing their saved settings; Ctrl+Shift+O
+toggles the GPU overlay. The overlay uses the existing GUI font and reports
+rolling GPU pass measurements, not CPU encoding estimates or an automatic
+effect-disable sweep. Slow-frame logging reports frames over 50 ms with their
+wall-clock timestamp and CPU wall stage breakdown, excluding harness pacing.
+The master affects all `EnhancedSettings` visual effects, not display, input,
+text or texture-quality preferences. Their selected values remain in force.
+
+Headless acceptance and the GUI redraw-cap decision use the captured ICC
+scene, actual Play hotkeys, unchanged camera and an ABBA overlay-hidden/visible/
+visible/hidden sequence. Pass profiling stays active on both sides to isolate
+the overlay's draw cost. Separate sweeps measure the master switch's world-GPU
+delta and the logger's incremental CPU cost with the shared profiler already
+active. These are not an isolated estimate of profiler query/readback overhead.
+Acquire the GPU timing lock before running:
+
+```sh
+AOMAC_AUDIO_MUTE=1 AOMAC_PERF=1 \
+AOMAC_INFRA_OUT="$HOME/aomac-handoff/gfx/parity/InfraFx" \
+CARGO_TARGET_DIR=/tmp/InfraFx/target \
+cargo test --release -p aomac enhanced_infrastructure_evidence -j 2 -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The output separates potentially overlapping ordinary GPU pass intervals from
+CPU frontend/layout and GUI command encoding. A separate GUI-only sweep drains
+prior world work, reuses an actual populated Play draw list, and timestamps only
+GUI submissions on the persistent target. That isolated total GUI GPU cost and
+its independent CPU encoding cost govern the redraw-cap decision, not the
+overlay's incremental text cost or the full frontend stage. A deliberately
+injected 55 ms frontend delay exercises the real slow-frame logger after all
+measurement distributions; it is explicitly not an observed natural hitch.
+
+Measured release acceptance (2026-10-18), captured ICC, 1280×800, native 1×,
+120 warmup / 600 measured frames per leg, GPU lock held throughout:
+
+| Measurement | Result |
+| --- | ---: |
+| Master selected Sun Shadows + AO + Bloom + HDR, world GPU | 4.43139 ms on / 1.36845 ms off; delta 3.06294 ms |
+| Twelve immediate master-transition frames | maximum 22.28279 ms; zero pipeline compiles or waits |
+| Isolated GUI GPU, overlay hidden / visible | 0.160081 / 0.165746 ms; overlay delta 0.005665 ms |
+| Isolated GUI encoding wall, hidden / visible | 0.095419 / 0.098964 ms; delta 0.003545 ms |
+| Logger enable/check thread CPU, shared collection already active | observed delta −0.011184 ms; noise, not a speedup |
+| Isolated stage-clock collection, actual diagnostic source, four million CPU-only samples | 0.000231 ms incremental thread CPU/frame |
+
+**No GUI redraw cap was added.** Total isolated GUI work was about 0.16 ms GPU
+and 0.10 ms encoding wall (independent, not summed), approximately 1.4% and
+0.8% respectively of the measured ordinary frame wall time. Neither exceeded
+the experiment's 0.2 ms threshold. A cached GUI layer, extra composite and
+redraw/input latency are not justified by this captured workload.
+
+The overlay delta excludes timestamp-query/readback overhead because collection
+was active on both sides. The isolated logger-clock figure excludes shared GPU
+profiling and actual log formatting/I/O. The controlled logger test emitted a
+timestamped 94.205 ms frame with 72.366 ms in frontend after its deliberate delay.
+These are headless shared-Mac observations, not universal latency guarantees.
+Inspected sheets, consecutive frame strips, actual Performance controls and
+raw CSVs are retained under `~/aomac-handoff/gfx/parity/InfraFx/`.
 
 Remote ground alignment is memoized by exact position/body/surface-state bits and
 the loaded collision world's generation; collision replacement and actual door

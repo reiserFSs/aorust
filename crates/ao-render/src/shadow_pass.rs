@@ -55,6 +55,7 @@ impl Renderer {
 
     /// Developer/offscreen only. Read each submitted sample before the next frame.
     pub fn set_shadow_gpu_timing(&mut self, enabled: bool) -> Result<()> {
+        anyhow::ensure!(!enabled || self.effect_profiler.is_none(), "offline shadow timing and live per-effect profiling must be sampled separately");
         if enabled && self.gpu_timer.is_some() { return Err(anyhow!("frame and shadow GPU timing must be sampled separately")); }
         self.shadow_timer_pending = false;
         self.shadow_timer = if enabled { Some(FrameGpuTimer::new(&self.device, &self.queue)?) } else { None };
@@ -130,7 +131,7 @@ impl Renderer {
         if admission { self.prepare_actor_shadows(&mut shadows); } else { shadows.actor_ids.clear(); shadows.actor_groups.clear(); }
         if !shadows.actor_ids.is_empty() {
             let timestamp_writes = self.shadow_timestamp(false);
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("sun current-frame visible surface admission"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &shadows.primary_ids, resolve_target: None, depth_slice: None,
@@ -157,7 +158,7 @@ impl Renderer {
         self.prepare_static_shadow_casters(&mut shadows, &frame);
         for layer in 0..CASCADES {
             let timestamp_writes = self.shadow_timestamp(layer == CASCADES - 1);
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("current-frame sun cascade"), color_attachments: &[],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &shadows.layers[layer],
