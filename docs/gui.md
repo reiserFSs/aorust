@@ -1510,7 +1510,7 @@ counts consistent. Repeated unchanged MSAA requests must not cancel a pending li
 Regression: `play::flow::tests::enhanced_option_switch_reuses_compiled_variants` exercises the
 real HUD/offscreen flow and checks frame-thread compile counts and warm-cache reuse.
 
-The **Grass & Plants / Ground Grass** section also exposes six independent
+The **Grass & Plants / Ground Grass** section also exposes seven independent
 Enhanced modifiers, each defaulting **off** and persisted/reset through the same
 DV Main registry:
 
@@ -1522,15 +1522,18 @@ DV Main registry:
 | Grass Gust Bands | `AomacGrassGustBands` |
 | Grass Sunlight | `AomacGrassSunlight` |
 | Grass Sun Shadows | `AomacGrassSunShadows` |
+| Grass Point Shadows | `AomacGrassPointShadows` |
 
 These modifiers do not enable Ground Grass or change the world Sun Shadows
 preference. Ground Grass remains the carpet's master switch; density and distance
 remain independent. Missing keys in older preferences retain false. The CPU uploads
 `GrassParams.features = [tufts, species, path_thinning, gust_bands]` and
-`lighting = [sunlight, sun_shadows, 0, 0]` before the distance bands
+`lighting = [sunlight, sun_shadows, point_shadows, 0]` before the distance bands
 every prepared frame, without per-blade allocations.
 Grass Sun Shadows adds blade casters independently of world Sun Shadows;
 the modifier neither requires nor enables that preference.
+Grass Point Shadows requests admitted point-light shadow resources for the grass
+receiver/caster without enabling world Clustered Lighting or Local Light Shadows.
 The artistic reference is ao-vk `rvk/grass.cpp` and
 `rvk/shaders/grass_common.glsl`, `grass.vert`, `grass.frag` (MIT; see `THIRD_PARTY`);
 these controls are not reconstructed retail settings. Native fog extinction and
@@ -1538,9 +1541,9 @@ actor admission remain unchanged.
 
 Headless fixture settings (`AOMAC_GFX_SETTINGS`) include `grass-tufts`,
 `grass-species`, `grass-path-thinning`, `grass-gust-bands`, `grass-sunlight`,
-and `grass-sun-shadows`, each enabling only its modifier
+`grass-sun-shadows`, and `grass-point-shadows`, each enabling only its modifier
 plus Ground Grass. `grass-all` leaves world Sun Shadows off for isolation;
-`grass-all`, `all`, and `all-no-bloom` enable all six modifiers.
+`grass-all`, `all`, and `all-no-bloom` enable all seven modifiers.
 `grass` and the historical `all-before` retain the modifiers off.
 Runnable CPU checks (not evidence of an executed gate):
 `cargo test --release -p ao-render grass_params_match_uniform_layout`,

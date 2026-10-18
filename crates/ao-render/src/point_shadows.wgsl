@@ -39,3 +39,36 @@ fn admitted_light_list(world: vec3<f32>) -> vec2<u32> {
     return bitcast<vec4<u32>>(dyn_lights[metadata.w + cell]).xy;
 }
 
+// Enhanced spatial distribution of blocked native gamma diffuse. The receiver
+// separately caps this loss to its exact Gouraud-interpolated native local share.
+fn grass_point_shadow_loss(world: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+    var loss = vec3<f32>(0.0);
+    let directional_count = u32(g.dyn_info.y);
+    var used = directional_count + select(0u, 1u, directional_count > 0u);
+    let count = min(bitcast<u32>(dyn_lights[322u].x), 64u);
+    let n = normalize(normal);
+    for (var k = 0u; k < count && used < 8u; k = k + 1u) {
+        let li = 66u + k * 4u;
+        let a = dyn_lights[li];
+        let packed = dyn_lights[li + 3u].w;
+        if !owner_light_admitted(packed) { continue; }
+        if a.w <= 0.0 { continue; }
+        let d = a.xyz - world;
+        let dist = length(d);
+        if dist > a.w { continue; }
+        used += 1u;
+        let col = dyn_lights[li + 1u];
+        let att = dyn_lights[li + 2u];
+        let l = d / max(dist, 1e-3);
+        var intensity = select(1.0 - dist / a.w, 1.0 / (att.x + dist * (att.y + dist * att.z)), att.x >= 0.0);
+        if col.w < 1.5 {
+            let rho = dot(-l, dyn_lights[li + 3u].xyz);
+            intensity *= clamp((rho - col.w) / max(att.w - col.w, 1e-4), 0.0, 1.0);
+        }
+        let nl = dot(n, l);
+        if nl > 0.0 {
+            loss += col.rgb * (intensity * nl) * (1.0 - point_shadow_visibility(-d, a.w, packed, false));
+        }
+    }
+    return max(loss, vec3<f32>(0.0));
+}

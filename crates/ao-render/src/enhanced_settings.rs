@@ -21,6 +21,7 @@ pub struct EnhancedSettings {
     pub grass_gust_bands: bool,
     pub grass_sunlight: bool,
     pub grass_sun_shadows: bool,
+    pub grass_point_shadows: bool,
     pub foliage_edges: bool,
     pub foliage_sway: bool,
     pub foliage_push: bool,
@@ -119,7 +120,7 @@ impl Default for EnhancedSettings {
         Self {
             sun_shadows: false, ambient_occlusion: false, emissive_bloom: false, ground_grass: false, hdr: false, contact_shadows: false,
             grass_tufts: false, grass_species: false, grass_path_thinning: false, grass_gust_bands: false,
-            grass_sunlight: false, grass_sun_shadows: false,
+            grass_sunlight: false, grass_sun_shadows: false, grass_point_shadows: false,
             height_haze: false, land_haze: false, valley_mist: false, volumetric_shafts: false,
             cloud_gap_shafts: false, volumetric_clouds: false, cloud_shadows: false, sky_discs: false,
             material_specular: false, clustered_lighting: false, moon_shadows: false, local_light_shadows: false,
@@ -160,7 +161,7 @@ impl EnhancedSettings {
             || self.enhanced_rain || self.wet_surfaces || self.weather_particles
             || self.gpu_spell_particles || self.fluid_smoke
             || self.grass_tufts || self.grass_species || self.grass_path_thinning || self.grass_gust_bands
-            || self.grass_sunlight || self.grass_sun_shadows
+            || self.grass_sunlight || self.grass_sun_shadows || self.grass_point_shadows
     }
 
     /// Enhanced local-light consumers require current-frame owner admission before any source cap.
@@ -168,6 +169,7 @@ impl EnhancedSettings {
         self.clustered_lighting || self.local_light_shadows || self.material_specular || self.material_pbr
             || self.material_reflections || self.environment_probe
             || self.generated_normals || self.material_maps
+            || (self.ground_grass && self.grass_point_shadows)
     }
 
     pub fn water_enabled(self) -> bool {
@@ -280,12 +282,18 @@ mod tests {
                 let settings = EnhancedSettings { $field: true, ..defaults };
                 assert!(settings.any_enabled());
                 assert!(!settings.ground_grass && !settings.sun_shadows);
+                assert!(!settings.clustered_lighting && !settings.local_light_shadows);
                 assert!(!settings.needs_sun_mask() && !settings.interaction_enabled());
+                assert!(!settings.needs_admitted_lights());
                 assert_eq!(settings.clamped(), settings);
             )+};
         }
         check!(grass_tufts, grass_species, grass_path_thinning, grass_gust_bands,
-            grass_sunlight, grass_sun_shadows);
+            grass_sunlight, grass_sun_shadows, grass_point_shadows);
+        let point = EnhancedSettings { ground_grass: true, grass_point_shadows: true, ..defaults };
+        assert!(point.needs_admitted_lights());
+        assert!(!point.clustered_lighting && !point.local_light_shadows);
+        assert!(!EnhancedSettings { ground_grass: true, ..defaults }.needs_admitted_lights());
     }
 
     #[test]

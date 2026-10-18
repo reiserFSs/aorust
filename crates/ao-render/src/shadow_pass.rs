@@ -130,7 +130,7 @@ impl Renderer {
         if let Some(frame) = frame.as_mut() {
             frame.uniform.forward[3] = strength * self.enhanced_settings.shadow_strength.clamp(0.0, 1.0);
             frame.uniform.eye[3] = receiver_far;
-            frame.uniform.control[1] = self.enhanced_settings.shadow_softness.clamp(0.0, 4.0).to_bits();
+            frame.uniform.control[1] = self.enhanced_settings.shadow_softness.clamp(0.0, 4.0).abs().to_bits();
             frame.uniform.control[2] = u32::from(grass_enabled && moon.is_none());
             // Shafts need solid depth maps even when beauty's world shadows are off.
             // Keep their raw map population separate from surface receiver permission.
@@ -201,8 +201,8 @@ impl Renderer {
                 }), timestamp_writes: grass_timestamp, occlusion_query_set: None, multiview_mask: None,
             });
             if moon.is_none() {
-                if let (Some(grass), Some(ground), Some(caster), Some(bind)) = (&self.grass, &self.ground, &shadows.grass_caster, &grass_bind) {
-                    grass.draw_shadow(&mut pass, &self.globals_bg, ground, &self.gpu, caster.pipeline.get(), bind);
+                if let (Some(grass), Some(caster), Some(bind)) = (&self.grass, &shadows.grass_caster, &grass_bind) {
+                    grass.draw_shadow(&mut pass, &self.globals_bg, caster.pipeline.get(), bind);
                 }
             }
         }

@@ -78,6 +78,7 @@ mod ambient_occlusion;
 mod sky_probe;
 mod sun_shadows;
 mod point_shadows;
+mod grass_point_shadows;
 mod shadow_pass;
 mod shadow_coverage;
 #[cfg(test)]

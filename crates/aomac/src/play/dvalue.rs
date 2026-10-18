@@ -210,6 +210,7 @@ impl DValues {
             grass_gust_bands: self.flag("AomacGrassGustBands"),
             grass_sunlight: self.flag("AomacGrassSunlight"),
             grass_sun_shadows: self.flag("AomacGrassSunShadows"),
+            grass_point_shadows: self.flag("AomacGrassPointShadows"),
             foliage_edges: self.flag("AomacFoliageEdges"),
             foliage_sway: self.flag("AomacFoliageSway"),
             foliage_push: self.flag("AomacFoliagePush"),

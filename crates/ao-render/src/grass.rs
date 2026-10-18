@@ -7,12 +7,12 @@ mod noise;
 mod mask;
 pub(super) use mask::{build as green_masks, GreenMasks};
 
-const MAX_CELLS: usize = 16384;
+pub(super) const MAX_CELLS: usize = 16384;
 /// Blades a cell can hold at the top density (2.0); the density knob scales how many of them are drawn.
 const MAX_BLADES: f32 = 1536.0;
 const MAX_RADIUS: f32 = 180.0;
 /// Successive distance bands halve the number of instanced blades.
-const BANDS: usize = 8;
+pub(super) const BANDS: usize = 8;
 const MAX_BENDERS: usize = 16;
 const MAX_EXPOSURE_CELLS: usize = 32768;
 const EXPOSURE_CELLS_PER_FRAME: usize = 4;
@@ -191,12 +191,14 @@ pub(super) struct Compiled {
     samples: u32,
     channels: (bool, bool, bool, bool, bool),
     shadows: bool,
+    admitted: bool,
 }
 pub(super) struct Grass {
     pipeline: crate::pipeline_creation::RenderPipeline,
     bind: Option<wgpu::BindGroup>,
     layout: wgpu::BindGroupLayout,
     shadows: bool,
+    admitted: bool,
     pub(super) cells_buffer: wgpu::Buffer,
     pub(super) params_buffer: wgpu::Buffer,
     params: Params,
@@ -237,7 +239,8 @@ pub(super) struct Grass {
 }
 impl Compiled {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(device: &wgpu::Device, globals: &wgpu::BindGroupLayout, material: &wgpu::BindGroupLayout, palette: &wgpu::BindGroupLayout, samples: u32, channels: (bool, bool, bool, bool, bool), shadows: bool, format: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device, globals: &wgpu::BindGroupLayout, material: &wgpu::BindGroupLayout, palette: &wgpu::BindGroupLayout, samples: u32, channels: (bool, bool, bool, bool, bool), shadows: bool, admitted: bool, format: wgpu::TextureFormat) -> Self {
+        let shadows = shadows || admitted;
         let mut entries = vec![
             wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
             wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
@@ -250,10 +253,13 @@ impl Compiled {
             // Root exposure comes from Cell.normals[0].w, not the world's lattice.
             entries.extend(crate::sun_shadows::receiver_entries().into_iter().filter(|entry| entry.binding != 7).map(|mut entry| { entry.binding += 2; entry }));
         }
+        if admitted {
+            entries.extend(crate::point_shadows::grass_receiver_entries());
+        }
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("grass cells, benders and shared sun receiver"), entries: &entries,
         });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("native material grass"), source: wgpu::ShaderSource::Wgsl(shader_source(channels, shadows).into()) });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("native material grass"), source: wgpu::ShaderSource::Wgsl(shader_source_with_lights(channels, shadows, admitted).into()) });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("grass"), bind_group_layouts: &[Some(globals), Some(material), Some(palette), Some(&layout)], immediate_size: 0 });
         let targets = [
             Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL }),
@@ -274,7 +280,7 @@ impl Compiled {
             depth_stencil: Some(wgpu::DepthStencilState { format: super::DEPTH, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::LessEqual), stencil: Default::default(), bias: Default::default() }),
             multisample: wgpu::MultisampleState { count: samples, alpha_to_coverage_enabled: samples > 1, ..Default::default() }, multiview_mask: None, cache: None,
         });
-        Self { pipeline, layout, samples, channels, shadows }
+        Self { pipeline, layout, samples, channels, shadows, admitted }
     }
     pub fn is_ready(&self) -> bool {
         self.pipeline.is_ready()
@@ -288,7 +294,7 @@ impl Compiled {
 }
 impl Grass {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, green: &GreenMasks, compiled: &Compiled) -> Self {
-        let Compiled { pipeline, layout, samples, channels, shadows } = compiled.clone();
+        let Compiled { pipeline, layout, samples, channels, shadows, admitted } = compiled.clone();
         let cells_buffer = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("grass cell cache"), size: (MAX_CELLS * std::mem::size_of::<Cell>()) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let params_buffer = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("grass wind and benders"), size: std::mem::size_of::<Params>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let visible_buffer = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("grass visible cells"), size: (BANDS * MAX_CELLS * 4) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -308,17 +314,19 @@ impl Grass {
             forced_band: None,
             trails: TrailGrid::default(),
             params: bytemuck::Zeroable::zeroed(),
+            admitted,
             pipeline, bind, layout, shadows, cells_buffer, params_buffer, visible_buffer, noise_view, noise_sampler, mask_view, green_bytes: green.layers.len(), cells: Vec::with_capacity(MAX_CELLS), batches: Vec::with_capacity(MAX_CELLS), visible: std::array::from_fn(|_| Vec::with_capacity(MAX_CELLS)), draws: Vec::new(), stride: 0, band_strides: [0; BANDS], surface_heights: Vec::new(), surface_parities: Vec::new(), samples, channels, wind_phase: 0.0, filtered_wind, benders: [[0.0; 3]; MAX_BENDERS], bender_count: 0, inputs: Vec::with_capacity(MAX_BENDERS), prepare_cpu_ns: 0, exposure: None, exposure_cache: std::collections::HashMap::with_capacity(MAX_EXPOSURE_CELLS * 2), exposure_order: std::collections::VecDeque::with_capacity(MAX_EXPOSURE_CELLS), candidates: Vec::with_capacity(MAX_CELLS), order: Vec::with_capacity(MAX_CELLS), last_selection: None, last_radius: 0, last_path: super::GroundPath::Simple, pending: false }
     }
     /// A render variant owns programs, not terrain/exposure or admitted motion.
     /// Retain those resources when shadow/AO/MSAA switches change the layout.
     fn reconfigure(&mut self, device: &wgpu::Device, compiled: &Compiled) {
-        let Compiled { pipeline, layout, samples, channels, shadows } = compiled.clone();
+        let Compiled { pipeline, layout, samples, channels, shadows, admitted } = compiled.clone();
         self.pipeline = pipeline;
         self.layout = layout;
         self.samples = samples;
         self.channels = channels;
         self.shadows = shadows;
+        self.admitted = admitted;
         self.bind = (!shadows).then(|| device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("grass"), layout: &self.layout, entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: self.cells_buffer.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: self.params_buffer.as_entire_binding() },
@@ -459,7 +467,7 @@ impl Grass {
         params.limits = [self.stride as f32, pixels, MIN_BLADE_PIXELS, self.bender_count as f32];
         params.wind = [strength, 1.0, 0.0, 0.0];
         params.features = [settings.grass_tufts, settings.grass_species, settings.grass_path_thinning, settings.grass_gust_bands].map(|enabled| f32::from(u8::from(enabled)));
-        params.lighting = [settings.grass_sunlight, settings.grass_sun_shadows, false, false].map(|enabled| f32::from(u8::from(enabled)));
+        params.lighting = [settings.grass_sunlight, settings.grass_sun_shadows, settings.grass_point_shadows, false].map(|enabled| f32::from(u8::from(enabled)));
         params.bands = std::array::from_fn(|row| std::array::from_fn(|col| self.band_strides[row * 4 + col] as f32));
         params.benders.fill([0.0; 4]);
         params.trail_origin = [self.trails.origin[0] as f32, self.trails.origin[1] as f32, TRAIL_CELL_SIZE, f32::from(u8::from(settings.grass_trails))];
@@ -508,10 +516,10 @@ impl Grass {
     #[allow(clippy::too_many_arguments)]
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, globals: &wgpu::BindGroup, ground: &GroundRun, gpu: &super::Gpu, shadow_bind: Option<&wgpu::BindGroup>) -> usize {
         if self.draws.is_empty() { return 0; }
-        self.draw_shadow(pass, globals, ground, gpu, &self.pipeline, shadow_bind.or(self.bind.as_ref()).expect("grass receiver prepared"))
+        self.draw_material(pass, globals, ground, gpu, &self.pipeline, shadow_bind.or(self.bind.as_ref()).expect("grass receiver prepared"))
     }
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn draw_shadow(&self, pass: &mut wgpu::RenderPass<'_>, globals: &wgpu::BindGroup, ground: &GroundRun, gpu: &super::Gpu, pipeline: &wgpu::RenderPipeline, bind: &wgpu::BindGroup) -> usize {
+    fn draw_material(&self, pass: &mut wgpu::RenderPass<'_>, globals: &wgpu::BindGroup, ground: &GroundRun, gpu: &super::Gpu, pipeline: &wgpu::RenderPipeline, bind: &wgpu::BindGroup) -> usize {
         if self.draws.is_empty() { return 0; }
         pass.set_bind_group(0, globals, &[]);
         pass.set_bind_group(3, bind, &[]);
@@ -531,6 +539,21 @@ impl Grass {
             draws += 1;
         }
         draws
+    }
+    pub(crate) fn draw_shadow(&self, pass: &mut wgpu::RenderPass<'_>, globals: &wgpu::BindGroup, pipeline: &wgpu::RenderPipeline, bind: &wgpu::BindGroup) {
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, globals, &[]);
+        pass.set_bind_group(3, bind, &[]);
+        for draw in &self.draws {
+            let (band, stride) = ((draw.band as u32) << 28, self.band_strides[draw.band]);
+            pass.draw(0..if draw.band >= 2 { 3 } else { 6 }, band + draw.slots.start * stride..band + draw.slots.end * stride);
+        }
+    }
+    pub(crate) fn point_shadow_counts(&self) -> [[u32; 4]; 2] {
+        std::array::from_fn(|row| std::array::from_fn(|column| self.visible[row * 4 + column].len() as u32))
+    }
+    pub(crate) fn point_shadow_strides(&self) -> [[u32; 4]; 2] {
+        std::array::from_fn(|row| std::array::from_fn(|column| self.band_strides[row * 4 + column]))
     }
     pub fn has_draws(&self) -> bool { !self.draws.is_empty() }
     pub fn resource_bytes(&self) -> usize { MAX_CELLS * (std::mem::size_of::<Cell>() + 4 * BANDS) + std::mem::size_of::<Params>() + (noise::SIZE * noise::SIZE * 8) as usize + self.green_bytes }
@@ -606,6 +629,9 @@ fn hash(mut value: u32) -> u32 { value ^= value >> 16; value = value.wrapping_mu
 fn cell_seed(x: u32, z: u32, tile: u16) -> u32 { hash(hash(x) ^ hash(z.rotate_left(16)) ^ u32::from(tile)) }
 
 pub(super) fn shader_source(channels: (bool, bool, bool, bool, bool), shadows: bool) -> String {
+    shader_source_with_lights(channels, shadows, false)
+}
+fn shader_source_with_lights(channels: (bool, bool, bool, bool, bool), shadows: bool, admitted: bool) -> String {
     let grass = crate::shader_source::load("grass.wgsl", include_str!("grass.wgsl"))
         .replace("//__AMBIENT_FIELD__", if channels.0 { "@location(1) ambient: vec4<f32>," } else { "" })
         .replace("//__EMISSIVE_FIELD__", if channels.1 { "@location(2) emissive: vec4<f32>," } else { "" })
@@ -617,6 +643,9 @@ pub(super) fn shader_source(channels: (bool, bool, bool, bool, bool), shadows: b
         } else { "" })
         .replace("//__SHADOW_VISIBILITY__", if shadows {
             "if shadow_frame.moon_direction.w > 0.0 {\n        if g.moon_direction.w > 0.0 && dot(shadow_frame.moon_direction.xyz, g.moon_direction.xyz) > 0.9999 {\n            moon_visibility = grass_sun_visibility(i.root + i.normal.xyz * 0.05, i.normal.xyz);\n            grass_direct_visibility = 1.0;\n        }\n    } else {\n        visibility = grass_sun_visibility(i.world + i.normal.xyz * 0.005, i.normal.xyz);\n    }"
+        } else { "" })
+        .replace("//__POINT_SHADOW_LOSS__", if admitted {
+            "if grass_params.lighting.z > 0.5 { light = max(light - min(i.local_share, grass_point_shadow_loss(i.world, i.normal.xyz)), vec3<f32>(0.0)); }"
         } else { "" })
         .replace("//__EMISSIVE_WRITE__", if channels.1 { "output.emissive = vec4<f32>(0.0);" } else { "" })
         // Same roof-tested terrain alpha and fog contract as the ground receiver.
@@ -636,6 +665,16 @@ pub(super) fn shader_source(channels: (bool, bool, bool, bool, bool), shadows: b
             "    return mix(1.0, visible, clamp(shadow_frame.forward.w, 0.0, 1.0));",
             "    grass_direct_visibility = visible;\n    return mix(1.0, visible, clamp(shadow_frame.forward.w, 0.0, 1.0));",
         ));
+    }
+    if admitted {
+        crate::point_shadows::admitted_native_pool(&mut source, "vertex_lights");
+        let mut receiver = crate::shader_source::load("point_shadows.wgsl", include_str!("point_shadows.wgsl")).into_owned();
+        receiver.push_str(&crate::shader_source::load("point_sampling.wgsl", include_str!("point_sampling.wgsl")));
+        receiver = receiver.replace("@binding(9)", "@binding(13)");
+        for binding in 3..=6 {
+            receiver = receiver.replace(&format!("@binding({binding})"), &format!("@binding({})", binding + 6));
+        }
+        source.push_str(&receiver);
     }
     source
 }
@@ -811,9 +850,10 @@ impl super::Renderer {
         };
         let samples = self.msaa_samples();
         let channels = (settings.ambient_occlusion, settings.emissive_bloom, settings.needs_sun_mask(), self.world_key.water_cloud, settings.material_reflections || settings.environment_probe);
-        let shadows = settings.sun_shadows || settings.moon_shadows || (settings.ground_grass && settings.grass_sun_shadows);
+        let admitted = settings.needs_admitted_lights();
+        let shadows = settings.sun_shadows || settings.moon_shadows || (settings.ground_grass && settings.grass_sun_shadows) || admitted;
         if let Some(grass) = &mut self.grass {
-            if grass.samples == samples && (grass.channels.0, grass.channels.1, grass.channels.2, grass.channels.4) == (channels.0, channels.1, channels.2, channels.4) && grass.shadows == shadows {
+            if grass.samples == samples && (grass.channels.0, grass.channels.1, grass.channels.2, grass.channels.4) == (channels.0, channels.1, channels.2, channels.4) && grass.shadows == shadows && grass.admitted == admitted {
                 if grass.channels.3 != channels.3 {
                     // Paired water-output programs share the same resource layout.
                     // Keep buffers, receiver bindings and interaction history intact.
@@ -834,7 +874,7 @@ impl super::Renderer {
     pub(super) fn prepare_grass_shadow_receiver(&mut self) {
         if let (Some(grass), Some(shadows)) = (&self.grass, &mut self.sun_shadows) {
             if grass.shadows && shadows.grass_receiver.is_none() {
-                shadows.grass_receiver = Some(shadows.grass_bind(&self.device, &grass.layout, &grass.cells_buffer, &grass.params_buffer, &grass.visible_buffer, &grass.noise_view, &grass.noise_sampler, &grass.mask_view));
+                shadows.grass_receiver = Some(shadows.grass_bind(&self.device, &grass.layout, &grass.cells_buffer, &grass.params_buffer, &grass.visible_buffer, &grass.noise_view, &grass.noise_sampler, &grass.mask_view, self.point_shadows.as_ref().filter(|_| grass.admitted)));
             }
         }
     }
@@ -904,7 +944,10 @@ impl super::Renderer {
         }
     }
     /// Bounded effect-owned buffers, excluding shared Enhanced targets.
-    pub fn enhanced_grass_resource_bytes(&self) -> usize { self.grass.as_ref().map_or(0, Grass::resource_bytes) }
+    pub fn enhanced_grass_resource_bytes(&self) -> usize {
+        self.grass.as_ref().map_or(0, Grass::resource_bytes)
+            + self.point_shadows.as_ref().map_or(0, crate::point_shadows::PointShadows::grass_resource_bytes)
+    }
     pub fn enhanced_grass_prepare_cpu_ns(&self) -> u64 { self.grass.as_ref().map_or(0, |grass| grass.prepare_cpu_ns) }
     pub fn enhanced_grass_cell_count(&self) -> usize { self.grass.as_ref().map_or(0, |grass| grass.cells.len()) }
     /// Offline fixture preparation only: do not advance native draw-count clocks.
@@ -1026,6 +1069,50 @@ mod tests {
             "grass_params.features.z", "grass_params.features.w", "grass_params.lighting.x",
             "fn grass_vertex(", "o.world = p;"] {
             assert!(shader.contains(contract), "missing grass shader contract: {contract}");
+        }
+    }
+
+    #[test]
+    fn grass_shared_admitted_pool_uses_native_rows_and_owner_proof() {
+        let source = shader_source_with_lights((false, false, false, false), true, true);
+        assert!(source.contains("let dyn_count = min(bitcast<u32>(dyn_lights[322u].x), 64u);"));
+        assert!(source.contains("let li = 66u + k * 4u;"));
+        assert!(source.contains("if !owner_light_admitted(dyn_lights[li + 3u].w) { continue; }"));
+        for binding in 9..=12 {
+            assert!(source.contains(&format!("@group(3) @binding({binding})")));
+        }
+        assert!(source.contains("@location(15) local_share: vec3<f32>"));
+        assert!(source.contains("if grass_params.lighting.z > 0.5 { light = max(light - min(i.local_share, grass_point_shadow_loss("));
+        assert!(!shader_source((false, false, false, false), false).contains("fn grass_point_shadow_loss("));
+    }
+
+    #[test]
+    fn grass_point_local_budget_excludes_fxs_directional_light_in_day_and_dark() {
+        let source = shader_source_with_lights((false, false, false, false), true, true);
+        assert!(source.contains("fn grass_directional_light("));
+        assert!(source.contains("grass_directional_light(ground_n)"), "daylight must retain its root-normal directional evaluation");
+        assert!(source.contains("grass_directional_light(n)"), "night must retain per-corner directional evaluation");
+        assert!(source.matches("grass_directional_light(").count() >= 3);
+        // Saturation and the night blend happen before native Gouraud
+        // interpolation. Directional FXS energy is not a point-shadow budget.
+        let shade = |sun: f32, fxs: f32, point: f32, ambient: f32, dark: f32, simple: bool| {
+            let diffuse = (sun + fxs + point).clamp(0.0, 1.0);
+            let native = if simple { (diffuse + ambient).clamp(0.0, 1.0) } else { diffuse };
+            native * (1.0 - dark) + (fxs + point).clamp(0.0, 1.0) * dark
+        };
+        let saturated_directional = shade(0.0, 0.9, 0.5, 0.0, 1.0, false);
+        let directional_only = shade(0.0, 0.9, 0.0, 0.0, 1.0, false);
+        assert!((saturated_directional - directional_only - 0.1).abs() < 0.000001,
+            "a saturated 0.9 directional + 0.5 point can lose only the surviving 0.1 local energy");
+        for dark in [0.0, 0.5, 1.0] {
+            for simple in [false, true] {
+                let no_points = shade(0.25, 0.4, 0.0, 0.1, dark, simple);
+                let with_points = shade(0.25, 0.4, 0.2, 0.1, dark, simple);
+                assert!((with_points - no_points - 0.2).abs() < 0.000001);
+                let saturated = shade(0.6, 0.4, 0.3, 0.1, dark, simple);
+                let baseline = shade(0.6, 0.4, 0.0, 0.1, dark, simple);
+                assert!((saturated - baseline) <= 0.3 + 0.000001);
+            }
         }
     }
 
@@ -1364,6 +1451,58 @@ mod blade_appearance_tests {
     }
 
     #[test]
+    fn grass_point_casters_light_real_blades_and_restore_native_without_world_overrides() {
+        use crate::{Camera, EnhancedSettings, Renderer, Targets, Vec3};
+        let mut scene = night_grass_scene();
+        scene.lights.push(ao_scene::Light {
+            pos: [3.0, 0.8, -4.0], color: [0.6, 0.45, 0.25], range: 12.0, ..Default::default()
+        });
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = Renderer::new(&instance, None).expect("grass point caster GPU");
+        renderer.set_msaa_samples(1);
+        renderer.upload(&scene);
+        let camera = Camera::look_at(Vec3::new(4.0, 3.0, 1.0), Vec3::new(4.0, 0.0, -4.0));
+        let settings = EnhancedSettings {
+            ground_grass: true, grass_density: 2.0, grass_distance: 60.0,
+            point_shadow_count: 1, ..Default::default()
+        };
+        renderer.set_enhanced_settings(settings);
+        renderer.set_enhanced_grass_exposure(Some(super::GrassExposure {
+            generation: 1, query: std::rc::Rc::new(|_| true),
+            line_of_sight: std::rc::Rc::new(|_, _| true),
+        }));
+        let output = renderer.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("independent grass point caster"),
+            size: wgpu::Extent3d { width: 256, height: 256, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: renderer.format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = output.create_view(&Default::default());
+        let targets = Targets::new(&renderer, 256, 256);
+        for mode in [3, 1, 0] {
+            renderer.set_ground_rendering(mode);
+            renderer.warm_grass_tiles(&camera);
+            let mut images = Vec::new();
+            for enabled in [false, true, false] {
+                renderer.set_enhanced_settings(EnhancedSettings { grass_point_shadows: enabled, ..settings });
+                renderer.render(&view, &targets, &camera);
+                assert!(!renderer.enhanced_settings.clustered_lighting);
+                assert!(!renderer.enhanced_settings.local_light_shadows);
+                assert!(!renderer.grass.as_ref().unwrap().cells.is_empty());
+                if enabled {
+                    assert!(renderer.point_shadows.as_ref().unwrap().grass_resource_bytes() > 0);
+                    assert!(renderer.sun_shadows.as_ref().unwrap().static_commands.is_empty(),
+                        "independent grass cubes must not submit world solid casters");
+                }
+                images.push(crate::texture_to_rgba(&renderer, &output, 256, 256).unwrap());
+            }
+            assert_ne!(images[0], images[1], "native mode {mode}: real lamp blade depths must affect pixels");
+            assert_eq!(images[0], images[2], "native mode {mode}: point off must restore frozen native light");
+        }
+    }
+
+    #[test]
     fn grass_sun_casters_change_pixels_and_toggle_back_exactly() {
         use crate::{Camera, EnhancedSettings, Renderer, Targets, Vec3};
         let mut scene = night_grass_scene();
@@ -1625,9 +1764,15 @@ mod blade_appearance_tests {
             assert_eq!(source.contains("grass_direct_visibility = visible;"), shadows,
                 "the HDR sun mask excludes beauty's retained shadow floor");
             // Creating the pipeline validates the shader against the real bind-group layouts.
-            let grass = super::Compiled::new(&renderer.device, &renderer.g_layout, &renderer.tex_layout, &renderer.holo_layout, 1, (ao, bloom, hdr, water, false), shadows, renderer.format);
+            let grass = super::Compiled::new(&renderer.device, &renderer.g_layout, &renderer.tex_layout, &renderer.holo_layout, 1, (ao, bloom, hdr, water, false), shadows, false, renderer.format);
             grass.wait();
             assert!(grass.is_ready());
+        }
+        for shadows in [false, true] {
+            let grass = super::Compiled::new(&renderer.device, &renderer.g_layout, &renderer.tex_layout, &renderer.holo_layout,
+                1, (false, false, false, false), shadows, true, renderer.format);
+            grass.wait();
+            assert!(grass.is_ready(), "admitted grass receiver must validate against its actual bindings");
         }
     }
 }

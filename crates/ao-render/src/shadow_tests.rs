@@ -45,6 +45,79 @@ fn standalone_grass_sun_shadows_compile_receivers_without_world_shadow_preferenc
 }
 
 #[test]
+fn standalone_grass_point_receiver_preserves_native_caps_palette_and_fog() {
+    let settings = EnhancedSettings { ground_grass: true, grass_point_shadows: true, ..Default::default() };
+    assert!(!settings.clustered_lighting && !settings.local_light_shadows);
+    let off = enhanced_shader::source(EnhancedSettings { grass_point_shadows: false, ..settings });
+    assert!(!off.contains("fn grass_point_shadow_loss("));
+    assert_eq!(off, enhanced_shader::source(EnhancedSettings { ground_grass: false, ..settings }));
+    assert_ne!(variant::Key::of(settings, 1), variant::Key::of(EnhancedSettings { grass_point_shadows: false, ..settings }, 1));
+    for clustered in [false, true] {
+        for packed in [false, true] {
+            for directional in 0..8 {
+                let source = enhanced_shader::source(EnhancedSettings {
+                    clustered_lighting: clustered, material_specular: packed,
+                    sun_shadows: directional & 1 != 0, moon_shadows: directional & 2 != 0,
+                    grass_sun_shadows: directional & 4 != 0,
+                    ambient_occlusion: true, emissive_bloom: true, hdr: true,
+                    ..settings
+                });
+                assert_eq!(source.contains("fn clustered_ground("), clustered,
+                    "grass alone must not turn on world per-pixel relighting");
+                assert!(source.contains("o.light - ground_without_local") || source.contains("o.light.xyz - ground_without_local"));
+                assert!(source.contains("ground_without_local + g.ambient_g.rgb"),
+                    "simple terrain's local cap must include its second native ambient saturation");
+                for name in ["fs_ground_fused", "fs_ground_shadow", "fs_ground_simple"] {
+                    let body = source.split(&format!("fn enhanced_original_{name}(")).nth(1).unwrap().split("\n}").next().unwrap();
+                    assert_eq!(body.matches("grass_point_shadow_loss(i.wpos, grass_point_normal)").count(), 1);
+                    assert!(!body.contains("grass_point_shadow_loss(i.wpos, i.n)"),
+                        "directional depth-bias facet normal is not a diffuse lighting normal");
+                    let wrapper = source.split(&format!("@fragment fn {name}(")).nth(1).unwrap().split("\n}").next().unwrap();
+                    assert!(wrapper.find("grass_point_normal = i.n;").unwrap() < wrapper.find("let beauty =").unwrap(),
+                        "preserve the authored normal before calling the body with the directional surface normal");
+                    let share = if name == "fs_ground_simple" { "tint" } else { "spec" };
+                    // Clustered lighting packs material fields too, even when
+                    // the authored-specular setting itself is disabled.
+                    let swizzle = if packed || clustered { ".xyz" } else { "" };
+                    assert!(body.contains(&format!("min(i.{share}{swizzle}, grass_point_shadow_loss(")),
+                        "{name} must cap the blocked loss to its own exact native local share");
+                    let loss = body.find("grass_point_shadow_loss").unwrap();
+                    let fog = body.rfind("ground_fog(i)").unwrap();
+                    assert!(loss < fog, "native fog must follow the local subtraction");
+                    if name != "fs_ground_simple" {
+                        assert!(loss < body.find("ground_palette(i)").unwrap(),
+                            "native palette saturation must follow the local subtraction");
+                    }
+                }
+                let base = source.split("fn enhanced_original_fs_ground_base(").nth(1).unwrap().split("\n}").next().unwrap();
+                assert!(!base.contains("grass_point_shadow_loss"), "two-pass base must not shadow twice");
+                let helper = source.split("fn grass_point_shadow_loss(").nth(1).unwrap().split("\n}").next().unwrap();
+                assert!(helper.contains("dyn_lights[322u]") && helper.contains("66u + k * 4u"));
+                assert!(helper.find("!owner_light_admitted(packed)").unwrap() < helper.find("used += 1u").unwrap());
+                assert!(helper.contains("used < 8u"));
+                assert!(helper.contains("1.0 - point_shadow_visibility(-d, a.w, packed, false)"));
+                assert!(!source.contains("@location(16)") && !source.contains("@group(4)"));
+            }
+        }
+    }
+    let shared = enhanced_shader::source(EnhancedSettings { local_light_shadows: true, ..settings });
+    assert!(!shared.contains("fn grass_ground_directional("), "existing local shadow receiver samples blade cubes already");
+    // Scalar channel model of the native two saturation stages: local light
+    // hidden by sun/ambient saturation cannot be removed later at the fragment.
+    let cap = |sun: f32, local: f32, ambient: f32| {
+        let full = (sun + local).clamp(0.0, 1.0);
+        let base = sun.clamp(0.0, 1.0);
+        (full - base, (full + ambient).clamp(0.0, 1.0) - (base + ambient).clamp(0.0, 1.0))
+    };
+    assert_eq!(cap(1.0, 0.5, 0.2), (0.0, 0.0));
+    assert_eq!(cap(0.5, 0.75, 0.5), (0.5, 0.0));
+    let corners = [cap(0.0, 0.5, 0.0).0, cap(1.0, 0.5, 0.0).0];
+    let gouraud_cap = 0.5 * (corners[0] + corners[1]);
+    assert_eq!(gouraud_cap, 0.25);
+    assert_eq!(gouraud_cap.min(0.5), 0.25, "cap after Gouraud interpolation, not from interpolated inputs");
+}
+
+#[test]
 fn real_grass_shadow_pipeline_is_opt_in_and_reuses_visible_geometry() {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let mut renderer = Renderer::new(&instance, None).expect("headless grass caster GPU");

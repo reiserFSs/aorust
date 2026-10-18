@@ -18,6 +18,7 @@ pub(super) struct Key {
     clustered_lighting: bool,
     local_light_shadows: bool,
     pub water_cloud: bool,
+    grass_point_shadows: bool,
     pub msaa: u32,
 }
 
@@ -29,6 +30,7 @@ impl Key {
             materials: [settings.generated_normals, settings.material_maps, settings.material_pbr, settings.material_reflections, settings.environment_probe],
             local_light_shadows: settings.local_light_shadows,
             grass_shadows: settings.ground_grass && settings.grass_sun_shadows,
+            grass_point_shadows: settings.ground_grass && settings.grass_point_shadows,
             bloom: settings.emissive_bloom, sun_mask: settings.needs_sun_mask(), water_cloud: false, msaa,
             foliage: [settings.foliage_edges, settings.foliage_sway, settings.foliage_push, settings.foliage_subdivision, settings.foliage_translucency, settings.foliage_lod] }
     }
@@ -36,7 +38,7 @@ impl Key {
         self.water_cloud = visible;
         self
     }
-    fn enhanced(self) -> bool { self.shadows || self.moon_shadows || self.grass_shadows || self.ao || self.bloom || self.sun_mask || self.material_specular || self.materials.iter().any(|&v| v) || self.clustered_lighting || self.local_light_shadows || self.night_mode != super::NightMode::AsGame || self.foliage.iter().any(|&v| v) }
+    fn enhanced(self) -> bool { self.shadows || self.moon_shadows || self.grass_shadows || self.grass_point_shadows || self.ao || self.bloom || self.sun_mask || self.material_specular || self.materials.iter().any(|&v| v) || self.clustered_lighting || self.local_light_shadows || self.night_mode != super::NightMode::AsGame || self.foliage.iter().any(|&v| v) }
 }
 
 pub(super) struct Pipes {
@@ -245,7 +247,7 @@ impl Request {
         let grass = super::grass::Compiled::new(
             &self.device, &self.g_layout, &self.tex_layout, &self.holo_layout, self.key.msaa,
             (settings.ambient_occlusion, settings.emissive_bloom, settings.needs_sun_mask(), self.key.water_cloud, settings.material_reflections || settings.environment_probe),
-            self.settings.sun_shadows || self.settings.moon_shadows || self.key.grass_shadows, self.format);
+            self.settings.sun_shadows || self.settings.moon_shadows || self.key.grass_shadows, self.settings.needs_admitted_lights(), self.format);
         Pipes { #[cfg(test)] shader, msaa: self.key.msaa, native_sky_pipes,
             pipes, actor_pipes, ground_pipes, depth_clear_pipe, grass }
     }

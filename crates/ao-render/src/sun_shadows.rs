@@ -172,7 +172,7 @@ pub(crate) struct GrassCaster {
     pub layout: wgpu::BindGroupLayout,
 }
 impl GrassCaster {
-    fn new(renderer: &super::Renderer) -> Self {
+    pub(crate) fn new(renderer: &super::Renderer) -> Self {
         let device = &renderer.device;
         let buffer = |binding, storage| wgpu::BindGroupLayoutEntry {
             binding, visibility: wgpu::ShaderStages::VERTEX,
@@ -190,10 +190,10 @@ impl GrassCaster {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None }, texture(8)],
         });
         let mut source = crate::grass::shader_source((false, false, false, false, false), false);
-        source.push_str("\n@group(3) @binding(2) var<uniform> grass_shadow_matrix: mat4x4<f32>;\n@vertex fn vs_grass_shadow(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance: u32) -> @builtin(position) vec4<f32> {\n    let blade = grass_vertex(vertex, instance);\n    if all(blade.clip == vec4<f32>(2.0, 2.0, 2.0, 1.0)) { return blade.clip; }\n    return grass_shadow_matrix * vec4<f32>(blade.world, 1.0);\n}\n");
+        source.push_str(&crate::shader_source::load("grass_caster.wgsl", include_str!("grass_caster.wgsl")));
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("shared grass caster geometry"), source: wgpu::ShaderSource::Wgsl(source.into()) });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("grass caster"), bind_group_layouts: &[Some(&renderer.g_layout), Some(&renderer.tex_layout), Some(&renderer.holo_layout), Some(&layout)], immediate_size: 0,
+            label: Some("grass caster"), bind_group_layouts: &[Some(&renderer.g_layout), None, None, Some(&layout)], immediate_size: 0,
         });
         let pipeline = crate::pipeline_creation::render_deferred(device, &wgpu::RenderPipelineDescriptor {
             label: Some("real grass blade shadows"), layout: Some(&pipeline_layout),
@@ -343,9 +343,8 @@ impl SunShadows {
             actor_ids_buffer, actor_visibility, actor_capacity, visibility_group }
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn grass_bind(&self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, cells: &wgpu::Buffer, params: &wgpu::Buffer, visible: &wgpu::Buffer, noise: &wgpu::TextureView, noise_sampler: &wgpu::Sampler, mask: &wgpu::TextureView) -> wgpu::BindGroup {
-        device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
-            label: Some("grass cells and shared sun receiver"), layout, entries: &[
+    pub fn grass_bind(&self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, cells: &wgpu::Buffer, params: &wgpu::Buffer, visible: &wgpu::Buffer, noise: &wgpu::TextureView, noise_sampler: &wgpu::Sampler, mask: &wgpu::TextureView, points: Option<&crate::point_shadows::PointShadows>) -> wgpu::BindGroup {
+        let mut entries = vec![
                 wgpu::BindGroupEntry { binding: 0, resource: cells.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.uniforms[0].as_entire_binding() },
@@ -355,7 +354,18 @@ impl SunShadows {
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(noise) },
                 wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(noise_sampler) },
                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(mask) },
-            ],
+        ];
+        if let Some(points) = points {
+            entries.extend([
+                wgpu::BindGroupEntry { binding: 9, resource: self.actor_visibility.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&points.array) },
+                wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::Sampler(&points.sampler) },
+                wgpu::BindGroupEntry { binding: 12, resource: points.metadata.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(&points.actor_array) },
+            ]);
+        }
+        device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
+            label: Some("grass cells and admitted shadow receivers"), layout, entries: &entries,
         })
     }
     pub fn grass_caster_bind(&self, device: &wgpu::Device, grass: &crate::grass::Grass) -> Option<wgpu::BindGroup> {
@@ -376,6 +386,7 @@ impl SunShadows {
         if count > self.actor_capacity {
             self.actor_capacity = count.next_power_of_two();
             (self.actor_ids_buffer, self.actor_visibility) = admission_buffers(device, self.actor_capacity);
+            self.grass_receiver = None;
             self.cascade_groups = caster_groups(device, &self.compiled.caster_layout, &self.uniforms, &self.actor_visibility);
             self.visibility_group = visibility_group(device, &self.compiled.visibility_layout, &self.primary_ids, &self.actor_visibility);
         }

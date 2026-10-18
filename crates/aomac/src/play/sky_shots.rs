@@ -670,11 +670,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                         off.render_frozen()?;
                     }
                 } else if authored_actor || settings.depth_of_field || own_avatar {
-                    let mut appearance = actor.clone();
-                    if lightbar {
-                        appearance.attractors.retain(|mount| mount.place != 5);
-                        appearance.attractors.push(ao_net::n3::dynel::AttractorMesh { place: 5, mesh: 26163, field: 0, byte: 0 });
-                    }
+                    let appearance = if lightbar { graphics_fixture_lightbar_appearance(&actor) } else { actor.clone() };
                     let mut avatar = super::avatar::Avatar::new(&store, &dir, 25988, &appearance,
                         ao_formats::character::actor::ActorAssets::new(&store)?)?;
                     if name == "newland-lightbar-night" {
@@ -877,6 +873,15 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         Err(error) => std::fs::write(status, format!("status=failed\nerror={error:#}\nvisual_acceptance=unexercised\n"))?,
     }
     result
+}
+
+fn graphics_fixture_lightbar_appearance(
+    actor: &ao_net::n3::dynel::SimpleCharFullUpdate,
+) -> ao_net::n3::dynel::SimpleCharFullUpdate {
+    let mut appearance = actor.clone();
+    appearance.attractors.retain(|mount| mount.place != 5);
+    appearance.attractors.push(ao_net::n3::dynel::AttractorMesh { place: 5, mesh: 26163, field: 0, byte: 0 });
+    appearance
 }
 
 fn graphics_fixture_actor() -> anyhow::Result<ao_net::n3::dynel::SimpleCharFullUpdate> {
@@ -1742,6 +1747,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
         "grass-gust-bands" => { settings.ground_grass = true; settings.grass_gust_bands = true; }
         "grass-sunlight" => { settings.ground_grass = true; settings.grass_sunlight = true; }
         "grass-sun-shadows" => { settings.ground_grass = true; settings.grass_sun_shadows = true; }
+        "grass-point-shadows" => { settings.ground_grass = true; settings.grass_point_shadows = true; }
         "grass-all" => {
             settings.ground_grass = true;
             settings.grass_tufts = true;
@@ -1750,6 +1756,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             settings.grass_gust_bands = true;
             settings.grass_sunlight = true;
             settings.grass_sun_shadows = true;
+            settings.grass_point_shadows = true;
         }
         "foliage-edges" => settings.foliage_edges = true,
         "foliage-sway" => settings.foliage_sway = true,
@@ -1835,6 +1842,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             settings.grass_gust_bands = true;
             settings.grass_sunlight = true;
             settings.grass_sun_shadows = true;
+            settings.grass_point_shadows = true;
             settings.hdr = true;
             settings.contact_shadows = true;
             settings.height_haze = true;
@@ -1865,7 +1873,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             grass_density: 1.0, grass_distance: 50.0, sun_boost: 0.5, grade_strength: 0.8, contact_strength: 0.4,
             ..Default::default()
         },
-        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|rain|wet-surfaces|weather-particles|spell-particles|fluid-smoke|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|clustered|local-shadows|local-shadows-one|local-shadows-clustered|moonlit|moon-shadows|moon-volumetric-shafts|moon-cloud-gap-shafts|dark-night|specular|generated-normals|material-maps|material-pbr|material-reflections|environment-probe|materials|wet-reflections|lighting|ao|bloom|grass|grass-tufts|grass-species|grass-path-thinning|grass-gust-bands|grass-sunlight|grass-sun-shadows|grass-all|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before|foliage-edges|foliage-sway|foliage-push|foliage-leaves|foliage-flutter|foliage-falling|grass-trails|foliage-subdivision|foliage-translucency|foliage-lod|all-foliage|all-foliage-shadows|water|water-waves|water-ripples|water-refraction|water-reflections|water-foam|water-wakes|waterfalls|underwater|water-caustics|water-sun-glint"),
+        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|rain|wet-surfaces|weather-particles|spell-particles|fluid-smoke|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|clustered|local-shadows|local-shadows-one|local-shadows-clustered|moonlit|moon-shadows|moon-volumetric-shafts|moon-cloud-gap-shafts|dark-night|specular|generated-normals|material-maps|material-pbr|material-reflections|environment-probe|materials|wet-reflections|lighting|ao|bloom|grass|grass-tufts|grass-species|grass-path-thinning|grass-gust-bands|grass-sunlight|grass-sun-shadows|grass-point-shadows|grass-all|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before|foliage-edges|foliage-sway|foliage-push|foliage-leaves|foliage-flutter|foliage-falling|grass-trails|foliage-subdivision|foliage-translucency|foliage-lod|all-foliage|all-foliage-shadows|water|water-waves|water-ripples|water-refraction|water-reflections|water-foam|water-wakes|waterfalls|underwater|water-caustics|water-sun-glint"),
     }
     Ok(settings)
 }
@@ -1990,23 +1998,24 @@ fn graphics_fixture_foliage_profiles_are_independent() {
 fn graphics_fixture_grass_profiles_are_independent() {
     let flags = |s: ao_render::EnhancedSettings| [
         s.grass_tufts, s.grass_species, s.grass_path_thinning, s.grass_gust_bands,
-        s.grass_sunlight, s.grass_sun_shadows,
+        s.grass_sunlight, s.grass_sun_shadows, s.grass_point_shadows,
     ];
     for (index, profile) in ["grass-tufts", "grass-species", "grass-path-thinning",
-        "grass-gust-bands", "grass-sunlight", "grass-sun-shadows"].iter().enumerate() {
+        "grass-gust-bands", "grass-sunlight", "grass-sun-shadows", "grass-point-shadows"].iter().enumerate() {
         let settings = graphics_fixture_settings(profile).unwrap();
-        let mut expected = [false; 6];
+        let mut expected = [false; 7];
         expected[index] = true;
         assert_eq!(flags(settings), expected);
         assert!(settings.ground_grass);
         assert!(!settings.sun_shadows);
         assert!(!settings.hdr && !settings.foliage_enabled());
+        assert!(!settings.clustered_lighting && !settings.local_light_shadows);
     }
     for profile in ["grass-all", "all", "all-no-bloom"] {
-        assert_eq!(flags(graphics_fixture_settings(profile).unwrap()), [true; 6]);
+        assert_eq!(flags(graphics_fixture_settings(profile).unwrap()), [true; 7]);
     }
     for profile in ["faithful", "neutral", "grass", "all-before"] {
-        assert_eq!(flags(graphics_fixture_settings(profile).unwrap()), [false; 6]);
+        assert_eq!(flags(graphics_fixture_settings(profile).unwrap()), [false; 7]);
     }
 }
 

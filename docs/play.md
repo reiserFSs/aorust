@@ -2110,8 +2110,8 @@ Newland day captures use time 3240 (midday), while preserving the original
 only; `AOMAC_GFX_DISTANCE` overrides the grass radius without changing density.
 
 The same harness accepts `AOMAC_GFX_GRASS_FEATURE=none` (default), `all`,
-`tufts`, `species`, `path_thinning`, `gust_bands`, `sunlight`, or `sun_shadows`.
-Selections are exact, not comma-separated; invalid values fail.
+`tufts`, `species`, `path_thinning`, `gust_bands`, `sunlight`, `sun_shadows`,
+or `point_shadows`. Selections are exact, not comma-separated; invalid values fail.
 Only variant 1 enables the selected grass switches. Selecting `sun_shadows` or
 `all` enables the shared sun maps in **both** variants; other native/Enhanced
 effects remain identical across the pair. The default
@@ -2127,6 +2127,7 @@ Build and run the CPU-only selector check before acquiring the GPU lock:
 
 ```sh
 CARGO_TARGET_DIR=/tmp/GrassPlus/target cargo test --profile fast -j 2 -p aomac grass_feature_selection_is_explicit
+CARGO_TARGET_DIR=/tmp/GrassPlus/target cargo test --profile fast -j 2 -p aomac grass_backlit_camera_requires_native_sun_ground_and_los
 CARGO_TARGET_DIR=/tmp/GrassPlus/target cargo test --profile fast -j 2 -p aomac grass_offline --no-run
 ```
 
@@ -2159,12 +2160,72 @@ CARGO_TARGET_DIR=/tmp/GrassPlus/target \
   --ignored --nocapture --test-threads=1
 ```
 
+Purpose-selected native grass views are available only by exact `AOMAC_GFX_VIEW`:
+
+| View | Native time | Selection |
+| --- | --- | --- |
+| `newland-grass-ground-backlit-dusk` | 4600 | Exposed native green cell, camera grounded 0.8 m above Collision, looking toward the actual above-horizon sun; positive direct sun energy and forward/sun dot >0.6 required. |
+| `newland-grass-ground-path-day` | 3240 by default | Confirmed green tile centre next to a nonzero, non-grass Collision material; grounded oblique camera with LOS to both sides. |
+| `newland-grass-ground-path-dusk` | 4600 | Same boundary requirement, with bare ground in the native sun's shadow direction and a grounded sun-facing camera for longer blade-shadow evidence. |
+| `newland-grass-ground-lightbar-night` | 0 | Captured actor25988, native mount5 LightBar mesh26163/field0/byte0, standing on the confirmed green root, grounded by Collision. |
+
+These views reuse native terrain cells, tile images, exposure and collision;
+there are no synthetic lights, geometry or exposure boosts. The manifest records
+the exact camera, root, grid, tile, sun and time. LightBar appearance, transform,
+native mounted lights and opacity are identical in both variants. The actor is
+submitted each frame with ordinary body admission (not `always`), requires
+camera-to-feet LOS, and the fixture fails unless its body is actually admitted.
+The canonical `newland-grass-ground-day` budget camera is unchanged.
+The generic `newland-day`, `newland-dusk`, and `newland-night` views now also use
+the same native terrain-height camera resolver as `graphics_offline_fixture`;
+older grass-harness images using their ungrounded placeholder eye are invalid
+evidence and must not be compared.
+
+Run each of these capture-only examples as its own GPU-lock chunk:
+
+```sh
+AOMAC_GFX_OUT=/tmp/GrassPlus/evidence-path-native \
+AOMAC_GFX_VIEW=newland-grass-ground-path-day AOMAC_GFX_GRASS_FEATURE=path_thinning \
+AOMAC_GFX_GRASS_COMPARE=features AOMAC_GFX_CAPTURE_ONLY=1 AOMAC_GFX_MSAA=4 \
+AOMAC_GFX_PNG_ONLY=1 CARGO_TARGET_DIR=/tmp/GrassPlus/target \
+  cargo test --profile fast -j 2 -p aomac grass_offline_capture_and_timing -- \
+  --ignored --nocapture --test-threads=1
+```
+
+```sh
+AOMAC_GFX_OUT=/tmp/GrassPlus/evidence-backlit-native \
+AOMAC_GFX_VIEW=newland-grass-ground-backlit-dusk AOMAC_GFX_GRASS_FEATURE=sunlight \
+AOMAC_GFX_GRASS_COMPARE=features AOMAC_GFX_CAPTURE_ONLY=1 AOMAC_GFX_MSAA=4 \
+AOMAC_GFX_PNG_ONLY=1 CARGO_TARGET_DIR=/tmp/GrassPlus/target \
+  cargo test --profile fast -j 2 -p aomac grass_offline_capture_and_timing -- \
+  --ignored --nocapture --test-threads=1
+```
+
+For blade sun shadows use the preceding command with
+`AOMAC_GFX_OUT=/tmp/GrassPlus/evidence-path-shadow-native`,
+`AOMAC_GFX_VIEW=newland-grass-ground-path-dusk`, and
+`AOMAC_GFX_GRASS_FEATURE=sun_shadows`.
+
+```sh
+AOMAC_GFX_OUT=/tmp/GrassPlus/evidence-lightbar-native \
+AOMAC_GFX_VIEW=newland-grass-ground-lightbar-night AOMAC_GFX_GRASS_FEATURE=point_shadows \
+AOMAC_GFX_GRASS_COMPARE=features AOMAC_GFX_CAPTURE_ONLY=1 AOMAC_GFX_MSAA=4 \
+AOMAC_GFX_PNG_ONLY=1 CARGO_TARGET_DIR=/tmp/GrassPlus/target \
+  cargo test --profile fast -j 2 -p aomac grass_offline_capture_and_timing -- \
+  --ignored --nocapture --test-threads=1
+```
+
 Temporal captures also honor both grass selectors. `AOMAC_GFX_TEMPORAL_STRIP=1`
 uses only the fixed ICC wind-on scenario, with 120 deterministic 0.1-second
 updates and paired contact-sheet columns at 0.1, 6.1 and 12.0 seconds. This is
 a finite gust-motion diagnostic, not the 60 Hz stability acceptance: it records
 metrics but explicitly disables behavioral assertions (`baseline=true`).
-No full frame sequence or image-processing dependency is added.
+It additionally saves 12 baseline/selected PNG pairs at frames 0, 10, …, 110
+(0.1, 1.1, …, 11.1 seconds), named
+`static-wind-on-variant{0,1}-frame{000,010,…,110}.png`, at 960×600. Use scratch
+output under `/tmp` to assemble a labeled before/after animation; delete these
+sparse source frames afterwards rather than retaining a handoff sequence.
+No image-processing dependency or unbounded/full frame sequence is added.
 
 ```sh
 AOMAC_GFX_OUT=/tmp/GrassPlus/evidence-gust-strip \

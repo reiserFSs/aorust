@@ -166,10 +166,22 @@ struct GOut {
     @location(12) @interpolate(flat) coverage: vec2<f32>, // field coverage, then geometry-LOD AO share
     @location(13) sunlight: vec2<f32>, // rounded-edge delta, physical blade sheen (before sun visibility)
     @location(14) world: vec3<f32>, // shared visible/caster geometry, including wind and admitted pushes
+    @location(15) local_share: vec3<f32>, // native surviving lamp energy after per-corner saturation and ambient
 }
 
 // Raw light visibility, before the artistic shadow-strength floor used by beauty.
 var<private> grass_direct_visibility: f32 = 1.0;
+// Match vertex_lights' FXS directional diffuse exactly: it is not lamp energy
+// and must survive point shadows even when it saturates the native light result.
+fn grass_directional_light(n: vec3<f32>) -> vec3<f32> {
+    var diffuse = vec3<f32>(0.0);
+    for (var k = 0u; k < u32(g.dyn_info.y); k += 1u) {
+        let nl = dot(n, g.directional[k * 2u].xyz);
+        if nl > 0.0 { diffuse += g.directional[k * 2u + 1u].rgb * nl; }
+    }
+    return diffuse;
+}
+
 
 fn grass_vertex(vertex: u32, instance: u32) -> GOut {
     var o: GOut;
@@ -420,6 +432,16 @@ fn grass_vertex(vertex: u32, instance: u32) -> GOut {
             }
             o.light += w4[j] * corner_light;
             o.dlight += w4[j] * corner_ambient;
+            if grass_params.lighting.z > 0.5 {
+                // Daylight's existing vertex_lights sample uses the root normal, not this corner's.
+                let directional = grass_directional_light(ground_n);
+                let no_lamp_diffuse = clamp(g.sun_g.rgb * max(dot(c.normals[j].xyz, g.sun_dir.xyz), 0.0) + directional, vec3<f32>(0.0), vec3<f32>(1.0));
+                var no_lamps = select(no_lamp_diffuse, clamp(no_lamp_diffuse + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), simple);
+                if g.moon_g.w > 0.0 {
+                    no_lamps = mix(no_lamps, clamp(directional, vec3<f32>(0.0), vec3<f32>(1.0)), g.moon_g.w);
+                }
+                o.local_share += w4[j] * max(corner_light - no_lamps, vec3<f32>(0.0));
+            }
         }
     }
     if darkness > 0.0 {
@@ -428,6 +450,7 @@ fn grass_vertex(vertex: u32, instance: u32) -> GOut {
         var native_light = vec3<f32>(0.0);
         var native_dlight = vec3<f32>(0.0);
         var native_spec = vec3<f32>(0.0);
+        var native_local_share = vec3<f32>(0.0);
         for (var j = 0u; j < 4u; j += 1u) {
             let corner = vec3<f32>(c.origin.x + f32(j & 1u) * size, c.heights[j], c.origin.y - f32(j >> 1u) * size);
             let n = normalize(c.normals[j].xyz);
@@ -448,10 +471,20 @@ fn grass_vertex(vertex: u32, instance: u32) -> GOut {
             native_light += w4[j] * corner_light;
             native_dlight += w4[j] * corner_ambient;
             native_spec += w4[j] * corner_spec;
+            if grass_params.lighting.z > 0.5 {
+                let directional = grass_directional_light(n);
+                let no_lamp_diffuse = clamp(g.sun_g.rgb * max(dot(n, g.sun_dir.xyz), 0.0) + directional, vec3<f32>(0.0), vec3<f32>(1.0));
+                var no_lamps = select(no_lamp_diffuse, clamp(no_lamp_diffuse + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), simple);
+                if g.moon_g.w > 0.0 {
+                    no_lamps = mix(no_lamps, clamp(directional, vec3<f32>(0.0), vec3<f32>(1.0)), g.moon_g.w);
+                }
+                native_local_share += w4[j] * max(corner_light - no_lamps, vec3<f32>(0.0));
+            }
         }
         o.light = mix(o.light, native_light, darkness);
         o.dlight = mix(o.dlight, native_dlight, darkness);
         o.spec = mix(o.spec, native_spec, darkness);
+        o.local_share = mix(o.local_share, native_local_share, darkness);
     }
     // Ground-root fog: raised tips cannot reduce native extinction. (Fog is linear in view depth, so the root's
     // equals the ground's own interpolation.)
@@ -489,6 +522,8 @@ fn fs_grass(i: GOut) -> GrassOutput {
     // Match native ground: remove the pre-palette direct sun, THEN add/clamp the baked palette.
     let sun_share = max(i.light - i.spec, vec3<f32>(0.0));
     light = max(light - sun_share * (1.0 - visibility), vec3<f32>(0.0));
+    // Remove only native lamp energy that survived saturation, never sun, ambient or baked palette.
+    //__POINT_SHADOW_LOSS__
     // Root openness is the authored terrain lattice already carried by this cell.
     // Add moon once, before the native palette clamp and both native fog equations.
     if g.moon_direction.w > 0.0 {

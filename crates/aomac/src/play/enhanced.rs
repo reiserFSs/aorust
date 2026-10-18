@@ -147,6 +147,7 @@ pub(super) fn controls() -> Vec<Control> {
         Control::check(Foliage, "Ground Grass", "AomacGrassGustBands", "Grass Gust Bands"),
         Control::check(Foliage, "Ground Grass", "AomacGrassSunlight", "Grass Sunlight"),
         Control::check(Foliage, "Ground Grass", "AomacGrassSunShadows", "Grass Sun Shadows"),
+        Control::check(Foliage, "Ground Grass", "AomacGrassPointShadows", "Grass Point Shadows"),
         Control::slider(Foliage, "Ground Grass", "AomacGrassDensity", "Ground Grass Density", "%.2fx", 1.0, 0.0, 2.0),
         Control::slider(Foliage, "Ground Grass", "AomacGrassDistance", "Ground Grass Distance", "%.1f m", 160.0, 0.0, 180.0),
         Control::check(Foliage, "Native Foliage", "AomacFoliageEdges", "Foliage Edges"),
