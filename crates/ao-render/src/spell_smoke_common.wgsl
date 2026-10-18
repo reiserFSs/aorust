@@ -18,6 +18,6 @@ fn quad(index: u32, center: vec3<f32>, extent: f32, alpha: f32) {
   vb[o]=pos.x; vb[o+1u]=pos.y; vb[o+2u]=pos.z;
   vb[o+3u]=0.0; vb[o+4u]=1.0; vb[o+5u]=0.0;
   vb[o+6u]=uv.x; vb[o+7u]=uv.y;
-  vb[o+8u]=p.color.r; vb[o+9u]=p.color.g; vb[o+10u]=p.color.b; vb[o+11u]=p.color.a*clamp(alpha,0.0,1.0);
+  vb[o+8u]=p.color.r; vb[o+9u]=p.color.g; vb[o+10u]=p.color.b; vb[o+11u]=clamp(alpha,0.0,1.0);
  }
 }

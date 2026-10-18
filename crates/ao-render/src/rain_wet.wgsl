@@ -2,12 +2,14 @@
 struct Params {
  inverse_vp: mat4x4<f32>, vp: mat4x4<f32>, eye_time: vec4<f32>,
  wind_rain: vec4<f32>, area: vec4<f32>, wet: vec4<f32>, sun: vec4<f32>, fog: vec4<f32>, colour: vec4<f32>,
- drift: vec4<f32>,
+ drift: vec4<f32>, surface_colour: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: Params;
 @group(0) @binding(1) var depth: texture_depth_2d;
 @group(0) @binding(2) var mask: texture_2d<f32>;
 @group(0) @binding(3) var roof: texture_2d<f32>;
+@group(0) @binding(4) var water_positions: texture_2d<f32>;
+@group(0) @binding(5) var water_normals: texture_2d<f32>;
 @vertex fn vs(@builtin(vertex_index) id: u32) -> @builtin(position) vec4<f32> {
  let xy = vec2<f32>(f32((id << 1u) & 2u), f32(id & 2u));
  return vec4<f32>(xy * 2.0 - 1.0, 0.0, 1.0);
@@ -60,6 +62,21 @@ fn receiver(pixel: vec2<i32>) -> vec4<f32> {
  let fresnel = pow(1.0-max(dot(n,v),0.0),5.0);
  let light = (gloss*0.22 + fresnel*patches*0.045)*r.w*u.wet.x;
  return vec4<f32>(light*max(u.colour.rgb,vec3<f32>(0.05)),0.0);
+}
+@fragment fn water_rings(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+ if any(textureDimensions(water_positions) != textureDimensions(depth)) { return vec4<f32>(0.0); }
+ let pixel=vec2<i32>(pos.xy);
+ let water=textureLoad(water_positions,pixel,0);
+ let n=textureLoad(water_normals,pixel,0);
+ if water.w<=0.0 || n.y<=0.7 { return vec4<f32>(0.0); }
+ let slope=rain_ring_normal(water.xyz,u.eye_time.w,u.wind_rain.w);
+ let distance=length(water.xyz-u.eye_time.xyz);
+ // Native water does not own the directional attachment: its B channel may
+ // retain fog from the opaque background. Use this liquid's own transmission,
+ // matching water_optics.wgsl, rather than extinguishing it with background fog.
+ let fog=clamp((u.fog.y-distance)/max(u.fog.y-u.fog.x,0.001),0.0,1.0);
+ let alpha=min(length(slope)*5.0,0.5)*exposed(water.xyz)*fog;
+ return vec4<f32>(u.surface_colour.rgb,alpha);
 }
 
 struct Drop {
@@ -159,23 +176,29 @@ struct Splash {
  let side=vec3<f32>(look.z,0.0,-look.x)/max(length(look.xz),0.001);
  let corners=array<vec2<f32>,6>(vec2<f32>(-1.0,-0.05),vec2<f32>(1.0,-0.05),vec2<f32>(1.0,1.0),vec2<f32>(-1.0,-0.05),vec2<f32>(1.0,1.0),vec2<f32>(-1.0,1.0));
  let c=corners[vertex];
- out.position=u.vp*vec4<f32>(p+side*c.x*0.18+vec3<f32>(0.0,c.y*0.24,0.0),1.0);
+ out.position=u.vp*vec4<f32>(p+side*c.x*0.25+vec3<f32>(0.0,c.y*0.6,0.0),1.0);
  out.corner=c; out.age=age;
  out.alpha=0.35*(1.0-smoothstep(u.fog.x,max(u.fog.y,u.fog.x+0.01),length(look)))*(1.0-textureLoad(mask,pixel,0).b);
  return out;
 }
 @fragment fn splash_fragment(splash: Splash) -> @location(0) vec4<f32> {
+ // Evaluate footprint before the depth discard; narrow crowns and droplets
+ // otherwise vanish between pixel centres in the native-sized world view.
+ let footprint=fwidth(splash.corner);
  if splash.position.z>textureLoad(depth,vec2<i32>(splash.position.xy),0)+0.00001 { discard; }
  let a=splash.age;
  let spread=0.15+0.75*sqrt(a);
  let height=0.4*sin(3.14159265*min(a*1.6,1.0));
- let crown=exp(-pow((abs(splash.corner.x)-spread)/0.09,2.0))*step(0.0,splash.corner.y)*(1.0-smoothstep(height*0.6,max(height,0.001),splash.corner.y));
+ let width=max(0.09,footprint.x*0.65);
+ let crown=exp(-pow((abs(splash.corner.x)-spread)/width,2.0))*step(0.0,splash.corner.y)*(1.0-smoothstep(height*0.6,max(height+footprint.y*0.5,0.001),splash.corner.y));
  var droplets=0.0;
  for(var k=0u;k<4u;k++) {
   let side=(f32(k&1u)*2.0-1.0)*(0.35+0.12*f32(k));
   let point=vec2<f32>(side*a*1.2,(2.2+0.4*f32(k))*a*(1.0-a));
-  droplets=max(droplets,1.0-smoothstep(0.05,0.11,length((splash.corner-point)*vec2<f32>(1.0,0.8))));
+  let radius=length((splash.corner-point)*vec2<f32>(1.0,0.8));
+  let edge=max(0.03,length(footprint)*0.5);
+  droplets=max(droplets,1.0-smoothstep(max(0.08-edge,0.0),0.08+edge,radius));
  }
- let alpha=splash.alpha*max(crown*0.4,droplets)*(1.0-a)*(1.0-a);
- return vec4<f32>(max(u.colour.rgb,vec3<f32>(0.1))*0.45,alpha);
+ let alpha=splash.alpha*max(crown*0.8,droplets)*(1.0-a);
+ return vec4<f32>(u.surface_colour.rgb,alpha);
 }

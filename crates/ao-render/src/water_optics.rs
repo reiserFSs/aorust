@@ -15,11 +15,12 @@ pub(super) struct WaterOpticsSwitches {
     pub foam: bool,
     pub waves: bool,
     pub wakes: bool,
+    pub rain_mask: bool,
     pub realism: f32,
 }
 impl Default for WaterOpticsSwitches {
     fn default() -> Self {
-        Self { refraction: false, reflections: false, underwater: false, ripples: false, caustics: false, sun_glint: false, waterfalls: false, foam: false, waves: false, wakes: false, realism: 0.5 }
+        Self { refraction: false, reflections: false, underwater: false, ripples: false, caustics: false, sun_glint: false, waterfalls: false, foam: false, waves: false, wakes: false, rain_mask: false, realism: 0.5 }
     }
 }
 #[derive(Clone, Copy)]
@@ -228,7 +229,7 @@ impl WaterOptics {
     pub(super) fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, size: (u32, u32), vp: Mat4, inverse_vp: Mat4, eye: Vec3, time: f32, eligibility: WaterEligibility, switches: WaterOpticsSwitches) -> bool {
         let underwater = switches.underwater && self.camera_underwater(eye);
         self.needs_bottom = switches.refraction || switches.caustics || switches.foam;
-        self.active = self.vertex_count > 0 && size.0 > 0 && size.1 > 0 && vp.is_finite() && inverse_vp.is_finite() && eye.is_finite() && (underwater || switches.refraction || switches.reflections || switches.caustics || switches.sun_glint || switches.waterfalls || switches.foam || switches.waves || switches.wakes || switches.ripples);
+        self.active = self.vertex_count > 0 && size.0 > 0 && size.1 > 0 && vp.is_finite() && inverse_vp.is_finite() && eye.is_finite() && (underwater || switches.refraction || switches.reflections || switches.caustics || switches.sun_glint || switches.waterfalls || switches.foam || switches.waves || switches.wakes || switches.ripples || switches.rain_mask);
         if !self.active { self.release_targets(); return false; }
         if self.targets.as_ref().is_none_or(|t| t.size != size) {
             let view = |label, format, usage| device.create_texture_tracked(&wgpu::TextureDescriptor { label: Some(label), size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] }).create_view(&Default::default());
@@ -251,6 +252,10 @@ impl WaterOptics {
         true
     }
     pub(super) fn needs_bottom_depth(&self) -> bool { self.active && self.needs_bottom }
+    pub(super) fn rain_masks(&self) -> Option<(&wgpu::TextureView, &wgpu::TextureView)> {
+        if !self.active { return None; }
+        self.targets.as_ref().map(|targets| (&targets.position, &targets.normal))
+    }
 
     /// Target for the parent's static-only bottom raster. Actors and liquids
     /// must never be submitted here; native opacity is preserved in scene colour.
@@ -299,6 +304,7 @@ mod tests {
         let switches = WaterOpticsSwitches::default();
         assert!(!switches.refraction && !switches.reflections && !switches.underwater && !switches.ripples && !switches.caustics && !switches.sun_glint && !switches.waterfalls && !switches.foam && !switches.waves && !switches.wakes);
         assert_eq!(switches.realism, 0.5);
+        assert!(!switches.rain_mask);
     }
     #[test]
     fn finite_triangle_membership_handles_shore_holes_slopes_and_edges() {
@@ -326,6 +332,114 @@ mod tests {
         assert!(!optics.camera_underwater(Vec3::ZERO), "room/depth rejection overrides the surface footprint");
         optics.set_membership(None);
         assert!(optics.camera_underwater(Vec3::ZERO), "offline fallback remains finite-triangle based");
+        optics.set_geometry(&renderer.device, &renderer.queue, &[
+            [-1.0, 2.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+            [1.0, 2.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+            [0.0, 2.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+        ]);
+        let eligibility = WaterEligibility { daylight: true, outdoors: true, fog_start: 0.0, fog_end: 100.0,
+            sun_direction: [0.0, 1.0, 0.0], sun_colour: [1.0; 3], sky_colour: [0.5; 3], fog_colour: [0.5; 3], samples: 1 };
+        assert!(optics.prepare(&renderer.device, &renderer.queue, (16, 16), Mat4::IDENTITY, Mat4::IDENTITY,
+            Vec3::ZERO, 0.0, eligibility, WaterOpticsSwitches { rain_mask: true, ..Default::default() }),
+            "rain alone requests the exact native liquid mask without enhanced water shading");
+        assert!(optics.rain_masks().is_some() && !optics.needs_bottom_depth());
+        assert!(!optics.prepare(&renderer.device, &renderer.queue, (16, 16), Mat4::IDENTITY, Mat4::IDENTITY,
+            Vec3::ZERO, 0.0, eligibility, WaterOpticsSwitches::default()));
+        assert!(optics.rain_masks().is_none(), "all-off releases the optical mask");
         assert!(pollster::block_on(scope.pop()).is_none());
+    }
+
+    #[test]
+    fn rain_only_native_sloped_plane_has_complete_mask_coverage() {
+        use ao_scene::{liquid::SourceTriangle, Blend, Instance, Mesh, Scene, Submesh, Vertex, IDENTITY};
+        let source = Surface::new(0, 0, [[0, 1, 2], [0, 2, 3]].map(|indices| SourceTriangle {
+            kind: 0xff20_3041,
+            vertices: indices.map(|i| Vertex {
+                pos: [[960.0, 18.6, -720.0], [1060.0, 19.6, -720.0],
+                    [1060.0, 21.6, -620.0], [960.0, 20.6, -620.0]][i],
+                ..Default::default()
+            }),
+        }).to_vec()).unwrap();
+        let camera = crate::Camera { pos: Vec3::new(1010.4, 24.0, -663.1),
+            yaw: 2.4288, pitch: -0.8, roll: 0.0 };
+        let (mut vertices, mut indices, mut colours) = (Vec::new(), Vec::new(), Vec::new());
+        source.geometry(camera.pos.to_array(), true, &mut vertices, &mut indices, &mut colours);
+        assert!(indices.len() > 6, "exercise the native tessellated plane, not two trivial triangles");
+        let count = vertices.len() as u32;
+        vertices.extend_from_within(..);
+        let submeshes = (0..2).map(|layer| Submesh { liquid: true, two_sided: true,
+            blend: Blend::AlphaBlend, emissive: [0.3; 3],
+            ..Submesh::new(indices.iter().map(|i| i + count * layer).collect(), None) }).collect();
+        let scene = Scene { meshes: vec![Mesh { vertices, submeshes }], liquids: vec![source],
+            instances: vec![Instance { mesh: 0, transform: IDENTITY }], daylight: Some(1.0),
+            ..Default::default() };
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = crate::Renderer::new(&instance, None).expect("native liquid coverage GPU");
+        renderer.upload(&scene);
+        renderer.set_enhanced_settings(crate::EnhancedSettings { enhanced_rain: true, ..Default::default() });
+        let output = renderer.device.create_texture_tracked(&wgpu::TextureDescriptor {
+            label: Some("native mask complete coverage"), size: wgpu::Extent3d { width: 48, height: 48, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: renderer.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+        });
+        let view = output.create_view(&Default::default());
+        let shader = renderer.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("native mask coverage readback"), source: wgpu::ShaderSource::Wgsl(r#"
+@group(0) @binding(0) var positions: texture_2d<f32>;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    return vec4<f32>(vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    return vec4<f32>(vec3<f32>(select(0.0, 1.0, textureLoad(positions, vec2<i32>(p.xy), 0).w > 0.0)), 1.0);
+}
+"#.into()),
+        });
+        let layout = renderer.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("native mask coverage"), entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None,
+            }],
+        });
+        let pipeline_layout = renderer.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("native mask coverage"), bind_group_layouts: &[Some(&layout)], immediate_size: 0,
+        });
+        let pipeline = renderer.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("native mask coverage readback"), layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: renderer.format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
+        });
+        for samples in [1, 4] {
+            renderer.set_msaa_samples(samples);
+            if renderer.msaa_samples() != samples { continue; }
+            let targets = crate::Targets::new(&renderer, 48, 48);
+            renderer.wait_for_pipeline_warmup();
+            renderer.render(&view, &targets, &camera);
+            renderer.wait_for_pipeline_warmup();
+            renderer.render(&view, &targets, &camera);
+            let (positions, _) = renderer.water.rain_masks().expect("rain-only native mask");
+            let bindings = renderer.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("native mask coverage"), layout: &layout,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(positions) }],
+            });
+            let mut encoder = renderer.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("native mask coverage"), color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view, resolve_target: None, depth_slice: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bindings, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            renderer.queue.submit([encoder.finish()]);
+            let pixels = crate::texture_to_rgba(&renderer, &output, 48, 48).expect("native mask readback");
+            assert!(pixels.as_chunks::<4>().0.iter().all(|pixel| *pixel == [255; 4]),
+                "native liquid triangles lost mask coverage at {samples}x MSAA");
+        }
     }
 }

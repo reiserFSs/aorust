@@ -77,7 +77,7 @@ impl Simulation {
         let state = std::array::from_fn(|_| buffer("native effect state", count as u64 * 48, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST));
         let params = buffer("native effect inputs", std::mem::size_of::<Params>() as u64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         let vertex_count = count * 6;
-        let vertices = buffer("native effect computed vertices", vertex_count as u64 * std::mem::size_of::<ao_scene::Vertex>() as u64, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX);
+        let vertices = buffer("native effect computed vertices", vertex_count as u64 * std::mem::size_of::<ao_scene::Vertex>() as u64, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX | if cfg!(test) { wgpu::BufferUsages::COPY_SRC } else { wgpu::BufferUsages::empty() });
         let groups = std::array::from_fn(|i| device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("native effect simulation"), layout: &programs.layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: state[i].as_entire_binding() },
@@ -88,7 +88,9 @@ impl Simulation {
     /// Revoke the whole simulation immediately when source admission is lost; never draw orphan history.
     #[allow(clippy::too_many_arguments)]
     pub fn update(&mut self, queue: &wgpu::Queue, source: Source, bodies: &[Body], dt: f32, time: f32, right: Vec3, up: Vec3) {
-        let radius = source.radius.clamp(0.03, 4.0);
+        // Native birth/death billboards can be millimetres wide. They identify the
+        // admitted material, not the Enhanced curl cloud / fluid injection footprint.
+        let radius = source.radius.clamp(if self.smoke { 0.35 } else { 0.45 }, 4.0);
         let size = *self.size.get_or_insert((radius * 12.0).clamp(4.0, 32.0));
         let corner = Vec3::from_array(source.position) - Vec3::new(size * 0.5, radius, size * 0.5);
         let shift = self.corner.map_or(Vec3::ZERO, |previous| corner - previous);
@@ -153,13 +155,35 @@ mod tests {
             let programs = Programs::new(&renderer.device, smoke);
             programs.wait();
             let mut sim = Simulation::new(&renderer.device, &programs);
-            sim.update(&renderer.queue, Source { position: [0.0;3], radius: 0.3, color: [1.0;4], uv: [0.0,0.0,1.0,1.0],
-                wind: [0.4,0.0,0.0], lifetime: 2.0, rise: 1.0 },
-                &[Body { feet: [0.0;3], height: 1.8, velocity: [1.0,0.0,0.0], radius: 0.35 }], 1.0/60.0, 1.0, Vec3::X, Vec3::Y);
+            // A native birth/death billboard must not collapse the Enhanced effect to a pixel.
+            for frame in 0..24 {
+                sim.update(&renderer.queue, Source { position: [0.0;3], radius: 0.003,
+                    color: [1.0, 1.0, 1.0, if smoke { 0.2 } else { 1.0 }], uv: [0.0,0.0,1.0,1.0],
+                    wind: [0.4,0.0,0.0], lifetime: 2.0, rise: 1.0 },
+                    &[], 1.0/30.0, frame as f32 / 30.0, Vec3::X, Vec3::Y);
+                let mut encoder = renderer.device.create_command_encoder(&Default::default());
+                assert!(sim.encode(&mut encoder, &programs));
+                renderer.queue.submit([encoder.finish()]);
+            }
+            let readback = renderer.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("native effect visibility regression"), size: sim.vertices.size(),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
+            });
             let mut encoder = renderer.device.create_command_encoder(&Default::default());
-            assert!(sim.encode(&mut encoder, &programs));
+            encoder.copy_buffer_to_buffer(&sim.vertices, 0, &readback, 0, sim.vertices.size());
             renderer.queue.submit([encoder.finish()]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            readback.slice(..).map_async(wgpu::MapMode::Read, move |result| tx.send(result).unwrap());
             renderer.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            rx.recv().unwrap().unwrap();
+            let mapped = readback.slice(..).get_mapped_range();
+            let vertices: &[ao_scene::Vertex] = bytemuck::cast_slice(&mapped);
+            let visible: Vec<_> = vertices.as_chunks::<6>().0.iter().filter(|quad| quad[0].color[3] > 0.25).collect();
+            assert!(visible.len() > 8, "effect needs visible GPU billboards, smoke={smoke}");
+            assert!(visible.iter().all(|quad| quad[1].pos[0] - quad[0].pos[0] > 0.05),
+                "GPU billboards must span multiple pixels at native fixture distance, smoke={smoke}");
+            drop(mapped);
+            readback.unmap();
             assert!(pollster::block_on(errors.pop()).is_none(), "native GPU effect validation, smoke={smoke}");
         }
     }

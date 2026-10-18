@@ -42,5 +42,5 @@ fn vertices(@builtin(global_invocation_id) gid: vec3<u32>) {
  let i=gid.x; if(i>=128u){return;} let c=input[i];
  let age=c.position_age.w/max(c.thermal_pressure.w,0.001);
  let fade=select(0.0,smoothstep(0.0,0.1,age)*(1.0-smoothstep(0.55,1.0,age)),c.thermal_pressure.w>0.0);
- quad(i,c.position_age.xyz,max(0.015,p.source.w*0.08)*(1.0-0.4*min(age,1.0)),fade);
+ quad(i,c.position_age.xyz,max(0.035,p.source.w*0.12)*(1.0-0.4*min(age,1.0)),fade*p.color.a);
 }

@@ -688,7 +688,8 @@ impl Renderer {
             let emitter = frame.enhanced_emitter?;
             let is_smoke = matches!(emitter.kind, 1009 | 3017);
             if !admitted.contains(&frame.id) || !spell_smoke::enabled(emitter.kind, spell, smoke) { return None; }
-            let vertices = frame.skin.as_ref()?;
+            // set_actors moves valid CPU skins into ActorGpu; frame.skin is consumed.
+            let vertices = layer.actors.get(&frame.id)?.skin.as_ref()?;
             let quad = vertices.as_chunks::<4>().0.iter().find(|quad| quad.iter().all(|v| v.color[3] > 0.0 && v.pos.iter().all(|v| v.is_finite())))?;
             let center = quad.iter().map(|v| Vec3::from_array(v.pos)).sum::<Vec3>() * 0.25;
             let radius = quad.iter().map(|v| center.distance(Vec3::from_array(v.pos))).fold(0.0f32, f32::max);
@@ -1123,6 +1124,55 @@ mod tests {
         }
     }
     use super::*;
+    #[test]
+    fn native_effect_admission_uses_uploaded_skin_and_revokes_hidden_sources() {
+        use ao_scene::Vertex;
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = Renderer::new(&instance, None).expect("native effect regression requires GPU");
+        renderer.set_enhanced_settings(EnhancedSettings {
+            gpu_spell_particles: true, fluid_smoke: true, ..Default::default()
+        });
+        renderer.spell_programs.wait();
+        renderer.smoke_programs.wait();
+        let skin = std::sync::Arc::new(vec![
+            Vertex { pos: [-0.3, -0.3, -3.0], uv: [0.0, 0.0], color: [1.0; 4], ..Default::default() },
+            Vertex { pos: [0.3, -0.3, -3.0], uv: [1.0, 0.0], color: [1.0; 4], ..Default::default() },
+            Vertex { pos: [-0.3, 0.3, -3.0], uv: [0.0, 1.0], color: [1.0; 4], ..Default::default() },
+            Vertex { pos: [0.3, 0.3, -3.0], uv: [1.0, 1.0], color: [1.0; 4], ..Default::default() },
+        ]);
+        let scene = Scene { meshes: vec![ao_scene::Mesh {
+            vertices: skin.as_ref().clone(),
+            submeshes: vec![ao_scene::Submesh::new(vec![0, 1, 2, 2, 1, 3], None)],
+        }], ..Default::default() };
+        renderer.add_actor_model(1, &scene);
+        let camera = Camera::look_at(Vec3::ZERO, Vec3::NEG_Z);
+        let encode = |renderer: &mut Renderer| {
+            renderer.prepare_actors(camera.pos, camera.forward(), &[Vec4::ZERO; 6]);
+            let mut encoder = renderer.device.create_command_encoder(&Default::default());
+            renderer.encode_enhanced_effects(&mut encoder, &camera);
+            renderer.queue.submit([encoder.finish()]);
+        };
+        let errors = renderer.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        for kind in [1018, 1009, 3017] {
+            let mut frame = ActorFrame { id: 7, model: 1, always: true, skin: Some(skin.clone()),
+                enhanced_emitter: Some(ao_scene::EnhancedEmitter { kind, position: [0.0, 0.0, -3.0],
+                    wind: [0.0; 3], lifetime: 1.4, rise: 1.0 }), ..Default::default() };
+            renderer.set_actors(vec![frame.clone()]);
+            assert!(renderer.act.frames[0].skin.is_none(), "upload consumes the submitted skin");
+            assert!(std::sync::Arc::ptr_eq(renderer.act.actors[&7].skin.as_ref().unwrap(), &skin));
+            encode(&mut renderer);
+            renderer.time += 1.0 / 60.0;
+            encode(&mut renderer);
+            assert!(renderer.act.enhanced_effects.get(&7).is_some_and(|(_, ready)| *ready),
+                "native class {kind} must reach its real GPU simulation after skin upload");
+            frame.alpha = 0.0;
+            renderer.set_actors(vec![frame]);
+            encode(&mut renderer);
+            assert!(renderer.act.enhanced_effects.is_empty(), "hidden sources revoke all GPU history");
+        }
+        renderer.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        assert!(pollster::block_on(errors.pop()).is_none(), "admitted native effect GPU dispatch");
+    }
     #[test]
     fn water_contacts_require_native_surface_and_current_primary_admission() {
         let mut layer = ActorLayer::default();

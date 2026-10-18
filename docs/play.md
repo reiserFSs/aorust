@@ -783,9 +783,12 @@ are separate default-off Sky & Weather controls. They consume the native `f[0]`
 precipitation channel and native scene-space wind rather than UTC or a cloud-colour
 guess. Enhanced rain is anchored in world coordinates, is clipped by current
 admitted depth, and places crown/droplet splashes on reconstructed upward
-surfaces using a bounded vertical depth search. Native-water rain rings are
-deferred until a published native water-surface mask API is available; this
-cutover does not add unpublished water integrations.
+surfaces using a bounded vertical depth search. Rain rings now use the published
+water renderer's exact current-frame native liquid triangle mask and normals,
+with collision roof exclusion and native fog attenuation. Enhanced Rain alone
+requests this mask: all Water-page effects may remain off, and no refraction,
+reflection or wave switch is implicitly enabled. Dry pixels and steep waterfall
+sheets receive no rings. The procedural ring helper contains no upstream artwork.
 The pre-existing faithful path has no native rain geometry submission;
 turning this control off leaves that path untouched, not an invented fallback.
 Wetness accumulates during native rain and decays after it stops; its independent
@@ -2222,14 +2225,17 @@ AOMAC_WEATHER_OUT=/tmp/WeatherFx/weather-evidence /absolute/path/to/aomac-test-e
 ```
 
 The output path must be new and under `/tmp/WeatherFx`. For a bounded single-case
-capture, set `AOMAC_WEATHER_CASE` to `rain-outdoor`, `rain-roof`, `rain-indoor`,
+capture, set `AOMAC_WEATHER_CASE` to `rain-outdoor`, `rain-splashes`, `rain-water`, `rain-roof`, `rain-indoor`,
 `wet-drying`, `sand`, `ash`, `fallout-red`, `fallout-green`, `sparkle-curl`, or
 `fluid-smoke`, with a fresh output directory for each run. The complete invocation
 has a 270-second render deadline. Every case uses independent off/on/on/off
-renderers, 32 frozen warmup frames and 96 measured frames at fixed dt 0.25 s,
-640×400, MSAA1. `frames.csv` records whole-frame GPU and CPU spans; `summary.csv`
+renderers, 32 frozen warmup frames and 96 measured frames at fixed dt 0.25 s
+(except `rain-splashes`, 1/60 s), 640×400, MSAA1. `frames.csv` records whole-frame GPU and CPU spans; `summary.csv`
 contains per-phase mean and nearest-rank p50/p95/p99. The manifest's paired delta is
 `(B1+B2-A0-A3)/2`; it is not an isolated-pass measurement or a performance verdict.
+The `rain-splashes` view uses the same native rain and open-ground collision proof,
+but looks down at pitch −0.7 to frame nearby 0.24 m crowns. Its 1/60 s timestep
+avoids aliasing the splash shader's four-Hz age cycle with a 0.25 s frame step.
 
 Each before/after PNG has OFF above ON at frame31. Each animated-strip PNG has
 OFF above ON and columns frame0/31/63/95; these are temporal contact strips, not
@@ -2244,13 +2250,52 @@ channels are isolated explicitly. Metadata records the unmodified source state,
 Open cameras require collision-proven flat ground (four 4 m neighbors within
 0.6 m), open sky, and a clear three-ray terrain corridor through 4/8/16/32/64 m;
 eight headings are searched instead of aiming blindly into the spawn hillside.
-Roof cameras retain a known native roof/ground pair and a clear 4/8 m corridor.
+Roof cameras require a native covered ground patch, including every 0.5 m shelter
+atlas texel centre across a ±3 m footprint, ground relief ≤0.3 m and a roof above
+the eye. They look straight down with the native 90° horizontal lens: the visible
+ground lies within ±2 m, leaving a metre of shelter margin. Looking along an open
+corridor from beneath a roof is not an exclusion control: outdoor rain can be visible.
 All searches stay within a ±256 m square of the fixture origin and record their final
 position, heading, ground and roof. Subway127 supplies the dungeon control.
-Native-water rain rings are deferred under the approved no-water fallback until
-a native water-mask API is published.
+The controlled `rain-water` case renders existing ICC4582 native liquids at the
+offshore camera `[1010.4,24,-663.1]`, yaw2.4288/pitch−0.8. ICC's own searched
+weather is dry: the fixture explicitly applies an unmodified native rainy state
+(precipitation ≥0.8) from another playfield. Metadata records
+`source_weather_pf`, `render_pf`, `controlled_native_input=true`, original fields
+and wind. This is a controlled native-input test, not a claim about ICC climate.
+Only Enhanced Rain is enabled; all ten Water switches stay off. Native collision
+must prove open sky at the camera and actual native liquid surfaces must exist.
+Inspect the water region in the before/after sheet and temporal strips for
+expanding rings; generic streak-induced pixel changes alone do not certify rings.
+Pair this native-asset capture with the ring-only renderer regression (no streaks
+or splashes) before acceptance:
+`cargo test --profile fast -p ao-render -j 2 water_rings_gpu_require_liquid_roof_fog_and_rain -- --nocapture --test-threads=1`.
+Its controls isolate liquid-mask, roof, actual water-distance native fog, rain
+intensity and steep surface rejection. Exposed rings must be exactly RGBA-identical
+with background directional fog mask.B zero or one: fogged terrain or sky behind
+the liquid must not suppress nearby liquid rings. `water_optics::shader_modules_validate`
+separately checks rain-only native-mask activation and all-off resource release.
+`water_optics::tests::rain_only_native_sloped_plane_has_complete_mask_coverage`
+requires exact native liquid-mask coverage at 1× and supported 4× MSAA on a sloped,
+subdivided native plane. Undeformed rain-only masks retain native triangles and
+invariant depth projection instead of adding a second, mismatched refinement.
+These are runnable checks, not a claim that the fixture worker exercised them.
 Smoke and sparkle use actual installed `gfxtweak` templates and native effect
 construction, never fabricated enhanced emitters. No character actors are added.
+Native effect admission reads the retained uploaded `ActorGpu.skin`: `set_actors`
+has already consumed `ActorFrame.skin`. Reading the consumed frame field rejected
+all native Sparks1018 and Smoke1009/3017 sources. The renderer regression
+`native_effect_admission_uses_uploaded_skin_and_revokes_hidden_sources` exercises
+real upload, admission, GPU dispatch and alpha-zero history revocation for all three
+classes. Enhanced injection/curl footprints, minimum spark size, smoke mass flux,
+ring contrast/reflected colour and crown edge filtering are artistic tuning, not
+retail asset reconstruction. `spell_and_fluid_dispatch_real_gpu_stages` checks
+visible-sized GPU billboards from a small native source; captures still require inspection.
+For fluid smoke, native particle alpha scales Beer–Lambert optical depth before
+integration, rather than capping final column opacity. Extinction is Enhanced
+art tuning at 24/m; native RGB and the material's textured puff profile remain
+unchanged. The GPU billboard regression includes a native-alpha 0.2 source to
+catch the former final-opacity cap. This is not a claim of visual capture acceptance.
 
 The installed-client CPU-only regression (no GPU lock needed) checks independent
 timestamp sampling against native frame-timer-stale reuse:
@@ -2259,10 +2304,27 @@ timestamp sampling against native frame-timer-stale reuse:
 CARGO_TARGET_DIR=/tmp/WeatherFx/target cargo test --profile fast -p aomac -j 2 weather_fixture_samples_fresh_native_timestamps -- --ignored --nocapture
 ```
 
-The last OFF phase has no WeatherInput and must match the first OFF phase's
-supplied weather byte-for-byte at every retained frame. Open outdoor and native
-effect cases must change captured pixels; the dungeon must not. The roof case
-retains collision evidence without requiring rain inside shelter. Drying must
-visibly evolve after rain removal. These assertions do not certify aesthetics: status
+The last OFF phase has absent WeatherInput during warmup and timed frames. At
+every retained frame of both OFF phases, the fixture invokes the actual disabled
+weather composition with the alternate supplied/absent input on the **same already
+captured native image** and requires whole-frame byte equality. It also requires
+optional weather resources to remain released. These references run outside timing,
+without rerasterizing native geometry, changing filtering, excluding pixels or
+applying a tolerance. The independent ABBA renderers remain the timing controls.
+
+The old cross-renderer oracle was not causal: identical supplied weather in all
+phases reproduced the original five-byte failure. Native replays also differed with
+byte-identical global uniforms and sorted draw commands; UV/position diagnostic
+outputs were stable, but those probes changed blending. The underlying native
+colour variation was not isolated further and is not attributed to a GPU defect.
+The weather-off early return precedes input/shelter use; testing its composition on
+the same native image isolates that contract without changing native rendering.
+Open outdoor and native effect cases must change captured pixels; the dungeon must
+not. Both ON roof phases must match the first OFF phase byte-for-byte across the
+entire covered ground viewport at all retained frames, without a tolerance or
+excluded pixels. `weather_roof_fixture_requires_covered_visible_ground` is the
+CPU-only regression for the footprint proof (open edges, unknown coverage and low
+ground are rejected). Drying must visibly evolve after rain removal.
+These assertions do not certify aesthetics: status
 keeps `visual_acceptance=unexercised` until the parent inspects the native-asset
 sheets. Retain compact sheets, CSVs and metadata only in the final ≤100 MB handoff.

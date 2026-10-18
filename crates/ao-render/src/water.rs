@@ -8,7 +8,7 @@ struct SurfaceRun {
     dynamics: Option<WaterDynamics>,
     shore: Vec<f32>,
     spacing: Vec<f32>,
-    cell: Option<([i32; 4], bool, usize)>,
+    cell: Option<([i32; 4], bool, usize, bool)>,
     vertices: Vec<ao_scene::Vertex>,
     indices: Vec<u32>,
     animated: Vec<[f32; 8]>,
@@ -58,6 +58,10 @@ impl Water {
         if let Some(spray) = &self.spray { spray.wait(); }
         if let Some(bottom) = &self.bottom { bottom.wait(); }
     }
+    pub(super) fn rain_masks(&self) -> Option<(&wgpu::TextureView, &wgpu::TextureView)> {
+        if !self.prepared { return None; }
+        self.optics.as_ref().and_then(WaterOptics::rain_masks)
+    }
 }
 
 impl Renderer {
@@ -98,6 +102,7 @@ impl Renderer {
             waterfalls: settings.waterfalls, underwater: settings.underwater,
             caustics: settings.water_caustics, sun_glint: settings.water_sun_glint,
             realism: settings.water_realism,
+            rain_mask: settings.enhanced_rain,
         };
         if !settings.water_enabled() || !self.liquids.iter().any(|run| matches!(run.source.style, 0 | 4)) {
             self.water.reset();
@@ -131,11 +136,19 @@ impl Renderer {
         water.geometry.clear();
         water.droplets.clear();
         let cell = ao_scene::liquid::Surface::cell(camera.pos.to_array());
+        let deform = settings.water_waves || settings.water_ripples || settings.water_wakes || settings.waterfalls;
         for (run, surface) in self.liquids.iter().zip(&mut water.surfaces) {
             let Some(surface) = surface else { continue; };
-            let key = ([cell[0], cell[1], (camera.pos.x / 8.0).floor() as i32, (camera.pos.z / 8.0).floor() as i32], self.realistic_water, run.vertices.len());
+            let key = ([cell[0], cell[1], (camera.pos.x / 8.0).floor() as i32, (camera.pos.z / 8.0).floor() as i32], self.realistic_water, run.vertices.len(), deform);
             if surface.cell != Some(key) {
-                crate::water_waves::refine(&run.vertices, &run.indices, camera.pos.to_array(), &mut surface.vertices, &mut surface.indices);
+                if deform {
+                    crate::water_waves::refine(&run.vertices, &run.indices, camera.pos.to_array(), &mut surface.vertices, &mut surface.indices);
+                } else {
+                    // Preserve the native raster's triangle planes exactly when no
+                    // displacement needs refinement (including rain-only masks).
+                    surface.vertices.clone_from(&run.vertices);
+                    surface.indices.clone_from(&run.indices);
+                }
                 surface.shoreline.distances(&surface.vertices, &mut surface.shore);
                 for (vertex, shore) in surface.vertices.iter().zip(&mut surface.shore) {
                     if crate::water_waves::is_waterfall(vertex.normal) { *shore = -(surface.sheets.along(vertex.pos) + 1.0); }

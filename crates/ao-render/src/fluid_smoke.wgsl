@@ -46,8 +46,9 @@ fn advect(@builtin(global_invocation_id) gid:vec3<u32>){
   v+=(vec3(random(seed),random(seed+17u),random(seed+7919u))*2.0-1.0)*wake*dt;
  }
  if(c.y==0){v.y=max(v.y,0.0);}
- cell.velocity_density=vec4(v*exp(-0.05*dt),max(cell.velocity_density.w*exp(-dt/p.wind_life.w),feed*min(dt*8.0,1.0)));
- cell.thermal_pressure=vec4(max(cell.thermal_pressure.x*exp(-dt),feed*min(dt*8.0,1.0)),0.0,0.0,0.0);
+ // Emission is a mass flux: accumulate it over time, not a per-frame density cap.
+ cell.velocity_density=vec4(v*exp(-0.05*dt),cell.velocity_density.w*exp(-dt/p.wind_life.w)+feed*dt*8.0);
+ cell.thermal_pressure=vec4(cell.thermal_pressure.x*exp(-dt)+feed*dt*8.0,0.0,0.0,0.0);
  output[i]=cell;
 }
 @compute @workgroup_size(64)
@@ -72,8 +73,10 @@ fn project(@builtin(global_invocation_id) gid:vec3<u32>){
 @compute @workgroup_size(64)
 fn vertices(@builtin(global_invocation_id) gid:vec3<u32>){
  let i=gid.x;if(i>=COUNT){return;}let h=p.corner_size.w/f32(N);let c=coord(i);let density=input[i].velocity_density.w;
- // Beer-Lambert coverage of one grid cell; native source texture supplies the puff profile.
- let alpha=1.0-exp(-max(density,0.0)*h*3.2);
+ // Integrate native opacity as extinction, not a post-integration opacity cap:
+ // many translucent cells must still be able to form an opaque smoke column.
+ // Native RGB and the source material's textured puff profile remain unchanged.
+ let alpha=1.0-exp(-max(density,0.0)*h*24.0*clamp(p.color.a,0.0,1.0));
  quad(i,p.corner_size.xyz+(vec3<f32>(c)+0.5)*h,h*0.75,alpha);
 }
 @compute @workgroup_size(64)

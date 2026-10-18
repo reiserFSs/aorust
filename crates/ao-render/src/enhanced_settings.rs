@@ -152,7 +152,7 @@ impl EnhancedSettings {
     pub fn water_enabled(self) -> bool {
         self.water_waves || self.water_ripples || self.water_refraction || self.water_reflections
             || self.water_foam || self.water_wakes || self.waterfalls || self.underwater
-            || self.water_caustics || self.water_sun_glint
+            || self.water_caustics || self.water_sun_glint || self.enhanced_rain
     }
 
     pub fn foliage_enabled(self) -> bool {

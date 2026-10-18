@@ -1254,6 +1254,21 @@ impl Offscreen {
         Ok(())
     }
 
+    /// Tests weather-off composition on the last native image, without rerasterizing
+    /// native geometry or advancing its render-count animation. No timing sample.
+    pub fn weather_off_reference_rgba(&mut self, input: crate::WeatherInput) -> Result<Vec<u8>> {
+        anyhow::ensure!(!self.r.enhanced_settings.any_enabled(), "weather-off reference requires faithful settings");
+        let original = std::mem::replace(&mut self.r.weather_input, input);
+        let mut encoder = self.r.device.create_command_encoder(&Default::default());
+        // The off guard must return before projection, shelter or input is used.
+        let env = self.r.env;
+        self.r.encode_weather(&mut encoder, glam::Mat4::IDENTITY, self.host.camera.pos, env);
+        self.r.weather_input = original;
+        anyhow::ensure!(self.r.rain_wet.is_none() && self.r.weather_particles.is_none(), "weather-off composition retained optional weather resources");
+        self.r.queue.submit([encoder.finish()]);
+        self.frozen_rgba()
+    }
+
     /// Reads the last persistent rendered frame without rerendering or changing motion history.
     pub fn frozen_rgba(&self) -> Result<Vec<u8>> {
         let perf = self.perf.as_ref().ok_or_else(|| anyhow::anyhow!("frozen_rgba requires a persistent evidence target"))?;
