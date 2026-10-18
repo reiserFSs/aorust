@@ -744,6 +744,9 @@ refinement does not import world-fog colour or gamma-decode into the native targ
 The view march uses 16 midpoint steps with four light-ray steps and skips empty
 density; transmittance exits stop fully extinguished work. Mapped shafts use
 24 midpoint strata and omit only the ray tail with zero native-fog weight.
+When neither surface Sun Shadows nor Moon Shadows is enabled, shaft-only
+cascades use half the configured map resolution (1024 at the 2048 default,
+minimum 256); enabling either surface-shadow switch retains its full resolution.
 Shaft-only and cloud-gap-only profiles use one premultiplied-alpha composite,
 sharing bilateral reconstruction for extinction and scatter. Coloured haze
 combinations retain the separate multiplicative and additive composites;

@@ -2,6 +2,24 @@
 use super::*;
 use crate::sun_shadows::{CascadeFrame, SunShadows, CASCADES};
 
+fn cascade_resolution(settings: EnhancedSettings) -> u32 {
+    if !settings.sun_shadows && !settings.moon_shadows && !settings.volumetric_shafts { return 1; }
+    let resolution = settings.shadow_map_size.clamp(256, 4096);
+    if settings.volumetric_shafts && !settings.sun_shadows && !settings.moon_shadows {
+        (resolution / 2).max(256)
+    } else { resolution }
+}
+
+#[test]
+fn shaft_only_maps_match_half_resolution_integration_without_lowering_surface_shadows() {
+    let shafts = EnhancedSettings { volumetric_shafts:true, ..Default::default() };
+    assert_eq!(cascade_resolution(EnhancedSettings::default()), 1);
+    assert_eq!(cascade_resolution(shafts), 1024);
+    assert_eq!(cascade_resolution(EnhancedSettings { sun_shadows:true, ..shafts }), 2048);
+    assert_eq!(cascade_resolution(EnhancedSettings { moon_shadows:true, ..shafts }), 2048);
+    assert_eq!(cascade_resolution(EnhancedSettings { shadow_map_size:256, ..shafts }), 256);
+}
+
 pub(super) fn authored_sun(scene: &Scene) -> Option<[f32; 3]> {
     scene.ground_light
         .filter(|(color, direction)| scene.sun_authored
@@ -79,7 +97,7 @@ impl Renderer {
         let admission = directional || self.enhanced_settings.needs_admitted_lights();
         // Moon illumination alone needs only the openness binding, not maps or a primary prepass.
         let resource_size = if admission { size } else { (1, 1) };
-        let resolution = if directional { self.enhanced_settings.shadow_map_size.clamp(256, 4096) } else { 1 };
+        let resolution = cascade_resolution(self.enhanced_settings);
         let mut shadows = self.sun_shadows.take().filter(|s| s.size == resource_size && s.resolution == resolution)
             .unwrap_or_else(|| SunShadows::new(self, resource_size, resolution));
         shadows.sun_replacement_active = false;
