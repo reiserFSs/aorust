@@ -775,6 +775,84 @@ pub(crate) mod tests {
         }
     }
     #[test]
+    fn night_window_sign_screen_glow_requires_self_saturating_visible_native_material() {
+        use crate::{Camera, EnhancedSettings, Renderer, Targets, Vec3, texture_to_rgba};
+        use ao_scene::{ActorFrame, Environment, Mesh, Scene, Submesh, Texture, TextureKey, Vertex};
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut r = Renderer::new(&instance, None).expect("night facade emission GPU");
+        r.set_msaa_samples(1);
+        r.upload(&Scene { environment: Some(Environment {
+            sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 10.0, fog_end: 20.0,
+            ambient: [0.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0], sun_specular: 0.0,
+        }), ..Default::default() });
+        let key = TextureKey { rdb_type: 1, id: 1 };
+        let facade = |emissive, glow_mask, alpha| {
+            // Native SetMaterial1004b199 emissive floor and SetAlphaMode10040645
+            // mode-5 texture-alpha ADD: the actual window/sign/screen contracts,
+            // not a beauty-brightness heuristic or an installed-asset claim.
+            let mut model = Scene { meshes: vec![Mesh {
+                vertices: [(-0.5,-0.5),(0.5,-0.5),(0.5,0.5),(-0.5,0.5)]
+                    .into_iter().map(|(x,y)| Vertex { pos: [x,y,0.0], normal: [0.0,0.0,1.0],
+                        uv: [0.5,0.5], color: [1.0; 4] }).collect(),
+                submeshes: vec![Submesh { emissive, glow_mask, two_sided: true,
+                    ..Submesh::new(vec![0,1,2,0,2,3], Some(key)) }],
+            }], ..Default::default() };
+            model.textures.insert(key, Texture { source: Default::default(), width: 1, height: 1,
+                rgba: vec![128,192,255,alpha] });
+            model
+        };
+        let output = r.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Night native facade regression"),
+            size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: r.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+        });
+        let view = output.create_view(&Default::default());
+        let capture = |r: &mut Renderer, enabled| {
+            r.set_enhanced_settings(EnhancedSettings { emissive_bloom: enabled, ..Default::default() });
+            r.render(&view, &Targets::new(r,64,64), &Camera::look_at(Vec3::ZERO, Vec3::NEG_Z));
+            texture_to_rgba(r, &output, 64, 64).unwrap()
+        };
+        let has_seed = |r: &Renderer| r.emissive_seed_rgba().unwrap().unwrap()
+            .as_chunks::<4>().0.iter().any(|p| p[..3].iter().any(|&v| v > 0));
+        for (index, (emissive, mask, alpha, emits)) in [
+            ([0.0; 3], false, 255, false),
+            ([0.5; 3], false, 255, false),
+            ([1.0; 3], false, 255, true),
+            ([0.0; 3], true, 127, false),
+            ([0.0; 3], true, 255, true),
+        ].into_iter().enumerate() {
+            let model = index as u64 + 1;
+            r.add_actor_model(model, &facade(emissive, mask, alpha));
+            let mut actor = ActorFrame { id: 1, model, ..Default::default() };
+            actor.transform[3][2] = -2.0;
+            r.set_actors(vec![actor.clone()]);
+            let faithful = capture(&mut r, false);
+            let glowing = capture(&mut r, true);
+            assert_eq!(has_seed(&r), emits, "native facade case {index}");
+            assert_eq!(faithful != glowing, emits, "only self-saturating facades gain a night halo");
+            if !emits { continue; }
+            actor.transform[3][2] = -30.0;
+            r.set_actors(vec![actor.clone()]);
+            capture(&mut r, true);
+            assert!(!has_seed(&r), "full native fog extinguishes facade emission");
+            actor.transform[3][2] = -2.0;
+            actor.alpha = 0.0;
+            r.set_actors(vec![actor.clone()]);
+            let invisible = capture(&mut r, true);
+            assert!(!has_seed(&r), "invisible actors cannot seed night glow");
+            r.set_actors(Vec::new());
+            assert_eq!(invisible, capture(&mut r, true), "non-admitted source leaves no glow history");
+            actor.alpha = 1.0;
+            r.add_actor_model(100, &facade([0.0; 3], false, 255));
+            let mut blocker = ActorFrame { id: 2, model: 100, ..Default::default() };
+            blocker.transform[3][2] = -1.0;
+            r.set_actors(vec![actor, blocker]);
+            capture(&mut r, true);
+            assert!(!has_seed(&r), "depth-hidden facades cannot seed a halo");
+        }
+    }
+    #[test]
     #[ignore = "whole installed authored CAT population, headless MRT readback; new AOMAC_GFX_OUT required"]
     fn graphics_bloom_authored_actor_survey() -> anyhow::Result<()> {
         use anyhow::{Context, ensure};
