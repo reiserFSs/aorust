@@ -166,6 +166,51 @@ mod tests {
         let (still,reset)=retention(Some((Vec3::ZERO,0.0)),Vec3::ZERO,1.0);assert!(!reset && still>0.0 && still<1.0);
         assert!(retention(Some((Vec3::ZERO,0.0)),Vec3::X,1.0).0<still);
     }
+    #[test] fn hoisted_ray_projection_matches_reference_with_rounding_tolerance() {
+        // CPU reference, not a byte-identical GPU/image claim: rounding may select
+        // a neighbouring pixel or change a boundary hit in this Enhanced-only pass.
+        let source=include_str!("material_reflections.wgsl");
+        let march=&source[source.find("let origin=p+n*0.05;").unwrap()..source.find("// Source already contains native fog").unwrap()];
+        let (setup,steps)=march.split_once("for(var i=1u;i<=48u;i+=1u)").unwrap();
+        assert!(setup.contains("let clip_origin=u.vp*vec4<f32>(origin,1.0)"));
+        assert!(setup.contains("let clip_direction=u.vp*vec4<f32>(ray,0.0)"));
+        assert!(steps.contains("let t=60.0*pow(f32(i)/48.0,2.0);let q=origin+ray*t;let clip=clip_origin+t*clip_direction"));
+        assert!(!steps.contains("u.vp*"));
+        assert!(steps.contains("let behind=length(q-u.eye.xyz)-length(hit_position-u.eye.xyz)"));
+        assert!(steps.contains("behind>0.0 && behind<max(0.15,(t-previous)*1.5)"));
+        assert!(steps.contains("source.a>=0.999"));
+        assert!(steps.contains("previous=t"));
+        for eye in [Vec3::ZERO,Vec3::new(128.0,35.0,-256.0),Vec3::new(1024.0,80.0,2048.0)] {
+            for forward in [Vec3::NEG_Z,Vec3::new(0.3,-0.2,-1.0).normalize()] {
+                for aspect in [1.0,16.0/9.0] {
+                    let vp=Mat4::perspective_rh(1.0,aspect,0.1,500.0)*Mat4::look_to_rh(eye,forward,Vec3::Y);
+                    for offset in [Vec3::new(0.0,0.05,-3.0),Vec3::new(2.0,1.0,-12.0)] {
+                        let origin=eye+offset;
+                        for ray in [Vec3::NEG_Z,Vec3::new(0.8,0.2,-0.6).normalize(),Vec3::Z] {
+                            let clip_origin=vp*origin.extend(1.0);
+                            let clip_direction=vp*ray.extend(0.0);
+                            for i in 1..=48 {
+                                let t=60.0*(i as f32/48.0).powf(2.0);
+                                let reference=vp*(origin+ray*t).extend(1.0);
+                                let hoisted=clip_origin+t*clip_direction;
+                                let tolerance=0.001+reference.abs().max_element()*2e-6;
+                                assert!((hoisted-reference).abs().max_element()<=tolerance,
+                                    "clip projection: eye={eye:?}, step={i}, reference={reference:?}, hoisted={hoisted:?}");
+                                // Perspective division is ill-conditioned at w=0;
+                                // compare NDC away from that singularity, including rays behind the eye.
+                                if reference.w.abs()>=1.0 && hoisted.w.abs()>=1.0 {
+                                    let ndc=reference.truncate()/reference.w;
+                                    let projected=hoisted.truncate()/hoisted.w;
+                                    let ndc_tolerance=tolerance*(1.0+ndc.abs().max_element())/hoisted.w.abs();
+                                    assert!((projected-ndc).abs().max_element()<=ndc_tolerance);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     #[test] fn history_requires_static_primary_and_unfiltered_sources() {
         let source=include_str!("material_reflections.wgsl");
         assert!(source.contains("m.b<0.999 || m.a<0.999"));

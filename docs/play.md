@@ -2055,8 +2055,35 @@ PBR omits the overwritten `clustered_receiver_spec` call (including its local-li
 shadow scan); non-PBR calls and native unlit/effect/room specular pass-through remain.
 Material diffuse reuses the receiver's invocation-private base clustered-light
 value instead of repeating its identical smooth-normal scan. Both mesh and ground
-receivers write it unconditionally before receiver guards; material-normal and
-GGX scans, admission and point-shadow sampling remain unchanged.
+receivers write it unconditionally before receiver guards.
+Static reflection/probe provenance also reuses diffuse's exact material-normal
+clustered result (`authored_specular.rs`), held in an invocation-private `vec3`
+plus a written flag. Position, cached material normal and footprint are identical:
+geometric/moon beauty wrappers only replace the lighting normal, not position,
+while `material_shading_normal` returns the same prepared value in both calls.
+Every primary mesh/ground wrapper resets the flag in
+`material_prepare_derivatives` before beauty, preventing preceding direct shade
+copies from contaminating provenance. Native unlit/emissive/effect paths that skip
+diffuse retain the full clustered fallback. The pure `visibility >= 0.999` test
+precedes that fallback, avoiding a scan for shadowed provenance without changing
+its result (including NaN rejection). The source contract exhausts all seven
+provenance callers; `static_source_early_eligibility_matches_previous_predicate_on_gpu_msaa4`
+adds numeric scan counts, diffuse/fallback controls, stale-cache reset and
+visibility/NaN controls to its existing eligibility comparisons.
+Point-shadow cube queries (`point_shadows.rs`) now run only for positive
+`dot(n, l)`, matching grass: diffuse, native specular and GGX already contribute
+zero on the other side. Accumulation, admitted-owner checks, native light budgets,
+GGX's alpha floor and front-facing shadow sampling remain unchanged.
+These duplicate-scan/backface changes preserve the lighting equations; they
+neither disable effects nor alter fog extinction or actor admission. Independent
+guarded/unconditional GPU GGX function bodies nevertheless exhibited a 1-ULP
+compiler-association difference even for front-facing lights where both query.
+The same-compiled-loop runtime-control regression isolates guard semantics from
+that compiler difference; it is not an independent-binary bit-identity claim.
+The faithful shader remains unchanged.
+The Enhanced reflection march separately hoists its view-projection products
+outside the loop. That reassociation permits floating-point roundoff and is not
+byte-identical; march steps/reach, fog and source-provenance rules are unchanged.
 Whole-frame performance still requires the acceptance/marginal fixtures above.
 At Newland, 1920×1200 with each preset's native 1× MSAA plus TAA/CAS, the
 600-sample pre-cache → post-cache GPU p50/p95 values were Modern
@@ -2065,6 +2092,20 @@ At Newland, 1920×1200 with each preset's native 1× MSAA plus TAA/CAS, the
 the `6d6152b3` commit message were transcription errors; these CSV-derived values
 are the correction. Both presets still miss their 8/12 ms budgets.
 Evidence: `~/aomac-handoff/gfx/parity/Presets/final-native-aa/history/`.
+
+The subsequent duplicate material-scan/backface-query/projection-hoist combination
+was compared against the accepted executable in whole-binary ABBA order at
+Newland, with 600 frames per leg and each preset's native 1× TAA/CAS settings.
+Mean leg p50 was **20.854417 → 19.505105 ms** for Modern (−1.349312 ms),
+and **21.255375 → 20.291125 ms** for Ultra (−0.964251 ms). These are
+paired-run observations, not the final four-scene matrix or additive effect costs;
+both still miss their 8/12 ms budgets. Raw legs and executable SHA-256 values:
+`~/aomac-handoff/gfx/parity/Presets/` (`binary-abba-newland-*.csv`).
+The gated implementation passed the complete ao-render release unit suite
+(442 passed, 20 ignored), focused aomac Enhanced/options/contracts
+(8 + 34 + 2 passed, one ignored), strict workspace release all-target Clippy,
+and four 1920×1200 4× faithful baseline comparisons plus independent repeats
+with zero differing bytes. All execution was headless; no real-window claim.
 
 
 Sun cascades admit loaded static geometry, including terrain patches, by their

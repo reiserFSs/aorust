@@ -100,8 +100,16 @@ pub(super) fn append_materials(source: &mut String, settings: crate::EnhancedSet
     }
     if source.contains("fn clustered_pixel_lights(") {
         shader = shader.replace(
+            "    let local_delta = vertex_lights(i.wpos, n, 0.0)[0] - vertex_lights(i.wpos, base, 0.0)[0];",
+            "    material_clustered_value = clustered_pixel_lights(i.wpos, n, material_footprint);\n    material_clustered_written = true;\n    let local_delta = vertex_lights(i.wpos, n, 0.0)[0] - vertex_lights(i.wpos, base, 0.0)[0];",
+        );
+        // This stays in the derivative preparation when early_rejection splits
+        // preparation, so every world/ground wrapper starts a fresh cache.
+        shader = shader.replace("fn material_prepare(i: VOut) {", "fn material_prepare(i: VOut) {\n    material_clustered_written = false;");
+        source.push_str("\nvar<private> material_clustered_value: vec3<f32>;\nvar<private> material_clustered_written: bool;\nfn material_clustered_source(i: VOut) -> vec3<f32> {\n    if material_clustered_written { return material_clustered_value; }\n    return clustered_pixel_lights(i.wpos, material_shading_normal(i), material_footprint);\n}\n");
+        shader = shader.replace(
             "vertex_lights(i.wpos, n, 0.0)[0] - vertex_lights(i.wpos, base, 0.0)[0]",
-            "clustered_pixel_lights(i.wpos, n, material_footprint) - clustered_local_value + clustered_directional(n) - clustered_directional(base) - g.sun_g.rgb * (max(dot(n, g.sun_dir.xyz), 0.0) - max(dot(base, g.sun_dir.xyz), 0.0))",
+            "material_clustered_value - clustered_local_value + clustered_directional(n) - clustered_directional(base) - g.sun_g.rgb * (max(dot(n, g.sun_dir.xyz), 0.0) - max(dot(base, g.sun_dir.xyz), 0.0))",
         );
     }
     source.push_str(&shader);
@@ -168,11 +176,11 @@ pub(super) fn append_materials(source: &mut String, settings: crate::EnhancedSet
     source.push_str(&format!("\nfn material_ground(i: VOut, base: vec3<f32>, light: vec3<f32>, fused: bool) -> vec3<f32> {{\n    let diffuse = material_diffuse(i, light);\n    let extra = {specular} + material_emissive(i);\n    return select(diffuse + extra / max(base, vec3<f32>(0.01)), base * diffuse + extra, fused);\n}}\n"));
     if settings.material_reflections || settings.environment_probe {
         let clustered = if source.contains("fn clustered_pixel_lights(") {
-            " && !any(clustered_pixel_lights(i.wpos, material_shading_normal(i), material_footprint) > vec3<f32>(0.0))"
+            " && !any(material_clustered_source(i) > vec3<f32>(0.0))"
         } else { "" };
         // Keep the positive float comparisons intact: negating the whole
         // eligibility predicate also rejects NaN scroll/AO values.
-        source.push_str(&format!("\nfn material_static_source(i: VOut) -> f32 {{\n    if !((u32(mat.native.z) & 128u) == 0u && (u32(mat.native.z) & 64u) == 0u && i.effect == 0u && all(mat.scroll.xy == vec2<f32>(0.0)) && i.ao_info.y == 0.0) {{ return 0.0; }}\n    let local = vertex_lights(i.wpos, material_shading_normal(i), 0.0);\n    let visibility = material_static_visibility_value;\n    return select(0.0, 1.0, !any(local[0] > vec3<f32>(0.0)) && !any(local[1] > vec3<f32>(0.0)){clustered} && visibility >= 0.999);\n}}\n"));
+        source.push_str(&format!("\nfn material_static_source(i: VOut) -> f32 {{\n    if !((u32(mat.native.z) & 128u) == 0u && (u32(mat.native.z) & 64u) == 0u && i.effect == 0u && all(mat.scroll.xy == vec2<f32>(0.0)) && i.ao_info.y == 0.0) {{ return 0.0; }}\n    let local = vertex_lights(i.wpos, material_shading_normal(i), 0.0);\n    let visibility = material_static_visibility_value;\n    return select(0.0, 1.0, !any(local[0] > vec3<f32>(0.0)) && !any(local[1] > vec3<f32>(0.0)) && visibility >= 0.999{clustered});\n}}\n"));
     }
 }
 
@@ -308,11 +316,64 @@ mod tests {
             assert!(guard < helper.find("let visibility =").unwrap());
             assert!(helper.contains("all(mat.scroll.xy == vec2<f32>(0.0)) && i.ao_info.y == 0.0)"));
             if clustered_lighting {
-                assert!(guard < helper.find("clustered_pixel_lights(").unwrap());
+                assert!(guard < helper.find("material_clustered_source(").unwrap());
+                assert!(helper.find("visibility >= 0.999").unwrap() < helper.find("material_clustered_source(").unwrap());
             }
-            assert_eq!(helper.contains("!any(clustered_pixel_lights("), clustered_lighting);
+            assert_eq!(helper.contains("!any(material_clustered_source("), clustered_lighting);
             if clustered_lighting {
-                assert!(helper.contains("clustered_pixel_lights(i.wpos, material_shading_normal(i), material_footprint)"));
+                assert!(source.contains("return clustered_pixel_lights(i.wpos, material_shading_normal(i), material_footprint);"));
+            }
+        }
+    }
+
+    #[test]
+    fn clustered_material_provenance_reuses_only_the_prepared_surface_scan() {
+        for material_pbr in [false, true] {
+            for sun_shadows in [false, true] {
+                for night_mode in [crate::NightMode::AsGame, crate::NightMode::Moonlit] {
+                    let mut source = crate::enhanced_shader::source(crate::EnhancedSettings {
+                        clustered_lighting: true, generated_normals: true, material_pbr,
+                        sun_shadows, night_mode, environment_probe: true, ..Default::default()
+                    });
+                    crate::foliage_edges::append(&mut source);
+                    let function = |name: &str| {
+                        let start = source.find(&format!("fn {name}(")).unwrap();
+                        &source[start..start + source[start..].find("\n}").unwrap() + 2]
+                    };
+                    let prepare = function("material_prepare_derivatives");
+                    assert!(prepare.find("material_clustered_written = false;").unwrap() < prepare.find("material_normal_value =").unwrap());
+                    assert!(prepare.contains("material_footprint = early_footprint;"));
+                    assert!(function("material_shading_normal").contains("return material_normal_value;"));
+                    let diffuse = function("material_diffuse");
+                    assert!(diffuse.contains("let n = material_shading_normal(i);"));
+                    assert_eq!(diffuse.matches("clustered_pixel_lights(").count(), 1);
+                    assert!(diffuse.find("material_clustered_value = clustered_pixel_lights(i.wpos, n, material_footprint);").unwrap()
+                        < diffuse.find("material_clustered_written = true;").unwrap());
+                    let cache = function("material_clustered_source");
+                    assert!(cache.contains("if material_clustered_written { return material_clustered_value; }"));
+                    assert!(cache.contains("return clustered_pixel_lights(i.wpos, material_shading_normal(i), material_footprint);"));
+                    let mut provenance_callers = 0;
+                    for part in source.split("fn ").skip(1) {
+                        let name = part.split('(').next().unwrap();
+                        let body = part.split_once('{').unwrap().1.split("\n}").next().unwrap();
+                        if let Some(provenance) = body.find("material_static_source(i)") {
+                            provenance_callers += 1;
+                            assert!(matches!(name, "fs_opaque" | "fs_test" | "fs_fade_opaque" | "fs_fade_test" |
+                                "fs_ground_fused" | "fs_ground_base" | "fs_ground_simple"));
+                            let prepared = body.find("material_prepare_derivatives(i);").unwrap();
+                            let beauty = body.find("let beauty =").unwrap();
+                            assert!(prepared < beauty && beauty < provenance);
+                            assert!(!body[..provenance].contains(".wpos ="));
+                        }
+                    }
+                    assert_eq!(provenance_callers, 7);
+                    // Direct shade copies can write the cache but never consume
+                    // provenance. The next prepared wrapper resets that value.
+                    for name in ["shade", "foliage_edge_shade", "material_ground"] {
+                        assert!(function(name).contains("material_diffuse(i, light)"));
+                        assert!(!function(name).contains("material_static_source("));
+                    }
+                }
             }
         }
     }
@@ -325,6 +386,36 @@ mod tests {
             let generated = crate::enhanced_shader::source(crate::EnhancedSettings {
                 environment_probe: true, material_reflections: true, clustered_lighting, ..Default::default()
             });
+            let function = |name: &str| {
+                let start = generated.find(&format!("fn {name}(")).unwrap();
+                &generated[start..start + generated[start..].find("\n}").unwrap() + 2]
+            };
+            let cache = if clustered_lighting { function("material_clustered_source") } else { "" };
+            let diffuse = if clustered_lighting { function("material_diffuse") } else { "" };
+            let reset = if clustered_lighting {
+                function("material_prepare_derivatives").lines().find(|line| line.contains("material_clustered_written = false;")).unwrap()
+            } else { "" };
+            let numeric = if clustered_lighting { format!(r#"
+    if test_case >= 11u {{
+        {reset}
+        material_orm_value = vec3<f32>(1.0);
+        var light = vec3<f32>(0.0);
+        if test_case == 11u || test_case == 13u {{ light = material_diffuse(i, vec3<f32>(0.0)); }}
+        if test_case == 14u {{
+            // Simulate a preceding direct shade copy at another position.
+            material_clustered_value = vec3<f32>(0.25);
+            material_clustered_written = true;
+            {reset}
+        }}
+        if test_case == 15u {{ material_static_visibility_value = 0.998; }}
+        if test_case == 16u {{ material_static_visibility_value = bitcast<f32>(0x7fc00000u); }}
+        let value = material_static_source(i);
+        let expected = select(1.0, 0.0, test_case == 12u || test_case == 13u || test_case >= 15u);
+        let scans = select(1u, 0u, test_case >= 15u);
+        let light_ok = all(light == vec3<f32>(select(0.0, 0.25, test_case == 13u)));
+        return vec4<f32>(value, select(0.0, 1.0, value == expected && cluster_queries == scans && light_ok), 0.0, 1.0);
+    }}
+"#) } else { String::new() };
             let start = generated.find("fn material_static_source(").unwrap();
             let helper = &generated[start..start + generated[start..].find("\n}").unwrap() + 2];
             let guard = helper.lines().nth(1).unwrap();
@@ -338,6 +429,19 @@ struct VOut {{ wpos: vec3<f32>, effect: u32, ao_info: vec3<f32> }}
 var<private> mat: Material;
 var<private> material_static_visibility_value: f32;
 var<private> material_footprint: f32;
+var<private> material_clustered_value: vec3<f32>;
+var<private> material_clustered_written: bool;
+var<private> clustered_local_value: vec3<f32>;
+var<private> material_base_normal: vec3<f32>;
+var<private> material_visibility_value: f32;
+var<private> material_orm_value: vec3<f32>;
+struct Globals {{ sun_g: vec4<f32>, sun_dir: vec4<f32> }}
+var<private> g: Globals;
+const MATERIAL_PBR: bool = false;
+fn material_metallic(i: VOut) -> f32 {{ return 0.0; }}
+fn material_mask(i: VOut) -> u32 {{ return 0u; }}
+fn clustered_directional(n: vec3<f32>) -> vec3<f32> {{ return vec3<f32>(0.0); }}
+var<private> cluster_queries: u32;
 var<private> test_case: u32;
 var<private> queries: u32;
 fn material_shading_normal(i: VOut) -> vec3<f32> {{ return vec3<f32>(0.0, 1.0, 0.0); }}
@@ -347,8 +451,11 @@ fn vertex_lights(p: vec3<f32>, n: vec3<f32>, power: f32) -> array<vec3<f32>, 2> 
 }}
 fn clustered_pixel_lights(p: vec3<f32>, n: vec3<f32>, footprint: f32) -> vec3<f32> {{
     queries += 1u;
-    return vec3<f32>(select(0.0, 1.0, test_case == 9u));
+    cluster_queries += 1u;
+    return vec3<f32>(select(0.0, 0.25, test_case == 9u || test_case == 12u || test_case == 13u));
 }}
+{cache}
+{diffuse}
 {helper}
 {reference}
 @vertex fn vs(@builtin(vertex_index) n: u32) -> @builtin(position) vec4<f32> {{
@@ -361,6 +468,7 @@ fn pixel(p: vec4<f32>, optimized: bool) -> vec4<f32> {{
     mat.scroll = vec4<f32>(select(select(0.0, -0.0, test_case == 6u), 0.1, test_case == 4u), 0.0, 0.0, 0.0);
     material_static_visibility_value = select(1.0, 0.998, test_case == 10u);
     let i = VOut(vec3<f32>(0.0), select(0u, 1u, test_case == 3u), vec3<f32>(0.0, select(0.0, 1.0, test_case == 5u), 0.0));
+    {numeric}
     var value: f32;
     if optimized {{ value = material_static_source(i); }} else {{ value = reference_source(i); }}
     // Green independently proves excluded pixels did not enter either query.
@@ -383,7 +491,7 @@ fn pixel(p: vec4<f32>, optimized: bool) -> vec4<f32> {{
                     multisample: wgpu::MultisampleState { count: 4, ..Default::default() }, multiview_mask: None, cache: None,
                 });
                 let texture = |count| r.device.create_texture(&wgpu::TextureDescriptor {
-                    label: None, size: wgpu::Extent3d { width: 11, height: 1, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: count,
+                    label: None, size: wgpu::Extent3d { width: 17, height: 1, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: count,
                     dimension: wgpu::TextureDimension::D2, format: r.format,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT | if count == 1 { wgpu::TextureUsages::COPY_SRC } else { wgpu::TextureUsages::empty() }, view_formats: &[],
                 });
@@ -400,13 +508,20 @@ fn pixel(p: vec4<f32>, optimized: bool) -> vec4<f32> {{
                     pass.draw(0..3, 0..1);
                 }
                 r.queue.submit([encoder.finish()]);
-                captures.push(crate::texture_to_rgba(&r, &output, 11, 1).unwrap());
+                captures.push(crate::texture_to_rgba(&r, &output, 17, 1).unwrap());
             }
             assert_eq!(captures[0], captures[1], "exact pre-guard parity at MSAA4, clustered={clustered_lighting}");
             for col in 0..11 {
                 let eligible = col == 0 || col == 6 || (col == 9 && !clustered_lighting);
                 assert_eq!(captures[1][col * 4], if eligible { 255 } else { 0 }, "case {col}");
                 assert_eq!(captures[1][col * 4 + 1], 255, "excluded case {col} entered a light query");
+            }
+            if clustered_lighting {
+                for col in 11..17 {
+                    let eligible = col == 11 || col == 14;
+                    assert_eq!(captures[1][col * 4], if eligible { 255 } else { 0 }, "cache case {col}");
+                    assert_eq!(captures[1][col * 4 + 1], 255, "cache count/output/reset case {col}");
+                }
             }
         }
     }

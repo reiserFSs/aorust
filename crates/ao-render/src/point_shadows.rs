@@ -487,7 +487,9 @@ pub(crate) fn apply_shader(source: &mut String, local: bool, clustered: bool) {
         body = body.replace("        let col = dyn_lights[li + 1u];",
             &format!("        if !owner_light_admitted(dyn_lights[li + 3u].w) {{ continue; }}\n{increment}        let col = dyn_lights[li + 1u];"));
         if local {
-            body = body.replace("        diffuse += ", "        intensity *= point_shadow_visibility(-d, a.w, dyn_lights[li + 3u].w, point_receiver_character);\n        diffuse += ");
+            // All three BRDFs are zero on the back face (GGX alpha >= 0.02).
+            // Skip only the explicit-level cube query, not admission or accumulation.
+            body = body.replace("        diffuse += ", "        if dot(n, l) > 0.0 {\n            intensity *= point_shadow_visibility(-d, a.w, dyn_lights[li + 3u].w, point_receiver_character);\n        }\n        diffuse += ");
         }
         source.replace_range(start..end, &body);
     }
@@ -519,6 +521,10 @@ mod specular_admission_tests;
 #[cfg(test)]
 #[path = "point_cache_tests.rs"]
 mod point_cache_tests;
+
+#[cfg(test)]
+#[path = "point_shadow_query_tests.rs"]
+mod point_shadow_query_tests;
 
 
 #[cfg(test)]

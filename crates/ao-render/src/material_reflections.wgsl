@@ -70,8 +70,10 @@ fn environment(ray:vec3<f32>,rough:f32)->vec3<f32>{
  let ray=reflect(v,n);var colour=environment(ray,rough);
  if u.control.x>0.5 && rough<0.75 {
  let origin=p+n*0.05;var previous=0.0;
+ // Enhanced-only reassociation can round differently at pixel/hit boundaries; not byte-identical.
+ let clip_origin=u.vp*vec4<f32>(origin,1.0);let clip_direction=u.vp*vec4<f32>(ray,0.0);
  for(var i=1u;i<=48u;i+=1u){
- let t=60.0*pow(f32(i)/48.0,2.0);let q=origin+ray*t;let clip=u.vp*vec4<f32>(q,1.0);
+ let t=60.0*pow(f32(i)/48.0,2.0);let q=origin+ray*t;let clip=clip_origin+t*clip_direction;
  if clip.w<=0.0 {break;}let ndc=clip.xy/clip.w;let uv=vec2<f32>(ndc.x*0.5+0.5,0.5-ndc.y*0.5);
  if any(uv<=vec2<f32>(0.0)) || any(uv>=vec2<f32>(1.0)){break;}
  let hp=vec2<i32>(uv*vec2<f32>(textureDimensions(depth)));let hd=textureLoad(depth,hp,0);

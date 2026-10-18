@@ -127,7 +127,7 @@ fn clustered_material_base_reuse_is_initialized_on_every_receiver_path() {
                     assert!(receiver.contains("early_footprint"));
                 }
                 let diffuse = function(&source, "material_diffuse");
-                assert!(diffuse.contains("clustered_pixel_lights(i.wpos, n, material_footprint) - clustered_local_value"));
+                assert!(diffuse.contains("material_clustered_value - clustered_local_value"));
                 assert!(!diffuse.contains("clustered_pixel_lights(i.wpos, base"));
                 assert!(function(&source, "material_prepare_derivatives").contains("material_base_normal = material_safe_normal(i.n);"));
                 assert!(function(&source, "material_prepare_derivatives").contains("material_footprint = early_footprint;"));
@@ -257,6 +257,8 @@ struct Globals {{ ambient_g:vec4<f32>, fog_g:vec4<f32>, sun_g:vec4<f32>, sun_dir
 var<private> g:Globals;
 var<private> clustered_normal:vec3<f32>;
 var<private> clustered_local_value:vec3<f32>;
+var<private> material_clustered_value:vec3<f32>;
+var<private> material_clustered_written:bool;
 var<private> query_count:u32;
 var<private> material_base_normal:vec3<f32>;
 var<private> material_footprint:f32;
