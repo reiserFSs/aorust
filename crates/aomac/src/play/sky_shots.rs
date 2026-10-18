@@ -1554,16 +1554,16 @@ fn graphics_fixture_snapshot_keys_share_only_matching_playfield_and_time() -> an
     for (_, pf, time, _) in &views {
         *keys.entry((*pf, time.to_bits())).or_default() += 1;
     }
-    assert_eq!(views.len(), 28);
+    assert_eq!(views.len(), 29);
     assert_eq!(keys.len(), 10);
     assert_eq!(keys[&(4582, 2648.69_f32.to_bits())], 7);
     assert_eq!(keys[&(630, 2648.69_f32.to_bits())], 1);
     assert_eq!(keys[&(800, 0.0_f32.to_bits())], 5);
     assert_eq!(keys[&(800, 3240.0_f32.to_bits())], 4);
     assert_eq!(keys[&(127, 3240.0_f32.to_bits())], 1);
-    for time in [3240.0_f32, 4860.0, 0.0] {
-        assert_eq!(keys[&(566, time.to_bits())], if time == 3240.0 { 4 } else { 1 });
-    }
+    assert_eq!(keys[&(566, 3240.0_f32.to_bits())], 4);
+    assert_eq!(keys[&(566, 4860.0_f32.to_bits())], 1);
+    assert_eq!(keys[&(566, 0.0_f32.to_bits())], 2);
     Ok(())
 }
 
