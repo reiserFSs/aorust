@@ -10,6 +10,14 @@ pub struct EnhancedSettings {
     pub hdr: bool,
     /// Half-resolution screen-space march towards the directional light; darkening only.
     pub contact_shadows: bool,
+    pub height_haze: bool,
+    pub land_haze: bool,
+    pub valley_mist: bool,
+    pub volumetric_shafts: bool,
+    pub cloud_gap_shafts: bool,
+    pub volumetric_clouds: bool,
+    pub cloud_shadows: bool,
+    pub sky_discs: bool,
     pub shadow_map_size: u32,
     /// Share of the sun that full shadow removes (the rest stays as sky-lit shade).
     pub shadow_strength: f32,
@@ -32,6 +40,8 @@ impl Default for EnhancedSettings {
     fn default() -> Self {
         Self {
             sun_shadows: false, ambient_occlusion: false, emissive_bloom: false, ground_grass: false, hdr: false, contact_shadows: false,
+            height_haze: false, land_haze: false, valley_mist: false, volumetric_shafts: false,
+            cloud_gap_shafts: false, volumetric_clouds: false, cloud_shadows: false, sky_discs: false,
             shadow_map_size: 2048, shadow_strength: 0.45, shadow_softness: 1.5, ao_radius: 1.75, ao_strength: 1.5, bloom_strength: 0.6,
             grass_density: 1.0, grass_distance: 160.0, sun_boost: 0.6, grade_strength: 0.8, contact_strength: 0.8,
         }
@@ -41,11 +51,14 @@ impl Default for EnhancedSettings {
 impl EnhancedSettings {
     pub fn any_enabled(self) -> bool {
         self.sun_shadows || self.ambient_occlusion || self.emissive_bloom || self.ground_grass || self.hdr || self.contact_shadows
+            || self.height_haze || self.land_haze || self.valley_mist || self.volumetric_shafts
+            || self.cloud_gap_shafts || self.volumetric_clouds || self.cloud_shadows || self.sky_discs
     }
 
-    /// The world pass writes the sun mask (frame.sun) for everything that reads the direct-sun share.
+    /// Directional share and authoritative admitted-world coverage (alpha); native sky/cloud depth is not world geometry.
     pub fn needs_sun_mask(self) -> bool {
-        self.hdr || self.contact_shadows
+        self.hdr || self.contact_shadows || self.cloud_shadows || self.volumetric_shafts || self.cloud_gap_shafts
+            || self.height_haze || self.land_haze || self.valley_mist || self.volumetric_clouds || self.sky_discs
     }
 
     /// Bound external preferences, replacing non-finite floats with their defaults.
@@ -81,13 +94,17 @@ mod tests {
         assert!(!defaults.any_enabled());
         assert_eq!(defaults.bloom_strength, 0.6);
         assert_eq!(defaults.clamped(), defaults);
-        for mask in 0..64 {
+        for mask in 0..(1 << 14) {
             let settings = EnhancedSettings {
                 sun_shadows: mask & 1 != 0, ambient_occlusion: mask & 2 != 0,
                 emissive_bloom: mask & 4 != 0, ground_grass: mask & 8 != 0, hdr: mask & 16 != 0, contact_shadows: mask & 32 != 0,
+                height_haze: mask & 64 != 0, land_haze: mask & 128 != 0, valley_mist: mask & 256 != 0,
+                volumetric_shafts: mask & 512 != 0, cloud_gap_shafts: mask & 1024 != 0,
+                volumetric_clouds: mask & 2048 != 0, cloud_shadows: mask & 4096 != 0, sky_discs: mask & 8192 != 0,
                 ao_strength: 0.0, bloom_strength: 0.0, grass_density: 0.0, sun_boost: 0.0, grade_strength: 0.0, contact_strength: 0.0, ..defaults
             };
             assert_eq!(settings.any_enabled(), mask != 0);
+            assert_eq!(settings.needs_sun_mask(), mask & (16 | 32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192) != 0);
         }
         assert_eq!(EnhancedSettings { sun_boost: 9.0, ..defaults }.clamped().sun_boost, 0.6);
         assert_eq!(EnhancedSettings { contact_strength: 9.0, ..defaults }.clamped().contact_strength, 1.0);

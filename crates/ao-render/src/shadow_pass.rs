@@ -67,7 +67,7 @@ impl Renderer {
 
     pub(crate) fn encode_enhanced_shadows(&mut self, encoder: &mut wgpu::CommandEncoder, cam: &Camera, size: (u32, u32), env: Environment, far: f32) {
         self.shadow_timer_pending = false;
-        if !self.enhanced_settings.sun_shadows {
+        if !self.enhanced_settings.sun_shadows && !self.enhanced_settings.volumetric_shafts {
             self.sun_shadows = None;
             return;
         }

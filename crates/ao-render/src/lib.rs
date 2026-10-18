@@ -3,6 +3,13 @@
 mod actors;
 mod bloom;
 mod contact_shadows;
+mod atmosphere;
+mod atmosphere_stack;
+#[cfg(test)]
+mod atmosphere_stack_tests;
+mod volumetric_clouds;
+mod cloud_shadows;
+mod sky_discs;
 mod grade;
 mod grass;
 pub use grass::{GrassBender, GrassExposure};
@@ -665,6 +672,14 @@ pub struct Renderer {
     shadow_pipelines: std::sync::Arc<sun_shadows::Compiled>,
     ambient_occlusion: Option<ambient_occlusion::AmbientOcclusion>,
     contact_shadows: Option<contact_shadows::ContactShadows>,
+    atmosphere: Option<atmosphere::Atmosphere>,
+    volumetric_clouds: Option<volumetric_clouds::VolumetricClouds>,
+    sky_discs: Option<sky_discs::SkyDiscs>,
+    atmosphere_layers: Vec<volumetric_clouds::CloudDensityLayer>,
+    atmosphere_base_height: f32,
+    atmosphere_native_layers: Vec<ao_scene::cloud::CloudLayer>,
+    sky_disc_transforms: Vec<[[f32; 4]; 4]>,
+    sky_disc_sources: sky_discs::DiscSources,
     gpu_timer: Option<FrameGpuTimer>,
     cpu_timings: Option<FrameCpuTimings>,
     pub stats: FrameStats,
@@ -1134,6 +1149,14 @@ impl Renderer {
             shadow_pipelines,
             ambient_occlusion,
             contact_shadows,
+            atmosphere: None,
+            volumetric_clouds: None,
+            sky_discs: None,
+            atmosphere_layers: Vec::new(),
+            atmosphere_base_height: 0.0,
+            atmosphere_native_layers: Vec::new(),
+            sky_disc_transforms: Vec::new(),
+            sky_disc_sources: sky_discs::DiscSources::default(),
             gpu_timer: None,
             cpu_timings: None,
             grass: None,
@@ -1404,7 +1427,8 @@ impl Renderer {
         if !settings.contact_shadows {
             self.contact_shadows.as_mut().expect("startup contact pipelines").release_targets();
         }
-        if !settings.sun_shadows { self.sun_shadows = None; }
+        if !settings.sun_shadows && !settings.volumetric_shafts { self.sun_shadows = None; }
+        self.release_disabled_atmosphere(settings);
         if changed_frame {
             self.release_effect_targets();
             self.enhanced_frame = None; self.bloom = None; self.grade = None;
@@ -1414,6 +1438,7 @@ impl Renderer {
     fn release_effect_targets(&mut self) {
         self.ambient_occlusion.as_mut().expect("startup AO pipelines").release_targets();
         self.contact_shadows.as_mut().expect("startup contact pipelines").release_targets();
+        self.release_atmosphere_targets();
     }
 
     fn await_enhanced_world(&mut self) {
@@ -1450,6 +1475,7 @@ impl Renderer {
             + self.contact_shadows.as_ref().map_or(0, contact_shadows::ContactShadows::target_bytes)
             + self.bloom.as_ref().map_or(0, |bloom| bloom.bytes)
             + self.grade.as_ref().map_or(0, |grade| grade::Grade::bytes(grade.size))
+            + self.atmosphere_target_bytes()
     }
     /// Explicit offline instrumentation; disabled by default and owns no resources then.
     /// After each render, read the result before encoding another timed frame.
@@ -1490,6 +1516,10 @@ impl Renderer {
         self.water_light = scene.water_light;
         self.sun_shadows = None;
         self.sky.clouds.clear();
+        self.release_atmosphere_targets();
+        self.atmosphere_base_height = scene.ground_detail.iter()
+            .flat_map(|patch| patch.heights.iter().map(move |height| f32::from(*height) * patch.height_scale / 256.0))
+            .filter(|height| height.is_finite()).reduce(f32::min).unwrap_or(0.0);
         self.ground_state.recreate();
         let bc_supported = self.device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
         let policy = self.texture_policy;
@@ -1755,6 +1785,7 @@ impl Renderer {
     pub fn set_sky(&mut self, scene: &Scene) {
         self.water_light = scene.water_light;
         self.update_shadow_sun(scene);
+        self.sky_disc_sources = sky_discs::DiscSources::from_scene(scene);
         for (k, t) in &scene.textures {
             if t.width > 0 && t.height > 0 && t.rgba.len() == (t.width * t.height * 4) as usize && !self.sky_views.contains_key(k) {
                 let v = self.texture_view(&t.rgba, t.width, t.height, t.source);
@@ -2211,7 +2242,7 @@ impl Renderer {
             ambient_g: g4(env.ambient, grade::daylight_weight(self.sky.pose.daylight)),
             fog_g: g4(env.fog_color, 1.0),
             view: Mat4::look_to_rh(cam.pos, cam.forward(), cam.up()).to_cols_array_2d(),
-            water_dir: v4(Vec3::from_array(water_dir).normalize_or_zero().to_array(), 0.0),
+            water_dir: v4(Vec3::from_array(water_dir).normalize_or_zero().to_array(), if self.enhanced_settings.cloud_shadows { 1.0 } else { 0.0 }),
             water_g: g4(water_color, env.sun_specular),
             dyn_info: [self.dyn_light_count, self.sky.pose.directional_lights.len().min(7) as i32, 0, 0],
             sky_counter: [self.sky_dot_counter, 0.0, 0.0, 0.0],
@@ -2332,6 +2363,7 @@ impl Renderer {
                 })
                 .collect();
             self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&xf));
+            if self.enhanced_settings.sky_discs { self.sky_disc_transforms.clone_from(&xf); }
         }
         self.sorted.clear();
         for (list, draws) in [&self.gpu.opaque, &self.gpu.blended, &self.gpu.liquid].into_iter().enumerate() {
@@ -2526,6 +2558,7 @@ impl Renderer {
         if self.enhanced_settings.contact_shadows {
             self.encode_enhanced_contact_shadows(&mut enc, vp, cam.pos, Vec3::from(env.sun_dir), far);
         }
+        self.encode_atmosphere_stack(&mut enc, vp, cam.pos, far, env);
         // After AO and contact shadows: expose first so the HDR pyramid reads the lifted scene; non-HDR bloom works on the native colour.
         let bloom_strength = if self.bloom.is_some() { self.enhanced_settings.bloom_strength } else { 0.0 };
         if let (Some(grade), Some(frame)) = (&self.grade, self.enhanced_frame.as_ref()) {

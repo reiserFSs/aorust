@@ -75,6 +75,14 @@ fn enhanced_sun(i: VOut, beauty: vec4<f32>, ground: bool, sky_visibility: f32) -
     // A single frame-uniform fog colour cannot describe material-local fog.
     // Keep those receivers native rather than expose a wrongly subtracted surface.
     if mat.scroll.z > 1.5 { return vec4<f32>(0.0, 0.0, 0.0, beauty.a); }
+    // Native liquid lighting uses WaterLight, never the outdoor sun shares.
+    // Only cloud shadows opt water in; HDR and geometric sun shadows stay native.
+    if !ground && g.water_dir.w > 0.0 && (u32(mat.native.z) & 16u) != 0u && !native_unlit() && i.effect == 0u && !(mat.emissive.w > 0.5 && mat.emissive.w < 1.5) {
+        let fog = native_fog(i.fog);
+        let direct = clamp(i.light - to_g(mat.emissive.rgb) - g.ambient_g.rgb - i.dlight, vec3<f32>(0.0), vec3<f32>(1.0));
+        let share = dot(direct, vec3<f32>(0.2126, 0.7152, 0.0722));
+        return vec4<f32>(share * (1.0 - fog), 0.0, fog, beauty.a);
+    }
     if !ground && (native_unlit() || i.effect != 0u || (u32(mat.native.z) & 16u) != 0u || (mat.emissive.w > 0.5 && mat.emissive.w < 1.5)) {
         return vec4<f32>(0.0, 0.0, 0.0, beauty.a);
     }

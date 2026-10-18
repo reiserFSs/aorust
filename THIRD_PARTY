@@ -83,3 +83,17 @@ sum/(directions*steps) normalisation in crates/ao-render/src/ambient_occlusion.w
 follow rvk/shaders/ao.frag and ao_blur.frag from ao-vk
 (https://github.com/wannabuh/ao-vk, MIT License). The algorithm was re-expressed in
 WGSL for this project's depth-bilateral pipeline; no source text or assets are copied.
+
+Enhanced atmosphere: ao-vk
+==========================
+
+The optional height/land haze, valley mist, volumetric shafts, cloud-gap shafts,
+volumetric clouds, cloud shadows and sky-disc effects adapt the atmosphere
+algorithms in ao-vk (https://github.com/wannabuh/ao-vk), inspected at
+53b6881eccd80b6d5887826106644ae7e7de3a44. Sources include
+rvk/shaders/volume.frag, cloud_layer.frag, cloud_resolve.frag,
+cloud_shadow.frag, cloud_shadow_common.glsl, cloud_light.glsl and sun.frag.
+Scene inputs and visibility constraints are specific to this renderer; no
+ao-vk artwork or binary assets are redistributed.
+ao-vk is Copyright (c) 2026 wannabuh, under the MIT License. The complete copyright,
+permission and warranty notice reproduced above applies to these contributions.

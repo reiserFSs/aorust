@@ -77,6 +77,7 @@ pub(super) fn source(shadows: bool, ao: bool, bloom: bool, hdr: bool) -> String 
         let fragment_input = if receiving { "surface" } else { "i" };
         let sun = match name.as_str() {
             _ if !hdr => "vec4<f32>(0.0)",
+            name if name.starts_with("fs_sky_") => "vec4<f32>(0.0)",
             "fs_opaque" | "fs_fade_opaque" | "fs_fade_test" | "fs_test" | "fs_blend" => "enhanced_sun(i, beauty, false, 0.0)",
             "fs_ground_fused" | "fs_ground_base" | "fs_ground_simple" => "enhanced_sun(i, beauty, true, terrain_sky_open(i.wpos))",
             // ZERO/SRCCOLOR must extinguish only direct exposure under a roof;
@@ -218,20 +219,21 @@ mod tests {
     }
 
     #[test]
-    fn daylight_mask_preserves_fog_and_closes_custom_fog_and_roof_umbra_on_gpu() {
+    fn daylight_mask_preserves_fog_and_closes_custom_fog_roof_and_native_water_on_gpu() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let r = crate::Renderer::new(&instance, None).expect("daylight mask regression requires offscreen GPU");
         let helper = &super::OUTPUT[super::OUTPUT.find("var<private> enhanced_sun_visibility").unwrap()..];
         let meadow = include_str!("grass.wgsl").lines().find(|line| line.trim_start().starts_with("let daylight =")).unwrap();
         let source = format!(r#"
-struct VOut {{ effect: u32, fog: f32, sun_share: vec4<f32>, color: vec4<f32> }}
+struct VOut {{ effect: u32, fog: f32, sun_share: vec4<f32>, color: vec4<f32>, light: vec3<f32>, dlight: vec3<f32> }}
 struct Material {{ scroll: vec4<f32>, native: vec4<f32>, emissive: vec4<f32> }}
 var<private> mat: Material;
-struct Globals {{ ambient_g: vec4<f32>, sun_dir: vec4<f32> }}
+struct Globals {{ ambient_g: vec4<f32>, sun_dir: vec4<f32>, water_dir: vec4<f32> }}
 var<private> g: Globals;
 var<private> grass_direct_visibility: f32;
 const LUMA: vec3<f32> = vec3<f32>(0.299, 0.587, 0.114);
-fn native_unlit() -> bool {{ return false; }}
+fn native_unlit() -> bool {{ return (u32(mat.native.z) & 4u) != 0u; }}
+fn to_g(v: vec3<f32>) -> vec3<f32> {{ return v; }}
 fn native_fog(f: f32) -> f32 {{ return f; }}
 fn ground_fog(i: VOut) -> f32 {{ return i.fog; }}
 {helper}
@@ -239,6 +241,21 @@ fn ground_fog(i: VOut) -> f32 {{ return i.fog; }}
     return vec4<f32>(vec2<f32>(f32((n << 1u) & 2u), f32(n & 2u)) * 2.0 - 1.0, 0.0, 1.0);
 }}
 @fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {{
+    if p.x >= 7.0 {{
+        mat.native.z = select(16.0, 20.0, p.x >= 9.0 && p.x < 10.0);
+        g.water_dir.w = select(0.0, 1.0, p.x >= 8.0);
+        mat.emissive = vec4<f32>(vec3<f32>(0.125), 0.0);
+        g.ambient_g = vec4<f32>(vec3<f32>(0.125), 0.0);
+        let local = vec3<f32>(0.25);
+        var light = vec3<f32>(1.0);
+        if p.x >= 10.0 && p.x < 11.0 {{ light = vec3<f32>(0.5); }}
+        if p.x >= 12.0 && p.x < 13.0 {{ light = vec3<f32>(1.0, 0.5, 0.5); }}
+        let fog = select(0.5, 1.0, p.x >= 11.0 && p.x < 12.0);
+        mat.scroll.z = select(0.0, 2.0, p.x >= 13.0);
+        // Native water never carries the outdoor sun shares.
+        return enhanced_sun(VOut(0u, fog, vec4<f32>(0.0), vec4<f32>(1.0), light, local),
+            vec4<f32>(0.75, 0.75, 0.75, 0.25), false, 1.0);
+    }}
     if p.x >= 4.0 {{
         g.ambient_g.w = select(0.0, 1.0, p.x >= 5.0);
         g.sun_dir.y = 1.0;
@@ -251,7 +268,7 @@ fn ground_fog(i: VOut) -> f32 {{ return i.fog; }}
     enhanced_sun_visibility = select(1.0, 0.0, p.x >= 2.0);
     let fog = select(0.5, 0.0, p.x >= 2.0);
     let alpha = select(1.0, 0.0, p.x >= 3.0);
-    return enhanced_sun(VOut(0u, fog, vec4<f32>(1.0), vec4<f32>(1.0, 1.0, 1.0, alpha)), vec4<f32>(1.0), p.x >= 2.0, 1.0 - alpha);
+    return enhanced_sun(VOut(0u, fog, vec4<f32>(1.0), vec4<f32>(1.0, 1.0, 1.0, alpha), vec3<f32>(1.0), vec3<f32>(0.0)), vec4<f32>(1.0), p.x >= 2.0, 1.0 - alpha);
 }}
 "#);
         let shader = r.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -266,7 +283,7 @@ fn ground_fog(i: VOut) -> f32 {{ return i.fog; }}
             primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
         });
         let texture = r.device.create_texture(&wgpu::TextureDescriptor {
-            label: None, size: wgpu::Extent3d { width: 7, height: 1, depth_or_array_layers: 1 },
+            label: None, size: wgpu::Extent3d { width: 14, height: 1, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: r.format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
         });
@@ -283,14 +300,21 @@ fn ground_fog(i: VOut) -> f32 {{ return i.fog; }}
             pass.draw(0..3, 0..1);
         }
         r.queue.submit([encoder.finish()]);
-        let pixels = crate::texture_to_rgba(&r, &texture, 7, 1).unwrap();
+        let pixels = crate::texture_to_rgba(&r, &texture, 14, 1).unwrap();
         assert_eq!(&pixels[..4], &[128, 0, 128, 255], "default-fog meshes retain native fog amount");
         assert_eq!(&pixels[4..8], &[0, 0, 0, 255], "custom-fog receivers cannot gain daylight energy");
         assert_eq!(&pixels[8..12], &[0, 0, 0, 255], "roof umbra has neither direct exposure nor sky fill");
         assert_eq!(&pixels[12..16], &[0, 255, 0, 255], "open shade receives only independently proven sky fill");
         assert_eq!(&pixels[16..20], &[0, 0, 0, 255], "bright moonlight cannot lift meadow albedo at authored night");
         assert_eq!(&pixels[20..24], &[0, 0, 0, 255], "the retained shadow floor cannot lift roofed meadow albedo");
-        assert_eq!(&pixels[24..], &[255; 4], "actual direct daylight retains the meadow lift");
+        assert_eq!(&pixels[24..28], &[255; 4], "actual direct daylight retains the meadow lift");
+        assert_eq!(&pixels[28..32], &[0, 0, 0, 64], "cloud switch zero leaves native water excluded even with HDR");
+        assert_eq!(&pixels[32..36], &[64, 0, 128, 64], "cloud-only water receives fog-attenuated WaterLight, no sky share, and native coverage");
+        assert_eq!(&pixels[36..40], &[0, 0, 0, 64], "unlit water remains excluded");
+        assert_eq!(&pixels[40..44], &[0, 0, 128, 64], "emission, ambient and local lights cannot become water directional light");
+        assert_eq!(&pixels[44..48], &[0, 0, 255, 64], "full native fog extinguishes water directional light without losing fog");
+        assert_eq!(&pixels[48..52], &[14, 0, 128, 64], "water directional share uses luminance, not the brightest channel");
+        assert_eq!(&pixels[52..56], &[0, 0, 0, 64], "custom-fog water remains excluded");
     }
 
     #[test]

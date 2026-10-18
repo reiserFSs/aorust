@@ -939,17 +939,23 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
     let tmp = crate::play::prefs::test_dir().join("aomac-enhanced-effects-persist");
     let _ = std::fs::remove_dir_all(&tmp);
     let mut d = DValues::new(&tmp);
-    let names = ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows"];
+    let names = ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows",
+        "AomacHeightHaze", "AomacLandHaze", "AomacValleyMist", "AomacVolumetricShafts",
+        "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs"];
     assert_eq!(d.enhanced_settings(), EnhancedSettings::default());
     d.open_user(&tmp, "account", 7);
-    for mask in 0..64 {
+    // Retain the original combinations, then cover each atmosphere switch and all-on.
+    for mask in (0..64).chain((6..names.len()).map(|bit| 1 << bit)).chain(std::iter::once((1 << names.len()) - 1)) {
         for (bit, name) in names.iter().enumerate() {
             assert!(d.persists(name));
             d.set(name, Variant::Bool(mask & (1 << bit) != 0));
         }
         let expected = EnhancedSettings {
             sun_shadows: mask & 1 != 0, ambient_occlusion: mask & 2 != 0,
-            emissive_bloom: mask & 4 != 0, ground_grass: mask & 8 != 0, hdr: mask & 16 != 0, contact_shadows: mask & 32 != 0, ..Default::default()
+            emissive_bloom: mask & 4 != 0, ground_grass: mask & 8 != 0, hdr: mask & 16 != 0, contact_shadows: mask & 32 != 0,
+            height_haze: mask & 64 != 0, land_haze: mask & 128 != 0, valley_mist: mask & 256 != 0,
+            volumetric_shafts: mask & 512 != 0, cloud_gap_shafts: mask & 1024 != 0,
+            volumetric_clouds: mask & 2048 != 0, cloud_shadows: mask & 4096 != 0, sky_discs: mask & 8192 != 0, ..Default::default()
         };
         assert_eq!(d.enhanced_settings(), expected);
         d.save_user();
@@ -983,7 +989,9 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
 #[test]
 fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
     let Some(mut r) = Rig::new() else { return };
-    for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows"] {
+    for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows",
+        "AomacHeightHaze", "AomacLandHaze", "AomacValleyMist", "AomacVolumetricShafts",
+        "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs"] {
         let view = r.show(name);
         assert!(!r.gui.checked(r.win(), &view));
         r.click(&view);
@@ -1012,7 +1020,9 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
     for option in super::super::enhanced::pages().iter().flat_map(Page::opts) {
         assert_eq!(option.value(&r.d), option.value(&defaults), "{} was not restored", option.var);
     }
-    for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows"] {
+    for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows",
+        "AomacHeightHaze", "AomacLandHaze", "AomacValleyMist", "AomacVolumetricShafts",
+        "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs"] {
         let view = r.show(name);
         assert!(!r.gui.checked(r.win(), &view));
     }

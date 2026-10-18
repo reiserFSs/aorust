@@ -1244,6 +1244,7 @@ impl Offscreen {
     pub fn frame_cpu_timings(&self) -> Option<crate::FrameCpuTimings> { self.r.frame_cpu_timings() }
     pub fn read_frame_gpu_ms(&mut self) -> Result<Option<f64>> { self.r.read_frame_gpu_ms() }
     pub fn enhanced_target_bytes(&self) -> u64 { self.r.enhanced_target_bytes() }
+    pub fn msaa_samples(&self) -> u32 { self.r.msaa_samples() }
     pub fn enhanced_settings(&self) -> crate::EnhancedSettings { self.r.enhanced_settings() }
     pub fn world_pipeline_compiles(&self) -> u64 { self.r.world_pipeline_compiles() }
     pub fn world_frame_thread_compiles(&self) -> u64 { self.r.world_frame_thread_compiles() }

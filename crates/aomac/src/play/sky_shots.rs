@@ -398,7 +398,10 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         let resource = command("shasum", &["-a".as_ref(), "256".as_ref(), dir.join("cd_image/rdb.db").as_os_str()])?;
         let weather = ao_formats::weather::State::clear();
         let size = (1920, 1200);
-        let mut manifest = format!("fixture_version=1\nrevision={}\nprofile={profile}\nsize={}x{}\npixel_format=RGBA8\nrow_order=top_to_bottom\nrenderer_time=0\neffect_time=0\ngame_day=0\ncrt_seed=1\ncloud_seed=1\nweather={weather:?}\nmsaa=1\nanisotropy=1\nwide=0\nscenery=1\nvisual_acceptance=unexercised\n",
+        let samples: u32 = std::env::var("AOMAC_GFX_MSAA").unwrap_or_else(|_| "1".into()).parse()
+            .context("AOMAC_GFX_MSAA must be 1, 2, 4 or 8")?;
+        ensure!(matches!(samples, 1 | 2 | 4 | 8), "AOMAC_GFX_MSAA must be 1, 2, 4 or 8");
+        let mut manifest = format!("fixture_version=1\nrevision={}\nprofile={profile}\nsize={}x{}\npixel_format=RGBA8\nrow_order=top_to_bottom\nrenderer_time=0\neffect_time=0\ngame_day=0\ncrt_seed=1\ncloud_seed=1\nweather={weather:?}\nmsaa={samples}\nanisotropy=1\nwide=0\nscenery=1\nvisual_acceptance=unexercised\n",
             revision, size.0, size.1);
         writeln!(manifest, "source_diff={source_diff:?}\nresource_sha256={resource}")?;
         writeln!(manifest, "icc_clock=authored_frozen2648.69\nsun_low_high_night_source=Borealis800")?;
@@ -460,13 +463,14 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 let mut shot = Shot { gui: Gui::new(&dir, None)?, scene: Some(scene.clone()), camera: fixed, lens };
                 let mut off = Offscreen::evidence(&shot, size)?;
                 off.fixed_camera(Some(fixed));
-                off.host.msaa_samples = Some(1);
+                off.host.msaa_samples = Some(samples);
                 off.host.anisotropy = Some(1);
                 off.host.fog_density_scale = Some(1.0);
                 off.host.enhanced_settings = Some(settings);
                 off.host.grass_exposure = grass_exposure.clone();
                 off.host.grass_wind = weather.wind;
                 let mut list = off.frame(&mut shot, 0.0);
+                ensure!(off.msaa_samples() == samples, "requested {samples}x MSAA, adapter selected {}x", off.msaa_samples());
                 let lightbar = matches!(name.as_str(), "borealis-lightbar-night" | "borealis-lightbar-night-close");
                 if name.starts_with("icc-actor-") || lightbar {
                     let mut appearance = actor.clone();
@@ -795,6 +799,24 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
         "hdr-max" => { settings.hdr = true; settings.sun_boost = 0.6; }
         "hdr-neutral" => { settings.hdr = true; settings.sun_boost = 0.0; settings.grade_strength = 0.0; }
         "contact" => settings.contact_shadows = true,
+        "height_haze" => settings.height_haze = true,
+        "land_haze" => settings.land_haze = true,
+        "valley_mist" => settings.valley_mist = true,
+        "volumetric_shafts" => settings.volumetric_shafts = true,
+        "cloud_gap_shafts" => settings.cloud_gap_shafts = true,
+        "volumetric_clouds" => settings.volumetric_clouds = true,
+        "cloud_shadows" => settings.cloud_shadows = true,
+        "sky_discs" => settings.sky_discs = true,
+        "atmosphere" => {
+            settings.height_haze = true;
+            settings.land_haze = true;
+            settings.valley_mist = true;
+            settings.volumetric_shafts = true;
+            settings.cloud_gap_shafts = true;
+            settings.volumetric_clouds = true;
+            settings.cloud_shadows = true;
+            settings.sky_discs = true;
+        }
         // Isolates the contact pass: shadows + hdr + contact vs `shadows-hdr`.
         "shadows-hdr" => { settings.sun_shadows = true; settings.hdr = true; }
         "shadows-hdr-contact" => { settings.sun_shadows = true; settings.hdr = true; settings.contact_shadows = true; }
@@ -805,6 +827,14 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             settings.ground_grass = true;
             settings.hdr = true;
             settings.contact_shadows = true;
+            settings.height_haze = true;
+            settings.land_haze = true;
+            settings.valley_mist = true;
+            settings.volumetric_shafts = true;
+            settings.cloud_gap_shafts = true;
+            settings.volumetric_clouds = true;
+            settings.cloud_shadows = true;
+            settings.sky_discs = true;
         }
         // 9f78245 all-on defaults, independent of subsequent tuning.
         "all-before" => settings = ao_render::EnhancedSettings {
@@ -813,8 +843,9 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             shadow_map_size: 2048, shadow_strength: 0.65, shadow_softness: 1.5,
             ao_radius: 1.75, ao_strength: 1.5, bloom_strength: 0.6,
             grass_density: 1.0, grass_distance: 50.0, sun_boost: 0.5, grade_strength: 0.8, contact_strength: 0.4,
+            ..Default::default()
         },
-        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|all|all-no-bloom|all-before"),
+        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before"),
     }
     Ok(settings)
 }
@@ -824,6 +855,27 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
     assert!(!graphics_fixture_settings("faithful").unwrap().any_enabled());
     let neutral = graphics_fixture_settings("neutral").unwrap();
     assert!(neutral.any_enabled() && neutral.grass_density == 0.0);
+    let atmosphere_flags = |s: ao_render::EnhancedSettings| [
+        s.height_haze, s.land_haze, s.valley_mist, s.volumetric_shafts,
+        s.cloud_gap_shafts, s.volumetric_clouds, s.cloud_shadows, s.sky_discs,
+    ];
+    for (bit, name) in [
+        "height_haze", "land_haze", "valley_mist", "volumetric_shafts",
+        "cloud_gap_shafts", "volumetric_clouds", "cloud_shadows", "sky_discs",
+    ].iter().enumerate() {
+        let s = graphics_fixture_settings(name).unwrap();
+        let mut expected = [false; 8];
+        expected[bit] = true;
+        assert_eq!(atmosphere_flags(s), expected);
+        assert!(s.any_enabled());
+        assert!(!s.sun_shadows && !s.ambient_occlusion && !s.emissive_bloom && !s.ground_grass && !s.hdr && !s.contact_shadows);
+    }
+    for name in ["atmosphere", "all", "all-no-bloom"] {
+        assert_eq!(atmosphere_flags(graphics_fixture_settings(name).unwrap()), [true; 8]);
+    }
+    for name in ["faithful", "all-before"] {
+        assert_eq!(atmosphere_flags(graphics_fixture_settings(name).unwrap()), [false; 8]);
+    }
     for (name, expected) in [
         ("neutral", [false, false, false, true]), ("shadows", [true, false, false, false]),
         ("shadows-hard", [true, false, false, false]),

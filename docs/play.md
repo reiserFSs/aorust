@@ -642,14 +642,67 @@ RGB/Rec.709 seed energy rather than asserting those author-fullbright assets dar
 
 `AOMAC_GFX_SETTINGS` accepts `faithful` (default, all switches off), `neutral`
 (Enhanced boundary with zero-density grass), `shadows`, `ao`, `bloom`, `grass`,
-or `all`. `all-no-bloom` differs from `all` only by disabling bloom, for highlight
-washout comparisons without changing shade, AO, grass or exposure. Each effect
-profile uses its explicit default knobs; the manifest records
+or `all`. Atmosphere-only profiles are `height_haze`, `land_haze`, `valley_mist`,
+`volumetric_shafts`, `cloud_gap_shafts`, `volumetric_clouds`, `cloud_shadows`,
+`sky_discs`, and `atmosphere` (all eight). `all` includes atmosphere;
+`all-before` retains only the historical effects. `all-no-bloom` differs from
+`all` only by disabling bloom. Each effect profile uses its explicit default
+knobs; the manifest records
 the full settings value. Selecting a profile does not change the captured world,
 camera, clock, actor equipment or lights.
 
+Atmosphere controls are independent checkboxes under **F10 → Enhanced → Sky & Weather**
+and default off. They persist in the normal account-independent root `Prefs.xml`.
+The registry's page reset restores that page; its global reset restores all Enhanced controls.
+
+| Control | Preference | Fixture profile |
+| --- | --- | --- |
+| Height Haze | `AomacHeightHaze` | `height_haze` |
+| Land Haze | `AomacLandHaze` | `land_haze` |
+| Valley Mist | `AomacValleyMist` | `valley_mist` |
+| Volumetric Shafts | `AomacVolumetricShafts` | `volumetric_shafts` |
+| Cloud-gap Shafts | `AomacCloudGapShafts` | `cloud_gap_shafts` |
+| Volumetric Clouds | `AomacVolumetricClouds` | `volumetric_clouds` |
+| Cloud Shadows | `AomacCloudShadows` | `cloud_shadows` |
+| Sky Discs | `AomacSkyDiscs` | `sky_discs` |
+
+These opt-in effects must preserve native fog extinction and must not reveal
+hidden or non-admitted actors. Enhanced nights may use adjustable moonlight and
+admitted local lights; the all-off path remains native. Cloud altitude,
+wind, storm state, thickness and light direction come from the native scene,
+not UTC. With all Enhanced switches off, the faithful rendering path is unchanged.
+
+Height haze analytically integrates an exponential vertical profile; distant
+land haze approaches the authored horizon colour before the native far clip
+(including admitted city ships). Valley mist includes native outdoor fog volumes
+and burns off using the actual sun elevation, not the chosen moon. Dungeon
+rooms keep their native fog; outdoor atmospheric profiles do not leak indoors.
+Shafts march current-frame admitted cascades at half resolution; cloud-gap
+shafts sample the shared 256² native-weather cloud transmittance field. Added
+scattering retains the original fog extinction as its minimum.
+Clouds use Perlin-Worley density, native wind and authored light/ambient colours,
+half-resolution four-phase temporal checker rendering and sky-only history.
+The existing world-mask alpha distinguishes admitted world geometry from
+native depth-writing cloud sheets: atmospheric postpasses never treat cloud
+depth as terrain, clear native depth, or admit cloud-occluded actors.
+Cloud shadows remove only the fog-attenuated directional share, including
+native WaterLight on water when that switch is enabled; they never darken
+unlit emission as if it were sunlight. Disc refinement uses the original
+sun/moon mesh identities, textures, current transforms and alpha, with
+cloud-attenuated soft cores, spikes and rays rather than an Earth-sky replacement.
+
+For paired evidence, capture `faithful` and one atmosphere profile with the same
+`AOMAC_GFX_VIEW`, separate new output directories and otherwise identical inputs;
+use the existing ICC, Borealis and Newland views, including dusk/night and the
+Subway interior control. This selects the real fixture scene without altering its
+camera or authored clock. No atmosphere visual acceptance is claimed here.
+
+
 `AOMAC_GFX_VIEW=<exact-name>` filters before scene loading and rendering; this
 existing filter renders only that view (including its two independent repeats).
+`AOMAC_GFX_MSAA=1|2|4|8` selects the requested sample count (default 1);
+the fixture rejects adapter clamping rather than mislabel a 4× benchmark.
+Atmosphere budget captures use `AOMAC_GFX_MSAA=4` at 1920×1200.
 Within one process, views share immutable scene/collision snapshots keyed by exact
 playfield and time bits, with the fixture's fixed clear weather/day. The current
 17-view matrix loads nine snapshots instead of seventeen; renderers, uploads and
