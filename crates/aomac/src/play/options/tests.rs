@@ -1001,6 +1001,48 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
 }
 
 #[test]
+fn enhanced_post_controls_persist_and_restore_independently() {
+    let tmp = crate::play::prefs::test_dir().join("aomac-post-grade-persist");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let mut d = DValues::new(&tmp);
+    d.open_user(&tmp, "account", 7);
+    assert_eq!(d.main_prefs_dir(), Some(tmp.as_path()));
+    let controls = crate::play::enhanced::controls();
+    for name in ["AomacGradingEnabled", "AomacZoneLut", "AomacTaa", "AomacFxaa", "AomacCas", "AomacDepthOfField"] {
+        assert!(d.persists(name));
+        assert_eq!(controls.iter().find(|control| control.name == name).unwrap().page, crate::play::enhanced::PageId::Camera);
+        d.set(name, Variant::Bool(true));
+    }
+    for (name, value) in [
+        ("AomacVignette", 0.6), ("AomacContrast", 1.6), ("AomacSaturation", 1.4), ("AomacWarmth", 0.8), ("AomacNightCool", 0.7),
+        ("AomacCasStrength", 0.3), ("AomacMotionBlur", 0.4), ("AomacDofAperture", 3.0), ("AomacDofMaxRadius", 12.0),
+    ] {
+        assert!(d.persists(name));
+        assert_eq!(controls.iter().find(|control| control.name == name).unwrap().page, crate::play::enhanced::PageId::Camera);
+        d.set(name, Variant::Float(value));
+    }
+    let settings = d.enhanced_settings();
+    assert!(!settings.hdr && settings.needs_grade() && settings.post_enabled());
+    assert_eq!((settings.vignette, settings.contrast, settings.saturation, settings.warmth, settings.night_cool), (0.6, 1.6, 1.4, 0.8, 0.7));
+    d.save_user();
+    let mut again = DValues::new(&tmp);
+    again.open_user(&tmp, "other-account", 99);
+    assert_eq!(again.enhanced_settings(), settings);
+    again.restore_original_graphics();
+    let restored = again.enhanced_settings();
+    assert!(!restored.any_enabled());
+    assert_eq!((restored.contrast, restored.saturation, restored.warmth, restored.night_cool), (1.0, 1.0, 0.5, 0.0));
+    assert_eq!((restored.vignette, restored.motion_blur), (0.0, 0.0));
+    assert_eq!((restored.cas_strength, restored.dof_aperture, restored.dof_max_radius), (0.5, 2.0, 8.0));
+    assert_eq!(restored, ao_render::EnhancedSettings::default());
+    again.save_user();
+    let mut reloaded = DValues::new(&tmp);
+    reloaded.open_user(&tmp, "account", 7);
+    assert_eq!(reloaded.enhanced_settings(), restored);
+    std::fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
 fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
     let Some(mut r) = Rig::new() else { return };
     for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows",

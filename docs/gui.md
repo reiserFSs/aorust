@@ -1599,6 +1599,45 @@ the 8-bit write (fixed-pattern noise, +-0.35 level). Zero exposure boost and zer
 retain native codes. Grass carries the same baked fine-cell terrain sky proof in spare normal.w,
 so near blades and the far substrate receive matching fill. Floor-only grass occupancy is not
 sky proof: roofed or unbaked cells stay closed, and the same authored-night and fog gates apply.
+
+Independent Enhanced post controls (all off by default) are registered once in
+`play/enhanced.rs` on **Enhanced / Camera & Post**, driving layout, persistence and
+page/global reset. They reuse `grade.rs` / `grade.wgsl` without enabling HDR sunlight.
+Contrast (0–2, neutral 1), saturation (0–2, neutral 1),
+warmth (0–1, neutral 0.5), and cooler-night tint (`AomacNightCool`, 0–1, default 0)
+are independent knobs, active whenever non-neutral without any master switch.
+`AomacGradingEnabled` enables only the legacy warm-sun/cool-shade chroma grade.
+Saturation/warmth/tint preserve luminance;
+user contrast and LUTs may alter day/night brightness under the Enhanced artistic policy.
+Black remains black. The independent `AomacVignette` slider (0–1, default 0) only darkens
+screen-edge surface radiance. New grading/LUT/vignette operations recover the surface
+term `(colour - F * fogColour) / (1 - F)` using the receiver's native fog amount F,
+then recompose with precisely the same transmission `(1 - F)` and fog radiance.
+Delta composition retains native quantization residuals; neutral controls preserve
+input codes exactly. Fully fogged pixels remain untouched, while partially fogged
+surfaces still respond to controls rather than disabling grading throughout outdoors.
+Fog extinction and sight range never change. These operations read only resolved
+visible colour and the current receiver mask, never actor lists or history.
+
+`AomacZoneLut` enables user-authored 3D `.cube` files in the root directory holding
+the account-independent `Prefs.xml`: `randy-vk-day.cube` and `randy-vk-night.cube`.
+Optional `luts/<tilemap>-day.cube` / `luts/<tilemap>-night.cube` override each phase
+for the current RDB playfield tilemap (not its server instance). The actual handoff is
+`flow.rs`'s `effect_playfield`, through both viewers' `Host::apply_actors` to
+`Renderer::set_grade_lut_source`. Day/night samples are blended by the native exact
+`Scene.daylight` / `GAME.CurrentDayIntensity` weight, not a binary clock threshold.
+Missing files use identity; malformed files are reported and use identity, without
+retaining the prior zone's LUT. Files reload on zone/root/enable changes (toggle off/on
+after editing). The bounded parser accepts 2–65 samples per axis, finite increasing
+domains, exactly N³ RGB samples in red-fastest order, and at most 16 MiB per file.
+RGB outputs must be in [0,1]; unsupported 1D LUTs and malformed/trailing rows are errors.
+GPU trilinear sampling uses eight bounded storage-buffer reads per LUT, with no
+per-frame LUT allocation/upload. Camera & Post's Restore Original resets that page's
+switches and quality knobs to registry defaults; Restore All resets every Enhanced page.
+Independent contrast/saturation/warmth/night-tint/vignette/motion-blur reset to neutral.
+Parser, GPU identity/day-night/fog/independence and
+preference roundtrip regressions live in `cube_lut.rs`, `grade.rs`, and options tests.
+
 Grass's meadow-albedo lift also requires raw visible sun and the same native daylight
 weight carried in previously-unused `Globals.ambient_g.w`; retained shade illumination is not direct light.
 Contact Shadows (port of ao-vk `contact.frag`) march 12 jittered steps (0.6 m, fixed-pattern interleaved gradient noise) from each
@@ -1609,6 +1648,7 @@ It reads only the red channel of the same sun mask as HDR (the fourth world-pass
 is on) but works with or without HDR. Weak moonlight and dusk are no longer discarded by a daylight threshold:
 they can receive proportional darkening. Sky, unlit and glow pixels remain excluded; fog attenuates the mask.
 No actor list or history is read, so hidden actors cannot change a pixel.
+
 The AO receiver uses a 1.25 sky-fill occlusion multiplier (formerly 2, which muddied broad shade)
 and a bounded 60% direct-diffuse occlusion budget (formerly 25%) so sunlit creases remain visible.
 Specular, emission, sky and fog remain excluded.
