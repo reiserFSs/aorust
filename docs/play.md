@@ -903,8 +903,10 @@ crown toward the grounded endpoint plus 0.8 m, keeping the exact same eye and th
 path computed from the original camera. Faithful and effect captures use this
 same framing and path; pair baselines with the same interaction flag. Newland,
 all no-interaction views, the clock and the native scene remain unchanged.
-Each step supplies the matching own-avatar bender; the final pose and interaction state are frozen for
-capture/timing. The manifest records the mode, step count, delta and per-view
+Each step supplies the matching own-avatar bender and calls `render_frozen`:
+frontend/upload steps alone do not advance renderer-owned trail history.
+The final pose and interaction state are frozen for capture/timing.
+The manifest records the mode, step count, delta and per-view
 terrain-grounded scene-space endpoints. Missing endpoint terrain fails only this
 opt-in mode. Omit it to preserve the original fixture placement and captures;
 pair baselines with the same mode. The separate night-fog positive control

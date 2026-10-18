@@ -538,6 +538,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                         off.host.grass_benders.clear();
                         off.host.grass_benders.push(ao_render::GrassBender { actor: None, position: position.to_array() });
                         list = off.frame(&mut shot, 0.0);
+                        off.render_frozen()?;
                     }
                 } else if authored_actor || settings.depth_of_field || own_avatar {
                     let mut appearance = actor.clone();
