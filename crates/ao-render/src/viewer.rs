@@ -1252,6 +1252,12 @@ impl Offscreen {
         crate::texture_to_rgba(&self.r, &perf._texture, self.size.0, self.size.1)
     }
 
+    /// Timing-only simulation step; leaves the authored scene clock, frontend and actor poses frozen.
+    pub fn advance_effect_time(&mut self, dt: f32) {
+        self.r.time += dt;
+        self.r.advance_grass_wind(dt);
+    }
+
     pub fn set_gpu_timing(&mut self, enabled: bool) -> Result<()> { self.r.set_gpu_timing(enabled) }
     pub fn set_cpu_timing(&mut self, enabled: bool) { self.r.set_cpu_timing(enabled); }
     pub fn frame_cpu_timings(&self) -> Option<crate::FrameCpuTimings> { self.r.frame_cpu_timings() }

@@ -20,11 +20,15 @@ fn gap_transmittance(p: vec3<f32>) -> f32 {
 }
 fn cloud_occlusion(p: vec3<f32>) -> vec2<f32> {
     if a.counts.z == 0u || a.counts.y == 0u { return vec2<f32>(0.0); }
+    let reach = min(length(p), a.eye.w);
+    let active_reach = min(reach, a.fog.w);
+    let direction = p / max(length(p), 0.00001);
+    let fog_range = max(a.fog.w - a.profile.y, 0.001);
     var lighting = vec2<f32>(0.0);
     for (var i = 0u; i < 24u; i++) {
-        let q = p * ((f32(i) + 0.5) / 24.0);
-        let lit = gap_transmittance(q);
-        lighting += vec2<f32>(1.0 - lit, lit) * native_remaining(q);
+        let distance = active_reach * (f32(i) + 0.5) / 24.0;
+        let lit = gap_transmittance(direction * distance);
+        lighting += vec2<f32>(1.0 - lit, lit) * clamp((a.fog.w - distance) / fog_range, 0.0, 1.0);
     }
-    return lighting / 24.0;
+    return lighting * (active_reach / max(reach, 0.00001) / 24.0);
 }

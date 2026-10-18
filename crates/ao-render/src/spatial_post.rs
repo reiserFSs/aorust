@@ -253,7 +253,7 @@ mod tests {
         let depth = texture(crate::DEPTH, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT).create_view_tracked(&Default::default());
         let output = texture(renderer.format, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
         let output_view = output.create_view_tracked(&Default::default());
-        let boundary = crate::enhanced::EnhancedFrame::new(&renderer.device, renderer.format, size, 1, crate::EnhancedSettings::default(), &renderer.enhanced_pipelines);
+        let boundary = crate::enhanced::EnhancedFrame::new(&renderer.device, renderer.format, size, 1, crate::EnhancedSettings::default(), false, &renderer.enhanced_pipelines);
         let mut post = post;
         let projection = Projection { near: 0.1, far: 100.0, fog_color: [0.3;3], focus_depth: Some(4.0) };
         let motion = texture(wgpu::TextureFormat::Rgba32Float, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);

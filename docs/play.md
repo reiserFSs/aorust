@@ -676,6 +676,14 @@ Moonlit without maps reuses a 1×1 SunShadows receiver for the exposure binding;
 Moon Shadows or Volumetric Shafts can independently request native cascades.
 Surface Moon-shadow sampling remains controlled by Moon Shadows. All-off uses
 the native shader unchanged apart from the shared Globals tail declarations.
+Atmosphere prefers contributing native sunlight. At night it consumes this shared
+Moon API only: exact mapped source metadata for mapped rays, with the general
+source available independently to cloud-gap rays and native cloud lighting.
+The original native sun elevation still controls mist burn-off. A dedicated
+atmospheric Moon-source flag admits the shared radiance in front of covered world
+geometry without writing Moon energy into the Sun-only HDR/contact mask.
+The `moon-volumetric-shafts` and `moon-cloud-gap-shafts` fixture profiles select
+Moonlit plus just that shaft switch, leaving surface Moon Shadows disabled.
 
 Focused headless regressions: `cargo test --release -p ao-render moon -j2 --
 --nocapture --test-threads=1` exercises authored phase/daylight, native lattice
@@ -691,6 +699,16 @@ maximum channel error against the PNG-only original `base-icc` fixture.
 Atmosphere controls are independent checkboxes under **F10 → Enhanced → Sky & Weather**
 and default off. They persist in the normal account-independent root `Prefs.xml`.
 The registry's page reset restores that page; its global reset restores all Enhanced controls.
+
+Atmosphere, volumetric-cloud and sky-disc pipelines are compiled during renderer
+startup and included in `wait_for_pipeline_warmup()` / `pipeline_warmup_complete()`.
+Feature toggles retain those pipelines and release only their frame resources;
+frame encoding neither creates passes nor explicitly waits for compilation.
+`enhanced_target_bytes()` reports zero with all effects off, excluding cached
+static buffers when no atmosphere targets, cloud field or disc vertices exist.
+Only volumetric clouds allocate the two half-resolution RGBA16 histories:
+turning them off releases 9,216,000 history bytes at 1920×1200, even while
+cloud-gap shafts or cloud shadows retain their shared 256² field.
 
 | Control | Preference | Fixture profile |
 | --- | --- | --- |
@@ -717,14 +735,40 @@ rooms keep their native fog; outdoor atmospheric profiles do not leak indoors.
 Shafts march current-frame admitted cascades at half resolution; cloud-gap
 shafts sample the shared 256² native-weather cloud transmittance field. Added
 scattering retains the original fog extinction as its minimum.
-Clouds use Perlin-Worley density, native wind and authored light/ambient colours,
-half-resolution four-phase temporal checker rendering and sky-only history.
+Atmospheric light/horizon radiance and celestial vertex tints are encoded exactly
+once for the native gamma-UNORM colour attachment, matching native sheet colours.
+Clouds use procedural value-noise density, native wind and authored gamma
+light/ambient colours, half-resolution four-phase temporal checker rendering
+and sky-only history. Native cloud sheets remain unfogged; their volume
+refinement does not import world-fog colour or gamma-decode into the native target.
+The view march uses 16 midpoint steps with four light-ray steps and skips empty
+density; transmittance exits stop fully extinguished work. Mapped shafts use
+24 midpoint strata and omit only the ray tail with zero native-fog weight.
+Shaft-only and cloud-gap-only profiles use one premultiplied-alpha composite,
+sharing bilateral reconstruction for extinction and scatter. Coloured haze
+combinations retain the separate multiplicative and additive composites;
+the fused shaft path differs by at most one code from their intermediate UNORM rounding.
+Volume bounds follow the native radial sheet bend (`cloud.rs`, DisplaySystem
+`10054e07`): altitude scales by camera far/1000 and drops by
+`1.5 * altitude * min((radius / (1500 * far/1000))², 1)`.
+The finite opt-in relief fades at its outer footprint rather than creating
+an infinite flat cloud shelf; native sheets and their depth remain untouched.
+The volume composites into the native sky beauty attachment before all world
+geometry and transparent/additive effects, using the actual MSAA sample count.
+It neither overwrites foreground effects nor needs a world-coverage MRT by itself.
+Only cloud-shadow modulation stays after the world pass.
 The existing world-mask alpha distinguishes admitted world geometry from
-native depth-writing cloud sheets: atmospheric postpasses never treat cloud
+native depth-writing cloud sheets: post-world atmospheric passes never treat cloud
 depth as terrain, clear native depth, or admit cloud-occluded actors.
 Cloud shadows remove only the fog-attenuated directional share, including
-native WaterLight on water when that switch is enabled; they never darken
-unlit emission as if it were sunlight. Disc refinement uses the original
+native WaterLight on water when that switch is enabled. A separate R16Float
+water budget preserves the native alpha-blended HDR/contact sun mask; it exists
+only while cloud shadows are enabled and the admitted draw queue contains water.
+Added foliage leaves write zero into this water budget whenever its attachment is active.
+Water visibility changes only that scalar attachment and cached pipeline shape:
+primary targets, temporal/cloud histories, grass bends and canopy leaves remain
+intact, and an in-flight settings request survives the shape swap.
+They never darken unlit emission as if it were sunlight. Disc refinement uses the original
 sun/moon mesh identities, textures, current transforms and alpha, with
 cloud-attenuated soft cores, spikes and rays rather than an Earth-sky replacement.
 
@@ -745,7 +789,10 @@ With DoF enabled, each view contains an actual captured own-character Avatar.
 Existing actor/light-bar views retain their authored placement; other views place
 that Avatar twelve world units along the fixed camera's forward ray. Focus is
 always taken from the submitted actor frame's actual scene transform, recorded
-in `<view>-focus.txt`; eight frozen post frames warm history before capture.
+in `<view>-focus.txt`. When postprocessing is enabled, eight frozen post frames
+warm history before capture only for selected `AOMAC_GFX_FEATURE` features or
+explicit post mode (`AOMAC_GFX_TIMING_PAN` or `AOMAC_GFX_OWN_AVATAR` set).
+Standard faithful/atmosphere PNGs retain their original time-zero capture path.
 This deterministic placement is separate from play: the real frontend publishes the actual own
 character's current scene position, even when first-person hides its body, and
 clears focus when there is no own player. No `always` actor is treated as the player.
@@ -1953,12 +2000,25 @@ gradients against the bilinear lattice rather than a tuned image threshold.
 The runtime now honors the existing 4096 setting instead of silently capping
 it to 2048; default map size remains 2048.
 
-Set `AOMAC_GFX_FRAME_TIMING=1` on `graphics_offline_fixture` to retain the
-selected profile and measure frozen whole-frame GPU time after capture, excluding
-screenshot readback. It warms 120 frames, records 600 samples, and writes
-`<view>-frame-gpu.txt` with the profile and nearest-rank p50/p95/p99 in
-milliseconds. Acquire the shared GPU timing lock before timing; do not run
-concurrent captures or GPU tests.
+Set `AOMAC_GFX_FRAME_TIMING=1` on `graphics_offline_fixture` to measure the selected
+profile's whole-frame GPU time after its time-zero PNG capture, excluding screenshot
+readback. By default all profiles, including faithful, advance renderer effects
+by exactly 1/60 s per timing frame while retaining the authored scene clock and
+actor poses. Setting `AOMAC_GFX_TIMING_PAN` or `AOMAC_GFX_OWN_AVATAR` (including
+`AOMAC_GFX_OWN_AVATAR=0`) freezes effect time in every profile, including faithful
+controls, so post feature-on/off matrices have matched frozen inputs.
+The manifest and timing reports record the chosen effect-time mode and delta.
+After 120 warmup frames it records 600 samples in `<view>-frame-gpu.txt`.
+The manifest records native cloud-layer winds; stationary zero-wind fixtures can
+reuse the 256² field and are not evidence of wind-driven map-rebuild cost.
+Faithful, cloud-shadow and cloud-gap profiles also write
+`<view>-camera-pan-frame-gpu.txt`: a separate 120+600-frame pass translating along
+the authored camera's right vector at 1 metre/s, changing the field cache key every
+sample without inventing weather. This supplement uses the same effect-time
+policy as the main timing pass; post camera-yaw sweeps remain a separate report.
+Neither timing pass changes capture/repeat poses or their effect time of zero.
+Both reports give full-frame nearest-rank p50/p95/p99 in milliseconds, not isolated
+pass cost. Acquire the shared GPU timing lock; no concurrent captures or GPU tests.
 
 `AOMAC_GFX_MSAA=4` selects the requested 1920×1200, 4× MSAA lighting
 measurement configuration; the default remains 1 for existing byte-comparison

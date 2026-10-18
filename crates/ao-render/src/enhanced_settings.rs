@@ -139,7 +139,7 @@ impl EnhancedSettings {
     pub fn needs_sun_mask(self) -> bool {
         self.needs_grade() || self.contact_shadows || self.post_enabled()
             || self.cloud_shadows || self.volumetric_shafts || self.cloud_gap_shafts
-            || self.height_haze || self.land_haze || self.valley_mist || self.volumetric_clouds || self.sky_discs
+            || self.height_haze || self.land_haze || self.valley_mist || self.sky_discs
     }
 
     /// Bound external preferences, replacing non-finite floats with their defaults.
@@ -255,7 +255,7 @@ mod tests {
                 ao_strength: 0.0, bloom_strength: 0.0, grass_density: 0.0, sun_boost: 0.0, grade_strength: 0.0, contact_strength: 0.0, ..defaults
             };
             assert_eq!(settings.any_enabled(), mask != 0);
-            assert_eq!(settings.needs_sun_mask(), mask & (16 | 32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192) != 0);
+            assert_eq!(settings.needs_sun_mask(), mask & (16 | 32 | 64 | 128 | 256 | 512 | 1024 | 4096 | 8192) != 0);
             assert_eq!(settings.needs_admitted_lights(), mask & (32768 | 65536 | 131072) != 0);
         }
         assert_eq!(EnhancedSettings { sun_boost: 9.0, ..defaults }.clamped().sun_boost, 0.6);

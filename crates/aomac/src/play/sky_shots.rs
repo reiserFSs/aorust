@@ -412,6 +412,10 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
             && std::env::var_os("AOMAC_GFX_TIMING_PAN").is_none(),
             "sequence evidence and frozen timing must be separate runs");
     }
+    let camera_pan = std::env::var_os("AOMAC_GFX_TIMING_PAN").is_some();
+    let (effect_dt, post_warmup_frames) = graphics_fixture_time_policy(
+        &features, camera_pan, std::env::var_os("AOMAC_GFX_OWN_AVATAR").is_some(), settings.post_enabled());
+    let effect_time_mode = if effect_dt == 0.0 { "frozen" } else { "advance_1_over_60" };
     ensure!(!out.exists(), "refusing to overwrite evidence {}", out.display());
     std::fs::create_dir_all(&out)?;
     let status = out.join("status.txt");
@@ -436,12 +440,13 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         writeln!(manifest, "source_diff={source_diff:?}\nresource_sha256={resource}")?;
         writeln!(manifest, "icc_clock=authored_frozen2648.69\nsun_low_high_night_source=Borealis800")?;
         writeln!(manifest, "enhanced_settings={settings:?}")?;
-        writeln!(manifest, "post_features={features:?}\nforce_own_avatar={own_avatar}\npost_focus_policy=actual_fixture_avatar_position_when_present\npost_warmup_frames=8")?;
         writeln!(manifest, "foliage_interaction={interaction}\nfoliage_interaction_steps=16\nfoliage_interaction_dt=0\nfoliage_interaction_source=captured_visible_own_avatar\nfoliage_interaction_pose=idle")?;
         writeln!(manifest, "sequence={sequence:?}\nsequence_simulation_dt_max={}\nsequence_game_clock=frozen_snapshot\nsequence_avatar_pose=captured_idle_translated_on_terrain", 1.0 / 60.0)?;
+        writeln!(manifest, "post_features={features:?}\nforce_own_avatar={own_avatar}\npost_focus_policy=actual_fixture_avatar_position_when_present\npost_warmup_frames={post_warmup_frames}\ntiming_camera_pan={camera_pan}\ntiming_effect_time_mode={effect_time_mode}\ntiming_effect_dt_seconds={effect_dt:?}")?;
         let baseline = std::env::var_os("AOMAC_GFX_BASELINE").map(PathBuf::from);
         let png_only = std::env::var_os("AOMAC_GFX_PNG_ONLY").is_some();
-        writeln!(manifest, "png_only={png_only}")?;
+        let frame_timing = std::env::var_os("AOMAC_GFX_FRAME_TIMING").is_some();
+        writeln!(manifest, "png_only={png_only}\nframe_timing_enabled={frame_timing}")?;
         let sky_pixels = std::env::var("AOMAC_SKY_PIXELS").ok().map(|value| {
             value.split(';').map(|pixel| {
                 let (x, y) = pixel.split_once(',').context("AOMAC_SKY_PIXELS must be x,y;x,y")?;
@@ -660,9 +665,9 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     list = off.frame(&mut shot, 0.0);
                 }
                 if grass_exposure.is_some() { off.warm_grass_tiles(); }
-                if settings.post_enabled() {
+                if post_warmup_frames > 0 {
                     off.prepare_frozen_rendering();
-                    for _ in 0..8 { off.render_frozen()?; }
+                    for _ in 0..post_warmup_frames { off.render_frozen()?; }
                 }
                 if interaction || settings.foliage_leaves || settings.foliage_flutter || settings.foliage_falling {
                     off.rgba(&shot, &list)?;
@@ -678,13 +683,13 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     image::save_buffer(out.join(format!("{name}-emissive-mask.png")),
                         &mask, size.0, size.1, image::ColorType::Rgba8)?;
                 }
-                if measure && std::env::var_os("AOMAC_GFX_FRAME_TIMING").is_some() {
+                if measure && frame_timing {
                     off.prepare_frozen_rendering();
                     off.set_gpu_timing(true)?;
                     let mut frames = Vec::with_capacity(600);
-                    let camera_pan = std::env::var_os("AOMAC_GFX_TIMING_PAN").is_some();
                     for sample in 0..720 {
                         if camera_pan { off.host.camera.yaw = fixed.yaw + (sample as f32 * 0.02).sin() * 0.1; }
+                        if effect_dt > 0.0 { off.advance_effect_time(effect_dt); }
                         off.render_frozen()?;
                         let ms = off.read_frame_gpu_ms()?.context("frame GPU timer did not record")?;
                         if sample >= 120 { frames.push(ms); }
@@ -698,7 +703,30 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     frames.sort_by(f64::total_cmp);
                     let percentiles = [0.50_f64, 0.95, 0.99].map(|p| frames[(p * frames.len() as f64).ceil() as usize - 1]);
                     std::fs::write(out.join(format!("{name}-frame-gpu.txt")),
-                        format!("profile={profile}\npost_features={features:?}\nmsaa_requested={msaa}\nmsaa_actual={actual_msaa}\ncamera_pan={camera_pan}\nresolution=1920x1200\nwarmup=120\nsamples=600\nunits=milliseconds\nframe_p50_p95_p99={percentiles:?}\n"))?;
+                        format!("profile={profile}\npost_features={features:?}\nmsaa_requested={msaa}\nmsaa_actual={actual_msaa}\ncamera_pan={camera_pan}\nresolution=1920x1200\nwarmup=120\nsamples=600\nunits=milliseconds\neffect_time_mode={effect_time_mode}\neffect_dt_seconds={effect_dt:?}\ncamera_motion={}\nnative_cloud_wind={:?}\ncloud_field_cache=native_layer_and_eye_key;zero_wind_may_reuse\nframe_p50_p95_p99={percentiles:?}\n",
+                            if camera_pan { "authored_yaw_sweep" } else { "stationary" },
+                            scene.single_clouds.iter().map(|layer| layer.wind).collect::<Vec<_>>()))?;
+                    // A clear-weather fixture has zero native high-altitude wind.
+                    // Measure a separate, explicit lateral-camera pass to include
+                    // real field rebuilds without inventing weather or changing PNG poses.
+                    if profile == "faithful" || settings.cloud_shadows || settings.cloud_gap_shafts {
+                        off.host.camera = fixed;
+                        off.set_gpu_timing(true)?;
+                        frames.clear();
+                        for sample in 0..720 {
+                            if effect_dt > 0.0 { off.advance_effect_time(effect_dt); }
+                            off.host.camera.pos = fixed.pos + fixed.right() * ((sample + 1) as f32 / 60.0);
+                            off.render_frozen()?;
+                            let ms = off.read_frame_gpu_ms()?.context("camera-pan frame GPU timer did not record")?;
+                            if sample >= 120 { frames.push(ms); }
+                        }
+                        off.set_gpu_timing(false)?;
+                        off.host.camera = fixed;
+                        frames.sort_by(f64::total_cmp);
+                        let percentiles = [0.50_f64, 0.95, 0.99].map(|p| frames[(p * frames.len() as f64).ceil() as usize - 1]);
+                        std::fs::write(out.join(format!("{name}-camera-pan-frame-gpu.txt")),
+                            format!("profile={profile}\npost_features={features:?}\nmsaa_requested={msaa}\nmsaa_actual={actual_msaa}\nresolution=1920x1200\nwarmup=120\nsamples=600\nunits=milliseconds\neffect_time_mode={effect_time_mode}\neffect_dt_seconds={effect_dt:?}\ncamera_motion=authored_right_1_metre_per_second\ncamera_start={fixed:?}\ncloud_field_cache=native_layer_and_eye_key;camera_changes_every_sample\nframe_p50_p95_p99={percentiles:?}\n"))?;
+                    }
                 }
                 if measure && profile == "shadows" && std::env::var_os("AOMAC_GFX_SHADOW_TIMING").is_some() {
                     graphics_shadow_timing(&mut off, &out, &name)?;
@@ -728,6 +756,8 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
             if settings.night_mode == ao_render::NightMode::Moonlit {
                 writeln!(manifest, "{name} enhanced_moon_sources={:?}", scene.moons)?;
             }
+            writeln!(manifest, "{name} native_cloud_layers={:?}\ntiming_png_and_repeat_effect_time=0\ntiming_stationary_cloud_cache=native_layer_and_eye_key;zero_native_wind_static\ntiming_camera_pan_supplement={}",
+                scene.single_clouds, frame_timing && (profile == "faithful" || settings.cloud_shadows || settings.cloud_gap_shafts))?;
             std::fs::write(out.join("manifest.txt"), &manifest)?;
             ensure!(repeat_differences == 0, "{name}: independent captures differ in {repeat_differences} bytes");
             if let Some(base) = &baseline {
@@ -1373,6 +1403,8 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
         "local-shadows-clustered" => { settings.clustered_lighting = true; settings.local_light_shadows = true; }
         "moon-shadows" => { settings.night_mode = ao_render::NightMode::Moonlit; settings.moon_shadows = true; }
         "moonlit" => settings.night_mode = ao_render::NightMode::Moonlit,
+        "moon-volumetric-shafts" => { settings.night_mode = ao_render::NightMode::Moonlit; settings.volumetric_shafts = true; }
+        "moon-cloud-gap-shafts" => { settings.night_mode = ao_render::NightMode::Moonlit; settings.cloud_gap_shafts = true; }
         "dark-night" => settings.night_mode = ao_render::NightMode::Dark,
         "specular" => settings.material_specular = true,
         "lighting" => { settings.clustered_lighting = true; settings.local_light_shadows = true; settings.moon_shadows = true; settings.material_specular = true; settings.night_mode = ao_render::NightMode::Moonlit; }
@@ -1466,9 +1498,32 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             grass_density: 1.0, grass_distance: 50.0, sun_boost: 0.5, grade_strength: 0.8, contact_strength: 0.4,
             ..Default::default()
         },
-        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|clustered|local-shadows|local-shadows-clustered|moonlit|moon-shadows|dark-night|specular|lighting|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before|foliage-edges|foliage-sway|foliage-push|foliage-leaves|foliage-flutter|foliage-falling|grass-trails|foliage-subdivision|foliage-translucency|foliage-lod|all-foliage|all-foliage-shadows"),
+        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|clustered|local-shadows|local-shadows-clustered|moonlit|moon-shadows|moon-volumetric-shafts|moon-cloud-gap-shafts|dark-night|specular|lighting|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before|foliage-edges|foliage-sway|foliage-push|foliage-leaves|foliage-flutter|foliage-falling|grass-trails|foliage-subdivision|foliage-translucency|foliage-lod|all-foliage|all-foliage-shadows"),
     }
     Ok(settings)
+}
+
+/// Post controls share frozen effect time; ordinary atmosphere captures stay at time zero
+/// without temporal warmup, then advance only in the separate GPU timing passes.
+fn graphics_fixture_time_policy(features: &str, camera_pan: bool, own_avatar_selected: bool, post_enabled: bool) -> (f32, usize) {
+    let explicit_post_mode = camera_pan || own_avatar_selected;
+    let effect_dt = if explicit_post_mode { 0.0 } else { 1.0 / 60.0 };
+    let warmup = if post_enabled && (!features.is_empty() || explicit_post_mode) { 8 } else { 0 };
+    (effect_dt, warmup)
+}
+
+#[test]
+fn graphics_fixture_time_policy_preserves_post_controls_and_atmosphere_time_zero() {
+    for post_enabled in [false, true] {
+        assert_eq!(graphics_fixture_time_policy("", false, false, post_enabled), (1.0 / 60.0, 0));
+        for features in ["", "taa"] {
+            for (camera_pan, own_avatar_selected) in [(true, false), (false, true), (true, true)] {
+                assert_eq!(graphics_fixture_time_policy(features, camera_pan, own_avatar_selected, post_enabled),
+                    (0.0, if post_enabled { 8 } else { 0 }));
+            }
+        }
+    }
+    assert_eq!(graphics_fixture_time_policy("taa", false, false, true), (1.0 / 60.0, 8));
 }
 
 fn graphics_fixture_msaa(value: &str) -> anyhow::Result<u32> {
@@ -1617,6 +1672,12 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
         assert!(!s.ambient_occlusion && !s.emissive_bloom && !s.ground_grass && !s.contact_shadows);
         assert_eq!((s.shadow_map_size, s.shadow_strength, s.shadow_softness), (4096, 0.45, 1.5));
         assert_eq!((s.sun_boost, s.grade_strength), (0.5, 0.8));
+    }
+    for (profile, mapped) in [("moon-volumetric-shafts", true), ("moon-cloud-gap-shafts", false)] {
+        let settings = graphics_fixture_settings(profile).unwrap();
+        assert_eq!(settings.night_mode, ao_render::NightMode::Moonlit);
+        assert_eq!((settings.volumetric_shafts, settings.cloud_gap_shafts), (mapped, !mapped));
+        assert!(!settings.moon_shadows && !settings.sun_shadows);
     }
     assert!(graphics_fixture_settings("contact").unwrap().contact_shadows);
     let isolated = graphics_fixture_settings("shadows-hdr-contact").unwrap();

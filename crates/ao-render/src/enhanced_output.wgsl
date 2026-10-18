@@ -69,20 +69,13 @@ fn terrain_sky_open(world: vec3<f32>) -> f32 {
     return textureSampleLevel(holo1, samp_clamp, uv, 0.0).r;
 }
 var<private> enhanced_sun_visibility: f32 = 1.0;
-// r: fog/shadow-attenuated directional share; g: roof-tested, fog-attenuated terrain sky visibility;
-// b: native fog amount. Terrain alpha defaults closed until collision baking.
+// r: HDR/contact fog/shadow-attenuated directional share;
+// g: nonnegative roof-tested, fog-attenuated terrain sky visibility;
+// b: native fog amount; a: admitted-world coverage. Terrain sky defaults closed until collision baking.
 fn enhanced_sun(i: VOut, beauty: vec4<f32>, ground: bool, sky_visibility: f32) -> vec4<f32> {
     // A single frame-uniform fog colour cannot describe material-local fog.
     // Keep those receivers native rather than expose a wrongly subtracted surface.
     if mat.scroll.z > 1.5 { return vec4<f32>(0.0, 0.0, 0.0, beauty.a); }
-    // Native liquid lighting uses WaterLight, never the outdoor sun shares.
-    // Only cloud shadows opt water in; HDR and geometric sun shadows stay native.
-    if !ground && g.water_dir.w > 0.0 && (u32(mat.native.z) & 16u) != 0u && !native_unlit() && i.effect == 0u && !(mat.emissive.w > 0.5 && mat.emissive.w < 1.5) {
-        let fog = native_fog(i.fog);
-        let direct = clamp(i.light - to_g(mat.emissive.rgb) - g.ambient_g.rgb - i.dlight, vec3<f32>(0.0), vec3<f32>(1.0));
-        let share = dot(direct, vec3<f32>(0.2126, 0.7152, 0.0722));
-        return vec4<f32>(share * (1.0 - fog), 0.0, fog, beauty.a);
-    }
     if !ground && (native_unlit() || i.effect != 0u || (u32(mat.native.z) & 16u) != 0u || (mat.emissive.w > 0.5 && mat.emissive.w < 1.5)) {
         return vec4<f32>(0.0, 0.0, 0.0, beauty.a);
     }
@@ -90,4 +83,10 @@ fn enhanced_sun(i: VOut, beauty: vec4<f32>, ground: bool, sky_visibility: f32) -
     let share = dot(i.sun_share.xyz, vec3<f32>(0.2126, 0.7152, 0.0722));
     let sky_open = sky_visibility * (1.0 - fog);
     return vec4<f32>(share * enhanced_sun_visibility * (1.0 - fog), sky_open, fog, beauty.a);
+}
+// Independent cloud-only WaterLight budget; the native sun mask never changes.
+fn enhanced_water_cloud(i: VOut, beauty: vec4<f32>) -> f32 {
+    if mat.scroll.z > 1.5 || native_unlit() || i.effect != 0u || (u32(mat.native.z) & 16u) == 0u || (mat.emissive.w > 0.5 && mat.emissive.w < 1.5) { return 0.0; }
+    let direct = clamp(i.light - to_g(mat.emissive.rgb) - g.ambient_g.rgb - i.dlight, vec3<f32>(0.0), vec3<f32>(1.0));
+    return dot(direct, vec3<f32>(0.2126, 0.7152, 0.0722)) * (1.0 - native_fog(i.fog));
 }

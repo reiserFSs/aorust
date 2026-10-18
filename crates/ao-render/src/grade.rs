@@ -467,7 +467,7 @@ mod tests {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let mut renderer = crate::Renderer::new(&instance, None).unwrap();
         renderer.set_enhanced_settings(crate::EnhancedSettings { hdr: true, emissive_bloom: true, ..Default::default() });
-        renderer.enhanced_frame = Some(crate::enhanced::EnhancedFrame::new(&renderer.device, renderer.format, (32,32), 1, renderer.enhanced_settings, &renderer.enhanced_pipelines));
+        renderer.enhanced_frame = Some(crate::enhanced::EnhancedFrame::new(&renderer.device, renderer.format, (32,32), 1, renderer.enhanced_settings, false, &renderer.enhanced_pipelines));
         renderer.prepare_enhanced_grade([0.0;3]);
         renderer.prepare_enhanced_bloom();
         assert!(renderer.bloom.is_some());

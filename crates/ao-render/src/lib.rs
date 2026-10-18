@@ -751,6 +751,7 @@ pub struct Renderer {
     /// Sample counts the adapter actually supports for both the surface colour format and [`DEPTH`] (always includes 1).
     msaa_supported: Vec<u32>,
     auxiliary_msaa: wgpu::TextureFormatFeatureFlags,
+    water_cloud_msaa: wgpu::TextureFormatFeatureFlags,
     texture_policy: native_texture::Policy,
     drawn_visuals: HashMap<VisualKey, i32>,
     pending_visuals: std::cell::RefCell<HashMap<VisualKey, i32>>,
@@ -921,7 +922,8 @@ fn compile_pipeline(
         let target = wgpu::ColorTargetState { format, blend: state, write_mask: wgpu::ColorWrites::ALL };
         let auxiliary = wgpu::ColorTargetState { format: enhanced::AUX, blend: state, write_mask: wgpu::ColorWrites::ALL };
         let sun_mask = settings.needs_sun_mask().then(|| auxiliary.clone());
-        let targets = [Some(target), settings.ambient_occlusion.then(|| ambient_target(state, depth_write)), settings.emissive_bloom.then_some(auxiliary), sun_mask];
+        let water_cloud = settings.cloud_shadows.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R16Float, blend: state, write_mask: wgpu::ColorWrites::RED });
+        let targets = [Some(target), settings.ambient_occlusion.then(|| ambient_target(state, depth_write)), settings.emissive_bloom.then_some(auxiliary), sun_mask, water_cloud];
         pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
             label: Some(fs),
             // Ground effects 8-11 sample `ground_palette` (holo0) at bind group 2; liquids (12/13) use `fs_blend`,
@@ -1096,6 +1098,7 @@ impl Renderer {
             color.into_iter().filter(|c| depth.contains(c)).collect()
         };
         let auxiliary_msaa = adapter.get_texture_format_features(enhanced::AUX).flags;
+        let water_cloud_msaa = adapter.get_texture_format_features(wgpu::TextureFormat::R16Float).flags;
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene"),
@@ -1183,6 +1186,9 @@ impl Renderer {
         let ambient_occlusion = Some(ambient_occlusion::AmbientOcclusion::new(&device, format));
         let contact_shadows = Some(contact_shadows::ContactShadows::new(&device, format));
         let cluster_programs = clustered_lighting::Programs::new(&device);
+        let atmosphere = Some(atmosphere::Atmosphere::new(&device, format));
+        let volumetric_clouds = Some(volumetric_clouds::VolumetricClouds::new(&device, format, &msaa_supported));
+        let sky_discs = Some(sky_discs::SkyDiscs::new(&device, format));
         let mut r = Self {
             device,
             queue,
@@ -1208,9 +1214,9 @@ impl Renderer {
             point_program,
             ambient_occlusion,
             contact_shadows,
-            atmosphere: None,
-            volumetric_clouds: None,
-            sky_discs: None,
+            atmosphere,
+            volumetric_clouds,
+            sky_discs,
             atmosphere_layers: Vec::new(),
             atmosphere_base_height: 0.0,
             atmosphere_native_layers: Vec::new(),
@@ -1263,6 +1269,7 @@ impl Renderer {
             requested_msaa: 1,
             msaa_supported,
             auxiliary_msaa,
+            water_cloud_msaa,
             texture_policy: Default::default(),
             sky: SkyGpu::default(),
             cloud_preferences: (true, true, false),
@@ -1318,6 +1325,9 @@ impl Renderer {
             && self.shadow_pipelines.is_ready()
             && self.ambient_occlusion.as_ref().is_some_and(|ao| ao.is_ready())
             && self.contact_shadows.as_ref().is_some_and(|contact| contact.is_ready())
+            && self.atmosphere.as_ref().is_some_and(|pass| pass.is_ready())
+            && self.volumetric_clouds.as_ref().is_some_and(|pass| pass.is_ready())
+            && self.sky_discs.as_ref().is_some_and(|pass| pass.is_ready())
             && self.screen.is_ready()
             && self.heat_haze.is_ready()
             && self.skin_pipeline_is_ready()
@@ -1335,6 +1345,9 @@ impl Renderer {
         self.shadow_pipelines.wait();
         self.ambient_occlusion.as_ref().expect("startup AO pipelines").wait();
         self.contact_shadows.as_ref().expect("startup contact pipelines").wait();
+        self.atmosphere.as_ref().expect("startup atmosphere pipelines").wait();
+        self.volumetric_clouds.as_ref().expect("startup cloud pipelines").wait();
+        self.sky_discs.as_ref().expect("startup sky disc pipelines").wait();
         self.screen.wait();
         self.heat_haze.wait();
         self.canopy_leaves.wait();
@@ -1413,7 +1426,9 @@ impl Renderer {
     fn clamp_msaa(&self, requested: u32, settings: EnhancedSettings) -> u32 {
         let auxiliary = settings.ambient_occlusion || settings.emissive_bloom || settings.needs_sun_mask();
         if auxiliary {
-            self.msaa_supported.iter().copied().filter(|&count| count <= requested && self.auxiliary_msaa.sample_count_supported(count)).max().unwrap_or(1)
+            self.msaa_supported.iter().copied().filter(|&count| count <= requested
+                && self.auxiliary_msaa.sample_count_supported(count)
+                && (!settings.cloud_shadows || self.water_cloud_msaa.sample_count_supported(count))).max().unwrap_or(1)
         } else {
             clamp_msaa_samples(requested.max(1), &self.msaa_supported)
         }
@@ -1448,17 +1463,22 @@ impl Renderer {
     }
 
     fn request_world(&mut self, key: variant::Key, settings: EnhancedSettings, defer: bool) {
-        if key == self.world_key {
+        // A shader-equivalent switch (e.g. HDR -> HDR + cloud shadows) still
+        // needs both attachment shapes warmed before water can enter the view.
+        let companion = key.with_water_cloud(!key.water_cloud);
+        let water_pair_cached = !settings.cloud_shadows || self.world_key == companion
+            || self.world_variants.iter().any(|(cached, _)| *cached == companion);
+        if key == self.world_key && water_pair_cached {
             self.pending_world = None;
             if self.enhanced_settings != settings { self.apply_enhanced_settings(settings); }
             return;
         }
-        if let Some(index) = self.world_variants.iter().position(|(cached, _)| *cached == key) {
+        if let Some(index) = self.world_variants.iter().position(|(cached, _)| water_pair_cached && *cached == key) {
             let world = self.world_variants.remove(index).1;
-            self.install_world(key, world, settings);
+            self.install_world(key, (world, None), settings);
             return;
         }
-        if let Some(pending) = self.pending_world.as_mut().filter(|pending| pending.key == key) {
+        if let Some(pending) = self.pending_world.as_mut().filter(|pending| pending.key == key && (!settings.cloud_shadows || pending.settings.cloud_shadows)) {
             pending.settings = settings;
             if !defer { self.await_enhanced_world(); }
             return;
@@ -1475,7 +1495,7 @@ impl Renderer {
         }
     }
 
-    fn install_world(&mut self, key: variant::Key, world: variant::Pipes, settings: EnhancedSettings) {
+    fn install_world(&mut self, key: variant::Key, (world, companion): variant::Built, settings: EnhancedSettings) {
         self.pending_world = None;
         let previous = std::mem::replace(&mut self.world, world);
         let previous_key = std::mem::replace(&mut self.world_key, key);
@@ -1485,8 +1505,12 @@ impl Renderer {
             self.bloom = None;
             self.grade = None;
         }
+        if let Some((companion_key, companion)) = companion {
+            self.world_variants.retain(|(cached, _)| *cached != companion_key);
+            self.world_variants.push((companion_key, companion));
+        }
         self.world_variants.push((previous_key, previous));
-        if self.world_variants.len() > WORLD_VARIANT_CACHE { self.world_variants.remove(0); }
+        while self.world_variants.len() > WORLD_VARIANT_CACHE { self.world_variants.remove(0); }
         self.apply_enhanced_settings(settings);
     }
 
@@ -1581,7 +1605,7 @@ impl Renderer {
     pub fn enhanced_target_bytes(&self) -> u64 {
         self.enhanced_frame.as_ref().map_or(0, |frame| {
             let pixels = u64::from(frame.size.0) * u64::from(frame.size.1);
-            let colour = 4 + 8 * (u64::from(frame.ambient.is_some()) + u64::from(frame.emissive.is_some()) + u64::from(frame.sun.is_some()));
+            let colour = 4 + 8 * (u64::from(frame.ambient.is_some()) + u64::from(frame.emissive.is_some()) + u64::from(frame.sun.is_some())) + 2 * u64::from(frame.water_cloud.is_some());
             let samples = u64::from(frame.sample_count);
             pixels * (colour + 4 * samples + if samples > 1 { colour * samples + 4 } else { 0 })
         }) + self.ambient_occlusion.as_ref().map_or(0, ambient_occlusion::AmbientOcclusion::target_bytes)
@@ -2335,8 +2359,8 @@ impl Renderer {
     fn isolate_sky(&self) -> bool {
         #[cfg(test)]
         if self.cloud_precision_probe != CloudPrecisionProbe::BeautySky { return false; }
-        !self.sky.clouds.is_empty() && ao_scene::cloud::resolution(
-            self.cloud_preferences.0, self.cloud_preferences.1, self.cloud_preferences.2) != 0
+        self.enhanced_settings.volumetric_clouds || (!self.sky.clouds.is_empty() && ao_scene::cloud::resolution(
+            self.cloud_preferences.0, self.cloud_preferences.1, self.cloud_preferences.2) != 0)
     }
 
     /// Draws one frame into `resolve` (a view of the output texture).
@@ -2382,7 +2406,7 @@ impl Renderer {
             ambient_g: g4(env.ambient, grade::daylight_weight(self.sky.pose.daylight)),
             fog_g: g4(env.fog_color, 1.0),
             view: Mat4::look_to_rh(cam.pos, cam.forward(), cam.up()).to_cols_array_2d(),
-            water_dir: v4(Vec3::from_array(water_dir).normalize_or_zero().to_array(), if self.enhanced_settings.cloud_shadows { 1.0 } else { 0.0 }),
+            water_dir: v4(Vec3::from_array(water_dir).normalize_or_zero().to_array(), 0.0),
             water_g: g4(water_color, env.sun_specular),
             dyn_info: [self.dyn_light_count, self.sky.pose.directional_lights.len().min(7) as i32, 0, 0],
             sky_counter: [self.sky_dot_counter, 0.0, 0.0, 0.0],
@@ -2428,6 +2452,30 @@ impl Renderer {
         self.foliage_detail_state.prepare(&self.device, self.enhanced_settings.foliage_subdivision);
         g.foliage_pushers = self.foliage.pushers();
         self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
+        self.sorted.clear();
+        for (list, draws) in [&self.gpu.opaque, &self.gpu.blended, &self.gpu.liquid].into_iter().enumerate() {
+            for (di, d) in draws.iter().enumerate() {
+                if d.count == 0 || self.ground.as_ref().is_some_and(|ground| ground.materials[d.mesh].is_some()) { continue; }
+                for vi in self.vis_range[d.mesh].clone() {
+                    let instance = self.vis_src[vi as usize] as usize;
+                    let key = d.node.map(|(node, _)| VisualKey::World(instance, node));
+                    let priority = visual_priority(d, key, &self.drawn_visuals).unwrap_or([3, 5, 4][list]);
+                    if priority < 0 { continue; }
+                    let matrix = Mat4::from_cols_array_2d(&self.gpu.insts[instance].m);
+                    let bucket = actors::render_bucket(matrix.transform_point3(Vec3::from(d.origin)).distance(cam.pos));
+                    self.sorted.push((priority, bucket, list as u8, di, vi));
+                }
+            }
+        }
+        self.sorted.sort_by(|a, b| actors::bucket_order(a.0, a.1, b.0, b.1)
+            .then_with(|| b.4.cmp(&a.4)).then_with(|| a.3.cmp(&b.3)));
+        let water_cloud = self.enhanced_settings.cloud_shadows && self.sorted.iter().any(|draw| draw.2 == 2);
+        let key = variant::Key::of(self.enhanced_settings, self.world.msaa).with_water_cloud(water_cloud);
+        if key != self.world_key {
+            let pending = self.pending_world.take();
+            self.request_world(key, self.enhanced_settings, false);
+            self.pending_world = pending;
+        }
         let grass_start = timed.then(std::time::Instant::now);
         self.prepare_enhanced_grass(cam, vp, env.fog_end.max(env.fog_start + 1e-3), 0.5 * t.size.1 as f32 / (0.5 * self.lens.vertical_fov(aspect)).tan());
         if let Some(start) = grass_start { cpu.grass_prepare_ms = start.elapsed().as_secs_f64() * 1000.0; }
@@ -2438,7 +2486,10 @@ impl Renderer {
             self.release_effect_targets();
             self.bloom = None;
             self.grade = None;
-            self.enhanced_frame = Some(enhanced::EnhancedFrame::new(&self.device, self.format, t.size, self.world.msaa, self.enhanced_settings, &self.enhanced_pipelines));
+            self.enhanced_frame = Some(enhanced::EnhancedFrame::new(&self.device, self.format, t.size, self.world.msaa, self.enhanced_settings, water_cloud, &self.enhanced_pipelines));
+        }
+        if let Some(frame) = self.enhanced_frame.as_mut() {
+            frame.set_water_cloud(&self.device, water_cloud);
         }
         self.prepare_enhanced_grade(env.fog_color);
         self.prepare_enhanced_bloom();
@@ -2518,23 +2569,6 @@ impl Renderer {
             self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&xf));
             if self.enhanced_settings.sky_discs { self.sky_disc_transforms.clone_from(&xf); }
         }
-        self.sorted.clear();
-        for (list, draws) in [&self.gpu.opaque, &self.gpu.blended, &self.gpu.liquid].into_iter().enumerate() {
-            for (di, d) in draws.iter().enumerate() {
-                if d.count == 0 || self.ground.as_ref().is_some_and(|ground| ground.materials[d.mesh].is_some()) { continue; }
-                for vi in self.vis_range[d.mesh].clone() {
-                    let instance = self.vis_src[vi as usize] as usize;
-                    let key = d.node.map(|(node, _)| VisualKey::World(instance, node));
-                    let priority = visual_priority(d, key, &self.drawn_visuals).unwrap_or([3, 5, 4][list]);
-                    if priority < 0 { continue; }
-                    let matrix = Mat4::from_cols_array_2d(&self.gpu.insts[instance].m);
-                    let bucket = actors::render_bucket(matrix.transform_point3(Vec3::from(d.origin)).distance(cam.pos));
-                    self.sorted.push((priority, bucket, list as u8, di, vi));
-                }
-            }
-        }
-        self.sorted.sort_by(|a, b| actors::bucket_order(a.0, a.1, b.0, b.1)
-            .then_with(|| b.4.cmp(&a.4)).then_with(|| a.3.cmp(&b.3)));
         if self.enhanced_settings.taa || self.enhanced_settings.motion_blur > 0.0 {
             let previous = self.post_previous_view.map_or(native_vp, |(matrix, _)| matrix);
             self.prepare_motion_vectors(t.size, native_vp, previous);
@@ -2544,6 +2578,7 @@ impl Renderer {
         self.encode_enhanced_shadows(&mut enc, cam, t.size, env, far);
         if let Some(start) = shadow_start { cpu.shadow_prepare_encode_ms = start.elapsed().as_secs_f64() * 1000.0; }
         self.prepare_grass_shadow_receiver();
+        self.prepare_atmosphere_stack(&mut enc, vp, cam.pos, far, env);
         let inst_buf = self.gpu.inst_bufs.get(self.frame);
         let sky_buf = self.sky.bufs.get(self.frame);
 
@@ -2561,6 +2596,7 @@ impl Renderer {
             enhanced_frame.and_then(|frame| frame.attachment(1)),
             enhanced_frame.and_then(|frame| frame.attachment(2)),
             enhanced_frame.and_then(|frame| frame.attachment(3)),
+            enhanced_frame.and_then(|frame| frame.attachment(4)),
         ];
         if isolate_sky { attachments[0].as_mut().unwrap().ops.store = wgpu::StoreOp::Store; }
         let final_world = enhanced_frame.is_none() && self.heat_haze.source().is_none() && self.screen.layers.is_empty();
@@ -2571,7 +2607,7 @@ impl Renderer {
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
-                color_attachments: &attachments[..if isolate_sky { 1 } else { enhanced_frame.map_or(1, |_| enhanced::target_count(&self.enhanced_settings)) }],
+                color_attachments: &attachments[..if isolate_sky { 1 } else { enhanced_frame.map_or(1, enhanced::EnhancedFrame::target_count) }],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: enhanced_frame.map_or(&t.depth, |frame| &frame.depth),
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: if isolate_sky || enhanced_frame.is_some() { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),
@@ -2698,6 +2734,9 @@ impl Renderer {
                     }
                 }
             }
+            if self.enhanced_settings.volumetric_clouds {
+                self.volumetric_clouds.as_ref().expect("startup cloud pipelines").draw_sky(&mut pass, self.world.msaa);
+            }
             if isolate_sky {
                 drop(pass);
                 let beauty = attachments[0].as_mut().unwrap();
@@ -2706,7 +2745,7 @@ impl Renderer {
                 beauty.resolve_target = msaa_target.map(|_| world_target);
                 pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("native world after beauty-only sky"),
-                    color_attachments: &attachments[..enhanced_frame.map_or(1, |_| enhanced::target_count(&self.enhanced_settings))],
+                    color_attachments: &attachments[..enhanced_frame.map_or(1, enhanced::EnhancedFrame::target_count)],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                         view: enhanced_frame.map_or(&t.depth, |frame| &frame.depth),
                         depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: if enhanced_frame.is_some() { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),

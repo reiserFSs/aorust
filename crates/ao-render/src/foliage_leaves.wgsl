@@ -139,6 +139,7 @@ struct CanopyOutput {
     //__AMBIENT_FIELD__
     //__EMISSIVE_FIELD__
     //__SUN_FIELD__
+    //__WATER_FIELD__
 }
 @fragment fn fs_canopy(i: VOut) -> CanopyOutput {
     var output: CanopyOutput;
@@ -154,6 +155,7 @@ struct CanopyOutput {
     //__AMBIENT_WRITE__
     //__EMISSIVE_WRITE__
     //__SUN_WRITE__
+    //__WATER_WRITE__
     return output;
 }
 struct CanopyShadow {

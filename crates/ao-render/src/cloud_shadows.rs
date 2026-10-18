@@ -39,7 +39,7 @@ impl CloudShadows {
     pub(super) fn is_ready(&self) -> bool { self.pipeline.is_ready() }
     pub(super) fn wait(&self) { self.pipeline.get(); }
     pub(super) fn release_targets(&mut self) { self.target = None; self.field = None; self.key = None; }
-    pub(super) fn target_bytes(&self) -> u64 { self.params.size() + if self.target.is_some() { u64::from(SIZE) * u64::from(SIZE) * 2 } else { 0 } }
+    pub(super) fn target_bytes(&self) -> u64 { self.target.as_ref().map_or(0, |_| self.params.size() + u64::from(SIZE) * u64::from(SIZE) * 2) }
     pub(super) fn field(&self) -> Option<CloudShadowField> { self.field.clone() }
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer, layers: &[CloudDensityLayer], eye: Vec3, far: f32) {

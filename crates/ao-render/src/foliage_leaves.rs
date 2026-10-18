@@ -26,7 +26,7 @@ pub(super) struct Leaves {
 }
 struct Compiled {
     key: (u32, bool, bool, bool, NightMode, bool, bool),
-    beauty: pipeline_creation::RenderPipeline,
+    beauty: [pipeline_creation::RenderPipeline; 2],
     shadow: pipeline_creation::RenderPipeline,
     uniform: wgpu::Buffer,
     bind: wgpu::BindGroup,
@@ -164,7 +164,7 @@ impl Leaves {
     /// Explicit loading/capture boundary only; ordinary frames remain nonblocking.
     pub(super) fn wait(&self) {
         if let Some(compiled) = &self.compiled {
-            compiled.beauty.get();
+            for beauty in &compiled.beauty { beauty.get(); }
             compiled.shadow.get();
         }
     }
@@ -206,9 +206,13 @@ impl Compiled {
             }, wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::VERTEX,
                 ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None }],
         });
-        let source = shader_source((key.1, key.2, key.3), key.4, key.5, key.6);
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("native canopy sprigs"), source: wgpu::ShaderSource::Wgsl(source.into()),
+        // Water visibility changes only the beauty attachment shape. Warm both
+        // shapes together and retain one caster, wind binding and leaf buffer.
+        let shaders = [false, true].map(|water| {
+            let source = shader_source((key.1, key.2, key.3, water), key.4, key.5, key.6);
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("native canopy sprigs"), source: wgpu::ShaderSource::Wgsl(source.into()),
+            })
         });
         let receiver_layout = (key.4 == NightMode::Moonlit || key.6)
             .then(|| sun_shadows::receiver_layout(device));
@@ -227,17 +231,21 @@ impl Compiled {
             wgpu::VertexBufferLayout { array_stride: 64, step_mode: wgpu::VertexStepMode::Instance, attributes: &instances },
         ];
         let auxiliary = || Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL });
-        let targets = [Some(wgpu::ColorTargetState { format: renderer.format, blend: None, write_mask: wgpu::ColorWrites::ALL }),
-            key.1.then(auxiliary).flatten(), key.2.then(auxiliary).flatten(), key.3.then(auxiliary).flatten()];
-        let target_count = if key.3 { 4 } else if key.1 || key.2 { 3 } else { 1 };
-        let make = |shadow: bool| pipeline_creation::render_deferred(device, &wgpu::RenderPipelineDescriptor {
+        let make = |shadow: bool, water: bool| {
+            let shader = &shaders[usize::from(water)];
+            let targets = [Some(wgpu::ColorTargetState { format: renderer.format, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+                key.1.then(auxiliary).flatten(), key.2.then(auxiliary).flatten(), key.3.then(auxiliary).flatten(),
+                water.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R16Float, blend: None, write_mask: wgpu::ColorWrites::RED })];
+            let target_count = if water { 5 } else if key.3 { 4 } else if key.1 || key.2 { 3 } else { 1 };
+            pipeline_creation::render_deferred(device, &wgpu::RenderPipelineDescriptor {
             label: Some(if shadow { "canopy sun caster" } else { "canopy native lighting" }), layout: Some(if shadow { &shadow_layout } else { &beauty_layout }),
-            vertex: wgpu::VertexState { module: &shader, entry_point: Some(if shadow { "vs_canopy_shadow" } else { "vs_canopy" }), compilation_options: Default::default(), buffers: &buffers },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(if shadow { "fs_canopy_shadow" } else { "fs_canopy" }), compilation_options: Default::default(), targets: if shadow { &[] } else { &targets[..target_count] } }),
+            vertex: wgpu::VertexState { module: shader, entry_point: Some(if shadow { "vs_canopy_shadow" } else { "vs_canopy" }), compilation_options: Default::default(), buffers: &buffers },
+            fragment: Some(wgpu::FragmentState { module: shader, entry_point: Some(if shadow { "fs_canopy_shadow" } else { "fs_canopy" }), compilation_options: Default::default(), targets: if shadow { &[] } else { &targets[..target_count] } }),
             primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
             depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::LessEqual), stencil: Default::default(), bias: Default::default() }),
             multisample: wgpu::MultisampleState { count: if shadow { 1 } else { key.0 }, alpha_to_coverage_enabled: !shadow && key.0 > 1, ..Default::default() }, multiview_mask: None, cache: None,
-        });
+            })
+        };
         let uniform = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("canopy wind switches"), size: std::mem::size_of::<Params>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let ground = device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
@@ -246,17 +254,19 @@ impl Compiled {
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("canopy wind"), layout: &layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: ground.as_entire_binding() }] });
-        Self { key, beauty: make(false), shadow: make(true), uniform, bind }
+        Self { key, beauty: [make(false, false), make(false, true)], shadow: make(true, false), uniform, bind }
     }
 }
-fn shader_source(channels: (bool, bool, bool), night: NightMode, moon_shadows: bool, sun_shadows: bool) -> String {
+fn shader_source(channels: (bool, bool, bool, bool), night: NightMode, moon_shadows: bool, sun_shadows: bool) -> String {
     let leaf = crate::shader_source::load("foliage_leaves.wgsl", include_str!("foliage_leaves.wgsl"))
         .replace("//__AMBIENT_FIELD__", if channels.0 { "@location(1) ambient: vec4<f32>," } else { "" })
         .replace("//__EMISSIVE_FIELD__", if channels.1 { "@location(2) emissive: vec4<f32>," } else { "" })
         .replace("//__SUN_FIELD__", if channels.2 { "@location(3) sun: vec4<f32>," } else { "" })
+        .replace("//__WATER_FIELD__", if channels.3 { "@location(4) water_cloud: f32," } else { "" })
         .replace("//__AMBIENT_WRITE__", if channels.0 { "output.ambient = vec4<f32>(0.0);" } else { "" })
         .replace("//__EMISSIVE_WRITE__", if channels.1 { "output.emissive = vec4<f32>(0.0);" } else { "" })
         .replace("//__SUN_WRITE__", if channels.2 { "output.sun = enhanced_sun(receiver, output.beauty, false, 0.0);" } else { "" })
+        .replace("//__WATER_WRITE__", if channels.3 { "output.water_cloud = 0.0;" } else { "" })
         .replace("//__MOON_RECEIVER__", if night != NightMode::AsGame {
             "let receiver = authored_moon_receiver(rounded, i.n, false);"
         } else { "let receiver = rounded;" });
@@ -319,9 +329,9 @@ impl Renderer {
         if !leaves.enabled { return 0; }
         let (Some(compiled), Some(vertices), Some(instances)) = (&leaves.compiled, &leaves.vertices, self.gpu.inst_bufs.get(self.frame)) else { return 0; };
         // Deferred pipelines compile on the existing startup worker. Keep native
-        // rendering until both programs are ready; never block the first frame.
-        if !compiled.beauty.is_ready() || !compiled.shadow.is_ready() { return 0; }
-        pass.set_pipeline(if shadows.is_some() { &compiled.shadow } else { &compiled.beauty });
+        // rendering until both attachment shapes and the shared caster are ready.
+        if compiled.beauty.iter().any(|beauty| !beauty.is_ready()) || !compiled.shadow.is_ready() { return 0; }
+        pass.set_pipeline(if shadows.is_some() { &compiled.shadow } else { &compiled.beauty[usize::from(self.world_key.water_cloud)] });
         pass.set_bind_group(0, &self.globals_bg, &[]);
         pass.set_bind_group(2, &compiled.bind, &[]);
         if shadows.is_none() && (compiled.key.4 == NightMode::Moonlit || compiled.key.6) {
@@ -349,15 +359,19 @@ mod tests {
     use super::*;
     #[test]
     fn canopy_post_mask_reuses_native_directional_budget() {
-        let source = shader_source((false, false, true), NightMode::AsGame, false, true);
-        assert!(source.contains("output.sun = enhanced_sun(receiver, output.beauty, false, 0.0);"));
-        assert!(source.contains("enhanced_sun_visibility = visible;"));
+        for water in [false, true] {
+            let source = shader_source((false, false, true, water), NightMode::AsGame, false, true);
+            assert!(source.contains("output.sun = enhanced_sun(receiver, output.beauty, false, 0.0);"));
+            assert!(source.contains("enhanced_sun_visibility = visible;"));
+            assert_eq!(source.contains("@location(4) water_cloud: f32,"), water);
+            assert_eq!(source.contains("output.water_cloud = 0.0;"), water);
+        }
     }
     #[test]
     fn canopy_night_shader_contract_keeps_shared_receiver_and_native_shading() {
         for night in [NightMode::AsGame, NightMode::Dark, NightMode::Moonlit] {
             for shadows in [false, true] {
-                let source = shader_source((true, true, true), night, shadows, true);
+                let source = shader_source((true, true, true, false), night, shadows, true);
                 let authored = night != NightMode::AsGame;
                 assert!(source.contains("@location(14) sun_share: vec4<f32>,"));
                 assert_eq!(source.contains("let receiver = authored_moon_receiver(rounded, i.n, false);"), authored);
@@ -490,6 +504,27 @@ mod tests {
             });
             renderer.prepare_canopy_leaves();
             renderer.wait_for_pipeline_warmup();
+            let compiled = renderer.canopy_leaves.compiled.as_ref().unwrap();
+            assert!(compiled.beauty.iter().all(|beauty| beauty.is_ready()),
+                "warmup must prepare both water attachment shapes");
+            let beauty = compiled.beauty.each_ref().map(|pipeline| pipeline.get().clone());
+            let caster = compiled.shadow.get().clone();
+            let uniform = compiled.uniform.clone();
+            let vertices = renderer.canopy_leaves.vertices.clone();
+            let baked = renderer.canopy_leaves.baked.clone();
+            let water = renderer.world_key.water_cloud;
+            for water_cloud in [!water, water] {
+                renderer.world_key.water_cloud = water_cloud;
+                renderer.prepare_canopy_leaves();
+                let compiled = renderer.canopy_leaves.compiled.as_ref().unwrap();
+                assert!(compiled.beauty.iter().all(|beauty| beauty.is_ready()));
+                assert!(compiled.shadow.is_ready());
+                assert_eq!(compiled.beauty[usize::from(water_cloud)].get(), &beauty[usize::from(water_cloud)]);
+                assert_eq!(compiled.shadow.get(), &caster, "water flips retain the caster");
+                assert_eq!(compiled.uniform, uniform, "water flips retain wind resources");
+                assert_eq!(renderer.canopy_leaves.vertices, vertices, "water flips retain leaf buffers");
+                assert_eq!(renderer.canopy_leaves.baked, baked, "water flips never regenerate leaves");
+            }
             let errors = renderer.device.push_error_scope(wgpu::ErrorFilter::Validation);
             renderer.render(&view, &Targets::new(&renderer, 64, 64), &camera);
             renderer.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();

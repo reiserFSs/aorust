@@ -15,6 +15,7 @@ pub(super) struct Key {
     material_specular: bool,
     clustered_lighting: bool,
     local_light_shadows: bool,
+    pub water_cloud: bool,
     pub msaa: u32,
 }
 
@@ -24,8 +25,12 @@ impl Key {
             moon_shadows: settings.moon_shadows, night_mode: settings.night_mode,
             material_specular: settings.material_specular, clustered_lighting: settings.clustered_lighting,
             local_light_shadows: settings.local_light_shadows,
-            bloom: settings.emissive_bloom, sun_mask: settings.needs_sun_mask(), msaa,
+            bloom: settings.emissive_bloom, sun_mask: settings.needs_sun_mask(), water_cloud: false, msaa,
             foliage: [settings.foliage_edges, settings.foliage_sway, settings.foliage_push, settings.foliage_subdivision, settings.foliage_translucency, settings.foliage_lod] }
+    }
+    pub(super) fn with_water_cloud(mut self, visible: bool) -> Self {
+        self.water_cloud = visible;
+        self
     }
     fn enhanced(self) -> bool { self.shadows || self.moon_shadows || self.ao || self.bloom || self.sun_mask || self.material_specular || self.clustered_lighting || self.local_light_shadows || self.night_mode != super::NightMode::AsGame || self.foliage.iter().any(|&v| v) }
 }
@@ -41,6 +46,7 @@ pub(super) struct Pipes {
     pub depth_clear_pipe: super::pipeline_creation::RenderPipeline,
     pub grass: super::grass::Compiled,
 }
+pub(super) type Built = (Pipes, Option<(Key, Pipes)>);
 
 impl Pipes {
     pub(super) fn is_ready(&self) -> bool {
@@ -135,15 +141,29 @@ impl Request {
         }
     }
 
-    pub(super) fn build(&self) -> Pipes {
+    pub(super) fn build(&self) -> Built {
         let pipes = self.prepare();
         pipes.warm();
-        pipes
+        let companion = self.settings.cloud_shadows.then(|| {
+            let mut request = Self::new(&self.device, &self.native, self.format,
+                (&self.g_layout, &self.tex_layout, &self.holo_layout),
+                self.key.with_water_cloud(!self.key.water_cloud), self.settings,
+                &self.compiles, &self.frame_compiles);
+            request.frame_thread = self.frame_thread;
+            let companion = request.prepare();
+            companion.warm();
+            (request.key, companion)
+        });
+        (pipes, companion)
     }
 
     pub(super) fn prepare(&self) -> Pipes {
+        // Cloud receivers still need the native sun mask without visible water.
+        let mut settings = self.settings;
+        settings.hdr |= settings.needs_sun_mask();
+        settings.cloud_shadows = self.key.water_cloud;
         let shader = self.key.enhanced().then(|| {
-            let source = super::enhanced_shader::source(self.settings);
+            let source = super::enhanced_shader::source(settings);
             let mut source = if self.settings.night_mode != super::NightMode::AsGame {
                 super::moon_shadows::shader(source, self.settings.moon_shadows, self.settings.night_mode == super::NightMode::Moonlit)
             } else { source };
@@ -176,7 +196,7 @@ impl Request {
         let compile = Arc::new(Compile {
             device: self.device.clone(), shader: shader.clone().unwrap_or_else(|| self.native.clone()),
             native: self.native.clone(), pipeline_layout, holo_pipeline_layout, format: self.format,
-            settings: self.settings, msaa: self.key.msaa, compiles: self.compiles.clone(),
+            settings, msaa: self.key.msaa, compiles: self.compiles.clone(),
             frame_compiles: self.frame_compiles.clone(), frame_thread: self.frame_thread,
         });
         let (mut pipes, mut actor_pipes, mut ground_pipes) = build_pipelines();
@@ -194,7 +214,6 @@ impl Request {
         let device = self.device.clone();
         let format = self.format;
         let msaa = self.key.msaa;
-        let settings = self.settings;
         let depth_clear_pipe = super::pipeline_creation::Deferred::new(move || {
             compile.compiles.fetch_add(1, Ordering::Relaxed);
             if std::thread::current().id() == compile.frame_thread {
@@ -204,7 +223,7 @@ impl Request {
         });
         let grass = super::grass::Compiled::new(
             &self.device, &self.g_layout, &self.tex_layout, &self.holo_layout, self.key.msaa,
-            (self.settings.ambient_occlusion, self.settings.emissive_bloom, self.settings.needs_sun_mask()),
+            (settings.ambient_occlusion, settings.emissive_bloom, settings.needs_sun_mask(), self.key.water_cloud),
             self.settings.sun_shadows || self.settings.moon_shadows, self.format);
         Pipes { #[cfg(test)] shader, msaa: self.key.msaa, native_sky_pipes,
             pipes, actor_pipes, ground_pipes, depth_clear_pipe, grass }
@@ -220,14 +239,14 @@ impl Request {
 pub(super) struct Pending {
     pub key: Key,
     pub settings: EnhancedSettings,
-    worker: Option<std::thread::JoinHandle<Pipes>>,
+    worker: Option<std::thread::JoinHandle<Built>>,
 }
 
 impl Pending {
-    pub(super) fn poll(&mut self) -> Option<Pipes> {
+    pub(super) fn poll(&mut self) -> Option<Built> {
         self.worker.as_ref().expect("pending worker").is_finished().then(|| self.wait())
     }
-    pub(super) fn wait(&mut self) -> Pipes {
+    pub(super) fn wait(&mut self) -> Built {
         match self.worker.take().expect("pending worker").join() {
             Ok(world) => world,
             Err(panic) => std::panic::resume_unwind(panic),

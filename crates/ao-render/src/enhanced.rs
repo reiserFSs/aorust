@@ -4,10 +4,10 @@ use crate::{gpu_stats::{GpuStatsExt, TextureViewStatsExt}, DEPTH};
 use crate::pipeline_creation::RenderPipeline;
 pub(super) const AUX: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
-/// Colour attachments the world pass declares: 1 native, 3 with AO/bloom masks, 4 when the HDR sun mask exists.
+/// Colour attachments the world pass declares, including the optional cloud-only water budget.
 /// Every world-pass pipeline must declare the same count.
 pub(super) fn target_count(settings: &crate::EnhancedSettings) -> usize {
-    if settings.needs_sun_mask() { 4 } else if settings.ambient_occlusion || settings.emissive_bloom { 3 } else { 1 }
+    if settings.cloud_shadows { 5 } else if settings.needs_sun_mask() { 4 } else if settings.ambient_occlusion || settings.emissive_bloom { 3 } else { 1 }
 }
 
 pub(super) struct EnhancedFrame {
@@ -16,17 +16,18 @@ pub(super) struct EnhancedFrame {
     pub colour: wgpu::TextureView,
     pub ambient: Option<wgpu::TextureView>,
     pub emissive: Option<wgpu::TextureView>,
-    /// Sun-lit weight (r), sunlit fraction (g), shadow visibility (b) per pixel; HDR sun brightening and contact shadows.
+    /// Directional share (r), terrain sky openness (g), native fog (b), admitted coverage (a).
     pub sun: Option<wgpu::TextureView>,
+    pub water_cloud: Option<wgpu::TextureView>,
     pub depth: wgpu::TextureView,
     pub resolved_depth: wgpu::TextureView,
-    pub msaa: Option<[Option<wgpu::TextureView>; 4]>,
+    pub msaa: Option<[Option<wgpu::TextureView>; 5]>,
     pub composite: RenderPipeline,
     pub composite_bg: wgpu::BindGroup,
     depth_resolve: Option<(RenderPipeline, wgpu::BindGroup)>,
 }
 impl EnhancedFrame {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32, u32), samples: u32, settings: crate::EnhancedSettings, compiled: &EnhancedPipelines) -> Self {
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32, u32), samples: u32, settings: crate::EnhancedSettings, water_cloud: bool, compiled: &EnhancedPipelines) -> Self {
         let make = |format, count, label| device.create_texture_tracked(&wgpu::TextureDescriptor {
             label: Some(label), size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: count, dimension: wgpu::TextureDimension::D2, format,
@@ -36,16 +37,35 @@ impl EnhancedFrame {
         let ambient = settings.ambient_occlusion.then(|| make(AUX, 1, "Enhanced ambient share"));
         let emissive = settings.emissive_bloom.then(|| make(AUX, 1, "Enhanced authored emission"));
         let sun = settings.needs_sun_mask().then(|| make(AUX, 1, "Enhanced sun mask"));
+        let water_cloud = water_cloud.then(|| Self::water_cloud_view(device, size, 1));
         let depth = make(DEPTH, samples, "Enhanced sampleable depth");
         let resolved_depth = if samples == 1 { depth.clone() } else { make(DEPTH, 1, "Enhanced resolved depth") };
-        let msaa = (samples > 1).then(|| [Some(make(format, samples, "Enhanced MSAA native colour")), settings.ambient_occlusion.then(|| make(AUX, samples, "Enhanced MSAA ambient")), settings.emissive_bloom.then(|| make(AUX, samples, "Enhanced MSAA emission")), settings.needs_sun_mask().then(|| make(AUX, samples, "Enhanced MSAA sun mask"))]);
+        let msaa = (samples > 1).then(|| [Some(make(format, samples, "Enhanced MSAA native colour")), settings.ambient_occlusion.then(|| make(AUX, samples, "Enhanced MSAA ambient")), settings.emissive_bloom.then(|| make(AUX, samples, "Enhanced MSAA emission")), settings.needs_sun_mask().then(|| make(AUX, samples, "Enhanced MSAA sun mask")), water_cloud.as_ref().map(|_| Self::water_cloud_view(device, size, samples))]);
         let composite = compiled.colour.clone();
         let composite_bg = bind(device, &compiled.colour_layout, &colour);
         let depth_resolve = (samples > 1).then(|| (compiled.depth.clone(), bind(device, &compiled.depth_layout, &depth)));
-        Self { size, sample_count: samples, colour, ambient, emissive, sun, depth, resolved_depth, msaa, composite, composite_bg, depth_resolve }
+        Self { size, sample_count: samples, colour, ambient, emissive, sun, water_cloud, depth, resolved_depth, msaa, composite, composite_bg, depth_resolve }
+    }
+    fn water_cloud_view(device: &wgpu::Device, size: (u32, u32), samples: u32) -> wgpu::TextureView {
+        device.create_texture_tracked(&wgpu::TextureDescriptor {
+            label: Some("Enhanced water cloud share"), size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: samples, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+        }).create_view_tracked(&Default::default())
+    }
+    pub fn set_water_cloud(&mut self, device: &wgpu::Device, enabled: bool) {
+        if self.water_cloud.is_some() == enabled { return; }
+        self.water_cloud = enabled.then(|| Self::water_cloud_view(device, self.size, 1));
+        if let Some(msaa) = self.msaa.as_mut() {
+            msaa[4] = enabled.then(|| Self::water_cloud_view(device, self.size, self.sample_count));
+        }
+    }
+    pub fn target_count(&self) -> usize {
+        if self.water_cloud.is_some() { 5 } else if self.sun.is_some() { 4 } else if self.ambient.is_some() || self.emissive.is_some() { 3 } else { 1 }
     }
     pub fn attachment(&self, index: usize) -> Option<wgpu::RenderPassColorAttachment<'_>> {
-        let resolved = [Some(&self.colour), self.ambient.as_ref(), self.emissive.as_ref(), self.sun.as_ref()][index]?;
+        let resolved = [Some(&self.colour), self.ambient.as_ref(), self.emissive.as_ref(), self.sun.as_ref(), self.water_cloud.as_ref()][index]?;
         let msaa = self.msaa.as_ref().and_then(|views| views[index].as_ref());
         Some(wgpu::RenderPassColorAttachment { view: msaa.unwrap_or(resolved), resolve_target: msaa.map(|_| resolved), depth_slice: None,
             ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: if msaa.is_some() { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store } } })

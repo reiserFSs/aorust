@@ -17,6 +17,7 @@ struct Params {
 @group(0) @binding(3) var sun_mask: texture_2d<f32>;
 @group(0) @binding(4) var history: texture_2d<f32>;
 @group(0) @binding(5) var shadow_field: texture_2d<f32>;
+@group(0) @binding(6) var water_cloud: texture_2d<f32>;
 fn mapped_transmittance(p: vec3<f32>) -> f32 {
     if params.shadow_sun.w < 0.5 || p.y >= params.enabled.z { return 1.0; }
     let projected = p.xz + params.shadow_sun.xz / params.shadow_sun.y * (params.shadow_area.w - p.y);
@@ -44,32 +45,34 @@ fn cloud_march(direction: vec3<f32>) -> vec4<f32> {
     var radiance = vec3(0.0);
     var transmittance = 1.0;
     for (var l = 0u; l < u32(params.control.x); l++) {
+        if transmittance <= 0.005 { break; }
         let layer = layers[l];
         let interval = cloud_interval(vec3(0.0), direction, layer, params.control.y);
         if interval.y <= interval.x { continue; }
-        let step = (interval.y - interval.x) / 24.0;
-        for (var i = 0; i < 24; i++) {
+        // Half resolution plus four checker phases amortizes the curved march;
+        // the short light ray needs fewer samples than the visible silhouette.
+        let step = (interval.y - interval.x) / 16.0;
+        let sun_length = length(layer.sun.xyz);
+        let sun = layer.sun.xyz / max(sun_length, 0.001);
+        for (var i = 0; i < 16; i++) {
+            if transmittance <= 0.005 { break; }
             let p = direction * (interval.x + (f32(i) + 0.5) * step);
             let density = cloud_density(p, layer);
             if density <= 0.0 { continue; }
             let extinction = 1.0 - exp(-density * step * layer.shape.w);
-            // Native authored light/direction gives sunset or night scattering.
-            // Native fog changes colour, never cloud extinction.
-            let sun_length = length(layer.sun.xyz);
-            var direct = vec3(0.0);
+            // Native sheets are unfogged and their authored colours are gamma
+            // values. This pass blends into the native gamma UNORM sky target:
+            // neither decode them to linear nor inject primary-world fog.
+            var direct = 0.0;
             if sun_length > 0.001 {
-                let sun = layer.sun.xyz / sun_length;
-                direct = cloud_transmittance(p, sun, layer, layer.shape.y * 8.0)
-                    * clamp(layer.light.rgb, vec3(0.0), vec3(1.0))
+                direct = cloud_transmittance_steps(p, sun, layer, layer.shape.y * 8.0, 4u)
                     * (0.5 + 0.5 * max(dot(direction, sun), 0.0));
             }
-            let distance = interval.x + (f32(i) + 0.5) * step;
-            let visibility = 1.0 - clamp((distance - params.fog.x) / max(params.fog.y - params.fog.x, 0.001), 0.0, 1.0);
-            let native_light = pow(clamp(layer.light.rgb, vec3(0.0), vec3(1.0)), vec3(2.2));
-            let illumination = native_light * (0.16 + direct * 0.84)
-                + pow(clamp(layer.ambient.rgb, vec3(0.0), vec3(1.0)), vec3(2.2));
-            let aerial = mix(params.fog_colour.rgb, illumination, visibility);
-            radiance += transmittance * extinction * aerial;
+            let grey = layer.ambient.w;
+            let illumination = clamp(vec3(grey) * (0.45 + 0.55 * direct)
+                + layer.ambient.rgb + grey * layer.light.rgb * (0.55 * direct),
+                vec3(0.0), vec3(1.0));
+            radiance += transmittance * extinction * illumination;
             transmittance *= 1.0 - extinction;
         }
     }
@@ -99,7 +102,9 @@ fn cloud_march(direction: vec3<f32>) -> vec4<f32> {
     var modulation = vec3(1.0);
     let mask = textureLoad(sun_mask, pixel, 0);
     if z < 1.0 && mask.a > 0.0001 && params.enabled.y > 0.5 {
-        let share = clamp(mask.r, 0.0, 1.0);
+        var water_share = 0.0;
+        if params.enabled.w > 0.5 { water_share = textureLoad(water_cloud, pixel, 0).r; }
+        let share = clamp(mask.r + water_share, 0.0, 1.0);
         if share > 0.0 {
             let uv = position.xy / vec2<f32>(textureDimensions(depth));
             let p = world(uv, z);
@@ -110,11 +115,16 @@ fn cloud_march(direction: vec3<f32>) -> vec4<f32> {
     }
     return vec4(clamp(modulation, vec3(0.0), vec3(1.0)), 1.0);
 }
-@fragment fn sky_composite(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
-    let pixel = vec2<i32>(position.xy);
-    // Native cloud sheets write depth too. Only admitted primary-world
-    // coverage excludes cloud sky; never clear native depth to infer sky.
-    if textureLoad(sun_mask, pixel, 0).a > 0.0001 { return vec4(0.0); }
-    let half_pixel = min(pixel / 2, vec2<i32>(textureDimensions(history)) - 1);
-    return textureLoad(history, half_pixel, 0);
+// Native sky boundary only: no primary depth/coverage read. Foreground geometry,
+// including non-depthwriting translucent FX, is submitted after this draw.
+@fragment fn sky_background(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    let size = vec2<i32>(textureDimensions(history));
+    let q = position.xy * 0.5 - 0.5;
+    let base = vec2<i32>(floor(q));
+    let f = fract(q);
+    let a = textureLoad(history, clamp(base, vec2(0), size - 1), 0);
+    let b = textureLoad(history, clamp(base + vec2(1, 0), vec2(0), size - 1), 0);
+    let c = textureLoad(history, clamp(base + vec2(0, 1), vec2(0), size - 1), 0);
+    let d = textureLoad(history, clamp(base + vec2(1, 1), vec2(0), size - 1), 0);
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }

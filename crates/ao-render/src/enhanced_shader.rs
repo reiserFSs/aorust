@@ -51,6 +51,9 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
     source = source.replace("@fragment\nfn fs_", "fn enhanced_original_fs_");
     source = source.replace(" -> @location(0) vec4<f32>", " -> vec4<f32>");
     source.push_str(&crate::shader_source::load("enhanced_output.wgsl", OUTPUT));
+    if settings.cloud_shadows {
+        source = source.replace("    @location(3) sun: vec4<f32>,", "    @location(3) sun: vec4<f32>,\n    @location(4) water_cloud: vec4<f32>,");
+    }
     for name in names {
         let ambient = match name.as_str() {
             "fs_opaque" | "fs_fade_opaque" | "fs_fade_test" | "fs_test" | "fs_blend" => "enhanced_ao_receiver(i, beauty)",
@@ -94,7 +97,12 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
             "fs_ground_shadow" => "vec4<f32>(1.0)",
             _ => "vec4<f32>(0.0, 0.0, 0.0, beauty.a)",
         };
-        source.push_str(&format!("\n@fragment fn {name}(i: VOut) -> EnhancedOutput {{\n{geometric_normal}    let envelope = vec4<f32>(1.0);\n    let emission_sample = {emission_sample};\n    let beauty = enhanced_original_{name}({fragment_input});\n    let bounded_beauty = clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0));\n    return EnhancedOutput(beauty, {ambient}, {emission_result}, {sun});\n}}\n"));
+        let water = if settings.cloud_shadows {
+            if name == "fs_ground_shadow" { ", vec4<f32>(1.0)".to_owned() }
+            else if matches!(name.as_str(), "fs_opaque" | "fs_fade_opaque" | "fs_fade_test" | "fs_test" | "fs_blend") { ", vec4<f32>(enhanced_water_cloud(i, beauty), 0.0, 0.0, beauty.a)".to_owned() }
+            else { ", vec4<f32>(0.0, 0.0, 0.0, beauty.a)".to_owned() }
+        } else { String::new() };
+        source.push_str(&format!("\n@fragment fn {name}(i: VOut) -> EnhancedOutput {{\n{geometric_normal}    let envelope = vec4<f32>(1.0);\n    let emission_sample = {emission_sample};\n    let beauty = enhanced_original_{name}({fragment_input});\n    let bounded_beauty = clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0));\n    return EnhancedOutput(beauty, {ambient}, {emission_result}, {sun}{water});\n}}\n"));
     }
     source = source.replace("sun_visibility(i.wpos)", "sun_visibility(i.wpos, i.n, i.clip.xy)");
     if shadows {
@@ -111,7 +119,7 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
         source.push_str("\nfn sun_visibility(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>) -> f32 { return 1.0; }\n");
     }
     // Remove disabled effects structurally, not merely by multiplying by zero.
-    for (enabled, name) in [(ao, "enhanced_ao_receiver"), (ao, "enhanced_ground_receiver"), (bloom, "enhanced_emission"), (hdr, "enhanced_sun")] {
+    for (enabled, name) in [(ao, "enhanced_ao_receiver"), (ao, "enhanced_ground_receiver"), (bloom, "enhanced_emission"), (hdr, "enhanced_sun"), (settings.cloud_shadows, "enhanced_water_cloud")] {
         if !enabled {
             let start = source.find(&format!("fn {name}(")).expect("enhanced helper");
             let end = start + source[start..].find("\n}\n").expect("enhanced helper end") + 3;
@@ -227,6 +235,11 @@ mod tests {
         let shadows_only = super::source(crate::EnhancedSettings { sun_shadows: true, ..Default::default() });
         assert!(!shadows_only.contains("ao_info:"));
         assert!(!shadows_only.contains("fn enhanced_ao_receiver"));
+        let clouds = super::source(crate::EnhancedSettings { cloud_shadows: true, ..Default::default() });
+        assert!(clouds.contains("@location(4) water_cloud: vec4<f32>"));
+        assert!(clouds.contains("vec4<f32>(enhanced_water_cloud(i, beauty), 0.0, 0.0, beauty.a)"));
+        assert!(!hdr.contains("@location(4) water_cloud:"));
+        assert!(!hdr.contains("fn enhanced_water_cloud("));
     }
 
     #[test]
@@ -255,17 +268,19 @@ fn ground_fog(i: VOut) -> f32 {{ return i.fog; }}
     if p.x >= 7.0 {{
         mat.native.z = select(16.0, 20.0, p.x >= 9.0 && p.x < 10.0);
         g.water_dir.w = select(0.0, 1.0, p.x >= 8.0);
-        mat.emissive = vec4<f32>(vec3<f32>(0.125), 0.0);
+        mat.emissive = vec4<f32>(vec3<f32>(0.125), select(0.0, 1.0, p.x >= 14.0));
         g.ambient_g = vec4<f32>(vec3<f32>(0.125), 0.0);
         let local = vec3<f32>(0.25);
         var light = vec3<f32>(1.0);
         if p.x >= 10.0 && p.x < 11.0 {{ light = vec3<f32>(0.5); }}
         if p.x >= 12.0 && p.x < 13.0 {{ light = vec3<f32>(1.0, 0.5, 0.5); }}
         let fog = select(0.5, 1.0, p.x >= 11.0 && p.x < 12.0);
-        mat.scroll.z = select(0.0, 2.0, p.x >= 13.0);
-        // Native water never carries the outdoor sun shares.
-        return enhanced_sun(VOut(0u, fog, vec4<f32>(0.0), vec4<f32>(1.0), light, local),
-            vec4<f32>(0.75, 0.75, 0.75, 0.25), false, 1.0);
+        mat.scroll.z = select(0.0, 2.0, p.x >= 13.0 && p.x < 14.0);
+        let water = VOut(0u, fog, vec4<f32>(0.0), vec4<f32>(1.0), light, local);
+        let beauty = vec4<f32>(0.75, 0.75, 0.75, 0.25);
+        let mask = enhanced_sun(water, beauty, false, 1.0);
+        let share = select(0.0, enhanced_water_cloud(water, beauty), g.water_dir.w > 0.0);
+        return vec4<f32>(mask.r, share, mask.b, mask.a);
     }}
     if p.x >= 4.0 {{
         g.ambient_g.w = select(0.0, 1.0, p.x >= 5.0);
@@ -294,7 +309,7 @@ fn ground_fog(i: VOut) -> f32 {{ return i.fog; }}
             primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
         });
         let texture = r.device.create_texture(&wgpu::TextureDescriptor {
-            label: None, size: wgpu::Extent3d { width: 14, height: 1, depth_or_array_layers: 1 },
+            label: None, size: wgpu::Extent3d { width: 15, height: 1, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: r.format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
         });
@@ -311,7 +326,7 @@ fn ground_fog(i: VOut) -> f32 {{ return i.fog; }}
             pass.draw(0..3, 0..1);
         }
         r.queue.submit([encoder.finish()]);
-        let pixels = crate::texture_to_rgba(&r, &texture, 14, 1).unwrap();
+        let pixels = crate::texture_to_rgba(&r, &texture, 15, 1).unwrap();
         assert_eq!(&pixels[..4], &[128, 0, 128, 255], "default-fog meshes retain native fog amount");
         assert_eq!(&pixels[4..8], &[0, 0, 0, 255], "custom-fog receivers cannot gain daylight energy");
         assert_eq!(&pixels[8..12], &[0, 0, 0, 255], "roof umbra has neither direct exposure nor sky fill");
@@ -320,12 +335,125 @@ fn ground_fog(i: VOut) -> f32 {{ return i.fog; }}
         assert_eq!(&pixels[20..24], &[0, 0, 0, 255], "the retained shadow floor cannot lift roofed meadow albedo");
         assert_eq!(&pixels[24..28], &[255; 4], "actual direct daylight retains the meadow lift");
         assert_eq!(&pixels[28..32], &[0, 0, 0, 64], "cloud switch zero leaves native water excluded even with HDR");
-        assert_eq!(&pixels[32..36], &[64, 0, 128, 64], "cloud-only water receives fog-attenuated WaterLight, no sky share, and native coverage");
+        assert_eq!(&pixels[32..36], &[0, 64, 0, 64], "cloud-only WaterLight budget is independent of the native sun mask");
         assert_eq!(&pixels[36..40], &[0, 0, 0, 64], "unlit water remains excluded");
-        assert_eq!(&pixels[40..44], &[0, 0, 128, 64], "emission, ambient and local lights cannot become water directional light");
-        assert_eq!(&pixels[44..48], &[0, 0, 255, 64], "full native fog extinguishes water directional light without losing fog");
-        assert_eq!(&pixels[48..52], &[14, 0, 128, 64], "water directional share uses luminance, not the brightest channel");
+        assert_eq!(&pixels[40..44], &[0, 0, 0, 64], "emission, ambient and local lights cannot become water directional light");
+        assert_eq!(&pixels[44..48], &[0, 0, 0, 64], "full native fog extinguishes water directional light");
+        assert_eq!(&pixels[48..52], &[0, 14, 0, 64], "water cloud share uses luminance, not the brightest channel");
         assert_eq!(&pixels[52..56], &[0, 0, 0, 64], "custom-fog water remains excluded");
+        assert_eq!(&pixels[56..60], &[0, 0, 0, 64], "emissive-mode water remains excluded with the cloud switch on");
+    }
+
+    #[test]
+    fn alpha_water_cloud_budget_preserves_sky_open_sun_mask_on_gpu() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let r = crate::Renderer::new(&instance, None).expect("water blending regression requires GPU");
+        let helper = &super::OUTPUT[super::OUTPUT.find("var<private> enhanced_sun_visibility").unwrap()..];
+        let source = format!(r#"
+struct VOut {{ effect: u32, fog: f32, sun_share: vec4<f32>, light: vec3<f32>, dlight: vec3<f32> }}
+struct Material {{ scroll: vec4<f32>, native: vec4<f32>, emissive: vec4<f32> }}
+var<private> mat: Material;
+struct Globals {{ ambient_g: vec4<f32> }}
+var<private> g: Globals;
+fn native_unlit() -> bool {{ return false; }}
+fn to_g(v: vec3<f32>) -> vec3<f32> {{ return v; }}
+fn native_fog(f: f32) -> f32 {{ return f; }}
+fn ground_fog(i: VOut) -> f32 {{ return i.fog; }}
+{helper}
+struct Output {{ @location(3) sun: vec4<f32>, @location(4) water: vec4<f32> }}
+@vertex fn vs(@builtin(vertex_index) n: u32) -> @builtin(position) vec4<f32> {{
+    return vec4<f32>(vec2<f32>(f32((n << 1u) & 2u), f32(n & 2u)) * 2.0 - 1.0, 0.0, 1.0);
+}}
+@fragment fn terrain() -> Output {{
+    let i = VOut(0u, 0.25, vec4<f32>(2.0 / 3.0), vec3<f32>(1.0), vec3<f32>(0.0));
+    return Output(enhanced_sun(i, vec4<f32>(1.0), true, 1.0), vec4<f32>(0.0));
+}}
+@fragment fn water() -> Output {{
+    mat.native.z = 16.0;
+    let i = VOut(0u, 0.5, vec4<f32>(0.0), vec3<f32>(0.5), vec3<f32>(0.0));
+    let beauty = vec4<f32>(0.75, 0.75, 0.75, 0.25);
+    return Output(enhanced_sun(i, beauty, false, 0.0), vec4<f32>(enhanced_water_cloud(i, beauty), 0.0, 0.0, beauty.a));
+}}
+"#);
+        let shader = r.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("real water alpha MRT"), source: wgpu::ShaderSource::Wgsl(source.into()) });
+        let read_shader = r.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("water MRT readback"), source: wgpu::ShaderSource::Wgsl(r#"
+@group(0) @binding(0) var sun: texture_2d<f32>;
+@group(0) @binding(1) var water: texture_2d<f32>;
+@vertex fn vs(@builtin(vertex_index) n: u32) -> @builtin(position) vec4<f32> {
+    return vec4<f32>(vec2<f32>(f32((n << 1u) & 2u), f32(n & 2u)) * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    let mask = textureLoad(sun, vec2<i32>(0), 0);
+    if p.x < 1.0 { return mask; }
+    return vec4<f32>(textureLoad(water, vec2<i32>(0), 0).rrr, 1.0);
+}
+"#.into()) });
+        let read_pipe = r.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None, layout: None,
+            vertex: wgpu::VertexState { module: &read_shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState { module: &read_shader, entry_point: Some("fs"), targets: &[Some(wgpu::ColorTargetState { format: r.format, blend: None, write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),
+            primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
+        });
+        for samples in [1, 4] {
+            if !r.msaa_supported.contains(&samples) || !r.auxiliary_msaa.sample_count_supported(samples) || !r.water_cloud_msaa.sample_count_supported(samples) { continue; }
+            let make = |format, count| r.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("water blending regression"), size: wgpu::Extent3d { width: 2, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1, sample_count: count, dimension: wgpu::TextureDimension::D2, format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+            }).create_view(&Default::default());
+            let sun = make(crate::enhanced::AUX, 1);
+            let budget = make(wgpu::TextureFormat::R16Float, 1);
+            let msaa_sun = (samples > 1).then(|| make(crate::enhanced::AUX, samples));
+            let msaa_budget = (samples > 1).then(|| make(wgpu::TextureFormat::R16Float, samples));
+            let mut captures = Vec::new();
+            for clouds in [false, true] {
+                let pipeline = |entry, blend| r.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("native alpha over sky-open terrain"), layout: None,
+                    vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+                    fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(entry), targets: &[
+                        None, None, None,
+                        Some(wgpu::ColorTargetState { format: crate::enhanced::AUX, blend, write_mask: wgpu::ColorWrites::ALL }),
+                        clouds.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R16Float, blend, write_mask: wgpu::ColorWrites::RED }),
+                    ][..if clouds { 5 } else { 4 }], compilation_options: Default::default() }),
+                    primitive: Default::default(), depth_stencil: None, multisample: wgpu::MultisampleState { count: samples, ..Default::default() }, multiview_mask: None, cache: None,
+                });
+                let terrain = pipeline("terrain", None);
+                let water = pipeline("water", Some(wgpu::BlendState::ALPHA_BLENDING));
+                let output = r.device.create_texture(&wgpu::TextureDescriptor {
+                    label: None, size: wgpu::Extent3d { width: 2, height: 1, depth_or_array_layers: 1 },
+                    mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: r.format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+                });
+                let output_view = output.create_view(&Default::default());
+                fn attachment<'a>(resolved: &'a wgpu::TextureView, msaa: Option<&'a wgpu::TextureView>) -> Option<wgpu::RenderPassColorAttachment<'a>> {
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: msaa.unwrap_or(resolved), resolve_target: msaa.map(|_| resolved), depth_slice: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                    })
+                }
+                let mut encoder = r.device.create_command_encoder(&Default::default());
+                {
+                    let attachments = [None, None, None, attachment(&sun, msaa_sun.as_ref()), if clouds { attachment(&budget, msaa_budget.as_ref()) } else { None }];
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { color_attachments: &attachments[..if clouds { 5 } else { 4 }], ..Default::default() });
+                    pass.set_pipeline(&terrain); pass.draw(0..3, 0..1);
+                    pass.set_pipeline(&water); pass.draw(0..3, 0..1);
+                }
+                let bind = r.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &read_pipe.get_bind_group_layout(0), entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&sun) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&budget) },
+                ] });
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { color_attachments: &[attachment(&output_view, None)], ..Default::default() });
+                    pass.set_pipeline(&read_pipe); pass.set_bind_group(0, &bind, &[]); pass.draw(0..3, 0..1);
+                }
+                r.queue.submit([encoder.finish()]);
+                captures.push(crate::texture_to_rgba(&r, &output, 2, 1).unwrap());
+            }
+            assert_eq!(&captures[0][..4], &captures[1][..4], "{samples}x: cloud switch cannot alter any native sun-mask channel");
+            assert_eq!(&captures[1][..4], &[96, 143, 48, 255], "positive terrain sky openness survives native water alpha blending");
+            assert_eq!(&captures[0][4..8], &[0, 0, 0, 255]);
+            assert_eq!(&captures[1][4..8], &[16, 16, 16, 255], "0.5 WaterLight * 0.5 native fog survival * 0.25 water alpha");
+        }
     }
 
     #[test]

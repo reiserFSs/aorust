@@ -140,7 +140,7 @@ pub(super) fn depth_clear_pipeline(device:&wgpu::Device,format:wgpu::TextureForm
     });
     let target = wgpu::ColorTargetState {format,blend:None,write_mask:wgpu::ColorWrites::empty()};
     let auxiliary=wgpu::ColorTargetState {format:crate::enhanced::AUX,blend:None,write_mask:wgpu::ColorWrites::empty()};
-    let targets = [Some(target), settings.ambient_occlusion.then(|| auxiliary.clone()), settings.emissive_bloom.then(|| auxiliary.clone()), settings.needs_sun_mask().then_some(auxiliary)];
+    let targets = [Some(target), settings.ambient_occlusion.then(|| auxiliary.clone()), settings.emissive_bloom.then(|| auxiliary.clone()), settings.needs_sun_mask().then_some(auxiliary), settings.cloud_shadows.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R16Float, blend: None, write_mask: wgpu::ColorWrites::empty() })];
     crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
         label:Some("native viewport depth clear"),layout:Some(&layout),
         vertex:wgpu::VertexState {module:&shader,entry_point:Some("vs"),compilation_options:Default::default(),buffers:&[]},

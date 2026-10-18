@@ -17,6 +17,7 @@ struct MistVolume { center_radius: vec4<f32>, density: vec4<f32> }
 // authored moon cascades. Parent supplies the shared authored moonlight energy.
 struct ShadowFrame {
     matrices: array<mat4x4<f32>, 3>, splits: vec4<f32>, eye: vec4<f32>, forward: vec4<f32>, control: vec4<u32>,
+    moon_direction: vec4<f32>, moon_budget: vec4<f32>,
 }
 @group(1) @binding(0) var<uniform> shadow_frame: ShadowFrame;
 @group(1) @binding(1) var shadow_maps: texture_depth_2d_array;
@@ -57,7 +58,10 @@ fn native_remaining(p: vec3<f32>) -> f32 {
 // the chosen directional radiance and current admitted occluder fields directly.
 fn air_light_admission(z: f32, surface_share: f32, remaining: f32) -> f32 {
     if z >= 1.0 { return 1.0; }
-    return clamp(surface_share, 0.0, 1.0) * clamp(remaining, 0.0, 1.0);
+    // Sun.r remains native sunlight for HDR/contact. Moon air instead uses
+    // the exact shared source radiance in a.light and admitted-world depth.
+    let share = select(clamp(surface_share, 0.0, 1.0), 1.0, a.sun.w > 0.5);
+    return share * clamp(remaining, 0.0, 1.0);
 }
 fn encode_transmittance(p: vec3<f32>, z: f32, pixel: vec2<i32>, lighting: vec2<f32>) -> vec4<f32> {
     let surface_share = textureLoad(directional_mask, pixel, 0).r;
@@ -101,8 +105,7 @@ fn filtered_atmosphere(position: vec4<f32>) -> vec4<f32> {
 @fragment fn composite(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     return vec4<f32>(filtered_atmosphere(position).rgb, 1.0);
 }
-@fragment fn composite_light(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
-    let filtered = filtered_atmosphere(position);
+fn scattered_light(position: vec4<f32>, filtered: vec4<f32>) -> vec3<f32> {
     let pixel = vec2<i32>(position.xy);
     let z = scene_depth(pixel);
     let p = point(pixel, min(z, 0.999999));
@@ -117,5 +120,15 @@ fn filtered_atmosphere(position: vec4<f32>) -> vec4<f32> {
         // horizon. This adds no surface visibility and never undoes extinction.
         aerial = a.horizon.rgb * (vec3<f32>(1.0) - haze_t) * shaft_t;
     }
-    return vec4<f32>(aerial + a.light.rgb * filtered.a * filtered.rgb * admitted, 1.0);
+    return aerial + a.light.rgb * filtered.a * filtered.rgb * admitted;
+}
+@fragment fn composite_light(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    return vec4<f32>(scattered_light(position, filtered_atmosphere(position)), 1.0);
+}
+// Without coloured haze the three transmittance channels are identical.
+// One premultiplied blend preserves the same gamma-domain multiply plus add,
+// avoiding a second full-frame depth-bilateral reconstruction and colour store.
+@fragment fn composite_shafts(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    let filtered = filtered_atmosphere(position);
+    return vec4<f32>(scattered_light(position, filtered), 1.0 - filtered.r);
 }

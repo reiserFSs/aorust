@@ -65,6 +65,10 @@ fn low_sun_scale(sun: bool, direction: Vec3) -> glam::Vec2 {
     glam::Vec2::new(1.0 + 0.5 * low, 1.0 + 0.2 * low)
 }
 
+fn disc_channel(vertex: f32, emissive: f32, base: f32) -> f32 {
+    (crate::gamma(vertex) + crate::gamma(emissive)).min(1.0) * crate::gamma(base)
+}
+
 /// No history and no owned colour targets. Disabling releases cached frame bindings.
 pub(super) struct SkyDiscs {
     pipeline: RenderPipeline,
@@ -154,8 +158,7 @@ impl SkyDiscs {
                 let ray = enlarged_world.truncate() / enlarged_world.w - eye;
                 let mut color = [0.0; 4];
                 for (channel, value) in color.iter_mut().take(3).enumerate() {
-                    let gamma = (vertex.color[channel].max(0.0).powf(1.0 / 2.2) + source.material.emissive[channel].max(0.0).powf(1.0 / 2.2)).min(1.0);
-                    *value = (gamma * source.material.base_color[channel].max(0.0).powf(1.0 / 2.2)).powf(2.2);
+                    *value = disc_channel(vertex.color[channel], source.material.emissive[channel], source.material.base_color[channel]);
                 }
                 color[3] = vertex.color[3] * source.material.base_color[3];
                 if source.sun && vertex.normal[2] >= 0.0 { color[3] *= 1.0 - flicker[(vertex.normal[2] + 0.5) as usize & 7] as f32 / 255.0; }
@@ -202,6 +205,13 @@ impl SkyDiscs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn disc_tint_is_encoded_once_for_the_native_gamma_target() {
+        let linear = |v: f32| v.powf(2.2);
+        assert!((disc_channel(linear(0.25), linear(0.125), linear(0.5)) - 0.1875).abs() < 1e-6);
+        assert!((disc_channel(linear(0.8), linear(0.8), linear(0.5)) - 0.5).abs() < 1e-6);
+        assert_eq!(disc_channel(-1.0, 0.0, 1.0), 0.0);
+    }
     #[test]
     fn low_sun_growth_is_bounded_and_never_changes_moon_radius() {
         assert_eq!(low_sun_scale(false, Vec3::X), glam::Vec2::ONE);

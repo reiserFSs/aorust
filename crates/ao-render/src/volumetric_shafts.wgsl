@@ -1,7 +1,5 @@
 // Current-frame native cascades, including authored moon maps from the parent.
-fn mapped_visibility(p: vec3<f32>) -> f32 {
-    let world = p + a.eye.xyz;
-    let view_depth = dot(world - shadow_frame.eye.xyz, shadow_frame.forward.xyz);
+fn mapped_visibility(world: vec3<f32>, view_depth: f32) -> f32 {
     if view_depth <= shadow_frame.splits.w || view_depth >= shadow_frame.eye.w || shadow_frame.forward.w <= 0.0 { return 1.0; }
     var layer = 0u;
     if view_depth > shadow_frame.splits.x { layer = 1u; }
@@ -16,14 +14,24 @@ fn mapped_visibility(p: vec3<f32>) -> f32 {
     let pixel = full_pixel(vec2<i32>(position.xy));
     let z = scene_depth(pixel);
     let end = point(pixel, min(z, 0.999999));
-    let reach = min(length(end), min(a.eye.w, shadow_frame.eye.w));
-    let direction = normalize(end);
+    // Cascade coverage bounds occluders, not the independent atmospheric ray.
+    let reach = min(length(end), a.eye.w);
+    let direction = end / max(length(end), 0.00001);
+    // Beyond native fog extinction every integration weight is exactly zero.
+    // Preserve the original interval's normalization when omitting that tail.
+    let active_reach = min(reach, a.fog.w);
+    let fog_range = max(a.fog.w - a.profile.y, 0.001);
+    let view_origin = dot(a.eye.xyz - shadow_frame.eye.xyz, shadow_frame.forward.xyz);
+    let view_step = dot(direction, shadow_frame.forward.xyz);
     var lighting = vec2<f32>(0.0);
-    // True world-space ray march; no screen-space radial approximation/history.
-    for (var i = 0u; i < 48u; i++) {
-        let q = direction * (reach * (f32(i) + 0.5) / 48.0);
-        let lit = mapped_visibility(q) * gap_transmittance(q);
-        lighting += vec2<f32>(1.0 - lit, lit) * native_remaining(q);
+    // Fixed midpoint strata stay stable under camera motion; bilateral half-res
+    // reconstruction supplies the spatial filtering without temporal history.
+    for (var i = 0u; i < 24u; i++) {
+        let distance = active_reach * (f32(i) + 0.5) / 24.0;
+        let q = direction * distance;
+        let remaining = clamp((a.fog.w - distance) / fog_range, 0.0, 1.0);
+        let lit = mapped_visibility(q + a.eye.xyz, view_origin + view_step * distance) * gap_transmittance(q);
+        lighting += vec2<f32>(1.0 - lit, lit) * remaining;
     }
-    return encode_transmittance(end, z, pixel, lighting / 48.0);
+    return encode_transmittance(end, z, pixel, lighting * (active_reach / max(reach, 0.00001) / 24.0));
 }

@@ -45,6 +45,7 @@ pub(super) struct Atmosphere {
     shafts: RenderPipeline,
     composite: RenderPipeline,
     scatter: RenderPipeline,
+    shaft_composite: RenderPipeline,
     targets: Option<Targets>,
 }
 struct Targets {
@@ -102,23 +103,27 @@ impl Atmosphere {
             color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
             alpha: wgpu::BlendComponent::REPLACE,
         }));
+        let shaft_composite = make("composite_shafts", &plain_layout, format, Some(wgpu::BlendState {
+            color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add },
+            alpha: wgpu::BlendComponent::REPLACE,
+        }));
         let params = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("atmosphere parameters"), size: std::mem::size_of::<Params>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         Self { layout, params, volumes: storage(device, "mist volumes", std::mem::size_of::<MistVolume>()),
             volume_capacity: 1,
-            volume_upload: Vec::new(), haze, shafts, composite, scatter, targets: None }
+            volume_upload: Vec::new(), haze, shafts, composite, scatter, shaft_composite, targets: None }
     }
-    pub(super) fn is_ready(&self) -> bool { self.haze.is_ready() && self.shafts.is_ready() && self.composite.is_ready() && self.scatter.is_ready() }
-    pub(super) fn wait(&self) { self.haze.get(); self.shafts.get(); self.composite.get(); self.scatter.get(); }
+    pub(super) fn is_ready(&self) -> bool { self.haze.is_ready() && self.shafts.is_ready() && self.composite.is_ready() && self.scatter.is_ready() && self.shaft_composite.is_ready() }
+    pub(super) fn wait(&self) { self.haze.get(); self.shafts.get(); self.composite.get(); self.scatter.get(); self.shaft_composite.get(); }
     pub(super) fn release_targets(&mut self) { self.targets = None; }
     pub(super) fn target_bytes(&self) -> u64 {
-        self.targets.as_ref().map_or(0, |t| u64::from(t.size.0.div_ceil(2)) * u64::from(t.size.1.div_ceil(2)) * 8)
-            + self.params.size() + self.volumes.size()
+        self.targets.as_ref().map_or(0, |t| u64::from(t.size.0.div_ceil(2)) * u64::from(t.size.1.div_ceil(2)) * 8
+            + self.params.size() + self.volumes.size())
     }
     #[allow(clippy::too_many_arguments)]
     pub(super) fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder,
         depth: &wgpu::TextureView, directional_mask: &wgpu::TextureView, colour: &wgpu::TextureView, size: (u32, u32),
-        vp: Mat4, eye: Vec3, far: f32, env: ao_scene::Environment, fog: Option<&ao_scene::FogModel>, base_height: f32,
+        vp: Mat4, eye: Vec3, far: f32, env: ao_scene::Environment, moon_air: bool, fog: Option<&ao_scene::FogModel>, base_height: f32,
         switches: AtmosphereSwitches, shadow_receiver: Option<&wgpu::BindGroup>, cloud_layers: &[CloudDensityLayer], native_sun_y: f32,
         cloud_field: Option<&crate::cloud_shadows::CloudShadowField>) {
         if !switches.any() || size.0 == 0 || size.1 == 0 || !vp.is_finite() || vp.determinant().abs() < 1e-12
@@ -151,10 +156,10 @@ impl Atmosphere {
         let cloud_base = cloud_layers.iter().map(|layer| layer.shape[0]).fold(f32::INFINITY, f32::min);
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&Params {
             inverse_vp: relative_inverse.as_mat4().to_cols_array_2d(), eye: eye.extend(far).to_array(),
-            sun: sun.extend(0.0).to_array(), fog: tint.extend(env.fog_end.max(0.01)).to_array(),
-            light: Vec3::from(env.sun_color).max(Vec3::ZERO).extend(0.0).to_array(),
-            horizon: Vec3::from(env.fog_color).lerp(Vec3::from(env.sky_color), if switches.land_haze { 0.35 } else { 0.0 })
-                .clamp(Vec3::ZERO, Vec3::ONE).extend(0.0).to_array(),
+            sun: sun.extend(u32::from(moon_air) as f32).to_array(), fog: tint.extend(env.fog_end.max(0.01)).to_array(),
+            light: encoded_radiance(env.sun_color),
+            horizon: encoded_radiance(Vec3::from(env.fog_color).lerp(Vec3::from(env.sky_color), if switches.land_haze { 0.35 } else { 0.0 })
+                .clamp(Vec3::ZERO, Vec3::ONE).to_array()),
             cloud_area, cloud_sun, cloud_shift: cloud_shift.extend(cloud_base).to_array(),
             profile: [base_height - eye.y, env.fog_start, mist_weight(native_sun_y), far],
             flags: [u32::from(switches.height_haze), u32::from(switches.land_haze), u32::from(switches.valley_mist), u32::from(switches.volumetric_shafts)],
@@ -180,13 +185,16 @@ impl Atmosphere {
         }
         let t = self.targets.as_ref().expect("atmosphere targets allocated");
         let mapped = switches.volumetric_shafts && shadow_receiver.is_some();
+        let combined = !switches.height_haze && !switches.land_haze && !switches.valley_mist;
         for (stage, output) in [(0, &t.half), (1, colour), (2, colour)] {
+            if combined && stage == 2 { break; }
             let estimate = stage == 0;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("layered atmosphere"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: output, resolve_target: None, depth_slice: None,
                     ops: wgpu::Operations { load: if estimate { wgpu::LoadOp::Clear(wgpu::Color::WHITE) } else { wgpu::LoadOp::Load }, store: wgpu::StoreOp::Store } })],
                 depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
-            pass.set_pipeline(if stage == 2 { &self.scatter } else if !estimate { &self.composite } else if mapped { &self.shafts } else { &self.haze });
+            pass.set_pipeline(if estimate { if mapped { &self.shafts } else { &self.haze } }
+                else if combined { &self.shaft_composite } else if stage == 2 { &self.scatter } else { &self.composite });
             pass.set_bind_group(0, if estimate { &t.estimate_bind } else { &t.bind }, &[]);
             if estimate && mapped { pass.set_bind_group(1, shadow_receiver.expect("mapped shafts receiver"), &[]); }
             pass.draw(0..3, 0..1);
@@ -194,10 +202,23 @@ impl Atmosphere {
     }
 }
 fn mist_weight(elevation: f32) -> f32 { 1.0 - ((elevation - 0.02) / 0.35).clamp(0.0, 1.0) }
+// The native colour attachment is gamma UNORM, not an sRGB/linear-light target.
+fn encoded_radiance(rgb: [f32; 3]) -> [f32; 4] {
+    Vec3::from(rgb.map(crate::gamma)).extend(0.0).to_array()
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn aerial_radiance_is_encoded_once_for_the_native_gamma_target() {
+        let linear = [0.25_f32, 0.5, 0.75].map(|v| v.powf(2.2));
+        let encoded = encoded_radiance(linear);
+        for (actual, expected) in encoded.into_iter().zip([0.25, 0.5, 0.75, 0.0]) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+        assert_eq!(encoded_radiance([-1.0, 0.0, 1.0]), [0.0, 0.0, 1.0, 0.0]);
+    }
     #[test]
     fn independent_switches_and_authored_sun_mist_burnoff() {
         assert!(!AtmosphereSwitches::default().any());
@@ -252,7 +273,7 @@ mod tests {
             let env = ao_scene::Environment { sky_color: [0.0; 3], fog_color: [0.2, 0.3, 0.5], fog_start: 0.1, fog_end: 100.0,
                 ambient: [0.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, -1.0, 0.0], sun_specular: 0.0 };
             atmosphere.encode(&r.device, &r.queue, &mut encoder, &depth, &mask, &colour, size,
-                Mat4::perspective_rh(1.0, 1.0, 0.1, 100.0), Vec3::ZERO, 100.0, env, None, 0.0, switches, None, &[], -1.0, None);
+                Mat4::perspective_rh(1.0, 1.0, 0.1, 100.0), Vec3::ZERO, 100.0, env, false, None, 0.0, switches, None, &[], -1.0, None);
             r.queue.submit([encoder.finish()]);
             outputs.push(crate::texture_to_rgba(&r, &colour_texture, size.0, size.1).unwrap());
         }
@@ -270,7 +291,117 @@ mod tests {
             for image in &outputs[offset + 1..offset + 4] { assert_ne!(image, &outputs[offset], "each haze switch acts independently"); }
         }
         assert_eq!(outputs[10], outputs[12], "native cloud-sheet depth is not admitted land");
+        // Disabled cascades, whether unencoded or carrying an old useful-far,
+        // cannot clip the independently integrated atmospheric interval.
+        let mut shadows = crate::sun_shadows::SunShadows::new(&r, size, 16);
+        let mut reach_pixels = None;
+        for reach in [0.0, 10.0, 100.0] {
+            let mut uniform: crate::sun_shadows::ShadowUniform = bytemuck::Zeroable::zeroed();
+            uniform.eye[3] = reach;
+            shadows.update(&r.queue, &crate::sun_shadows::CascadeFrame { uniform });
+            let mut encoder = r.device.create_command_encoder(&Default::default());
+            {
+                let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("unencoded cascade reach"), color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &colour, resolve_target: None, depth_slice: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                });
+            }
+            let env = ao_scene::Environment { sky_color: [0.0; 3], fog_color: [0.2; 3], fog_start: 0.1, fog_end: 100.0,
+                ambient: [0.0; 3], sun_color: [1.0; 3], sun_dir: [0.0, 1.0, 0.0], sun_specular: 0.0 };
+            atmosphere.encode(&r.device, &r.queue, &mut encoder, &depth, &mask, &colour, size,
+                Mat4::perspective_rh(1.0, 1.0, 0.1, 100.0), Vec3::ZERO, 100.0, env, false, None, 0.0,
+                AtmosphereSwitches { volumetric_shafts: true, ..Default::default() }, Some(&shadows.receiver), &[], 1.0, None);
+            r.queue.submit([encoder.finish()]);
+            let pixels = crate::texture_to_rgba(&r, &colour_texture, size.0, size.1).unwrap();
+            if let Some(expected) = &reach_pixels {
+                assert_eq!(&pixels, expected, "unencoded cascades collapsed the independent atmospheric ray reach");
+            } else { reach_pixels = Some(pixels); }
+        }
+        // Moon air receives the shared source even where the native Sun-only
+        // MRT share is zero. It must not relabel Moon as Sun for HDR/contact.
+        for moon_air in [false, true] {
+        for fog_end in [100.0, 0.1] {
+            let mut encoder = r.device.create_command_encoder(&Default::default());
+            for (view, clear) in [
+                (&colour, wgpu::Color::BLACK),
+                (&mask, wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
+            ] {
+                let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("shared Moon air without native Sun share"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, depth_slice: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store } })],
+                    depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                });
+            }
+            let env = ao_scene::Environment { sky_color: [0.0; 3], fog_color: [0.2; 3], fog_start: 0.1, fog_end,
+                ambient: [0.0; 3], sun_color: [0.5_f32.powf(2.2); 3], sun_dir: [0.0, 1.0, 0.0], sun_specular: 0.0 };
+            atmosphere.encode(&r.device, &r.queue, &mut encoder, &depth, &mask, &colour, size,
+                Mat4::perspective_rh(1.0, 1.0, 0.1, 100.0), Vec3::ZERO, 100.0, env, moon_air, None, 0.0,
+                AtmosphereSwitches { volumetric_shafts: true, ..Default::default() }, Some(&shadows.receiver), &[], -1.0, None);
+            r.queue.submit([encoder.finish()]);
+            let pixels = crate::texture_to_rgba(&r, &colour_texture, size.0, size.1).unwrap();
+            assert_eq!(pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[..3] != [0, 0, 0]), moon_air && fog_end > 0.1,
+                "shared Moon air needs admitted world coverage and must vanish behind full native fog");
+        }
+        }
+        // Exercise nontrivial achromatic attenuation and additive energy on the
+        // native gamma UNORM target, independent of scene/cascade geometry.
+        for fog_end in [0.1, 100.0] {
+            let env = ao_scene::Environment { sky_color: [0.0; 3], fog_color: [0.2; 3], fog_start: 0.1, fog_end,
+                ambient: [0.0; 3], sun_color: [0.25, 0.5, 0.75], sun_dir: [0.0, 1.0, 0.0], sun_specular: 0.0 };
+            let mut encoder = r.device.create_command_encoder(&Default::default());
+            atmosphere.encode(&r.device, &r.queue, &mut encoder, &depth, &mask, &colour, size,
+                Mat4::perspective_rh(1.0, 1.0, 0.1, 100.0), Vec3::ZERO, 100.0, env, true, None, 0.0,
+                AtmosphereSwitches { volumetric_shafts: true, ..Default::default() }, Some(&shadows.receiver), &[], -1.0, None);
+            r.queue.submit([encoder.finish()]);
+            let t = atmosphere.targets.as_ref().unwrap();
+            let mut no_scatter: Option<Vec<u8>> = None;
+            for scattering in [0.0, 0.3] {
+                let mut legacy: Option<Vec<u8>> = None;
+                for combined in [false, true] {
+                    let mut encoder = r.device.create_command_encoder(&Default::default());
+                    for (view, clear) in [
+                        (&colour, wgpu::Color { r: 0.25, g: 0.5, b: 0.75, a: 1.0 }),
+                        (&t.half, wgpu::Color { r: 0.65, g: 0.65, b: 0.65, a: scattering }),
+                    ] {
+                        let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("shaft blend equivalence inputs"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, depth_slice: None,
+                                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store } })],
+                            depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                        });
+                    }
+                    let pipelines = if combined { [Some(&atmosphere.shaft_composite), None] }
+                        else { [Some(&atmosphere.composite), Some(&atmosphere.scatter)] };
+                    for pipeline in pipelines.into_iter().flatten() {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("shaft blend equivalence"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &colour, resolve_target: None, depth_slice: None,
+                                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
+                            depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                        });
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, &t.bind, &[]);
+                        pass.draw(0..3, 0..1);
+                    }
+                    r.queue.submit([encoder.finish()]);
+                    let pixels = crate::texture_to_rgba(&r, &colour_texture, size.0, size.1).unwrap();
+                    assert!(pixels.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255),
+                        "shaft blend must preserve native output alpha");
+                    if let Some(expected) = &legacy {
+                        assert!(pixels.iter().zip(expected).all(|(&a, &b)| a.abs_diff(b) <= 1),
+                            "combined shafts differ beyond one UNORM intermediate rounding code");
+                        if fog_end == 0.1 {
+                            if let Some(expected) = &no_scatter { assert_eq!(&pixels, expected, "full native fog must reject shaft scattering exactly"); }
+                            else { no_scatter = Some(pixels); }
+                        }
+                    } else { legacy = Some(pixels); }
+                }
+            }
+        }
         atmosphere.release_targets();
-        assert_eq!(atmosphere.target_bytes(), atmosphere.params.size() + atmosphere.volumes.size());
+        assert_eq!(atmosphere.target_bytes(), 0);
     }
 }
