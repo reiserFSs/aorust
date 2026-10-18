@@ -491,7 +491,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
             let interaction_path = if interaction {
                 // Newland pf566 statel+0x4076, mesh95575 dry_edge_grass_small:
                 // native scene root, not a camera-derived or guessed plant position.
-                let endpoint = (pf == 566).then_some(Vec3::new(427.2627258, 25.0000992, -332.0443726));
+                let endpoint = (pf == 566).then_some(Vec3::new(427.262_73, 25.000_1, -332.044_37));
                 let path = graphics_fixture_interaction_path(fixed, endpoint,
                     |point| collision.borrow().terrain_height(point))?;
                 writeln!(manifest, "{name} interaction_start_scene={:?} interaction_end_scene={:?}", path.0, path.1)?;
@@ -746,7 +746,7 @@ fn graphics_fixture_interaction_path_grounds_each_endpoint() {
     }).unwrap();
     assert_eq!(start, Vec3::new(9.0, 4.0, -23.0));
     assert_eq!(end, Vec3::new(10.0, 6.0, -23.0));
-    let endpoint = Vec3::new(427.2627258, 25.0000992, -332.0443726);
+    let endpoint = Vec3::new(427.262_73, 25.000_1, -332.044_37);
     let (start, end) = graphics_fixture_interaction_path(camera, Some(endpoint),
         |point| (point[2] == endpoint.z).then_some(point[0])).unwrap();
     assert_eq!(start, Vec3::new(endpoint.x - 1.0, endpoint.x - 1.0, endpoint.z));
