@@ -438,6 +438,14 @@ pub struct ActorFrame {
     pub render_bucket: Option<i32>,
     /// Owning actor of a native Shadow3008 visual; only a valid enhanced sun replacement hides it.
     pub native_shadow_source: Option<u32>,
+    /// Actual submitted swimming movement mode; effects and non-character bodies leave this false.
+    pub swimming: bool,
+    /// Submitted character candidate, refined by final-camera native collision LOS before rendering.
+    /// True at renderer submission means water-admitted; disabled wakes or missing collision clears it.
+    pub water_admitted: bool,
+    /// Native water contact level at the current feet, only when final-camera LOS admits the character.
+    /// Water styles 0/4 require feet strictly below the surface; banks and missing collision are `None`.
+    pub water_surface: Option<f32>,
 }
 
 impl Default for ActorFrame {
@@ -464,6 +472,9 @@ impl Default for ActorFrame {
             part_priorities: Vec::new(),
             render_bucket: None,
             native_shadow_source: None,
+            swimming: false,
+            water_admitted: false,
+            water_surface: None,
         }
     }
 }

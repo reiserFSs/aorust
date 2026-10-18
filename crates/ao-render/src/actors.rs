@@ -138,6 +138,10 @@ struct Item {
     priority: Option<i32>,
     native_shadow_source: Option<u32>,
     native_shadow_receiver: Option<(Vec3, f32)>,
+    /// Captured only from the current LOS-admitted frame, never retained actor state.
+    water_body: Option<[f32; 3]>,
+    swimming: bool,
+    water_surface: Option<f32>,
 }
 
 fn bounds_depth((center, half): (Vec3, Vec3), transform: Mat4, eye: Vec3, forward: Vec3) -> f32 {
@@ -189,14 +193,28 @@ pub(crate) struct ActorLayer {
 }
 
 impl ActorLayer {
+    fn enhanced_body_admitted(&self, item: &Item, fog_end: f32) -> bool {
+        if item.mesh != 0 || item.faded { return false; }
+        // Match shade()'s native fog exemptions; these bodies can remain visible.
+        if matches!(item.rendering_effect, 2 | 4..=6) { return true; }
+        let fogged = item.fog_depth >= fog_end;
+        !fogged || self.models[&item.model].topology[item.mesh].1.iter().any(|part| !part.fog_enabled)
+    }
+
     pub(super) fn enhanced_grass_actor_ids(&self, fog_end: f32) -> impl Iterator<Item = u32> + '_ {
-        self.items.iter().filter(move |item| {
-            if item.mesh != 0 || item.faded { return false; }
-            // Match shade()'s native fog exemptions; these bodies can remain visible.
-            if matches!(item.rendering_effect, 2 | 4..=6) { return true; }
-            let fogged = item.fog_depth >= fog_end;
-            !fogged || self.models[&item.model].topology[item.mesh].1.iter().any(|part| !part.fog_enabled)
-        }).map(|item| item.actor)
+        self.items.iter().filter(move |item| self.enhanced_body_admitted(item, fog_end)).map(|item| item.actor)
+    }
+
+    pub(super) fn enhanced_water_contacts(&self, fog_end: f32, out: &mut Vec<(u32, [f32; 3], f32, bool)>) {
+        out.clear();
+        out.extend(self.items.iter().filter(|item| self.enhanced_body_admitted(item, fog_end))
+            .filter_map(|item| Some((item.actor, item.water_body?, item.water_surface?, item.swimming))));
+    }
+
+    pub(super) fn enhanced_water_body_positions(&self, fog_end: f32, out: &mut Vec<(u32, [f32; 3])>) {
+        out.clear();
+        out.extend(self.items.iter().filter(|item| self.enhanced_body_admitted(item, fog_end))
+            .filter_map(|item| item.water_body.map(|position| (item.actor, position))));
     }
     fn remove_model(&mut self, key: u64) {
         self.models.remove(&key);
@@ -622,12 +640,20 @@ impl Renderer {
         out.clear();
         out.extend(self.act.items.iter().filter(|item| item.mesh == 0).map(|item| item.actor));
     }
+    /// Current native water contacts; actual swim mode is separate from pre-swim entry contact.
+    pub fn enhanced_water_contacts(&self, fog_end: f32, out: &mut Vec<(u32, [f32; 3], f32, bool)>) {
+        self.act.enhanced_water_contacts(fog_end, out);
+    }
+    /// Current LOS-admitted bodies, including non-swimmers, for first-entry velocity history.
+    pub fn enhanced_water_body_positions(&self, fog_end: f32, out: &mut Vec<(u32, [f32; 3])>) {
+        self.act.enhanced_water_body_positions(fog_end, out);
+    }
 
 
 
     /// Frustum-culls the submitted actors, fills the instance buffer; called by `render` before the pass.
     pub(crate) fn prepare_actors(&mut self, cam: Vec3, forward: Vec3, planes: &[Vec4; 6]) {
-        let grass_enabled = self.enhanced_settings().ground_grass;
+        let body_fog_enabled = self.enhanced_settings().ground_grass || self.enhanced_settings().water_wakes;
         let sun_enabled = self.enhanced_settings().sun_shadows;
         let layer = &mut self.act;
         layer.items.clear();
@@ -656,7 +682,7 @@ impl Renderer {
                 }
                 let bucket = f.render_bucket.filter(|b| (0..=1800).contains(b))
                     .unwrap_or_else(|| render_bucket(m.w_axis.truncate().distance(cam)));
-                let fog_depth = if (mi == 0 && grass_enabled) || sun_enabled {
+                let fog_depth = if (mi == 0 && body_fog_enabled) || sun_enabled {
                     let bounds = if let Some(actor) = layer.actors.get(&f.id).filter(|actor| mi == 0 && actor.vb.is_some()) {
                         actor.skin.as_ref().and(actor.skin_bounds)
                     } else { Some(mesh.bounds) };
@@ -677,7 +703,9 @@ impl Renderer {
                         + m.y_axis.truncate().abs() * half.y + m.z_axis.truncate().abs() * half.z;
                     (m.transform_point3(center), extent.length())
                 });
-                layer.items.push(Item { actor: f.id, model: f.model, mesh: mi, fog_depth, bucket, faded: alpha < 1.0, rendering_effect: f.rendering_effect, priority, native_shadow_source: f.native_shadow_source, native_shadow_receiver });
+                layer.items.push(Item { actor: f.id, model: f.model, mesh: mi, fog_depth, bucket, faded: alpha < 1.0, rendering_effect: f.rendering_effect, priority,
+                    native_shadow_source: f.native_shadow_source, native_shadow_receiver,
+                    water_body: (mi == 0 && f.water_admitted).then_some([f.transform[3][0], f.transform[3][1], f.transform[3][2]]), swimming: f.swimming, water_surface: f.water_surface });
                 // m0.w carries `alpha - 1` to the shader (the affine matrix' unused column element)
                 let mut a = m.to_cols_array_2d();
                 a[0][3] = alpha.min(1.0) - 1.0;
@@ -1023,13 +1051,53 @@ mod tests {
     }
     use super::*;
     #[test]
+    fn water_contacts_require_native_surface_and_current_primary_admission() {
+        let mut layer = ActorLayer::default();
+        layer.models.insert(1, Model { meshes: vec![], mats: vec![], holo: None, views: vec![],
+            view_of: HashMap::new(), textures: vec![], identities: HashMap::new(),
+            topology: vec![(0, vec![ao_scene::Submesh::new(vec![], None)])], native_skin: None });
+        assert!(!ActorFrame::default().swimming);
+        assert!(!ActorFrame::default().water_admitted);
+        assert_eq!(ActorFrame::default().water_surface, None);
+        let feet = [1.0, 2.0, 3.0];
+        layer.items.push(Item { actor: 7, model: 1, mesh: 0, fog_depth: 9.0, bucket: 0,
+            faded: false, rendering_effect: 0, priority: None, native_shadow_source: None, native_shadow_receiver: None, water_body: Some(feet), swimming: false, water_surface: None });
+        let mut positions = vec![];
+        layer.enhanced_water_body_positions(20.0, &mut positions);
+        assert_eq!(positions, [(7, feet)], "dry admitted bodies seed first-entry velocity history");
+        let mut contacts = vec![];
+        layer.enhanced_water_contacts(20.0, &mut contacts);
+        assert!(contacts.is_empty(), "bank bodies have no native contact");
+        layer.items[0].water_surface = Some(2.5);
+        layer.enhanced_water_contacts(20.0, &mut contacts);
+        assert_eq!(contacts, [(7, feet, 2.5, false)], "wet pre-swim entry preserves actual non-swim mode");
+        layer.items[0].swimming = true;
+        layer.enhanced_water_contacts(20.0, &mut contacts);
+        assert_eq!(contacts, [(7, feet, 2.5, true)]);
+        layer.enhanced_water_contacts(9.0, &mut contacts);
+        assert!(contacts.is_empty(), "fully fogged contacts are absent");
+        layer.items[0].faded = true;
+        layer.enhanced_water_contacts(20.0, &mut contacts);
+        assert!(contacts.is_empty(), "faded primary bodies are absent");
+        layer.items[0].faded = false;
+        layer.items[0].mesh = 1;
+        layer.enhanced_water_contacts(20.0, &mut contacts);
+        assert!(contacts.is_empty(), "mounts cannot create contacts");
+        layer.items.clear();
+        layer.enhanced_water_contacts(20.0, &mut contacts);
+        assert!(contacts.is_empty(), "previous contacts cannot persist");
+        layer.enhanced_water_body_positions(20.0, &mut positions);
+        assert!(positions.is_empty(), "absent bodies cannot retain history");
+    }
+
+    #[test]
     fn grass_admission_uses_final_camera_body_depth_and_native_fog_exemptions() {
         let mut layer = ActorLayer::default();
         layer.models.insert(1, Model { meshes: vec![], mats: vec![], holo: None, views: vec![],
             view_of: HashMap::new(), textures: vec![], identities: HashMap::new(),
             topology: vec![(0, vec![ao_scene::Submesh::new(vec![], None)])], native_skin: None });
         layer.items.push(Item { actor: 7, model: 1, mesh: 0, fog_depth: 9.0,
-            bucket: 0, faded: false, rendering_effect: 0, priority: None, native_shadow_source: None, native_shadow_receiver: None });
+            bucket: 0, faded: false, rendering_effect: 0, priority: None, native_shadow_source: None, native_shadow_receiver: None, water_body: None, swimming: false, water_surface: None });
         let camera = Camera::look_at(Vec3::ZERO, -Vec3::Z);
         let ids = |layer: &ActorLayer, end| layer.enhanced_grass_actor_ids(end).collect::<Vec<_>>();
         assert_eq!(ids(&layer, 20.0), [7], "positive control: a drawn opaque body bends");
@@ -1449,7 +1517,7 @@ mod tests {
             layer.models.entry(model).or_insert_with(|| Model { meshes: vec![], mats: vec![], holo: None, views: vec![], view_of: HashMap::new(), textures: vec![], identities: HashMap::new(), topology: vec![], native_skin: None });
             layer.actors.insert(id, ActorGpu { vb: None, seen: 1, model, skin: None, skin_bounds: None, pose: None });
             layer.frames.push(ActorFrame { id, model, skin: Some(std::sync::Arc::new(vec![ao_scene::Vertex::default()])), ..Default::default() });
-            layer.items.push(Item { actor: id, model, mesh: 0, fog_depth: 0.0, bucket: 0, faded: false, rendering_effect: 0, priority: None, native_shadow_source: None, native_shadow_receiver: None });
+            layer.items.push(Item { actor: id, model, mesh: 0, fog_depth: 0.0, bucket: 0, faded: false, rendering_effect: 0, priority: None, native_shadow_source: None, native_shadow_receiver: None, water_body: None, swimming: false, water_surface: None });
         }
         for key in [7, 7, 99] {
             layer.remove_model(key);

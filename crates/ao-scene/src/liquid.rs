@@ -75,6 +75,14 @@ impl Surface {
         Some(std::array::from_fn(|i|((f64::from(triangle[0][i])+f64::from(triangle[1][i])+f64::from(triangle[2][i]))/3.0) as f32))
     }
 
+    /// Exact loaded liquid topology, independent of camera-cell refinement.
+    pub fn triangles(&self) -> impl Iterator<Item = [Vertex; 3]> + '_ {
+        self.triangles.iter().map(|triangle| triangle.indices.map(|index| {
+            let point = self.vertices[index as usize];
+            Vertex { color: rgba(point.argb), ..point.vertex }
+        }))
+    }
+
     /// Conservative source-triangle bounds exclude vegetation beside or below liquid.
     /// False positives at shoreline triangle corners only remove optional grass.
     pub fn overlaps_ground_cell(&self, x: f32, z: f32, size: f32, ground_y: f32) -> bool {

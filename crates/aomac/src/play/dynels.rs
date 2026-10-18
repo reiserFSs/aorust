@@ -3662,7 +3662,8 @@ impl Dynels {
             let (s, cs) = scene_yaw(c.pose.yaw).sin_cos();
             let k = c.scale;
             let transform = [[cs * k, 0.0, -s * k, 0.0], [0.0, k, 0.0, 0.0], [s * k, 0.0, cs * k, 0.0], [p[0], p[1], p[2], 1.0]];
-            let actor = ActorFrame { id: *id as u32, model: c.key, character: true, transform, parts: c.parts.clone(), part_attractors: rig.part_attractors(), skin_pose: c.current_palette.as_ref().map(Arc::clone), always: false, alpha: 1.0, ..Default::default() };
+            let swimming = c.mover.status().mode == Mode::Swim;
+            let actor = ActorFrame { id: *id as u32, model: c.key, character: true, transform, parts: c.parts.clone(), part_attractors: rig.part_attractors(), skin_pose: c.current_palette.as_ref().map(Arc::clone), always: false, alpha: 1.0, swimming, water_admitted: true, ..Default::default() };
             // Worn/attached item lights (the Light Bar's embedded `RLight_t` and similar, `mesh.rs::decode_mesh_lights`):
             // actor-relative from `ActorRig::mount_lights`, placed in the world by this dynel's own transform, the same
             // way `ActorFrame::transform` places its mesh vertices (`vertex_lights` in the shader then lights terrain,

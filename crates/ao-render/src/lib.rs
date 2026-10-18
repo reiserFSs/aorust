@@ -32,6 +32,14 @@ pub use native_fog::{NativeFog,SharedNativeFog,NativeFogControl};
 mod native_ground;
 mod native_texture;
 mod native_liquid;
+mod water;
+mod water_waves;
+mod water_dynamics;
+mod water_optics;
+mod water_spray;
+mod water_bottom;
+#[cfg(test)]
+mod water_tests;
 mod pipelines;
 mod foliage_edges;
 mod foliage;
@@ -758,6 +766,7 @@ pub struct Renderer {
     actor_visual_retirements: Vec<(u32, u32)>,
     gpu: Gpu,
     liquids: Vec<native_liquid::LiquidRun>,
+    water: water::Water,
     heat_haze: heat_haze::HeatHaze,
     realistic_water: bool,
     liquid_edge: [f32; 3],
@@ -1234,6 +1243,7 @@ impl Renderer {
             spaceship_slots: vec![],
             spaceships_shown: true,
             liquids: vec![],
+            water: water::Water::default(),
             drawn_visuals: HashMap::new(),
             pending_visuals: Default::default(),
             actor_visual_retirements: Vec::new(),
@@ -1330,6 +1340,7 @@ impl Renderer {
             && self.sky_discs.as_ref().is_some_and(|pass| pass.is_ready())
             && self.screen.is_ready()
             && self.heat_haze.is_ready()
+            && self.water.is_ready()
             && self.skin_pipeline_is_ready()
             && self.temporal_programs.as_ref().is_none_or(temporal::TemporalPrograms::is_ready)
             && self.motion_programs.as_ref().is_none_or(|programs| programs.is_ready())
@@ -1349,6 +1360,7 @@ impl Renderer {
         self.volumetric_clouds.as_ref().expect("startup cloud pipelines").wait();
         self.sky_discs.as_ref().expect("startup sky disc pipelines").wait();
         self.screen.wait();
+        self.water.wait();
         self.heat_haze.wait();
         self.canopy_leaves.wait();
         self.wait_skin_pipeline();
@@ -1554,6 +1566,7 @@ impl Renderer {
             if count > 0 { self.queue.write_buffer(&self.dyn_light_buf, 0, bytemuck::cast_slice(&self.dynamic_packed[..count])); }
             self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &self.light_buf, &self.light_cells_buf, &self.light_idx_buf, &self.dyn_light_buf, &self.sampler, &self.clamp_sampler);
         }
+        self.configure_water();
         if !settings.ground_grass || settings.grass_density <= 0.0 { self.grass = None; }
         if !settings.ambient_occlusion {
             self.ambient_occlusion.as_mut().expect("startup AO pipelines").release_targets();
@@ -1617,6 +1630,7 @@ impl Renderer {
             + self.motion_vectors.as_ref().map_or(0, actors::motion_vectors::MotionVectors::bytes)
             + self.post_target.as_ref().map_or(0, |target| u64::from(target.size.0) * u64::from(target.size.1) * 4)
             + self.spatial_post.as_ref().map_or(0, spatial_post::SpatialPost::bytes)
+            + self.water.target_bytes()
     }
     /// Explicit offline instrumentation; disabled by default and owns no resources then.
     /// After each render, read the result before encoding another timed frame.
@@ -1894,6 +1908,10 @@ impl Renderer {
         self.canopy_leaves.upload(&self.device, scene, &self.gpu);
         self.drawn_visuals.retain(|key, _| matches!(key, VisualKey::Actor(..)));
         self.liquids = scene.liquids.iter().cloned().map(native_liquid::LiquidRun::new).collect();
+        self.water.reset();
+        self.water.set_static_lights(&scene.lights);
+        self.set_camera_underwater(None);
+        self.configure_water();
         self.heat_haze.reset();
         // A new scene's ground has its own green masks: Enhanced grass is rebuilt on its first frame.
         self.grass = None;
@@ -2491,6 +2509,7 @@ impl Renderer {
         if let Some(frame) = self.enhanced_frame.as_mut() {
             frame.set_water_cloud(&self.device, water_cloud);
         }
+        self.prepare_water(cam, vp, t.size, env);
         self.prepare_enhanced_grade(env.fog_color);
         self.prepare_enhanced_bloom();
         let encode_start = timed.then(std::time::Instant::now);
@@ -2579,6 +2598,7 @@ impl Renderer {
         if let Some(start) = shadow_start { cpu.shadow_prepare_encode_ms = start.elapsed().as_secs_f64() * 1000.0; }
         self.prepare_grass_shadow_receiver();
         self.prepare_atmosphere_stack(&mut enc, vp, cam.pos, far, env);
+        self.encode_water_bottom(&mut enc);
         let inst_buf = self.gpu.inst_bufs.get(self.frame);
         let sky_buf = self.sky.bufs.get(self.frame);
 
@@ -2791,6 +2811,7 @@ impl Renderer {
         if let Some(frame) = enhanced_frame {
             frame.resolve_depth(&mut enc);
         }
+        self.encode_water(&mut enc);
         if self.enhanced_settings.ambient_occlusion {
             let ao_start = timed.then(std::time::Instant::now);
             self.encode_enhanced_ao(&mut enc, vp, ambient_occlusion::fog_depth_limit(self.lens.near, far, env.fog_end));

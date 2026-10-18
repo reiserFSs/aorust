@@ -1106,6 +1106,65 @@ fn enhanced_post_controls_persist_and_restore_independently() {
 }
 
 #[test]
+fn enhanced_water_switches_persist_independently_and_reset() {
+    use ao_render::EnhancedSettings;
+    let tmp = crate::play::prefs::test_dir().join("aomac-enhanced-water-persist");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let names = [
+        "AomacWaterWaves", "AomacWaterRipples", "AomacWaterRefraction", "AomacWaterReflections",
+        "AomacWaterFoam", "AomacWaterWakes", "AomacWaterfalls", "AomacUnderwater",
+        "AomacWaterCaustics", "AomacWaterSunGlint",
+    ];
+    let mut d = DValues::new(&tmp);
+    assert_eq!(d.enhanced_settings(), EnhancedSettings::default());
+    d.open_user(&tmp, "account", 7);
+    for mask in 0..1024 {
+        for (bit, name) in names.iter().enumerate() {
+            assert!(d.persists(name));
+            d.set(name, Variant::Bool(mask & (1 << bit) != 0));
+        }
+        let expected = EnhancedSettings {
+            water_waves: mask & 1 != 0, water_ripples: mask & 2 != 0,
+            water_refraction: mask & 4 != 0, water_reflections: mask & 8 != 0,
+            water_foam: mask & 16 != 0, water_wakes: mask & 32 != 0,
+            waterfalls: mask & 64 != 0, underwater: mask & 128 != 0,
+            water_caustics: mask & 256 != 0, water_sun_glint: mask & 512 != 0, ..Default::default()
+        };
+        assert_eq!(d.enhanced_settings(), expected);
+        assert_eq!(expected.any_enabled(), mask != 0);
+        d.save_user();
+        let mut again = DValues::new(&tmp);
+        again.open_user(&tmp, "other-account", 99);
+        assert_eq!(again.enhanced_settings(), expected);
+    }
+    for (name, value) in [
+        ("AomacWaterRealism", 0.75),
+        ("AomacWaterWakeStrength", 3.0), ("AomacWaterWakeVisibility", 1.0),
+        ("AomacWaterWakeDuration", 0.5), ("AomacWaterWakeSpeed", 4.0),
+        ("AomacWaterWakeTreading", 2.0), ("AomacWaterWakeSplash", 0.5),
+    ] {
+        assert!(d.persists(name));
+        d.set(name, Variant::Float(value));
+    }
+    let quality = d.enhanced_settings();
+    assert_eq!(quality.water_realism, 0.75);
+    assert_eq!([quality.water_wake_strength, quality.water_wake_visibility, quality.water_wake_duration,
+        quality.water_wake_speed, quality.water_wake_treading, quality.water_wake_splash],
+        [3.0, 1.0, 0.5, 4.0, 2.0, 0.5]);
+    d.save_user();
+    let mut before_reset = DValues::new(&tmp);
+    before_reset.open_user(&tmp, "other-account", 99);
+    assert_eq!(before_reset.enhanced_settings(), quality);
+    d.restore_original_graphics();
+    assert_eq!(d.enhanced_settings(), EnhancedSettings::default());
+    d.save_user();
+    let mut again = DValues::new(&tmp);
+    again.open_user(&tmp, "account", 7);
+    assert_eq!(again.enhanced_settings(), d.enhanced_settings());
+    std::fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
 fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
     let Some(mut r) = Rig::new() else { return };
     for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows",
@@ -1113,7 +1172,11 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
         "AomacHeightHaze", "AomacLandHaze", "AomacValleyMist", "AomacVolumetricShafts",
         "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs",
         "AomacFoliageEdges", "AomacFoliageSway", "AomacFoliagePush", "AomacFoliageLeaves", "AomacFoliageFlutter",
-        "AomacFoliageFalling", "AomacGrassTrails", "AomacFoliageSubdivision", "AomacFoliageTranslucency", "AomacFoliageLod"] {
+        "AomacFoliageFalling", "AomacGrassTrails", "AomacFoliageSubdivision", "AomacFoliageTranslucency", "AomacFoliageLod",
+        "AomacWaterWaves", "AomacWaterRipples", "AomacWaterRefraction", "AomacWaterReflections",
+        "AomacWaterFoam", "AomacWaterWakes", "AomacWaterfalls", "AomacUnderwater",
+        "AomacWaterCaustics", "AomacWaterSunGlint",
+    ] {
         let view = r.show(name);
         assert!(!r.gui.checked(r.win(), &view));
         r.click(&view);
@@ -1131,6 +1194,10 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
         ("AomacGrassDensity", 1.5), ("AomacGrassDistance", 35.0), ("AomacSunBoost", 0.5), ("AomacGrade", 0.5), ("AomacContactStrength", 0.7),
         ("AomacLampIntensity", 2.0), ("AomacCarriedLightIntensity", 1.5),
         ("AomacMoonIntensity", 2.5), ("AomacDarkNightStrength", 0.75),
+        ("AomacWaterRealism", 0.75),
+        ("AomacWaterWakeStrength", 3.0), ("AomacWaterWakeVisibility", 1.0),
+        ("AomacWaterWakeDuration", 0.5), ("AomacWaterWakeSpeed", 4.0),
+        ("AomacWaterWakeTreading", 2.0), ("AomacWaterWakeSplash", 0.5),
     ] {
         let view = r.show(name);
         let event = Event::SliderChanged { window: r.win(), view, value, final_change: true };
@@ -1157,7 +1224,11 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
         "AomacHeightHaze", "AomacLandHaze", "AomacValleyMist", "AomacVolumetricShafts",
         "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs",
         "AomacFoliageEdges", "AomacFoliageSway", "AomacFoliagePush", "AomacFoliageLeaves", "AomacFoliageFlutter",
-        "AomacFoliageFalling", "AomacGrassTrails", "AomacFoliageSubdivision", "AomacFoliageTranslucency", "AomacFoliageLod"] {
+        "AomacFoliageFalling", "AomacGrassTrails", "AomacFoliageSubdivision", "AomacFoliageTranslucency", "AomacFoliageLod",
+        "AomacWaterWaves", "AomacWaterRipples", "AomacWaterRefraction", "AomacWaterReflections",
+        "AomacWaterFoam", "AomacWaterWakes", "AomacWaterfalls", "AomacUnderwater",
+        "AomacWaterCaustics", "AomacWaterSunGlint",
+    ] {
         let view = r.show(name);
         assert!(!r.gui.checked(r.win(), &view));
     }
@@ -1212,6 +1283,7 @@ fn enhanced_subpage_bounds_and_scrolling_at_large_minimum_and_small_sizes() {
     let id = r.win();
     let (minimum, _) = r.gui.window_preferred_size_limits(id).unwrap();
     let mut scrolled = false;
+    let mut water_scrolled = false;
     for page in &pages {
         let selected = r.opt.pages.iter().position(|p| p.label == page.label).unwrap();
         r.show_page(selected);
@@ -1264,6 +1336,7 @@ fn enhanced_subpage_bounds_and_scrolling_at_large_minimum_and_small_sizes() {
             r.send(InputEvent::Wheel { x: viewport.l + 2.0, y: viewport.t + 2.0, dy: -1.0 });
             if needs_scroll {
                 scrolled = true;
+                water_scrolled |= page.label == "Enhanced/Water";
                 assert!(r.gui.scroll_offset(id, &pg) > 0.0, "{} must scroll at {screen:?}", page.label);
                 if let (Some(first), Some(top)) = (controls.first(), top) {
                     assert!(r.gui.view_rect(id, first).unwrap().t < top.t);
@@ -1283,6 +1356,7 @@ fn enhanced_subpage_bounds_and_scrolling_at_large_minimum_and_small_sizes() {
         }
     }
     assert!(scrolled, "layout regression must exercise a scrollable Enhanced subpage");
+    assert!(water_scrolled, "water controls must exercise scrolling at small sizes");
     // Shrinking the application viewport must re-fit an already open Options window,
     // without a caller supplying a replacement Preferences frame.
     r.opt.set_screen((1280, 800));

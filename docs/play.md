@@ -905,9 +905,103 @@ existing filter renders only that view (including its two independent repeats).
 `AOMAC_GFX_MSAA=1|2|4|8` selects the requested sample count (default 1);
 the fixture rejects adapter clamping rather than mislabel a 4× benchmark.
 Atmosphere budget captures use `AOMAC_GFX_MSAA=4` at 1920×1200.
+
+The **Enhanced / Water** subpage exposes ten independent, persisted switches:
+**Water Waves**, **Water Ripples**, **Water Refraction**, **Water Reflections**,
+**Water Foam**, **Water Wakes**, **Waterfalls**, **Underwater**, **Water Caustics**,
+and **Water Sun Glint**. Each defaults off; **Restore Page** resets all Water
+controls, including numeric defaults; **Restore All** resets every Enhanced page.
+Their preference keys are
+`AomacWaterWaves`, `AomacWaterRipples`, `AomacWaterRefraction`,
+`AomacWaterReflections`, `AomacWaterFoam`, `AomacWaterWakes`, `AomacWaterfalls`,
+`AomacUnderwater`, `AomacWaterCaustics`, and `AomacWaterSunGlint`.
+**Water Realism** (`AomacWaterRealism`, default 0.5, range 0–1) blends richer native
+colour at 0 toward restrained realistic water at 1; it never enables an effect.
+Wake sliders use `AomacWaterWake` plus `Strength`, `Visibility`, `Duration`,
+`Speed`, `Treading`, or `Splash`. Their defaults/ranges are respectively
+2 / 0–4, 2 / 0–4, 0.3 / 0.05–2, 3.6 / 0.1–8, 1 / 0–3, and 1 / 0–3.
+They persist independently and never enable wakes without the **Water Wakes**
+switch. Both reset actions restore the numeric defaults listed above.
+
+Enhanced water keeps the original liquid layers and their opacity unchanged.
+An exact-triangle surface mask supplies eight Gerstner waves, detail normals,
+depth-derived absorption, current-frame SSR with authored-sky fallback, and
+load-time shoreline-distance foam. Near-eye subdivision is cached per 8m cell;
+the faithful geometry and collision mesh are never displaced.
+Because native liquid layers write depth, bottom depth is rasterized separately
+from current visible static opaque/cutout meshes; no actor or liquid enters that
+depth target. This avoids treating the surface as the seabed or exposing a hidden
+swimmer through a caustic/shoreline silhouette. Native resolved depth still gates
+surface occlusion, SSR and spray.
+The single-sample surface mask compensates for the minimum-depth MSAA resolve
+using the triangle's half-pixel depth-derivative span at multisampled settings;
+one-sample rendering uses only floating-point roundoff allowance, not a depth bias.
+The 128×128 CPU local wave-equation field uses 0.35m cells (44.8m span),
+exact native-triangle membership and reflecting dry boundaries,
+swimmer dipoles, idle treading and surface-entry impulses. Only current admitted
+primary characters with native camera-to-feet line of sight and exact native
+liquid contact feed it. Contact-entry splashes precede the swimming-mode
+transition; only actual swimming-mode characters generate dipoles or idle wakes.
+Admission removal flushes the field rather than leaving a hidden swimmer trail.
+Loaded steep liquid triangles produce gravity-driven strands, foot churn,
+depth-occluded spray and mist. No observed-draw history or hidden-actor probe is used.
+Optical deltas retain native fog transmission. Exact live camera membership comes
+from the native room/depth-bounded collision liquid query; the frozen source-only
+renderer uses finite-triangle membership when no collision result is supplied.
+
+For isolated fixture captures, select `water-waves`, `water-ripples`,
+`water-refraction`, `water-reflections`, `water-foam`, `water-wakes`,
+`waterfalls`, `underwater`, `water-caustics`, or `water-sun-glint`; `water`
+enables all ten and no other effect. `all` and `all-no-bloom` include all ten;
+the historical `all-before` profile keeps them off.
+
+The fixture requires actual MSAA samples to equal the request and records both
+requested and actual counts; unsupported sample counts fail rather than clamp.
+For the 1920×1200 four-sample gate, set
+`AOMAC_GFX_MSAA=4 AOMAC_GFX_FRAME_TIMING=1` to record 600 measured frames.
+Water views are `icc-water-authored`, `borealis-water-day`,
+`borealis-water-night`, and `newland-water`. Native ground vertices are probed
+through `Collision::liquid_at`; the camera prefers 1.5–3.5 m water depth nearest
+2 m (bounded fallback 0.8–6 m), requires exact authored-water triangle membership
+and a clear native camera line, and uses fixed eye offset `[0,4,8]`.
+The manifest records mesh, surface target and final camera.
+`icc-water-underwater-authored` retains the largest projected authored water
+triangle centroid and places the eye 0.5 m below it, requiring native collision
+membership. `pleasant-meadows-waterfall-native-authored` selects the largest
+authored style0/4 water triangle whose normal has
+`abs(Y) < 0.9 * length(normal)` in PF **630, Pleasant Meadows**, not ICC
+(4582 has no qualifying source). The ignored CPU asset survey
+`cargo test --profile fast -j2 -p ao-formats --test water_real -- --ignored --nocapture`
+scans `list_playfields` and `wildlife_geometry().water_triangles`, mapping raw
+liquid kinds through `ao_scene::liquid::style` before filtering. It prefers
+2–80 m drops with a flat water triangle within 60 m of the foot at the same
+height (1 m tolerance), then verifies a full scene load.
+PF630's largest native curtain has kind1/style0, twice-area4737.816 and
+22 m drop, with centroid `[1550,19.666666,689.3333]` and vertices
+`[1620,27,691]`, `[1410,27,691]`, `[1620,5,686]`.
+Full loading selects an equal-area 22 m curtain in mesh251 with scene-space
+vertices `[1620,49,-782]`, `[1410,49,-782]`, `[1620,27,-777]` and centroid
+`[1550,41.666668,-780.3333]`. For the waterfall alone, the camera targets the
+triangle's bounding-box midpoint `[1515,38,-779.5]`, moves 20 m beyond the
+bounds along the geometric normal's horizontal projection, and adds 5% of
+the authored drop in eye height: eye `[1515,39.1,-757]`, chosen to frame the
+22 m lip-to-foot span without changing native geometry; city-water and
+underwater camera selection is unchanged.
+`icc-water-sun-glint-authored` is an additional comparison view selectable by name:
+it retains the ordinary ICC native-water target but aligns the eye to
+`reflect(-scene.sun_dir, Y)` at 4 m above it, rather than guessing a world
+position. It requires the authored sun above the horizon and records its
+actual eye offset. The regular four city-water cameras remain unchanged.
+Missing authored water or a steep waterfall is an explicit fixture error,
+not a fallback to a guessed world position. Source scene topology is unchanged.
+Every water view except the waterfall submits the installed Testy avatar in
+the Swim pose, with explicit admission and feet 0.8 m below the surface,
+independent of the selected effect profile (including `faithful`).
+The fixture advances 120 steps of 1/60 s along a segment of at most 3 m strictly
+inside the selected triangle, then captures the resulting frozen state.
 Within one process, views share immutable scene/collision snapshots keyed by exact
 playfield and time bits, with the fixture's fixed clear weather/day. The current
-18-view matrix loads nine snapshots instead of eighteen; renderers, uploads and
+28-view matrix loads ten snapshots instead of twenty-eight; renderers, uploads and
 independent-repeat checks remain separate. `scene_load_count` and `scene_load_ms`
 in the manifest report loader work (collision loading is not included in the time).
 The destination must not exist. The fixed matrix covers ICC 4582 landmark and

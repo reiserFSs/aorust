@@ -62,6 +62,24 @@ pub struct EnhancedSettings {
     pub night_mode: NightMode,
     pub moon_intensity: f32,
     pub dark_night_strength: f32,
+    pub water_waves: bool,
+    pub water_ripples: bool,
+    pub water_refraction: bool,
+    pub water_reflections: bool,
+    pub water_foam: bool,
+    pub water_wakes: bool,
+    pub waterfalls: bool,
+    pub underwater: bool,
+    pub water_caustics: bool,
+    pub water_sun_glint: bool,
+    /// 0 keeps the richer native colour; 1 favours physically restrained water.
+    pub water_realism: f32,
+    pub water_wake_strength: f32,
+    pub water_wake_visibility: f32,
+    pub water_wake_duration: f32,
+    pub water_wake_speed: f32,
+    pub water_wake_treading: f32,
+    pub water_wake_splash: f32,
     pub shadow_map_size: u32,
     /// Share of the sun that full shadow removes (the rest stays as sky-lit shade).
     pub shadow_strength: f32,
@@ -96,6 +114,11 @@ impl Default for EnhancedSettings {
             foliage_edges: false, foliage_sway: false, foliage_push: false, foliage_leaves: false,
             foliage_flutter: false, foliage_falling: false, grass_trails: false,
             foliage_subdivision: false, foliage_translucency: false, foliage_lod: false,
+            water_waves: false, water_ripples: false, water_refraction: false, water_reflections: false,
+            water_foam: false, water_wakes: false, waterfalls: false, underwater: false,
+            water_caustics: false, water_sun_glint: false, water_realism: 0.5,
+            water_wake_strength: 2.0, water_wake_visibility: 2.0, water_wake_duration: 0.3,
+            water_wake_speed: 3.6, water_wake_treading: 1.0, water_wake_splash: 1.0,
             shadow_map_size: 2048, shadow_strength: 0.45, shadow_softness: 1.5, ao_radius: 1.75, ao_strength: 1.5, bloom_strength: 0.6,
             grass_density: 1.0, grass_distance: 160.0, sun_boost: 0.6, grade_strength: 0.8, contact_strength: 0.8,
         }
@@ -109,11 +132,18 @@ impl EnhancedSettings {
             || self.cloud_gap_shafts || self.volumetric_clouds || self.cloud_shadows || self.sky_discs
             || self.material_specular || self.clustered_lighting || self.moon_shadows || self.local_light_shadows
             || self.night_mode != NightMode::AsGame || self.foliage_enabled() || self.post_enabled()
+            || self.water_enabled()
     }
 
     /// Enhanced local-light consumers require current-frame owner admission before any source cap.
     pub(crate) fn needs_admitted_lights(self) -> bool {
         self.clustered_lighting || self.local_light_shadows || self.material_specular
+    }
+
+    pub fn water_enabled(self) -> bool {
+        self.water_waves || self.water_ripples || self.water_refraction || self.water_reflections
+            || self.water_foam || self.water_wakes || self.waterfalls || self.underwater
+            || self.water_caustics || self.water_sun_glint
     }
 
     pub fn foliage_enabled(self) -> bool {
@@ -174,6 +204,13 @@ impl EnhancedSettings {
             motion_blur: finite(self.motion_blur, 1.0, defaults.motion_blur),
             dof_aperture: finite(self.dof_aperture, 8.0, defaults.dof_aperture),
             dof_max_radius: finite(self.dof_max_radius, 16.0, defaults.dof_max_radius),
+            water_realism: finite(self.water_realism, 1.0, defaults.water_realism),
+            water_wake_strength: finite(self.water_wake_strength, 4.0, defaults.water_wake_strength),
+            water_wake_visibility: finite(self.water_wake_visibility, 4.0, defaults.water_wake_visibility),
+            water_wake_duration: finite(self.water_wake_duration, 2.0, defaults.water_wake_duration).max(0.05),
+            water_wake_speed: finite(self.water_wake_speed, 8.0, defaults.water_wake_speed).max(0.1),
+            water_wake_treading: finite(self.water_wake_treading, 3.0, defaults.water_wake_treading),
+            water_wake_splash: finite(self.water_wake_splash, 3.0, defaults.water_wake_splash),
             ..self
         }
     }
@@ -258,6 +295,32 @@ mod tests {
             assert_eq!(settings.needs_sun_mask(), mask & (16 | 32 | 64 | 128 | 256 | 512 | 1024 | 4096 | 8192) != 0);
             assert_eq!(settings.needs_admitted_lights(), mask & (32768 | 65536 | 131072) != 0);
         }
+        for mask in 0..1024 {
+            let settings = EnhancedSettings {
+                water_waves: mask & 1 != 0, water_ripples: mask & 2 != 0,
+                water_refraction: mask & 4 != 0, water_reflections: mask & 8 != 0,
+                water_foam: mask & 16 != 0, water_wakes: mask & 32 != 0,
+                waterfalls: mask & 64 != 0, underwater: mask & 128 != 0,
+                water_caustics: mask & 256 != 0, water_sun_glint: mask & 512 != 0, ..defaults
+            };
+            assert_eq!(settings.any_enabled(), mask != 0);
+            assert_eq!(settings.clamped(), settings);
+        }
+        assert_eq!(defaults.water_realism, 0.5);
+        assert_eq!(EnhancedSettings { water_realism: -1.0, ..defaults }.clamped().water_realism, 0.0);
+        assert_eq!(EnhancedSettings { water_realism: 2.0, ..defaults }.clamped().water_realism, 1.0);
+        for value in [-1.0, 10.0] {
+            let settings = EnhancedSettings {
+                water_wake_strength: value, water_wake_visibility: value,
+                water_wake_duration: value, water_wake_speed: value,
+                water_wake_treading: value, water_wake_splash: value, ..defaults
+            }.clamped();
+            assert_eq!([settings.water_wake_strength, settings.water_wake_visibility,
+                settings.water_wake_duration, settings.water_wake_speed,
+                settings.water_wake_treading, settings.water_wake_splash],
+                if value < 0.0 { [0.0, 0.0, 0.05, 0.1, 0.0, 0.0] } else { [4.0, 4.0, 2.0, 8.0, 3.0, 3.0] });
+            assert!(!settings.any_enabled());
+        }
         assert_eq!(EnhancedSettings { sun_boost: 9.0, ..defaults }.clamped().sun_boost, 0.6);
         for night_mode in [NightMode::Moonlit, NightMode::Dark] {
             assert!(EnhancedSettings {night_mode, ..defaults}.any_enabled());
@@ -277,6 +340,12 @@ mod tests {
         assert_eq!((shadow.shadow_strength, shadow.shadow_softness), (1.0, 4.0));
         assert_eq!(EnhancedSettings { shadow_map_size: u32::MAX, ..defaults }.clamped().shadow_map_size, 4096);
         for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(EnhancedSettings { water_realism: invalid, ..defaults }.clamped(), defaults);
+            assert_eq!(EnhancedSettings {
+                water_wake_strength: invalid, water_wake_visibility: invalid,
+                water_wake_duration: invalid, water_wake_speed: invalid,
+                water_wake_treading: invalid, water_wake_splash: invalid, ..defaults
+            }.clamped(), defaults);
             assert_eq!(EnhancedSettings {
                 shadow_strength: invalid, shadow_softness: invalid, ao_radius: invalid, ao_strength: invalid, bloom_strength: invalid,
                 moon_intensity: invalid, dark_night_strength: invalid,

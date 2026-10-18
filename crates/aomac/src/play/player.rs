@@ -783,6 +783,8 @@ impl Player {
                 self.avatar.frame()
             };
             frame.alpha = alpha;
+            frame.swimming = self.mode() == 4;
+            frame.water_admitted = true; // Character candidate; final-camera LOS is applied by flow.
             zone.world.set_own_pick(self.avatar.pick_bounds()
                 .map(|bounds| super::hud_pick::PickBody { id: self.char_id as i32, bounds, pos: scene_pos(pos), yaw: scene_yaw(yaw), scale: self.avatar.body_scale() }));
             host.actors.push(frame);

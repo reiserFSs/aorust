@@ -27,6 +27,67 @@ fn environment_effect_inputs_follow_native_oscillator_not_weather() {
     assert_eq!(phase, 40.0);
 }
 
+pub(super) fn camera_underwater(liquid: Option<ao_formats::playfield::collision::Liquid>, eye_y: f32) -> bool {
+    liquid.is_some_and(|liquid| matches!(ao_scene::liquid::style(liquid.kind), Some(0 | 4)) && eye_y < liquid.level)
+}
+
+#[cfg(test)]
+#[test]
+fn camera_underwater_requires_native_water_and_strict_depth() {
+    use ao_formats::playfield::collision::Liquid;
+    assert!(!camera_underwater(None, -10.0));
+    for kind in 0..32 {
+        let liquid = Some(Liquid { kind, level: 10.0, normal: [0.0, 1.0, 0.0] });
+        assert_eq!(camera_underwater(liquid, 9.0), !matches!(kind, 2 | 3 | 6 | 7 | 14..=17));
+        assert!(!camera_underwater(liquid, 10.0));
+        assert!(!camera_underwater(liquid, 11.0));
+    }
+}
+
+fn refresh_water_admission(
+    actors: &mut [ao_scene::ActorFrame], eye: [f32; 3],
+    mut clear: impl FnMut([f32; 3], [f32; 3]) -> bool,
+    mut liquid_at: impl FnMut([f32; 3]) -> Option<ao_formats::playfield::collision::Liquid>,
+) {
+    for actor in actors {
+        actor.water_surface = None;
+        if !actor.water_admitted { continue; }
+        let feet = [actor.transform[3][0], actor.transform[3][1], actor.transform[3][2]];
+        actor.water_admitted = clear(eye, [feet[0], feet[1] + 0.1, feet[2]]);
+        if actor.water_admitted {
+            actor.water_surface = liquid_at(feet).filter(|liquid| camera_underwater(Some(*liquid), feet[1])).map(|liquid| liquid.level);
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn water_admission_uses_final_camera_and_only_real_character_candidates() {
+    let mut actors = [
+        ao_scene::ActorFrame { water_admitted: true, ..Default::default() },
+        ao_scene::ActorFrame { swimming: true, ..Default::default() },
+    ];
+    let eye = [3.0, 4.0, 5.0];
+    let mut calls = 0;
+    refresh_water_admission(&mut actors, eye, |from, to| {
+        calls += 1;
+        assert_eq!(from, eye);
+        assert_eq!(to, [0.0, 0.1, 0.0]);
+        true
+    }, |feet| {
+        assert_eq!(feet, [0.0; 3]);
+        Some(ao_formats::playfield::collision::Liquid { kind: 0, level: 1.0, normal: [0.0, 1.0, 0.0] })
+    });
+    assert_eq!(calls, 1);
+    assert!(actors[0].water_admitted, "non-swimmers retain admitted first-entry history");
+    assert!(!actors[1].water_admitted, "an effect cannot invent character admission");
+    assert_eq!(actors[0].water_surface, Some(1.0), "native wet contact precedes swimming mode");
+    assert_eq!(actors[1].water_surface, None, "non-candidates cannot invent water contact");
+    refresh_water_admission(&mut actors, eye, |_, _| false, |_| panic!("rejected LOS must not query liquid"));
+    assert!(actors.iter().all(|actor| !actor.water_admitted), "disabled or missing collision clears admission");
+    assert!(actors.iter().all(|actor| actor.water_surface.is_none()), "admission loss clears contact");
+}
+
 
 fn center(size: (u32, u32), outer: (u32, u32)) -> (i32, i32) {
     // `Window::MoveToCenter` [GUI 0x10154986]: floor(0.5 * screen - 0.5 * frame)
@@ -1418,6 +1479,7 @@ impl Frontend for Play {
 
     fn frame(&mut self, dt: f32, size: (u32, u32), host: &mut Host) -> DrawList {
         host.post_focus = None;
+        host.camera_underwater = Some(false);
         if self.player.is_none() {
             host.grass_exposure = None;
             host.grass_benders.clear();
@@ -1779,8 +1841,9 @@ impl Frontend for Play {
             self.zone.world.update_with_collision(dt, host.camera.pos.to_array(), host.camera.forward().to_array(), host, query, |id| {
                 player?.effect_anchor(id).map(|matrix| glam::Mat4::from_cols_array_2d(&matrix))
             });
+            // Native weather also drives opt-in water when ground grass is disabled.
+            host.grass_wind = self.world_weather.as_ref().map_or([0.0; 3], |weather| weather.state().wind);
             if host.enhanced().is_some_and(|s| s.foliage_enabled() || s.interaction_enabled()) {
-                host.grass_wind = self.world_weather.as_ref().map_or([0.0; 3], |weather| weather.state().wind);
                 host.grass_benders.retain(|bender| bender.actor.is_none());
                 host.grass_benders.extend(self.zone.world.grass_characters()
                     .map(|(id, position)| ao_render::GrassBender { actor: Some(id), position }));
@@ -1810,6 +1873,18 @@ impl Frontend for Play {
                 Ok(offset) => super::camera::apply_ground_shake(&mut host.camera, offset),
                 Err(error) => eprintln!("effect camera: {error:#}"),
             }
+            let eye = host.camera.pos.to_array();
+            let liquid = self.player.as_ref().and_then(|player| player.effect_surface())
+                .and_then(|surface| surface.borrow().liquid_at(eye));
+            host.camera_underwater = Some(camera_underwater(liquid, eye[1]));
+            let water_surface = if host.enhanced().is_some_and(|settings| settings.water_wakes) {
+                self.player.as_ref().and_then(|player| player.effect_surface())
+            } else { None };
+            let water_surface = water_surface.as_ref().map(|surface| surface.borrow());
+            refresh_water_admission(&mut host.actors, eye, |from, to| {
+                water_surface.as_ref().is_some_and(|surface| super::player::segment_clear(surface, from, to))
+            }, |feet| water_surface.as_ref().and_then(|surface| surface.liquid_at(feet)));
+            drop(water_surface);
             for sound in self.zone.world.take_effect_sounds() {
                 if let Some(audio) = &self.audio {
                     // SI100071ed rounds the authored radius with x87 round(radius - 0.49999).

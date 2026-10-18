@@ -172,3 +172,16 @@ Vogel-disk filter adapted from ao-vk's rvk/shaders/ffp_main.glsl
 Copyright (c) 2026 wannabuh, under the MIT License; the complete copyright,
 permission and warranty notice reproduced above applies. Native moon tracks,
 fog extinction and current-frame actor admission remain this renderer's inputs.
+
+Enhanced water
+==============
+
+The optional native water renderer in crates/ao-render/src/water_waves.rs,
+water_dynamics.rs, water_optics.rs/.wgsl and water_spray.rs/.wgsl ports the
+Gerstner wave spectrum, damped wave-equation swimmer disturbances, waterfall
+free-fall timing, and screen-space water optics from ao-vk's rvk/water.cpp,
+rvk/shaders/water_common.glsl, water_sim.comp and water.frag
+(https://github.com/wannabuh/ao-vk). Copyright (c) 2026 wannabuh;
+the MIT license and permission notice above apply to these portions.
+Native liquid triangles, admitted swimming state, shore topology and scene depth
+replace draw observation. No game assets or upstream binary assets are copied.

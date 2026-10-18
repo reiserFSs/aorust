@@ -516,6 +516,28 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 let (root, camera) = selected?;
                 (camera, Some(root))
             } else { (fixed, None) };
+            let water_center = if name.contains("-water") {
+                let (camera, mesh, center) = if name.contains("-waterfall") || name.contains("-underwater") {
+                    graphics_fixture_water_camera(scene, name.contains("-waterfall"))?
+                } else {
+                    let collision = collision.borrow();
+                    graphics_fixture_shore_camera(scene, |point| {
+                        let liquid = collision.liquid_at(point)?;
+                        Some(liquid.level)
+                    }, |eye, target| collision.line(eye, target).is_none())?
+                };
+                let camera = if name == "icc-water-sun-glint-authored" {
+                    graphics_fixture_sun_glint_camera(Vec3::from(scene.environment.context("sun-glint fixture requires native environment")?.sun_dir), Vec3::from(center))?
+                } else { camera };
+                writeln!(manifest, "{name} water_mesh={mesh} source_water_target={center:?} eye_offset={:?}", camera.pos - Vec3::from(center))?;
+                Some((camera, center))
+            } else { None };
+            let fixed = if let Some((camera, center)) = water_center {
+                if name.contains("-underwater") {
+                    let center = Vec3::from(center);
+                    Camera::look_at(center - Vec3::Y * 0.5, center + Vec3::Z * 4.0 - Vec3::Y * 0.5)
+                } else { camera }
+            } else { fixed };
             let interaction_path = if interaction {
                 // Newland pf566 statel+0x4060, mesh95575 dry_edge_grass_small:
                 // native scene root, not a camera-derived or guessed plant position.
@@ -540,7 +562,15 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     writeln!(manifest, "{name} sequence_frame={index:02} renderer_time={target} sample_dt={} avatar_scene={position:?}", sequence.dt)?;
                 }
             }
-            let capture = |measure: bool| -> anyhow::Result<(Vec<u8>, Lens, usize, usize)> {
+            let camera_underwater = super::flow::camera_underwater(collision.borrow().liquid_at(fixed.pos.to_array()), fixed.pos.y);
+            if name.contains("-underwater") {
+                ensure!(camera_underwater, "{name}: resolved eye is not inside native liquid");
+            }
+            let swimming = graphics_fixture_has_swimmer(&name);
+            if swimming {
+                writeln!(manifest, "{name} swimmer=Testy admitted=true pose=Swim feet_depth=0.8 simulation_frames=120 dt=1/60 path_max_m=3 freeze_after=true profile_independent=true renderer_time=2 effect_time=2")?;
+            }
+            let capture = |measure: bool| -> anyhow::Result<(Vec<u8>, Lens, usize, usize, u32)> {
                 // Fresh renderers and the original per-capture CRT reset remain independent.
                 // Both consume clones of the same immutable snapshot, including across views.
                 ao_scene::crt_srand(1);
@@ -550,6 +580,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 let mut shot = Shot { gui: Gui::new(&dir, None)?, scene: Some(scene.clone()), camera: fixed, lens };
                 let mut off = Offscreen::evidence(&shot, size)?;
                 off.fixed_camera(Some(fixed));
+                off.host.camera_underwater = Some(camera_underwater);
                 off.host.msaa_samples = Some(msaa);
                 off.host.anisotropy = Some(1);
                 off.host.fog_density_scale = Some(1.0);
@@ -617,7 +648,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                             ensure!(previous == raw, "{file}: independent sequence captures differ");
                         }
                     }
-                    return Ok((raw, lens, counts.0, counts.1));
+                    return Ok((raw, lens, counts.0, counts.1, actual_msaa));
                 }
                 let lightbar = matches!(name.as_str(), "borealis-lightbar-night" | "borealis-lightbar-night-close");
                 let authored_actor = name.starts_with("icc-actor-") || lightbar;
@@ -663,6 +694,35 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     off.host.actors.push(frame);
                     off.host.post_focus = Some(focus);
                     list = off.frame(&mut shot, 0.0);
+                }
+                // Water simulation advances in Renderer::render, not logic-only
+                // frontend frames. Warm identical rendered snapshots in every profile.
+                if name.contains("-water") { off.prepare_frozen_rendering(); }
+                if swimming {
+                    let center = Vec3::from(water_center.context("swimmer requires authored water center")?.1);
+                    let end = graphics_fixture_swim_endpoint(scene, center)?;
+                    let mut avatar = super::avatar::Avatar::new(&store, &dir, 25988, &actor,
+                        ao_formats::character::actor::ActorAssets::new(&store)?)?;
+                    avatar.set_pose(&store, super::avatar::AvatarPose {
+                        role: ao_formats::character::Role::Swim, speed: 1.5, ref_speed: 1.5,
+                    })?;
+                    off.host.actor_models.push((super::avatar::MODEL_KEY, std::sync::Arc::new(avatar.model().clone())));
+                    for step in 0..=120 {
+                        let position = center.lerp(end, step as f32 / 120.0) - Vec3::Y * 0.8;
+                        avatar.set_transform(position.to_array(), 0.0);
+                        if step != 0 { avatar.update(1.0 / 60.0); }
+                        let mut frame = avatar.frame();
+                        frame.swimming = true;
+                        frame.water_admitted = collision.borrow().line(fixed.pos.to_array(), (position + Vec3::Y * 0.1).to_array()).is_none();
+                        frame.water_surface = collision.borrow().liquid_at(position.to_array()).filter(|liquid| {
+                            frame.water_admitted && super::flow::camera_underwater(Some(*liquid), position.y)
+                        }).map(|liquid| liquid.level);
+                        off.host.actors.push(frame);
+                        list = off.frame(&mut shot, if step == 0 { 0.0 } else { 1.0 / 60.0 });
+                    }
+                }
+                if name.contains("-waterfall") {
+                    for _ in 0..120 { list = off.frame(&mut shot, 1.0 / 60.0); }
                 }
                 if grass_exposure.is_some() { off.warm_grass_tiles(); }
                 if post_warmup_frames > 0 {
@@ -731,14 +791,15 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 if measure && profile == "shadows" && std::env::var_os("AOMAC_GFX_SHADOW_TIMING").is_some() {
                     graphics_shadow_timing(&mut off, &out, &name)?;
                 }
-                Ok((raw, lens, counts.0, counts.1))
+                Ok((raw, lens, counts.0, counts.1, actual_msaa))
             };
-            let (raw, lens, meshes, instances) = capture(true).with_context(|| format!("capture {name}"))?;
+            let (raw, lens, meshes, instances, actual_msaa) = capture(true).with_context(|| format!("capture {name}"))?;
+            writeln!(manifest, "{name} requested_msaa={msaa} actual_msaa={actual_msaa}")?;
             if !png_only {
                 std::fs::write(out.join(format!("{name}.rgba")), &raw)?;
             }
             image::save_buffer(out.join(format!("{name}.png")), &raw, size.0, size.1, image::ColorType::Rgba8)?;
-            let (repeated, _, _, _) = capture(false).with_context(|| format!("repeat {name}"))?;
+            let (repeated, _, _, _, _) = capture(false).with_context(|| format!("repeat {name}"))?;
             let differing = |other: &[u8]| raw.iter().zip(other).filter(|(a, b)| a != b).count() + raw.len().abs_diff(other.len());
             let repeat_differences = differing(&repeated);
             if repeat_differences != 0 {
@@ -851,6 +912,16 @@ fn graphics_fixture_views(actor: &ao_net::n3::dynel::SimpleCharFullUpdate) -> Ve
         Camera::look_at([679.6, 74.5, -476.7].into(), [679.6, 74.0, -482.7].into())));
     views.push(("borealis-lightbar-night-close".into(), 800, 0.0,
         Camera::look_at([679.6, 74.0, -480.2].into(), [679.6, 74.0, -482.7].into())));
+    for (name, pf, time) in [
+        ("icc-water-authored", 4582, 2648.69), ("borealis-water-day", 800, 3240.0),
+        ("borealis-water-night", 800, 0.0), ("newland-water", 566, 3240.0),
+        ("icc-water-underwater-authored", 4582, 2648.69),
+        ("pleasant-meadows-waterfall-native-authored", 630, 2648.69),
+        ("icc-water-sun-glint-authored", 4582, 2648.69),
+    ] {
+        // Resolved from immutable authored liquid topology after loading the snapshot.
+        views.push((name.into(), pf, time, Camera::look_at(Vec3::Y, Vec3::ZERO)));
+    }
     views
 }
 
@@ -1201,6 +1272,192 @@ fn graphics_fixture_sequence_controls_and_grounded_rebound() {
     assert!(graphics_fixture_sequence_position(root, 0.0, |_| Some(f32::NAN)).is_err());
 }
 
+fn graphics_fixture_water_camera(scene: &ao_scene::Scene, waterfall: bool) -> anyhow::Result<(Camera, usize, [f32; 3])> {
+    use anyhow::Context;
+    let mut largest = None;
+    let mut largest_area = 0.0;
+    for surface in scene.liquids.iter().filter(|surface| matches!(surface.style, 0 | 4)) {
+        for triangle in surface.triangles() {
+            let [a, b, c] = triangle.map(|vertex| Vec3::from(vertex.pos));
+            let normal = (b - a).cross(c - a);
+            let area = if waterfall {
+                if normal.y.abs() >= normal.length() * 0.9 { continue; }
+                normal.length()
+            } else { normal.y.abs() };
+            if area > largest_area {
+                largest_area = area;
+                let (center, eye) = if waterfall {
+                    let lo = a.min(b).min(c);
+                    let hi = a.max(b).max(c);
+                    let center = (lo + hi) * 0.5;
+                    let outward = Vec3::new(normal.x, 0.0, normal.z).normalize();
+                    let edge = ((hi - lo) * 0.5).dot(outward.abs());
+                    (center, center + outward * (edge + 20.0) + Vec3::Y * ((hi.y - lo.y) * 0.05))
+                } else {
+                    let center = (a + b + c) / 3.0;
+                    (center, center + Vec3::new(0.0, 4.0, 8.0))
+                };
+                largest = Some((Camera::look_at(eye, center), surface.mesh, center.to_array()));
+            }
+        }
+    }
+    largest.with_context(|| format!("water fixture requires a nondegenerate authored {} triangle", if waterfall { "steep waterfall" } else { "water" }))
+}
+
+fn graphics_fixture_water_triangle(points: [Vec3; 3], point: Vec3) -> bool {
+    let [a, b, c] = points;
+    let cross = |u: Vec3, v: Vec3| u.x * v.z - u.z * v.x;
+    let denominator = cross(b - a, c - a);
+    if denominator.abs() < 0.00001 { return false; }
+    let u = cross(point - a, c - a) / denominator;
+    let v = cross(b - a, point - a) / denominator;
+    let height = a.y + u * (b.y - a.y) + v * (c.y - a.y);
+    u > 0.001 && v > 0.001 && u + v < 0.999 && (height - point.y).abs() < 0.05
+}
+
+fn graphics_fixture_shore_camera(
+    scene: &ao_scene::Scene,
+    liquid_level: impl Fn([f32; 3]) -> Option<f32>,
+    clear: impl Fn([f32; 3], [f32; 3]) -> bool,
+) -> anyhow::Result<(Camera, usize, [f32; 3])> {
+    use anyhow::Context;
+    let mut selected = None;
+    let mut best = f32::INFINITY;
+    for patch in &scene.ground_detail {
+        let Some(mesh) = scene.meshes.get(patch.mesh) else { continue };
+        for vertex in &mesh.vertices {
+            let Some(level) = liquid_level(vertex.pos) else { continue };
+            let depth = level - vertex.pos[1];
+            if !(0.8..=6.0).contains(&depth) { continue; }
+            let score = if (1.5..=3.5).contains(&depth) { (depth - 2.0).abs() } else { 10.0 + (depth - 2.0).abs() };
+            if score >= best { continue; }
+            let target = Vec3::new(vertex.pos[0], level, vertex.pos[2]);
+            let eye = target + Vec3::new(0.0, 4.0, 8.0);
+            if !clear(eye.to_array(), (target + Vec3::Y * 0.1).to_array()) { continue; }
+            let surface = scene.liquids.iter().filter(|surface| matches!(surface.style, 0 | 4))
+                .find(|surface| surface.triangles().any(|triangle| {
+                    graphics_fixture_water_triangle(triangle.map(|v| Vec3::from(v.pos)), target)
+                }));
+            if let Some(surface) = surface {
+                selected = Some((Camera::look_at(eye, target), surface.mesh, target.to_array()));
+                best = score;
+            }
+        }
+    }
+    selected.context("shore fixture requires native ground inside authored water at 0.8–6m depth with clear camera sight")
+}
+
+fn graphics_fixture_swim_endpoint(scene: &ao_scene::Scene, center: Vec3) -> anyhow::Result<Vec3> {
+    for surface in scene.liquids.iter().filter(|surface| matches!(surface.style, 0 | 4)) {
+        for triangle in surface.triangles() {
+            let points = triangle.map(|vertex| Vec3::from(vertex.pos));
+            if graphics_fixture_water_triangle(points, center) {
+                let delta = points[0] - center;
+                return Ok(center + delta * (3.0 / delta.length().max(0.0001)).min(0.5));
+            }
+        }
+    }
+    anyhow::bail!("swimmer center has no exact authored water triangle")
+}
+
+fn graphics_fixture_sun_glint_camera(sun: Vec3, target: Vec3) -> anyhow::Result<Camera> {
+    anyhow::ensure!(sun.is_finite() && sun.y > 0.0, "sun-glint fixture requires an authored sun above the horizon");
+    let outgoing = -sun + 2.0 * sun.y * Vec3::Y;
+    Ok(Camera::look_at(target + outgoing * (4.0 / outgoing.y), target))
+}
+
+#[test]
+fn graphics_fixture_sun_glint_camera_reflects_native_sun() {
+    let sun = Vec3::new(0.3, 0.8, -0.4).normalize();
+    let target = Vec3::new(10.0, 3.0, -20.0);
+    let camera = graphics_fixture_sun_glint_camera(sun, target).unwrap();
+    let outgoing = (camera.pos - target).normalize();
+    assert!((outgoing - (-sun + 2.0 * sun.y * Vec3::Y)).length() < 1e-5);
+    assert!((camera.pos.y - target.y - 4.0).abs() < 1e-5);
+    assert!(graphics_fixture_sun_glint_camera(-Vec3::Y, target).is_err());
+}
+
+fn graphics_fixture_has_swimmer(name: &str) -> bool {
+    name.contains("-water") && !name.contains("-waterfall")
+}
+
+#[test]
+fn graphics_fixture_swimmer_is_independent_of_effect_settings() {
+    for name in ["icc-water-authored", "borealis-water-day", "borealis-water-night",
+        "newland-water", "icc-water-underwater-authored", "icc-water-sun-glint-authored"] {
+        assert!(graphics_fixture_has_swimmer(name));
+    }
+    for name in ["pleasant-meadows-waterfall-native-authored", "icc-actor-authored", "newland-day"] {
+        assert!(!graphics_fixture_has_swimmer(name));
+    }
+}
+
+
+#[test]
+fn graphics_fixture_water_camera_uses_immutable_source_membership() {
+    let source = ao_scene::liquid::SourceTriangle {
+        kind: 0,
+        vertices: [[0.0, 5.0, 0.0], [12.0, 5.0, 0.0], [0.0, 5.0, -12.0]]
+            .map(|pos| ao_scene::Vertex { pos, normal: [0.0, 1.0, 0.0], uv: [0.0; 2], color: [1.0; 4] }),
+    };
+    let mut scene = ao_scene::Scene::default();
+    assert!(graphics_fixture_water_camera(&scene, false).is_err());
+    scene.liquids.push(ao_scene::liquid::Surface::new(7, 0, vec![source]).unwrap());
+    let before: Vec<_> = scene.liquids[0].triangles().collect();
+    let (camera, mesh, center) = graphics_fixture_water_camera(&scene, false).unwrap();
+    assert_eq!(mesh, 7);
+    assert!(before.iter().any(|triangle| {
+        let points = triangle.map(|vertex| Vec3::from(vertex.pos));
+        ((points[0] + points[1] + points[2]) / 3.0 - Vec3::from(center)).length() < 0.0001
+    }));
+    assert_eq!(camera.pos, Vec3::from(center) + Vec3::new(0.0, 4.0, 8.0));
+    let end = graphics_fixture_swim_endpoint(&scene, center.into()).unwrap();
+    assert!((end - Vec3::from(center)).length() <= 3.0001);
+    assert_eq!(end.y, center[1]);
+    assert!(graphics_fixture_water_camera(&scene, true).is_err());
+    assert_eq!(scene.liquids[0].triangles().map(|triangle| triangle.map(|v| v.pos)).collect::<Vec<_>>(),
+        before.iter().map(|triangle| triangle.map(|v| v.pos)).collect::<Vec<_>>());
+    scene.liquids.push(ao_scene::liquid::Surface::new(8, 0, vec![
+        ao_scene::liquid::SourceTriangle {
+            kind: 0,
+            vertices: [[1620.0, 49.0, -782.0], [1410.0, 49.0, -782.0], [1620.0, 27.0, -777.0]]
+                .map(|pos| ao_scene::Vertex { pos, normal: [0.0, 0.0, 1.0], uv: [0.0; 2], color: [1.0; 4] }),
+        },
+    ]).unwrap());
+    let (camera, mesh, target) = graphics_fixture_water_camera(&scene, true).unwrap();
+    assert_eq!(mesh, 8);
+    assert_eq!(target, [1515.0, 38.0, -779.5]);
+    assert!((camera.pos - Vec3::new(1515.0, 39.1, -757.0)).length() < 1e-4);
+}
+
+#[test]
+fn graphics_fixture_shore_camera_prefers_native_shallow_clear_water() {
+    let vertex = |pos| ao_scene::Vertex { pos, normal: [0.0, 1.0, 0.0], uv: [0.0; 2], color: [1.0; 4] };
+    let mut scene = Scene::default();
+    scene.meshes.push(ao_scene::Mesh {
+        vertices: [[1.0, 1.0, -1.0], [2.0, 3.0, -2.0], [3.0, 2.0, -3.0],
+            [20.0, 3.0, -20.0]].map(vertex).to_vec(), ..Default::default()
+    });
+    scene.ground_detail.push(ao_scene::ground_detail::GroundPatch { mesh: 0, ..Default::default() });
+    scene.liquids.push(ao_scene::liquid::Surface::new(7, 0, vec![
+        ao_scene::liquid::SourceTriangle {
+            kind: 0, vertices: [[0.0, 5.0, 0.0], [12.0, 5.0, 0.0], [0.0, 5.0, -12.0]].map(vertex),
+        },
+    ]).unwrap());
+    let select = |clear: bool| graphics_fixture_shore_camera(&scene, |_| Some(5.0), |_, _| clear);
+    let (camera, mesh, target) = select(true).unwrap();
+    assert_eq!(mesh, 7);
+    assert_eq!(target, [2.0, 5.0, -2.0]);
+    assert_eq!(camera.pos, Vec3::from(target) + Vec3::new(0.0, 4.0, 8.0));
+    assert!(select(false).is_err());
+    assert!(graphics_fixture_shore_camera(&scene, |_| None, |_, _| true).is_err());
+    let endpoint = graphics_fixture_swim_endpoint(&scene, target.into()).unwrap();
+    assert!((endpoint - Vec3::from(target)).length() <= 3.0001);
+    assert!(scene.liquids[0].triangles().any(|triangle| {
+        graphics_fixture_water_triangle(triangle.map(|v| v.pos.into()), endpoint)
+    }));
+}
+
 fn graphics_fixture_newland_camera(terrain_height: impl Fn([f32; 3]) -> Option<f32>) -> anyhow::Result<Camera> {
     use anyhow::Context;
     let mut eye = [414.0, 2.5, -320.0];
@@ -1264,14 +1521,15 @@ fn graphics_fixture_snapshot_keys_share_only_matching_playfield_and_time() -> an
     for (_, pf, time, _) in &views {
         *keys.entry((*pf, time.to_bits())).or_default() += 1;
     }
-    assert_eq!(views.len(), 21);
-    assert_eq!(keys.len(), 9);
-    assert_eq!(keys[&(4582, 2648.69_f32.to_bits())], 4);
-    assert_eq!(keys[&(800, 0.0_f32.to_bits())], 4);
-    assert_eq!(keys[&(800, 3240.0_f32.to_bits())], 3);
+    assert_eq!(views.len(), 28);
+    assert_eq!(keys.len(), 10);
+    assert_eq!(keys[&(4582, 2648.69_f32.to_bits())], 7);
+    assert_eq!(keys[&(630, 2648.69_f32.to_bits())], 1);
+    assert_eq!(keys[&(800, 0.0_f32.to_bits())], 5);
+    assert_eq!(keys[&(800, 3240.0_f32.to_bits())], 4);
     assert_eq!(keys[&(127, 3240.0_f32.to_bits())], 1);
     for time in [3240.0_f32, 4860.0, 0.0] {
-        assert_eq!(keys[&(566, time.to_bits())], if time == 3240.0 { 3 } else { 1 });
+        assert_eq!(keys[&(566, time.to_bits())], if time == 3240.0 { 4 } else { 1 });
     }
     Ok(())
 }
@@ -1470,6 +1728,28 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             settings.cloud_shadows = true;
             settings.sky_discs = true;
         }
+        "water-waves" => settings.water_waves = true,
+        "water-ripples" => settings.water_ripples = true,
+        "water-refraction" => settings.water_refraction = true,
+        "water-reflections" => settings.water_reflections = true,
+        "water-foam" => settings.water_foam = true,
+        "water-wakes" => settings.water_wakes = true,
+        "waterfalls" => settings.waterfalls = true,
+        "underwater" => settings.underwater = true,
+        "water-caustics" => settings.water_caustics = true,
+        "water-sun-glint" => settings.water_sun_glint = true,
+        "water" => {
+            settings.water_waves = true;
+            settings.water_ripples = true;
+            settings.water_refraction = true;
+            settings.water_reflections = true;
+            settings.water_foam = true;
+            settings.water_wakes = true;
+            settings.waterfalls = true;
+            settings.underwater = true;
+            settings.water_caustics = true;
+            settings.water_sun_glint = true;
+        }
         // Isolates the contact pass: shadows + hdr + contact vs `shadows-hdr`.
         "shadows-hdr" => { settings.sun_shadows = true; settings.hdr = true; }
         "shadows-hdr-contact" => { settings.sun_shadows = true; settings.hdr = true; settings.contact_shadows = true; }
@@ -1488,6 +1768,16 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             settings.volumetric_clouds = true;
             settings.cloud_shadows = true;
             settings.sky_discs = true;
+            settings.water_waves = true;
+            settings.water_ripples = true;
+            settings.water_refraction = true;
+            settings.water_reflections = true;
+            settings.water_foam = true;
+            settings.water_wakes = true;
+            settings.waterfalls = true;
+            settings.underwater = true;
+            settings.water_caustics = true;
+            settings.water_sun_glint = true;
         }
         // 9f78245 all-on defaults, independent of subsequent tuning.
         "all-before" => settings = ao_render::EnhancedSettings {
@@ -1498,7 +1788,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
             grass_density: 1.0, grass_distance: 50.0, sun_boost: 0.5, grade_strength: 0.8, contact_strength: 0.4,
             ..Default::default()
         },
-        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|clustered|local-shadows|local-shadows-clustered|moonlit|moon-shadows|moon-volumetric-shafts|moon-cloud-gap-shafts|dark-night|specular|lighting|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before|foliage-edges|foliage-sway|foliage-push|foliage-leaves|foliage-flutter|foliage-falling|grass-trails|foliage-subdivision|foliage-translucency|foliage-lod|all-foliage|all-foliage-shadows"),
+        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|clustered|local-shadows|local-shadows-clustered|moonlit|moon-shadows|moon-volumetric-shafts|moon-cloud-gap-shafts|dark-night|specular|lighting|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before|foliage-edges|foliage-sway|foliage-push|foliage-leaves|foliage-flutter|foliage-falling|grass-trails|foliage-subdivision|foliage-translucency|foliage-lod|all-foliage|all-foliage-shadows|water|water-waves|water-ripples|water-refraction|water-reflections|water-foam|water-wakes|waterfalls|underwater|water-caustics|water-sun-glint"),
     }
     Ok(settings)
 }
@@ -1683,6 +1973,23 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
     let isolated = graphics_fixture_settings("shadows-hdr-contact").unwrap();
     assert!(isolated.sun_shadows && isolated.hdr && isolated.contact_shadows);
     assert!(!graphics_fixture_settings("shadows-hdr").unwrap().contact_shadows);
+    for (bit, name) in [
+        "water-waves", "water-ripples", "water-refraction", "water-reflections",
+        "water-foam", "water-wakes", "waterfalls", "underwater", "water-caustics", "water-sun-glint", "water",
+    ].iter().enumerate() {
+        let settings = graphics_fixture_settings(name).unwrap();
+        let flags = [
+            settings.water_waves, settings.water_ripples, settings.water_refraction, settings.water_reflections,
+            settings.water_foam, settings.water_wakes, settings.waterfalls, settings.underwater,
+            settings.water_caustics, settings.water_sun_glint,
+        ];
+        for (i, enabled) in flags.into_iter().enumerate() {
+            assert_eq!(enabled, bit == 10 || bit == i);
+        }
+        assert!(settings.any_enabled());
+        assert!(!settings.sun_shadows && !settings.ambient_occlusion && !settings.emissive_bloom
+            && !settings.ground_grass && !settings.hdr && !settings.contact_shadows);
+    }
     assert!(graphics_fixture_settings("hdr").unwrap().hdr);
     let hdr_bloom = graphics_fixture_settings("hdr-bloom").unwrap();
     assert!(hdr_bloom.hdr && hdr_bloom.emissive_bloom && !hdr_bloom.sun_shadows);
@@ -1699,7 +2006,9 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
     let actor = graphics_fixture_actor().unwrap();
     assert_eq!(actor.name, "Testy");
     let views = graphics_fixture_views(&actor);
-    assert_eq!(views.iter().map(|view| &view.0).collect::<std::collections::HashSet<_>>().len(), 21);
+    assert_eq!(views.iter().map(|view| &view.0).collect::<std::collections::HashSet<_>>().len(), 28);
+    let waterfall = views.iter().find(|view| view.0 == "pleasant-meadows-waterfall-native-authored").unwrap();
+    assert_eq!((waterfall.1, waterfall.2), (630, 2648.69));
     for (light, expected_time) in [("day", 3240.0), ("dusk", 4860.0), ("night", 0.0)] {
         let newland = views.iter().find(|view| view.0 == format!("newland-{light}")).unwrap();
         assert_eq!((newland.1, newland.2), (566, expected_time));
