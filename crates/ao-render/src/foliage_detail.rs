@@ -140,7 +140,7 @@ mod tests {
     }
     #[test]
     fn switches_are_structurally_independent() {
-        let base = crate::enhanced_shader::source(false,false,false,false);
+        let base = crate::enhanced_shader::source(crate::EnhancedSettings::default());
         let mut off = base.clone(); append_shader(&mut off,false,false); assert_eq!(off,base);
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let renderer = crate::Renderer::new(&instance, None).expect("foliage shader regression requires offscreen GPU");
@@ -164,7 +164,7 @@ mod tests {
     }
     #[test]
     fn transmission_is_sun_gated_and_keeps_native_fog() {
-        let original = crate::enhanced_shader::source(false,false,false,false);
+        let original = crate::enhanced_shader::source(crate::EnhancedSettings::default());
         let mut source = original.clone();
         append_shader(&mut source,true,false);
         let fog = "let rgb = select(mix(lit, authored_fog, f), lit, add);";

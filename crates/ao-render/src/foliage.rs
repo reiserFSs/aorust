@@ -130,7 +130,10 @@ mod tests {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let renderer = crate::Renderer::new(&instance, None).expect("foliage regression requires GPU");
         for shadows in [false, true] {
-            let mut source = crate::enhanced_shader::source(shadows, true, true, true);
+            let mut source = crate::enhanced_shader::source(crate::EnhancedSettings {
+                sun_shadows: shadows, ambient_occlusion: true, emissive_bloom: true, hdr: true,
+                ..Default::default()
+            });
             append_shader(&mut source);
             crate::foliage_detail::append_shader(&mut source, true, true);
             crate::foliage_edges::append(&mut source);

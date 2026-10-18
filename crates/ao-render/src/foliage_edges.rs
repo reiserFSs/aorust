@@ -50,7 +50,7 @@ pub(super) fn append(source: &mut String) {
 mod tests {
     #[test]
     fn partition_preserves_native_coverage_and_alpha_test() {
-        let mut source = super::super::enhanced_shader::source(false, false, false, false);
+        let mut source = super::super::enhanced_shader::source(crate::EnhancedSettings::default());
         super::append(&mut source);
         for stem in ["blend", "sprite"] {
             for suffix in ["core", "soft"] {

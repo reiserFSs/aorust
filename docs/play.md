@@ -1360,6 +1360,11 @@ seconds and revoke each source's contribution before upload when it is no longer
 admitted. Backlit foliage transmission retains the native fog operation; the
 separate distant-plant shading switch omits local/specular evaluation beyond 48 m.
 
+World variants retain independent moon/night settings alongside the foliage key.
+Shader generation uses the complete `EnhancedSettings` API, applies the moon
+rewrite before foliage hooks, and appends foliage globals after the native moon
+fields in both beauty and caster sources to match the CPU uniform layout.
+
 `AomacGroundGrass` is an off-by-default enhancement, not a reproduction of native
 vegetation geometry. Every green part of the terrain's original tile pictures
 admits blades, including grass/soil transition tiles; the per-texel green mask
