@@ -2058,6 +2058,14 @@ value instead of repeating its identical smooth-normal scan. Both mesh and groun
 receivers write it unconditionally before receiver guards; material-normal and
 GGX scans, admission and point-shadow sampling remain unchanged.
 Whole-frame performance still requires the acceptance/marginal fixtures above.
+At Newland, 1920×1200 with each preset's native 1× MSAA plus TAA/CAS, the
+600-sample pre-cache → post-cache GPU p50/p95 values were Modern
+**22.475750/24.306792 → 21.115417/22.733709 ms** and Ultra
+**26.137709/27.913334 → 24.437083/26.073167 ms**. The pre-cache p95 figures in
+the `6d6152b3` commit message were transcription errors; these CSV-derived values
+are the correction. Both presets still miss their 8/12 ms budgets.
+Evidence: `~/aomac-handoff/gfx/parity/Presets/final-native-aa/history/`.
+
 
 Sun cascades admit loaded static geometry, including terrain patches, by their
 light volume rather than the camera-visible instance list. Their depth range
