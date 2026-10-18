@@ -1445,9 +1445,13 @@ pinch zoom, widescreen camera FOV, text preferences or session diagnostics/suspe
 | Preset | Semantics |
 | --- | --- |
 | Original | All graphical effect switches off; registry quality defaults, 1× MSAA, 1× anisotropy. |
-| Classic+ | Sun shadows, AO, contact shadows, HDR, grading, bloom, clustered local lighting, authored material specular and local light shadows only; no added grass, sky, water or foliage content. Sun boost 0.15, grade 0.25, bloom 0.2, AO strength 0.6, contact strength 0.4; 4× MSAA and 8× anisotropy. |
-| Modern | Recommended materials/reflections, night/local lighting, weather/clouds, water, foliage/grass and grading effects, with TAA + CAS sharpening and 4× MSAA. FXAA, cinematic depth of field/motion blur and user LUTs remain off. Shadow map 1024, Low shadow receiver/AO, 2 point shadows, grass density 0.5 / distance 96 m, Normal cloud/water; Moonlit night, night tint 0.15, vignette 0.1; 16× anisotropy. |
-| Ultra | Same effects as Modern, with 2048 shadow map, Normal shadow receiver/AO, 4 point shadows, AO radius 2.5 / strength 1.8, grass density 1 / distance 144 m, High cloud/water quality; same MSAA and anisotropy. Cinematic effects and user LUTs remain opt-in. |
+| Classic+ | Sun shadows, AO, contact shadows, HDR, grading, bloom, clustered local lighting, authored material specular and local light shadows only; no added grass, sky, water or foliage content. Sun boost 0.15, grade 0.25, bloom 0.2, AO strength 0.6, contact strength 0.4; 4× MSAA, no TAA or CAS, and 8× anisotropy. |
+| Modern | Recommended materials/reflections, night/local lighting, weather/clouds, water, foliage/grass and grading effects, with TAA + CAS sharpening and 1× MSAA (no multisampling). FXAA, cinematic depth of field/motion blur and user LUTs remain off. Shadow map 1024, Low shadow receiver/AO, 2 point shadows, grass density 0.5 / distance 96 m, Normal cloud/water; Moonlit night, night tint 0.15, vignette 0.1; 16× anisotropy. |
+| Ultra | Same effects and TAA + CAS as Modern, with 2048 shadow map, Normal shadow receiver/AO, 4 point shadows, AO radius 2.5 / strength 1.8, grass density 1 / distance 144 m, High cloud/water quality; 1× MSAA and 16× anisotropy. Cinematic effects and user LUTs remain opt-in. |
+
+Each preset uses its own MSAA sample count in both the UI and headless measurements.
+`AomacEdgeSmoothing` persists index 0 (1 sample) for Original, Modern and Ultra,
+and index 2 (4 samples) for Classic+; Original also leaves TAA, CAS and FXAA off.
 
 Screen-space indirect light remains **off in both Modern and Ultra** and is available as
 a manual, budget-dependent opt-in. It is not included merely because Ultra raises quality:
@@ -1466,7 +1470,8 @@ changing back to the preset's value. Custom never auto-matches a named preset an
 selecting Custom itself preserves current settings. Loading saved controls bypasses
 manual-edit tracking, retaining the saved selection; older files without a selection
 retain their controls and become Custom when any graphical value is non-default.
-Regression coverage: `enhanced::tests::presets_cover_every_graphical_control_and_manual_edits_stay_custom`
+Regression coverage: `enhanced::tests::presets_cover_every_graphical_control_and_manual_edits_stay_custom`,
+`enhanced::tests::preset_antialiasing_uses_and_persists_each_presets_own_samples`
 and `options::tests::enhanced_preset_radio_dispatch_and_custom_roundtrip`.
 
 
@@ -1559,6 +1564,22 @@ coverage. It learns before post/weather effects, forgets on scene changes and
 teleports, and fades with camera movement and time. Roughness uses a bounded
 GGX-lobe filter. Unlike ao-vk's distance-only player exclusion, no actor colour
 is admitted into persistent probe history.
+
+`material_static_source` is shared by the opaque/test/faded-opaque/faded-test
+and fused/base/simple ground primary outputs. It returns zero before native or
+clustered local-light queries when dynamic (128) or foliage (64) flags, native
+effects, nonzero UV scroll or nonzero AO light provenance exclude the source.
+The original positive float equalities are retained (signed zero is eligible;
+NaN scroll/AO is not); eligible pixels retain the same light/visibility tests.
+The earlier provenance visibility query in material preparation remains
+unconditional: it can update the raw-sun value and consecutive-query memo used
+by subsequent shading, so skipping it is not part of this optimization.
+Source coverage checks guard ordering; the GPU regression
+`static_source_early_eligibility_matches_previous_predicate_on_gpu_msaa4`
+compares the previous predicate byte-for-byte at 4× MSAA, with eligible positive
+controls, excluded foliage/dynamic/effect/scroll/AO cases, signed zero,
+local/clustered contamination and shadow rejection. These checks were added,
+not run by the author; no measured performance claim is made.
 
 Both viewers request a background world-pipeline variant and keep drawing the previous settings
 until it is ready. Variants are keyed by shadows, AO, bloom, sun-mask and clamped MSAA;

@@ -3310,8 +3310,8 @@ impl Renderer {
                     &attachments[..enhanced_frame.map_or(1, enhanced::EnhancedFrame::target_count)],
                     enhanced_frame.map_or(&t.depth, |frame| &frame.depth));
             }
-            // Existing native list order; list 4 remains the liquid list.
-            for priority in [1, 2, 3, 4, 5, 6, 10, 7] {
+            // Complete native opaque scenery/actors before depth-writing canopy.
+            for priority in [1, 2, 3] {
                 world_phase(&mut pass, priority);
             }
             if split_canopy_cost {
@@ -3321,6 +3321,16 @@ impl Renderer {
                     enhanced_frame.map_or(&t.depth, |frame| &frame.depth));
             }
             calls.set(calls.get() + self.draw_canopy_leaves(&mut pass) as usize);
+            if split_canopy_cost {
+                drop(pass);
+                pass = effect_gpu::resume_world_pass(&mut enc, "profiled world continuation",
+                    &attachments[..enhanced_frame.map_or(1, enhanced::EnhancedFrame::target_count)],
+                    enhanced_frame.map_or(&t.depth, |frame| &frame.depth));
+            }
+            // Keep native transparency order: liquid list 4 must blend over leaves.
+            for priority in [4, 5, 6, 10, 7] {
+                world_phase(&mut pass, priority);
+            }
         }
         if let Some(frame) = enhanced_frame {
             frame.resolve_depth(&mut enc);
@@ -5039,6 +5049,24 @@ mod sky_tests {
         // up-left normal -> bottom row would be v > 0.5: a +y normal samples the *bottom* texels (no flip), here bottom-left blue
         let up_left = actor_shot(&Scene::default(), model([-0.5, 0.5, 0.7], true), [0.0, 0.0, -5.0], "up_left").unwrap();
         assert!(up_left[2] > 200 && up_left[0] < 40 && up_left[1] < 40, "bottom-left (blue) texel: {up_left:?}");
+    }
+
+    #[test]
+    fn canopy_depth_precedes_native_transparency_and_mrt_consumers() {
+        let source = include_str!("lib.rs").split("pub fn render_to_png(").next().unwrap();
+        let stages = [
+            "for priority in [1, 2, 3]",
+            "self.draw_canopy_leaves(&mut pass)",
+            "for priority in [4, 5, 6, 10, 7]",
+            "frame.resolve_depth(&mut enc)",
+            "self.encode_material_reflections(&mut enc",
+            "self.encode_water(&mut enc)",
+            "self.encode_atmosphere_stack(&mut enc",
+        ];
+        for pair in stages.windows(2) {
+            assert!(source.find(pair[0]).unwrap() < source.find(pair[1]).unwrap(),
+                "{} must precede {}", pair[0], pair[1]);
+        }
     }
 
     /// Render list order (`DisplaySystem_t::Render` @0x100793b8): a liquid (list 4) is drawn after an opaque actor (list 3) even though

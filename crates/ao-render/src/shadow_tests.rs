@@ -23,8 +23,10 @@ fn grass_shadow_receiver_preserves_ambient_and_disables_without_caster_layer() {
     assert!(source.contains("if shadow_frame.control.w != 0u {"));
     assert!(include_str!("grass_shadow.wgsl").contains("if shadow_frame.control.w != 0u {"));
     let grass = include_str!("grass_shadow.wgsl");
-    assert!(grass.contains("if blend > 0.0 {\n            if layer < 2u"),
-        "the adjacent cascade must not be sampled outside its crossfade");
+    for receiver in [source, grass] {
+        assert!(receiver.contains("if blend > 0.0 {\n            if layer < 2u"),
+            "the adjacent cascade must not be sampled outside its crossfade");
+    }
     assert!(!include_str!("volumetric_shafts.wgsl").contains("shadow_frame.control.w"),
         "shaft ray marching must retain raw solid depths independently of surface receiver permission");
     // Only the directional share is attenuated; the receiver's existing artistic

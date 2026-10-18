@@ -45,10 +45,13 @@ fn material_prepare(i: VOut) {
     let uv = material_uv(i);
     material_base_normal = material_safe_normal(i.n);
     material_footprint = max(length(fwidth(i.wpos)), 1e-6);
+    var geometric_visibility = 1.0;
     material_visibility_value = sun_visibility(i.wpos, i.n, i.clip.xy);
     material_static_visibility_value = material_visibility_value;
     if MATERIAL_STATIC_PROVENANCE {
-        material_static_visibility_value = min(material_visibility_value, sun_visibility(i.wpos, cross(dpdx(i.wpos), dpdy(i.wpos)), i.clip.xy));
+        // Receiving wrappers pass this geometric plane to beauty, GGX and clusters.
+        geometric_visibility = sun_visibility(i.wpos, cross(dpdx(i.wpos), dpdy(i.wpos)), i.clip.xy);
+        material_static_visibility_value = min(material_visibility_value, geometric_visibility);
     }
     material_albedo_value = sample_clamped(tex, uv).rgb * i.tint.xyz;
     let generated = sample_clamped(generated_normal_tex, uv);

@@ -19,7 +19,7 @@ impl GraphicsPreset {
         Self::ALL.into_iter().find(|preset| preset.name() == name)
     }
 
-    pub fn msaa(self) -> u32 { if self == Self::Original { 1 } else { 4 } }
+    pub fn msaa(self) -> u32 { if self == Self::ClassicPlus { 4 } else { 1 } }
     pub fn anisotropy(self) -> u16 {
         match self { Self::Original => 1, Self::ClassicPlus => 8, Self::Modern | Self::Ultra => 16 }
     }
@@ -498,6 +498,31 @@ mod tests {
             assert_eq!(loaded.get(control.name), Some(&control.default));
         }
         assert_eq!(loaded.get("UnrelatedRetailPreference"), Some(&Variant::Int(7)));
+    }
+
+    #[test]
+    fn preset_antialiasing_uses_and_persists_each_presets_own_samples() {
+        let mut d = values();
+        for (preset, samples, edge_smoothing, temporal) in [
+            (GraphicsPreset::Original, 1, 0, false),
+            (GraphicsPreset::ClassicPlus, 4, 2, false),
+            (GraphicsPreset::Modern, 1, 0, true),
+            (GraphicsPreset::Ultra, 1, 0, true),
+        ] {
+            for name in ["AomacTaa", "AomacCas", "AomacFxaa"] {
+                d.set_raw(name, Variant::Bool(!temporal));
+            }
+            d.set_raw("AomacEdgeSmoothing", Variant::Int(3));
+            d.set("AomacGraphicsPreset", Variant::Int(preset.index()));
+            assert_eq!(preset.msaa(), samples, "{preset:?}");
+            assert_eq!(d.get_i64("AomacEdgeSmoothing"), Some(edge_smoothing), "{preset:?}");
+            let mut loaded = values();
+            loaded.load_config(&d.save_config(CAT_MAIN), CAT_MAIN, false);
+            assert_eq!(loaded.get_i64("AomacEdgeSmoothing"), Some(edge_smoothing), "{preset:?}");
+            assert_eq!(loaded.flag("AomacTaa"), temporal, "{preset:?}");
+            assert_eq!(loaded.flag("AomacCas"), temporal, "{preset:?}");
+            assert!(!loaded.flag("AomacFxaa"), "{preset:?}");
+        }
     }
 
     #[test]

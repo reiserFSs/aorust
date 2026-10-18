@@ -670,9 +670,18 @@ AOMAC_GFX_PNG_ONLY=1 \
 cameras for **Original, Classic+, Modern, Ultra × ICC, Borealis day, Borealis
 night, Newland day**. Presets come from the same `enhanced::apply_preset` registry
 as the UI, including every renderer control, anisotropy and better mip filtering.
-Every measurement requests **1920×1200, actual 4× MSAA**, including Original:
-this deliberate benchmark override differs from Original's normal 1× default.
-The test fails rather than silently accepting a lower adapter sample count.
+Every measurement uses **1920×1200 and the preset's own `GraphicsPreset::msaa()`**:
+Original 1× with effects off; Classic+ 4× without TAA/CAS; Modern and Ultra 1×
+with TAA + CAS and FXAA off. Timing, beauty and interaction phases require the
+actual sample count to match the preset, rather than silently accepting adapter
+clamping. The Modern ≤8 ms / Ultra ≤12 ms budgets apply at their own quality,
+not a forced-4× comparison.
+
+Historical 16-cell measurements and retained CSVs/screensheets from the initial
+acceptance convention used a deliberate **4× override for every preset**, including
+Original, Modern and Ultra. Those remain the initial 4× baseline, not measurements
+of the current native-AA presets; do not relabel them or infer native-AA budget
+acceptance from them.
 
 Build once (no GPU execution), then use the exact executable Cargo prints:
 
@@ -721,9 +730,10 @@ Each cell runs 120 warmup frames followed by **600 GPU timestamp samples**;
 simulation advances 1/60 s per frame while the authored game clock, clear weather
 and day remain fixed. There is no screenshot/readback in measured samples beyond
 the GPU timestamp readback. `frames.csv` retains all 600 unsorted frame times;
-`summary.csv` reports actual count, actual MSAA, anisotropy and nearest-rank
-p50/p95 milliseconds. Both are checkpointed after each preset. `manifest.txt`
-records resource SHA-256, revision/source diff, shader override, native playfield,
+`summary.csv` reports actual count, requested/actual MSAA, anisotropy and nearest-rank
+p50/p95 milliseconds; raw frame CSV rows also record actual MSAA. Both are
+checkpointed after each preset. `manifest.txt` records per-cell requested/actual
+MSAA, resource SHA-256, revision/source diff, shader override, native playfield,
 game time, resolved camera/lens, environment, instance counts and exact settings.
 
 One full-resolution beauty PNG per cell and a compact `beauties.png` grid support
@@ -732,9 +742,10 @@ Newland; filtered-out cells remain blank). Every preset also gets a 120-frame
 moving-camera/visible-actor interaction sequence at 60 Hz, retained only as a
 12-thumbnail contact sheet (`*-temporal120.png`, frames 9,19,…,119) and objective
 consecutive-frame statistics for **all 119 pairs** in `temporal.csv`. The separate
-`combined-all` profile starts from Ultra quality and explicitly enables all
-registered graphical checkboxes plus nonzero motion blur, independently of the
-recommended presets. Mutually exclusive night modes use Moonlit. Combined strips
+`combined-all` profile starts from Ultra quality, including its 1× MSAA and TAA,
+and explicitly enables all registered graphical checkboxes plus nonzero motion
+blur, independently of the recommended presets. Mutually exclusive night modes
+use Moonlit. Combined strips
 also supply the existing weather fixture's unmodified native rain/storm channels
 as an explicitly controlled combination (not a claim that this climate occurs in
 the measured scene), plus actual authored Smoke1009, Sparks1018 and
@@ -752,18 +763,23 @@ acceptance; these landscape strips do not pretend to replace them. A sheet is
 visual evidence, not an automatic aesthetic pass.
 
 Each interaction cell additionally exercises the existing fog/admission positive-control
-pattern at compact resolution: a zero-alpha actor and its owner-tagged bender
-must equal absence, unfogged red/green body colours must differ, and fully fogged
-red/green bodies must be identical. No full RGBA files or frame PNG sequences are
-retained; output is capped at 100 MB per invocation. `status.txt` distinguishes
+pattern separately at **384×240, requested-and-checked actual 4× MSAA**; the manifest
+labels this invariant sample count independently of the preset's main render.
+A zero-alpha actor and its owner-tagged bender must equal absence, unfogged red/green
+body colours must differ, and fully fogged red/green bodies must be identical.
+No full RGBA files or frame PNG sequences are retained; output is capped at 100 MB
+per invocation. `status.txt` distinguishes
 completed numerical checks from still-unexercised human visual acceptance.
 
 #### Whole-frame Modern marginal costs
 
-`graphics_preset_marginal_costs` measures **A=Modern, B=Modern with one exact
-graphical Bool disabled**, in ABBA order. Each of the four legs has 120 warmup
-frames and 240 whole-frame GPU timestamp samples at 1920×1200, actual 4× MSAA,
-16× anisotropy and Modern texture policy. There are no photos or timing-budget
+`graphics_preset_marginal_costs` measures **A=Modern, B=Modern with the selected
+graphical Bool key(s) disabled**, in ABBA order. Each of the four legs has 120 warmup
+frames and 240 whole-frame GPU timestamp samples at 1920×1200, Modern's own
+`GraphicsPreset::Modern.msaa()` (currently actual 1× MSAA, TAA + CAS), 16×
+anisotropy and Modern texture policy. Requested and actual MSAA must match at
+the start and end of every leg. Historical forced-4× marginal results retain
+that original label and are not native-AA measurements. There are no photos or timing-budget
 assertions. It reuses the snapshot cameras, collision/sky-open bake and grass
 exposure; settings switch synchronously. Renderers are reused except when
 changing better mip filtering, which requires fresh texture uploads per leg.
@@ -783,13 +799,35 @@ AOMAC_GFX_EFFECTS=AomacAmbientOcclusion,AomacContactShadows \
   graphics_preset_marginal_costs --ignored --nocapture --test-threads=1
 ```
 
-`AOMAC_GFX_OUT` is required and must not exist. `AOMAC_GFX_VIEW` accepts only
-`icc-landmark-authored` or `newland-day`; omitted means both. Batch a small set
-per lease with comma-separated **exact DValue keys** in `AOMAC_GFX_EFFECTS`;
-unknown/non-Bool/nongraphical keys, duplicates, empty entries and effects already
-off in Modern are rejected. Any registered graphical Bool that Modern enables
-can be isolated, including `AomacBetterMipFiltering`. This is leave-one-out,
-not a standalone on/off benchmark and not an additive allocation of frame cost.
+`AOMAC_GFX_OUT` is required and must not exist. `AOMAC_GFX_VIEW` accepts exactly
+`icc-landmark-authored`, `newland-day`, `borealis-foliage-sun-high`, or
+`borealis-foliage-night`. Omitting it still measures only ICC and Newland;
+select a Borealis view explicitly for worst-scene investigation. Batch a small set
+per lease with comma-separated entries in `AOMAC_GFX_EFFECTS`. Each entry is an
+**exact DValue key** or a `+`-joined group of exact keys; all group keys are on in
+A and off in B, and the unchanged group string labels the CSV rows.
+Unknown/non-Bool/nongraphical keys, duplicate entries, duplicate keys within a
+group, empty entries/keys and effects already off in Modern are rejected.
+Any registered graphical Bool that Modern enables can be isolated, including
+`AomacBetterMipFiltering`. This is leave-one-out, not a standalone on/off
+benchmark and not an additive allocation of frame cost.
+
+Shared resources can make a single-key leave-one-out delta nearly zero without
+making that effect free: another enabled effect may still require the same
+targets or pipeline layout. For example, material reflections and the environment
+probe both retain the seven-MRT layout. To investigate their **joint whole-frame
+marginal**, use:
+
+```sh
+AOMAC_GFX_EFFECTS=AomacMaterialReflections+AomacEnvironmentProbe
+# Or jointly remove the canopy leaves and their dependent motion/content:
+AOMAC_GFX_EFFECTS=AomacFoliageLeaves+AomacFoliageFlutter+AomacFoliageFalling
+```
+
+These assignments replace `AOMAC_GFX_EFFECTS` in the invocation above; groups may
+also be batched with commas. A group still runs four ABBA legs per view, not four
+per key. Its delta is not an exclusive/shared-resource cost allocation, and
+group deltas must not be summed with their constituent single-key deltas.
 
 The default 16 controls are `AomacAmbientOcclusion`, `AomacContactShadows`,
 `AomacVolumetricClouds`, `AomacWaterReflections`, `AomacWaterRefraction`,
@@ -797,7 +835,8 @@ The default 16 controls are `AomacAmbientOcclusion`, `AomacContactShadows`,
 `AomacEnvironmentProbe`, `AomacSunShadows`, `AomacTaa`, `AomacEmissiveBloom`,
 `AomacCloudShadows`, `AomacVolumetricShafts`, `AomacClusteredLighting` and
 `AomacLocalLightShadows`. Each toggles one Bool only. Four legs per effect
-means 64 legs for one view or 128 for both; explicitly selecting two effects
+means 64 legs for one explicitly selected view or 128 for the default ICC/Newland
+pair; explicitly selecting two effects
 and one view runs eight legs. Split defaults across acquisitions, never exceed
 the five-minute lease, and wait three minutes before reacquiring.
 
@@ -1969,6 +2008,23 @@ exactly like their shade copy so positive edge alpha survives both guards.
 Native-only directional memo variants omit the HDR/GGX raw side channel instead
 of referencing an unavailable cache.
 
+Directional receivers (`sun_shadows.wgsl`) skip the adjacent cascade when its
+crossfade weight is zero, matching the existing grass receiver guard; positive
+crossfades retain the same taps, bias, visibility and fog math. Material static
+provenance (`materials.wgsl`) queries the shading normal first and geometric plane
+last, keeping the one-entry exact receiver memo available to beauty/GGX/clusters:
+receiving wrappers pass `surface.n = early_geometric_normal` to those consumers.
+The minimum of the two visibility values is unchanged, and geometric derivatives
+remain hoisted before discard. Moon generation queries raw shading then geometric
+provenance while sunlight remains neutral under moon
+maps; existing raw-visibility resets and cache-hit restoration remain unchanged.
+Source regressions in `shadow_tests`, `enhanced_shader` and `moon_shadows` cover the
+zero-weight guard, query order, provenance minimum and derivative separation.
+PBR omits the overwritten `clustered_receiver_spec` call (including its local-light
+shadow scan); non-PBR calls and native unlit/effect/room specular pass-through remain.
+These are work-elimination changes, not reduced quality settings; byte parity
+and whole-frame performance still require the acceptance/marginal fixtures above.
+
 Sun cascades admit loaded static geometry, including terrain patches, by their
 light volume rather than the camera-visible instance list. Their depth range
 expands for loaded caster spheres overlapping the existing cascade XY footprint:
@@ -2047,6 +2103,16 @@ with UV-area density and bounded, fair per-material allocation; the original
 cards remain intact. Sprigs lift and tilt out from the cards, have outward crown
 normals, and share anchored branch flutter and alpha rims in beauty/sun-shadow
 passes. They receive native sunlight and sun shadows.
+Depth-writing sprigs draw after native opaque scenery/actors (lists 1–3), before
+liquids and transparency (lists 4, 5, 6, 10, 7). Their unblended `LessEqual`
+pipeline must establish depth before non-depth-writing surfaces blend over them;
+drawing it last would replace nearer blended colour. Native generated liquid
+passes do write depth and already reject farther sprigs, but must still blend
+over sprigs behind the liquid rather than the earlier bare background.
+The shared MRT attachments remain live through both stages; depth resolve,
+material-reflection/water consumers and atmosphere/cloud composition stay after
+them. Leaf source admission, fog and excluded reflection/indirect provenance
+are unchanged (`ao-render/src/lib.rs`, `foliage_leaves.rs`, `pipelines.rs`).
 At most five detached slots per material drift and tumble during gusts, land on
 the native terrain height and normal at their actual endpoint, rest for five
 seconds, then shrink over one second. Missing terrain suppresses the detached

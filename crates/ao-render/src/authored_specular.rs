@@ -144,6 +144,9 @@ pub(super) fn append_materials(source: &mut String, settings: crate::EnhancedSet
         }
     }
     if settings.material_pbr {
+        // PBR replaces clustered specular whenever its shared native/effect
+        // pass-through guard is false; otherwise both preserve the input.
+        *source = source.replace("    spec = clustered_receiver_spec(i, spec);\n", "");
         *source = source.replace("    let alpha = sqrt(clamp(2.0 / (max(power, 0.0) + 2.0) + variance, 0.0004, 1.0));", "    let alpha = material_alpha(i);");
         *source = source.replace("    let f0 = clamp(vec3<f32>(i.light.w, i.dlight.w, i.spec.w), vec3<f32>(0.0), vec3<f32>(1.0));",
             "    let albedo = material_albedo_value;\n    let f0 = mix(vec3<f32>(0.04), albedo, material_metallic(i));");
@@ -167,7 +170,9 @@ pub(super) fn append_materials(source: &mut String, settings: crate::EnhancedSet
         let clustered = if source.contains("fn clustered_pixel_lights(") {
             " && !any(clustered_pixel_lights(i.wpos, material_shading_normal(i), material_footprint) > vec3<f32>(0.0))"
         } else { "" };
-        source.push_str(&format!("\nfn material_static_source(i: VOut) -> f32 {{\n    let local = vertex_lights(i.wpos, material_shading_normal(i), 0.0);\n    let visibility = material_static_visibility_value;\n    return select(0.0, 1.0, (u32(mat.native.z) & 128u) == 0u && (u32(mat.native.z) & 64u) == 0u && i.effect == 0u && all(mat.scroll.xy == vec2<f32>(0.0)) && i.ao_info.y == 0.0 && !any(local[0] > vec3<f32>(0.0)) && !any(local[1] > vec3<f32>(0.0)){clustered} && visibility >= 0.999);\n}}\n"));
+        // Keep the positive float comparisons intact: negating the whole
+        // eligibility predicate also rejects NaN scroll/AO values.
+        source.push_str(&format!("\nfn material_static_source(i: VOut) -> f32 {{\n    if !((u32(mat.native.z) & 128u) == 0u && (u32(mat.native.z) & 64u) == 0u && i.effect == 0u && all(mat.scroll.xy == vec2<f32>(0.0)) && i.ao_info.y == 0.0) {{ return 0.0; }}\n    let local = vertex_lights(i.wpos, material_shading_normal(i), 0.0);\n    let visibility = material_static_visibility_value;\n    return select(0.0, 1.0, !any(local[0] > vec3<f32>(0.0)) && !any(local[1] > vec3<f32>(0.0)){clustered} && visibility >= 0.999);\n}}\n"));
     }
 }
 
@@ -245,6 +250,40 @@ mod tests {
     }
 
     #[test]
+    fn pbr_skips_only_overwritten_clustered_specular_and_keeps_native_passthrough() {
+        for material_pbr in [false, true] {
+            for shadows in [false, true] {
+                for moon in [false, true] {
+                    let mut source = crate::enhanced_shader::source(crate::EnhancedSettings {
+                        clustered_lighting: true, material_specular: true, material_pbr,
+                        sun_shadows: shadows, local_light_shadows: shadows, moon_shadows: shadows,
+                        night_mode: if moon { crate::NightMode::Moonlit } else { crate::NightMode::AsGame },
+                        ..Default::default()
+                    });
+                    if moon { source = crate::moon_shadows::shader(source, shadows, true); }
+                    crate::foliage_edges::append(&mut source);
+                    let guard = "if native_unlit() || mat.emissive.w > 1.5 || (i.effect & 0x7fffffffu) != 0u";
+                    let clustered = source.split("fn clustered_receiver_spec(").nth(1).unwrap().split("\n}").next().unwrap();
+                    assert!(clustered.contains(&format!("{guard} {{\n        return original;\n    }}")));
+                    let authored = source.split("fn authored_specular(").nth(1).unwrap().split("\n}").next().unwrap();
+                    let authored_only = if material_pbr { "" } else { " || power <= 0.0 || !any(f0 > vec3<f32>(0.0))" };
+                    assert!(authored.contains(&format!("{guard}{authored_only} {{\n        return native_spec;\n    }}")));
+                    assert_eq!(authored.matches("native_spec").count(), 2, "only the native pass-through reads incoming specular");
+                    for name in ["shade", "foliage_edge_shade"] {
+                        let shade = source.split(&format!("fn {name}(")).nth(1).unwrap().split("\n}").next().unwrap();
+                        assert_eq!(shade.contains("spec = clustered_receiver_spec(i, spec);"), !material_pbr);
+                        assert!(shade.contains("spec = authored_specular(i, spec);"));
+                        assert!(shade.contains("var spec = "), "keep native specular, including the shadowed native input");
+                        let room = shade.find("if !native_unlit() && mat.emissive.w > 1.5").unwrap();
+                        let zero = room + shade[room..].find("spec = vec3<f32>(0.0);").unwrap();
+                        assert!(zero < shade.find("spec = authored_specular(i, spec);").unwrap(), "native room zeroing still precedes pass-through");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn native_reflection_budget_survives_default_roughness_but_fades_matte() {
         let source = crate::enhanced_shader::source(crate::EnhancedSettings {
             environment_probe: true, ..Default::default()
@@ -264,9 +303,110 @@ mod tests {
             let helper = source.split("fn material_static_source(").nth(1).unwrap().split("\n}").next().unwrap();
             assert!(helper.contains("(u32(mat.native.z) & 64u) == 0u"));
             assert!(helper.contains("let visibility = material_static_visibility_value;"));
+            let guard = helper.find("{ return 0.0; }").unwrap();
+            assert!(guard < helper.find("vertex_lights(").unwrap());
+            assert!(guard < helper.find("let visibility =").unwrap());
+            assert!(helper.contains("all(mat.scroll.xy == vec2<f32>(0.0)) && i.ao_info.y == 0.0)"));
+            if clustered_lighting {
+                assert!(guard < helper.find("clustered_pixel_lights(").unwrap());
+            }
             assert_eq!(helper.contains("!any(clustered_pixel_lights("), clustered_lighting);
             if clustered_lighting {
                 assert!(helper.contains("clustered_pixel_lights(i.wpos, material_shading_normal(i), material_footprint)"));
+            }
+        }
+    }
+
+    #[test]
+    fn static_source_early_eligibility_matches_previous_predicate_on_gpu_msaa4() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let r = crate::Renderer::new(&instance, None).expect("static provenance GPU");
+        for clustered_lighting in [false, true] {
+            let generated = crate::enhanced_shader::source(crate::EnhancedSettings {
+                environment_probe: true, material_reflections: true, clustered_lighting, ..Default::default()
+            });
+            let start = generated.find("fn material_static_source(").unwrap();
+            let helper = &generated[start..start + generated[start..].find("\n}").unwrap() + 2];
+            let guard = helper.lines().nth(1).unwrap();
+            let eligibility = guard.trim().strip_prefix("if !(").unwrap().strip_suffix(") { return 0.0; }").unwrap();
+            let reference = helper.replace("fn material_static_source(", "fn reference_source(")
+                .replace(&format!("{guard}\n"), "")
+                .replace("return select(0.0, 1.0, ", &format!("return select(0.0, 1.0, {eligibility} && "));
+            let source = format!(r#"
+struct Material {{ native: vec4<f32>, scroll: vec4<f32> }}
+struct VOut {{ wpos: vec3<f32>, effect: u32, ao_info: vec3<f32> }}
+var<private> mat: Material;
+var<private> material_static_visibility_value: f32;
+var<private> material_footprint: f32;
+var<private> test_case: u32;
+var<private> queries: u32;
+fn material_shading_normal(i: VOut) -> vec3<f32> {{ return vec3<f32>(0.0, 1.0, 0.0); }}
+fn vertex_lights(p: vec3<f32>, n: vec3<f32>, power: f32) -> array<vec3<f32>, 2> {{
+    queries += 1u;
+    return array<vec3<f32>, 2>(vec3<f32>(select(0.0, 1.0, test_case == 7u)), vec3<f32>(select(0.0, 1.0, test_case == 8u)));
+}}
+fn clustered_pixel_lights(p: vec3<f32>, n: vec3<f32>, footprint: f32) -> vec3<f32> {{
+    queries += 1u;
+    return vec3<f32>(select(0.0, 1.0, test_case == 9u));
+}}
+{helper}
+{reference}
+@vertex fn vs(@builtin(vertex_index) n: u32) -> @builtin(position) vec4<f32> {{
+    return vec4<f32>(vec2<f32>(f32((n << 1u) & 2u), f32(n & 2u)) * 2.0 - 1.0, 0.0, 1.0);
+}}
+fn pixel(p: vec4<f32>, optimized: bool) -> vec4<f32> {{
+    test_case = u32(p.x);
+    queries = 0u;
+    mat.native = vec4<f32>(0.0, 0.0, select(select(0.0, 64.0, test_case == 1u), 128.0, test_case == 2u), 0.0);
+    mat.scroll = vec4<f32>(select(select(0.0, -0.0, test_case == 6u), 0.1, test_case == 4u), 0.0, 0.0, 0.0);
+    material_static_visibility_value = select(1.0, 0.998, test_case == 10u);
+    let i = VOut(vec3<f32>(0.0), select(0u, 1u, test_case == 3u), vec3<f32>(0.0, select(0.0, 1.0, test_case == 5u), 0.0));
+    var value: f32;
+    if optimized {{ value = material_static_source(i); }} else {{ value = reference_source(i); }}
+    // Green independently proves excluded pixels did not enter either query.
+    let excluded = test_case >= 1u && test_case <= 5u;
+    return vec4<f32>(value, select(1.0, 0.0, optimized && excluded && queries != 0u), 0.0, 1.0);
+}}
+@fragment fn reference(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {{ return pixel(p, false); }}
+@fragment fn optimized(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {{ return pixel(p, true); }}
+"#);
+            let module = r.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("static provenance eligibility parity"), source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            let mut captures = Vec::new();
+            for entry in ["reference", "optimized"] {
+                let pipeline = r.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: None, layout: None,
+                    vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+                    fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some(entry), targets: &[Some(wgpu::ColorTargetState { format: r.format, blend: None, write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),
+                    primitive: Default::default(), depth_stencil: None,
+                    multisample: wgpu::MultisampleState { count: 4, ..Default::default() }, multiview_mask: None, cache: None,
+                });
+                let texture = |count| r.device.create_texture(&wgpu::TextureDescriptor {
+                    label: None, size: wgpu::Extent3d { width: 11, height: 1, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: count,
+                    dimension: wgpu::TextureDimension::D2, format: r.format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | if count == 1 { wgpu::TextureUsages::COPY_SRC } else { wgpu::TextureUsages::empty() }, view_formats: &[],
+                });
+                let output = texture(1);
+                let view = output.create_view(&Default::default());
+                let msaa = texture(4);
+                let msaa_view = msaa.create_view(&Default::default());
+                let mut encoder = r.device.create_command_encoder(&Default::default());
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &msaa_view, resolve_target: Some(&view), depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })], ..Default::default()
+                    });
+                    pass.set_pipeline(&pipeline);
+                    pass.draw(0..3, 0..1);
+                }
+                r.queue.submit([encoder.finish()]);
+                captures.push(crate::texture_to_rgba(&r, &output, 11, 1).unwrap());
+            }
+            assert_eq!(captures[0], captures[1], "exact pre-guard parity at MSAA4, clustered={clustered_lighting}");
+            for col in 0..11 {
+                let eligible = col == 0 || col == 6 || (col == 9 && !clustered_lighting);
+                assert_eq!(captures[1][col * 4], if eligible { 255 } else { 0 }, "case {col}");
+                assert_eq!(captures[1][col * 4 + 1], 255, "excluded case {col} entered a light query");
             }
         }
     }

@@ -40,7 +40,7 @@ fn capture(out: &std::path::Path, selected_view: Option<&str>, selected_preset: 
     let combined_weather = if phase != "timing" && selected_preset.is_none_or(|profile| profile == "combined-all") {
         super::weather_shots::native_weather_cases(&store, &[0, 3, 4, 5, 6])?
     } else { Vec::new() };
-    let mut manifest = format!("fixture=graphics_preset_acceptance\nsize=1920x1200\nmsaa_requested=4\noriginal_msaa_override=4_for_fair_comparison\nwarmup=120\nsamples=600\nunits=milliseconds\npercentile=nearest_rank_ceil_np\ngame_day=0\ncrt_seed=1\nweather={weather:?}\nsimulation_dt=1/60\ngame_clock=frozen_authored_snapshot\ntiming=GPU_frame_timestamp_not_wall_time\nretained_rgba=false\nvisual_acceptance=unexercised\nshader_dir={:?}\nactor_source=docs/captures/zone_ithaca.rec\nactor_id=25988\n", std::env::var_os("AOMAC_SHADER_DIR"));
+    let mut manifest = format!("fixture=graphics_preset_acceptance\nsize=1920x1200\nmsaa_policy=preset_native\ncombined_msaa_policy=Ultra\ninvariant_size=384x240\ninvariant_msaa_requested=4\nwarmup=120\nsamples=600\nunits=milliseconds\npercentile=nearest_rank_ceil_np\ngame_day=0\ncrt_seed=1\nweather={weather:?}\nsimulation_dt=1/60\ngame_clock=frozen_authored_snapshot\ntiming=GPU_frame_timestamp_not_wall_time\nretained_rgba=false\nvisual_acceptance=unexercised\nshader_dir={:?}\nactor_source=docs/captures/zone_ithaca.rec\nactor_id=25988\n", std::env::var_os("AOMAC_SHADER_DIR"));
     for (label, program, args) in [
         ("revision", "git", vec!["rev-parse".into(), "HEAD".into()]),
         ("source_diff", "git", vec!["diff".into(), "--no-ext-diff".into(), "HEAD".into()]),
@@ -50,9 +50,9 @@ fn capture(out: &std::path::Path, selected_view: Option<&str>, selected_preset: 
         ensure!(output.status.success(), "{program} failed");
         writeln!(manifest, "{label}={:?}", String::from_utf8(output.stdout)?.trim())?;
     }
-    let mut summary = String::from("view,preset,pf,game_time,width,height,msaa_actual,anisotropy,warmup,samples,p50_ms,p95_ms\n");
-    let mut frames = String::from("view,preset,sample,gpu_frame_ms\n");
-    let mut temporal = String::from("view,preset,frame,mean_abs_rgb_codes,max_rgb_codes,pixels_gt2,different_rgba_bytes\n");
+    let mut summary = String::from("view,preset,pf,game_time,width,height,msaa_requested,msaa_actual,anisotropy,warmup,samples,p50_ms,p95_ms\n");
+    let mut frames = String::from("view,preset,msaa_actual,sample,gpu_frame_ms\n");
+    let mut temporal = String::from("view,preset,msaa_actual,frame,mean_abs_rgb_codes,max_rgb_codes,pixels_gt2,different_rgba_bytes\n");
     let mut beauties = image::RgbaImage::new(4 * 384, 4 * 240);
     for (name, pf, time, fixed) in graphics_fixture_views(&actor).into_iter().filter(|(name, _, _, _)| {
         VIEWS.contains(&name.as_str()) && selected_view.is_none_or(|selected| selected == name)
@@ -73,6 +73,7 @@ fn capture(out: &std::path::Path, selected_view: Option<&str>, selected_preset: 
         }) {
             let combined = choice.is_none();
             let preset = choice.unwrap_or(GraphicsPreset::Ultra);
+            let msaa = preset.msaa();
             let profile = if combined { "combined-all" } else { preset.name() };
             let mut values = DValues::new(&dir);
             apply_preset(&mut values, preset);
@@ -88,7 +89,7 @@ fn capture(out: &std::path::Path, selected_view: Option<&str>, selected_preset: 
             let mut shot = Shot { gui: Gui::new(&dir, None)?, scene: Some(scene.clone()), camera: fixed, lens };
             let mut off = Offscreen::evidence_timing(&shot, SIZE)?;
             off.fixed_camera(Some(fixed));
-            off.host.msaa_samples = Some(4);
+            off.host.msaa_samples = Some(msaa);
             off.host.anisotropy = Some(preset.anisotropy());
             off.host.texture_policy = Some((2, false, values.flag("AomacBetterMipFiltering")));
             off.host.fog_density_scale = Some(1.0);
@@ -97,7 +98,7 @@ fn capture(out: &std::path::Path, selected_view: Option<&str>, selected_preset: 
             off.host.grass_wind = weather.wind;
             off.frame(&mut shot, 0.0);
             off.wait_for_pipeline_warmup();
-            ensure!(off.msaa_samples() == 4, "{name}/{profile}: actual MSAA {} != 4", off.msaa_samples());
+            ensure!(off.msaa_samples() == msaa, "{name}/{profile}: actual MSAA {} != {msaa}", off.msaa_samples());
             off.warm_grass_tiles();
             let measured = phase != "interactions" && !combined;
             if measured {
@@ -108,27 +109,28 @@ fn capture(out: &std::path::Path, selected_view: Option<&str>, selected_preset: 
                     let ms = off.read_frame_gpu_ms()?.context("GPU frame timestamp missing")?;
                     ensure!(ms.is_finite() && ms > 0.0, "invalid GPU frame timestamp {ms}");
                     if frame >= 120 {
-                        writeln!(frames, "{name},{profile},{},{ms:.9}", frame - 120)?;
+                        writeln!(frames, "{name},{profile},{},{},{ms:.9}", off.msaa_samples(), frame - 120)?;
                         samples.push(ms);
                     }
                 }
-                ensure!(samples.len() == 600 && off.msaa_samples() == 4, "incomplete or wrong-quality timing phase");
+                ensure!(samples.len() == 600 && off.msaa_samples() == msaa, "incomplete or wrong-quality timing phase");
                 off.set_gpu_timing(false)?;
                 samples.sort_by(f64::total_cmp);
-                writeln!(summary, "{name},{profile},{pf},{time},1920,1200,{},{},120,{},{:.9},{:.9}", off.msaa_samples(), preset.anisotropy(), samples.len(), samples[299], samples[569])?;
+                writeln!(summary, "{name},{profile},{pf},{time},1920,1200,{msaa},{},{},120,{},{:.9},{:.9}", off.msaa_samples(), preset.anisotropy(), samples.len(), samples[299], samples[569])?;
                 eprintln!("{name}/{profile}: samples=600 GPU p50={:.3}ms p95={:.3}ms", samples[299], samples[569]);
             } else {
                 for _ in 0..120 { off.frame(&mut shot, 1.0 / 60.0); }
             }
             let list = off.frame(&mut shot, 0.0);
             let beauty = off.rgba(&shot, &list)?;
+            ensure!(off.msaa_samples() == msaa, "{name}/{profile}: wrong-quality beauty phase");
             image::save_buffer(out.join(format!("{name}-{profile}-beauty.png")), &beauty, SIZE.0, SIZE.1, image::ColorType::Rgba8)?;
             if !combined {
                 let row = VIEWS.iter().position(|view| *view == name).context("matrix row")?;
                 image::imageops::replace(&mut beauties, &thumbnail(&beauty)?, column as i64 * 384, row as i64 * 240);
                 beauties.save(out.join("beauties.png"))?;
             }
-            writeln!(manifest, "completed_view={name} preset={profile:?} phase={phase} settings={settings:?} msaa_actual={} anisotropy={} gpu_samples={} enhanced_target_bytes={} grass_metrics={:?}", off.msaa_samples(), preset.anisotropy(), if measured { 600 } else { 0 }, off.enhanced_target_bytes(), off.evidence_grass_metrics())?;
+            writeln!(manifest, "completed_view={name} preset={profile:?} phase={phase} settings={settings:?} msaa_requested={msaa} msaa_actual={} anisotropy={} gpu_samples={} enhanced_target_bytes={} grass_metrics={:?}", off.msaa_samples(), preset.anisotropy(), if measured { 600 } else { 0 }, off.enhanced_target_bytes(), off.evidence_grass_metrics())?;
             // Checkpoint measured results before the slower readback/interaction checks.
             std::fs::write(out.join("frames.csv"), &frames)?;
             std::fs::write(out.join("summary.csv"), &summary)?;
@@ -190,7 +192,7 @@ fn capture(out: &std::path::Path, selected_view: Option<&str>, selected_preset: 
                 let raw = off.rgba(&shot, &list)?;
                 if let Some(previous) = &previous {
                     let (mean, max, over_two, different) = consecutive_diff(previous, &raw);
-                    writeln!(temporal, "{name},{profile},{frame},{mean:.9},{max},{over_two},{different}")?;
+                    writeln!(temporal, "{name},{profile},{},{frame},{mean:.9},{max},{over_two},{different}", off.msaa_samples())?;
                 }
                 if frame % 10 == 9 {
                     let index = frame / 10;
@@ -198,6 +200,7 @@ fn capture(out: &std::path::Path, selected_view: Option<&str>, selected_preset: 
                 }
                 previous = Some(raw);
             }
+            ensure!(off.msaa_samples() == msaa, "{name}/{profile}: wrong-quality interaction phase");
             sheet.save(out.join(format!("{name}-{profile}-temporal120.png")))?;
             for (index, effect) in native_effects.iter().enumerate() {
                 ensure!(effect_admitted_frames[index] > 0, "combined native effect {index} never admitted");
@@ -205,7 +208,7 @@ fn capture(out: &std::path::Path, selected_view: Option<&str>, selected_preset: 
             }
             fog_and_admission(&dir, &scene, placement.0, lens, settings, &avatar, exposure.clone())
                 .with_context(|| format!("{name}/{profile} fog/admission"))?;
-            writeln!(manifest, "checked_view={name} preset={profile:?} temporal_frames=120 temporal_pairs=119 sheet_frames=9,19,29,39,49,59,69,79,89,99,109,119 temporal_dt=1/60 camera_yaw_per_frame=0.0005 actor_path_m=1 invariant_resolution=384x240 fully_fogged_colours_equal=true unfogged_colours_differ=true non_admitted_equals_absent=true")?;
+            writeln!(manifest, "checked_view={name} preset={profile:?} msaa_requested={msaa} msaa_actual={} temporal_frames=120 temporal_pairs=119 sheet_frames=9,19,29,39,49,59,69,79,89,99,109,119 temporal_dt=1/60 camera_yaw_per_frame=0.0005 actor_path_m=1 invariant_resolution=384x240 invariant_msaa_requested=4 invariant_msaa_actual=4 fully_fogged_colours_equal=true unfogged_colours_differ=true non_admitted_equals_absent=true", off.msaa_samples())?;
             std::fs::write(out.join("temporal.csv"), &temporal)?;
             std::fs::write(out.join("manifest.txt"), &manifest)?;
         }
@@ -278,7 +281,9 @@ fn fog_and_admission(dir: &std::path::Path, scene: &Scene, fixed: Camera, lens: 
         off.warm_grass_tiles();
         off.rgba(&shot, &list)?;
         off.wait_for_pipeline_warmup();
-        off.rgba(&shot, &list)
+        let rgba = off.rgba(&shot, &list)?;
+        ensure!(off.msaa_samples() == 4, "fog/admission invariant actual MSAA {} != 4", off.msaa_samples());
+        Ok(rgba)
     };
     ensure!(render(false, 0)? == render(false, 1)?, "non-admitted body/bender leaks a signal");
     ensure!(render(false, 2)? != render(false, 3)?, "unfogged body positive control invisible");
@@ -289,6 +294,9 @@ fn fog_and_admission(dir: &std::path::Path, scene: &Scene, fixed: Camera, lens: 
 #[test]
 fn preset_matrix_contract() {
     assert_eq!(VIEWS.len() * PRESETS.len(), 16);
+    assert_eq!(SIZE, (1920, 1200));
+    assert_eq!(PRESETS.map(GraphicsPreset::msaa), [1, 4, 1, 1]);
+    assert_eq!(GraphicsPreset::Ultra.msaa(), 1); // combined-all inherits Ultra AA.
     assert_eq!(consecutive_diff(&[10, 20, 30, 255], &[11, 24, 30, 255]), (5.0 / 3.0, 4, 1, 2));
     for preset in PRESETS {
         assert_eq!(graphics_fixture_settings(preset.name()).unwrap(), {

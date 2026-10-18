@@ -110,7 +110,7 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
             emission_result.to_owned()
         };
         let receiving = shadows && matches!(name.as_str(), "fs_opaque" | "fs_fade_opaque" | "fs_fade_test" | "fs_test" | "fs_blend" | "fs_sprite" | "fs_add" | "fs_mesh_add" | "fs_add_one" | "fs_ground_fused" | "fs_ground_shadow" | "fs_ground_simple");
-        let geometric_normal = if receiving { "    var surface = i;\n    surface.n = cross(dpdx(i.wpos), dpdy(i.wpos));\n" } else { "" };
+        let geometric_normal = if receiving { "    var surface = i;\n    surface.n = early_geometric_normal;\n" } else { "" };
         let fragment_input = if receiving { "surface" } else { "i" };
         let sun = match name.as_str() {
             _ if !hdr => "vec4<f32>(0.0)",
@@ -237,7 +237,7 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
 fn early_rejection(source: &mut String) {
     if source.contains("fn material_prepare(") {
         *source = source.replace("fn material_prepare(i: VOut) {", "fn material_prepare_derivatives(i: VOut) {");
-        let start = source.find("    material_visibility_value = sun_visibility(").expect("material receiver");
+        let start = source.find("    var geometric_visibility = 1.0;").expect("material receiver");
         let end = source[start..].find("    material_albedo_value =").unwrap() + start;
         let receiver = source[start..end].replace("cross(dpdx(i.wpos), dpdy(i.wpos))", "early_geometric_normal");
         source.replace_range(start..end, "");
@@ -469,6 +469,7 @@ mod tests {
                 let wrapper = wrapper.split("\n}").next().unwrap();
                 let prepare = wrapper.find("material_prepare(i);").unwrap();
                 if let Some(reject) = wrapper.find("early_reject(i, early_mode);") {
+                    assert!(wrapper.find("early_geometric_normal = cross(dpdx(i.wpos), dpdy(i.wpos));").unwrap() < reject);
                     assert!(wrapper.find("material_prepare_derivatives(i);").unwrap() < reject);
                     assert!(reject < prepare);
                     assert!(reject < wrapper.find("let beauty =").unwrap());
@@ -726,8 +727,22 @@ fn sun_visibility_uncached(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>
                 expected.split("\n}").next().unwrap(), "fog, cascade, admission and grass receiver math stays verbatim");
             let source = if moon { crate::moon_shadows::shader(source, true, true) } else { source };
             let prepare = source.split("fn material_prepare(").nth(1).unwrap().split("\n}").next().unwrap();
-            assert!(prepare.contains("i.wpos, i.n, i.clip.xy"));
-            assert!(prepare.contains("i.wpos, early_geometric_normal, i.clip.xy"));
+            let geometric = prepare.find("geometric_visibility = sun_visibility(i.wpos, early_geometric_normal, i.clip.xy);").unwrap();
+            let shading = prepare.find("material_visibility_value = ").unwrap();
+            let provenance = prepare.split("if MATERIAL_STATIC_PROVENANCE {").nth(1).unwrap().split("\n    }").next().unwrap();
+            assert!(provenance.contains("geometric_visibility = sun_visibility("),
+                "without static provenance, only the shading-normal receiver is queried");
+            assert!(shading < geometric, "retain the geometric receiver passed to beauty in the one-entry memo");
+            let after_geometric = prepare[geometric..].split_once('\n').unwrap().1;
+            assert!(!after_geometric.contains("sun_visibility("), "no later query may evict the beauty receiver");
+            let static_visibility = if moon {
+                "material_static_visibility_value = min(shading_raw, geometric_visibility);"
+            } else {
+                "material_static_visibility_value = min(material_visibility_value, geometric_visibility);"
+            };
+            assert!(prepare.contains(static_visibility));
+            assert!(!prepare.contains("dpdx(") && !prepare.contains("dpdy("),
+                "receiver preparation after discard must use the hoisted geometric normal");
             let ggx = source.split("fn authored_specular(").nth(1).unwrap().split("\n}").next().unwrap();
             assert!(ggx.contains("var visibility = "));
             assert!(ggx.contains("sun_visibility(i.wpos, i.n, i.clip.xy)"));
@@ -736,6 +751,13 @@ fn sun_visibility_uncached(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>
             for wrapper in source.split("@fragment fn ").skip(1) {
                 let wrapper = wrapper.split("\n}").next().unwrap();
                 assert!(wrapper.find("sun_memo_valid = false;").unwrap() < wrapper.find("material_prepare(i);").unwrap());
+                if wrapper.contains("var surface = i;") {
+                    let hoisted = wrapper.find("early_geometric_normal = cross(dpdx(i.wpos), dpdy(i.wpos));").unwrap();
+                    let normal = wrapper.find("surface.n = early_geometric_normal;").unwrap();
+                    assert!(hoisted < normal && normal < wrapper.find("material_prepare(i);").unwrap());
+                    assert!(wrapper.contains("(surface);") || wrapper.contains("authored_moon_receiver(surface, i.n,"),
+                        "beauty or its moon receiver must consume the exact geometric normal retained by material_prepare");
+                }
             }
             if clustered {
                 assert!(source.contains("fn clustered_receiver("));
@@ -1207,12 +1229,12 @@ struct Output {{ @location(3) sun: vec4<f32>, @location(4) water: vec4<f32> }}
             let generated = super::source(crate::EnhancedSettings { sun_shadows: shadows, hdr: true, ..Default::default() });
             let wrapper = generated[generated.find("@fragment fn fs_ground_shadow(").unwrap()..]
                 .split("\n}").next().unwrap().replacen("@fragment ", "", 1);
-            // This probe isolates the multiplier, not the uniform sampling
-            // prefix (covered by the complete generated-shader regressions).
+            // Isolate the multiplier from texture sampling, retaining the real
+            // pre-discard geometric derivative consumed by receiving wrappers.
             let start = wrapper.find("\n    let early_mode").unwrap();
             let end = wrapper.find("    early_normal_dy = dpdy(early_n);\n").unwrap() + "    early_normal_dy = dpdy(early_n);\n".len();
             let mut wrapper = wrapper;
-            wrapper.replace_range(start..end, "\n");
+            wrapper.replace_range(start..end, "\n    early_geometric_normal = cross(dpdx(i.wpos), dpdy(i.wpos));\n");
             // Exercise the generated wrapper with a fake roof receiver: beauty
             // retains its artistic floor while raw direct visibility is zero.
             let source = format!(r#"
@@ -1220,6 +1242,7 @@ struct VOut {{ clip: vec4<f32>, n: vec3<f32>, wpos: vec3<f32> }}
 struct EnhancedOutput {{ beauty: vec4<f32>, ambient: vec4<f32>, emission: vec4<f32>, sun: vec4<f32> }}
 var<private> enhanced_sun_visibility: f32 = 1.0;
 var<private> sun_memo_valid: bool = false;
+var<private> early_geometric_normal: vec3<f32>;
 fn enhanced_original_fs_ground_shadow(i: VOut) -> vec4<f32> {{
     enhanced_sun_visibility = select(0.0, 1.0, i.clip.x >= 1.0);
     return vec4<f32>(0.4, 0.4, 0.4, 1.0);

@@ -22,20 +22,33 @@ fn effects(requested: Option<&str>, modern: &DValues) -> anyhow::Result<Vec<Stri
     let registry = controls();
     let mut selected = Vec::with_capacity(names.len());
     for name in names {
-        ensure!(registry.iter().any(|control| control.name == name && graphical(name)
-            && matches!(control.kind, ControlKind::Check)),
-            "{name:?} is not an exact graphical Bool DValue key");
-        ensure!(modern.flag(name), "{name} is already off in Modern; cannot disable one");
+        let mut keys = Vec::new();
+        for key in name.split('+') {
+            ensure!(registry.iter().any(|control| control.name == key && graphical(key)
+                && matches!(control.kind, ControlKind::Check)),
+                "{key:?} is not an exact graphical Bool DValue key");
+            ensure!(modern.flag(key), "{key} is already off in Modern; cannot disable it");
+            ensure!(!keys.contains(&key), "duplicate key {key} in group {name}");
+            keys.push(key);
+        }
         ensure!(!selected.iter().any(|previous| previous == name), "duplicate effect {name}");
         selected.push(name.to_owned());
     }
     Ok(selected)
 }
 
+fn set_effect(values: &mut DValues, effect: &str, enabled: bool) {
+    for key in effect.split('+') { values.set_raw(key, Variant::Bool(enabled)); }
+}
+
 fn percentiles(samples: &mut [f64]) -> (f64, f64) {
     samples.sort_by(f64::total_cmp);
     let rank = |percent: usize| (samples.len() * percent).div_ceil(100) - 1;
     (samples[rank(50)], samples[rank(95)])
+}
+
+fn includes_view(name: &str, selected: Option<&str>) -> bool {
+    selected.map_or_else(|| MARGINAL_VIEWS.contains(&name), |selected| selected == name)
 }
 
 #[test]
@@ -45,8 +58,8 @@ fn graphics_preset_marginal_costs() -> anyhow::Result<()> {
         .context("set AOMAC_GFX_OUT to a NEW directory")?);
     ensure!(!out.exists(), "refusing to overwrite {}", out.display());
     let view = std::env::var("AOMAC_GFX_VIEW").ok();
-    ensure!(view.as_deref().is_none_or(|name| MARGINAL_VIEWS.contains(&name)),
-        "AOMAC_GFX_VIEW must be icc-landmark-authored or newland-day");
+    ensure!(view.as_deref().is_none_or(|name| VIEWS.contains(&name)),
+        "AOMAC_GFX_VIEW must be icc-landmark-authored, newland-day, borealis-foliage-sun-high, or borealis-foliage-night");
     let dir = ao_gui::client_dir();
     let mut modern = DValues::new(&dir);
     apply_preset(&mut modern, GraphicsPreset::Modern);
@@ -66,8 +79,9 @@ fn capture_marginals(out: &std::path::Path, dir: &std::path::Path, view: Option<
     let store = ao_rdb::RecordStore::open(dir)?;
     let actor = graphics_fixture_actor()?;
     let weather = ao_formats::weather::State::clear();
+    let msaa = GraphicsPreset::Modern.msaa();
     let legs = selected.len() * ORDER.len() * if view.is_some() { 1 } else { MARGINAL_VIEWS.len() };
-    let mut manifest = format!("fixture=graphics_preset_marginal_costs\nsize=1920x1200\nreference=Modern\norder=A,B,B,A\nA=Modern\nB=Modern_with_exactly_one_Bool_false\neffects={selected:?}\nplanned_legs={legs}\nwarmup={WARMUP}\nsamples_per_leg={SAMPLES}\nmsaa_requested=4\nanisotropy=16\ntexture_quality=2\ntexture_compressed=false\ntexture_better_mips=Modern_except_when_that_is_the_selected_control\npercentile=nearest_rank_ceil_np\ndelta_ms=mean(A_leg_p50)-mean(B_leg_p50)\ntiming=GPU_frame_timestamp_not_wall_time\npass_profiling=false\npng=false\ngame_day=0\ncrt_seed=1\nsimulation_dt=1/60\ngame_clock=frozen_authored_snapshot\nrenderer_time=continuous_across_reused_legs_reset_on_rebuild\nweather={weather:?}\nactor_source=docs/captures/zone_ithaca.rec\nactor_id=25988\nshader_dir={:?}\nexecutable={:?}\n", std::env::var_os("AOMAC_SHADER_DIR"), std::env::current_exe()?);
+    let mut manifest = format!("fixture=graphics_preset_marginal_costs\nsize=1920x1200\nreference=Modern\norder=A,B,B,A\nA=Modern\nB=Modern_with_selected_Bool_keys_false\ngroup_separator=+\ngroup_cost=whole_frame_joint_marginal_not_exclusive\neffects={selected:?}\nplanned_legs={legs}\nwarmup={WARMUP}\nsamples_per_leg={SAMPLES}\nmsaa_policy=Modern_native\nmsaa_requested={msaa}\nanisotropy=16\ntexture_quality=2\ntexture_compressed=false\ntexture_better_mips=Modern_except_when_selected_in_control_group\npercentile=nearest_rank_ceil_np\ndelta_ms=mean(A_leg_p50)-mean(B_leg_p50)\ntiming=GPU_frame_timestamp_not_wall_time\npass_profiling=false\npng=false\ngame_day=0\ncrt_seed=1\nsimulation_dt=1/60\ngame_clock=frozen_authored_snapshot\nrenderer_time=continuous_across_reused_legs_reset_on_rebuild\nweather={weather:?}\nactor_source=docs/captures/zone_ithaca.rec\nactor_id=25988\nshader_dir={:?}\nexecutable={:?}\n", std::env::var_os("AOMAC_SHADER_DIR"), std::env::current_exe()?);
     for (label, program, args) in [
         ("revision", "git", vec!["rev-parse".into(), "HEAD".into()]),
         ("source_diff", "git", vec!["diff".into(), "--no-ext-diff".into(), "HEAD".into()]),
@@ -78,12 +92,12 @@ fn capture_marginals(out: &std::path::Path, dir: &std::path::Path, view: Option<
         writeln!(manifest, "{label}={:?}", String::from_utf8(output.stdout)?.trim())?;
     }
     writeln!(manifest, "harness_source={:?}", include_str!("marginal.rs"))?;
-    let mut frames = String::from("view,effect,leg,condition,sample,gpu_frame_ms\n");
-    let mut summary = String::from("view,effect,leg,condition,pf,game_time,width,height,msaa_actual,anisotropy,better_mips,warmup,samples,p50_ms,p95_ms\n");
+    let mut frames = String::from("view,effect,leg,condition,msaa_actual,sample,gpu_frame_ms\n");
+    let mut summary = String::from("view,effect,leg,condition,pf,game_time,width,height,msaa_requested,msaa_actual,anisotropy,better_mips,warmup,samples,p50_ms,p95_ms\n");
     let mut deltas = String::from("view,effect,a_mean_p50_ms,b_mean_p50_ms,delta_ms\n");
     std::fs::write(out.join("manifest.txt"), &manifest)?;
     for (name, pf, time, fixed) in graphics_fixture_views(&actor).into_iter().filter(|(name, _, _, _)| {
-        MARGINAL_VIEWS.contains(&name.as_str()) && view.is_none_or(|selected| selected == name)
+        includes_view(name, view)
     }) {
         ao_scene::crt_srand(1);
         let (mut scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, dir, pf, time, 0, Some(weather))?;
@@ -97,23 +111,24 @@ fn capture_marginals(out: &std::path::Path, dir: &std::path::Path, view: Option<
         let mut shot = Shot { gui: Gui::new(dir, None)?, scene: None, camera: fixed, lens };
         let mut renderer: Option<Offscreen> = None;
         for effect in selected {
+            let rebuild_textures = effect.split('+').any(|key| key == "AomacBetterMipFiltering");
             let mut medians = [0.0; 4];
             for (leg, enabled) in ORDER.into_iter().enumerate() {
                 let condition = if enabled { "A" } else { "B" };
                 let mut values = DValues::new(dir);
                 apply_preset(&mut values, GraphicsPreset::Modern);
-                values.set_raw(effect, Variant::Bool(enabled));
+                set_effect(&mut values, effect, enabled);
                 let settings = values.enhanced_settings();
                 let better_mips = values.flag("AomacBetterMipFiltering");
                 // Texture policy is consumed during upload: rebuild for this control, not a stale resident texture set.
-                if effect == "AomacBetterMipFiltering" { renderer = None; }
+                if rebuild_textures { renderer = None; }
                 let rebuilt = renderer.is_none();
                 if rebuilt {
                     ao_scene::crt_srand(1);
                     shot.scene = Some(scene.clone());
                     let mut off = Offscreen::evidence_timing(&shot, SIZE)?;
                     off.fixed_camera(Some(fixed));
-                    off.host.msaa_samples = Some(4);
+                    off.host.msaa_samples = Some(msaa);
                     off.host.anisotropy = Some(16);
                     off.host.texture_policy = Some((2, false, better_mips));
                     off.host.fog_density_scale = Some(1.0);
@@ -128,7 +143,7 @@ fn capture_marginals(out: &std::path::Path, dir: &std::path::Path, view: Option<
                 off.set_enhanced_settings(settings);
                 off.wait_for_pipeline_warmup();
                 off.warm_grass_tiles();
-                ensure!(off.msaa_samples() == 4, "{name}/{effect}/{leg}: actual MSAA != 4");
+                ensure!(off.msaa_samples() == msaa, "{name}/{effect}/{leg}: actual MSAA {} != {msaa}", off.msaa_samples());
                 off.set_gpu_timing(true)?;
                 let mut samples = Vec::with_capacity(SAMPLES);
                 for frame in 0..WARMUP + SAMPLES {
@@ -136,16 +151,16 @@ fn capture_marginals(out: &std::path::Path, dir: &std::path::Path, view: Option<
                     let ms = off.read_frame_gpu_ms()?.context("GPU frame timestamp missing")?;
                     ensure!(ms.is_finite() && ms > 0.0, "invalid GPU frame timestamp {ms}");
                     if frame >= WARMUP {
-                        writeln!(frames, "{name},{effect},{leg},{condition},{},{ms:.9}", frame - WARMUP)?;
+                        writeln!(frames, "{name},{effect},{leg},{condition},{},{},{ms:.9}", off.msaa_samples(), frame - WARMUP)?;
                         samples.push(ms);
                     }
                 }
                 off.set_gpu_timing(false)?;
-                ensure!(samples.len() == SAMPLES && off.msaa_samples() == 4, "incomplete or wrong-quality timing leg");
+                ensure!(samples.len() == SAMPLES && off.msaa_samples() == msaa, "incomplete or wrong-quality timing leg");
                 let (p50, p95) = percentiles(&mut samples);
                 medians[leg] = p50;
-                writeln!(summary, "{name},{effect},{leg},{condition},{pf},{time},1920,1200,{},16,{better_mips},{WARMUP},{},{p50:.9},{p95:.9}", off.msaa_samples(), samples.len())?;
-                writeln!(manifest, "completed_view={name} effect={effect} leg={leg} condition={condition} renderer_rebuilt={rebuilt} msaa_actual={} samples={} settings={settings:?}", off.msaa_samples(), samples.len())?;
+                writeln!(summary, "{name},{effect},{leg},{condition},{pf},{time},1920,1200,{msaa},{},16,{better_mips},{WARMUP},{},{p50:.9},{p95:.9}", off.msaa_samples(), samples.len())?;
+                writeln!(manifest, "completed_view={name} effect={effect} leg={leg} condition={condition} renderer_rebuilt={rebuilt} msaa_requested={msaa} msaa_actual={} samples={} settings={settings:?}", off.msaa_samples(), samples.len())?;
                 std::fs::write(out.join("frames.csv"), &frames)?;
                 std::fs::write(out.join("summary.csv"), &summary)?;
                 std::fs::write(out.join("manifest.txt"), &manifest)?;
@@ -157,7 +172,7 @@ fn capture_marginals(out: &std::path::Path, dir: &std::path::Path, view: Option<
             std::fs::write(out.join("deltas.csv"), &deltas)?;
             eprintln!("{name}/{effect}: whole-frame marginal GPU delta={:.3}ms", a - b);
             // Restore Modern's texture policy before reusing a renderer for the next effect.
-            if effect == "AomacBetterMipFiltering" { renderer = None; }
+            if rebuild_textures { renderer = None; }
         }
     }
     Ok(())
@@ -167,22 +182,36 @@ fn capture_marginals(out: &std::path::Path, dir: &std::path::Path, view: Option<
 fn graphics_preset_marginal_contract() {
     let mut modern = DValues::new(&ao_gui::client_dir());
     apply_preset(&mut modern, GraphicsPreset::Modern);
+    assert_eq!(GraphicsPreset::Modern.msaa(), 1);
+    assert!(modern.flag("AomacTaa") && modern.flag("AomacCas"));
+    assert!(!modern.flag("AomacFxaa"));
     assert_eq!(effects(None, &modern).unwrap().len(), 16);
     assert_eq!(ORDER, [true, false, false, true]);
     assert_eq!((WARMUP, SAMPLES), (120, 240));
+    assert_eq!(VIEWS.into_iter().filter(|name| includes_view(name, None)).count(), 2);
+    for view in VIEWS {
+        assert_eq!(VIEWS.into_iter().filter(|name| includes_view(name, Some(view))).collect::<Vec<_>>(), [view]);
+    }
     assert_eq!(effects(Some("AomacAmbientOcclusion,AomacBetterMipFiltering"), &modern).unwrap(),
         ["AomacAmbientOcclusion", "AomacBetterMipFiltering"]);
     for invalid in ["", "AmbientOcclusion", "AomacAoRadius", "AomacEffectGpuOverlay", "AomacPinchZoom",
-        "AomacDepthOfField", "AomacFxaa", "AomacAmbientOcclusion,", "AomacTaa,AomacTaa"] {
+        "AomacDepthOfField", "AomacFxaa", "AomacAmbientOcclusion,", "AomacTaa,AomacTaa",
+        "AomacTaa+AomacTaa", "AomacTaa+", "+AomacTaa", "AomacTaa+AomacFxaa"] {
         assert!(effects(Some(invalid), &modern).is_err(), "accepted {invalid:?}");
     }
-    for effect in DEFAULT_EFFECTS {
+    let group = "AomacMaterialReflections+AomacEnvironmentProbe";
+    let canopy = "AomacFoliageLeaves+AomacFoliageFlutter+AomacFoliageFalling";
+    assert_eq!(effects(Some(group), &modern).unwrap(), [group]);
+    assert_eq!(effects(Some(canopy), &modern).unwrap(), [canopy]);
+    for effect in DEFAULT_EFFECTS.into_iter().chain([group, canopy]) {
         let mut disabled = DValues::new(&ao_gui::client_dir());
         apply_preset(&mut disabled, GraphicsPreset::Modern);
-        disabled.set_raw(effect, Variant::Bool(false));
+        set_effect(&mut disabled, effect, false);
         let changed: Vec<_> = controls().into_iter().filter(|control| graphical(control.name)
             && modern.get(control.name) != disabled.get(control.name)).map(|control| control.name).collect();
-        assert_eq!(changed, [effect]);
+        assert_eq!(changed, effect.split('+').collect::<Vec<_>>());
+        set_effect(&mut disabled, effect, true);
+        assert_eq!(disabled.enhanced_settings(), modern.enhanced_settings());
     }
     let baseline = modern.enhanced_settings();
     modern.set_raw("AomacAmbientOcclusion", Variant::Bool(false));
