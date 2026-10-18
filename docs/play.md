@@ -1239,6 +1239,18 @@ the appropriate channel without quantizing fog or changing native extinction.
 blur, far highlights across different far depths, circular support and
 foreground isolation. `dof_targets_round_up_without_losing_edge_pixels` covers odd and 1px targets.
 
+Measured on M4 Pro (1920×1200, requested/actual 4× MSAA), paired on/off/off/on,
+120 warmup + 600 GPU samples per leg: the old `65aea629` fast-profile mean
+increment was **6.743 ms ICC / 6.695 ms Newland**. The optimized shipping-release
+increment is **1.175 / 1.173 ms**; matched optimized fast-profile costs were
+**1.158 / 1.219 ms**. These are whole-frame timestamp differences, not exclusive
+gather timings or an RTX comparison. The original ≤0.8 ms target was **not met**;
+the reduced cost was accepted for this opt-in effect. Shared MSAA depth-resolve /
+post-boundary work is a further investigation idea, not an isolated cost claim.
+Shipping own-character and native LED sheets, raw ABBA CSVs, profiles and metadata:
+`~/aomac-handoff/gfx/parity/DofPerf/`. Both view controls remain byte-identical to
+the old faithful controls (9,216,000 RGBA bytes each).
+
 TAA also compares exact GPU-visible actor-pose IDs across frames, reduced from
 all native-depth-admitted MSAA identity samples. A visible-set change rejects
 history for the whole frame so old actor shadows/glow cannot survive on unchanged
