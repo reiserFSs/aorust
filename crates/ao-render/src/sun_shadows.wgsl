@@ -68,10 +68,15 @@ fn primary_actor_id(i: ShadowVertex, cutout: bool) -> u32 {
 }
 @fragment fn fs_shadow_primary_opaque(i: ShadowVertex) -> @location(0) u32 { return primary_actor_id(i, false); }
 @fragment fn fs_shadow_primary_test(i: ShadowVertex) -> @location(0) u32 { return primary_actor_id(i, true); }
-@fragment fn fs_shadow_opaque(i: ShadowVertex) { shadow_alpha(i, false); }
-@fragment fn fs_shadow_test(i: ShadowVertex) { shadow_alpha(i, true); }
-@fragment fn fs_shadow_dynamic_opaque(i: ShadowVertex) { shadow_alpha(i, false); shadow_admission(i); }
-@fragment fn fs_shadow_dynamic_test(i: ShadowVertex) { shadow_alpha(i, true); shadow_admission(i); }
+fn shadow_atlas_clip(i: ShadowVertex) {
+    if (shadow_frame.control.y & 0x80000000u) != 0u && shadow_frame.forward.w > 0.0 {
+        if any(i.clip.xy >= vec2<f32>(shadow_frame.forward.w)) { discard; }
+    }
+}
+@fragment fn fs_shadow_opaque(i: ShadowVertex) { shadow_atlas_clip(i); shadow_alpha(i, false); }
+@fragment fn fs_shadow_test(i: ShadowVertex) { shadow_atlas_clip(i); shadow_alpha(i, true); }
+@fragment fn fs_shadow_dynamic_opaque(i: ShadowVertex) { shadow_atlas_clip(i); shadow_alpha(i, false); shadow_admission(i); }
+@fragment fn fs_shadow_dynamic_test(i: ShadowVertex) { shadow_atlas_clip(i); shadow_alpha(i, true); shadow_admission(i); }
 // Vogel (golden-angle) disk point, radius 1, rotated.
 fn shadow_vogel(index: u32, count: u32, rotation: f32) -> vec2<f32> {
     let r = sqrt((f32(index) + 0.5) / f32(count));

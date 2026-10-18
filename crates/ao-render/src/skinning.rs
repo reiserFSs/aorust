@@ -6,7 +6,7 @@ pub(super) struct PoseGpu {
     bones: wgpu::Buffer,
     capacity: u64,
     bind: wgpu::BindGroup,
-    palette: Arc<Vec<ao_scene::SkinBone>>,
+    pub(super) palette: Arc<Vec<ao_scene::SkinBone>>,
     pending: bool,
     initialize: bool,
 }

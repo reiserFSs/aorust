@@ -361,6 +361,7 @@ impl SunShadows {
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&points.sampler) },
                 wgpu::BindGroupEntry { binding: 6, resource: points.metadata.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: self.exposure.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&points.actor_array) },
             ],
         })
     }

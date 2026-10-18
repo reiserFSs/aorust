@@ -775,11 +775,12 @@ The separate receiver limit retains a smooth fade over its final 10% when it end
 
 `AomacLocalLightShadows` / `EnhancedSettings.local_light_shadows` is independent
 of sun/moon shadows and clustered lighting, and defaults off. The implementation
-in `ao-render/src/point_shadows.rs`, `point_shadow_select.wgsl` and
-`point_shadows.wgsl` supports one to sixteen 256² depth cubes (six faces each).
-`AomacPointShadowCount` defaults to four: 24 actual face passes / 6 MiB of depth
-maps, with sixteen / 96 passes / 24 MiB available. GPU primary-owner admission
-precedes both the 64-light pool and the cube budget; a hidden owner cannot evict
+in `ao-render/src/point_shadows.rs`, feature-local `point_cache.rs` /
+`point_cache.wgsl`, `point_shadow_select.wgsl`, and `point_sampling.wgsl`
+supports one to sixteen point lights, with separate static and actor depth arrays.
+`AomacPointShadowCount` still defaults to four (12 MiB of depth at four,
+48 MiB at sixteen). GPU primary-owner admission precedes both the 64-light pool
+and the cube budget; a hidden owner cannot evict
 a visible lamp. GPU ranking gives retained sources the ao-vk 0.8 distance-key
 preference. Exact owner ID plus per-owner light ordinal preserves cube identity
 when unrelated actor or producer order changes.
@@ -788,10 +789,47 @@ Initial scene lamps start fully visible; genuinely new source appearances fade
 over 0.25 seconds of renderer simulation time. Source birth age covers every
 current native candidate before either capacity cap, so an existing lamp
 restored after a now-hidden owner frees capacity does not retain a fade deficit.
-Frozen captures never advance fades. Face matrices and ownership/empty flags are
-generated on GPU; current loaded static ranges are submitted without inferring
-GPU visibility on CPU. Every active face is redrawn from the current frame;
-there is no cached geometry or historical pose.
+Frozen captures never advance fades or the 120-second static refresh clock.
+Each static face retains the projection from its actual render; moving sources
+and changed loaded-world casters dirty faces, with at most two updated faces per
+cube per frame after the full-cube cold bootstrap. A mature source restored to
+a cold slot after capacity/admission loss receives a full six-face static
+bootstrap: withholding its visible occlusion would itself retain a negative
+signal from the departed owner. This fairness exception does not restart native
+source fade; genuinely new arrivals and ordinary existing-cube changes retain
+two-face scheduling. Actor-only faces likewise retain current admitted poses
+and update two faces round-robin on pose changes.
+Any admitted caster membership change refreshes all actor faces immediately,
+removing hidden actor history without throwing away unrelated static occlusion.
+Owner proof is checked on GPU before actor membership/pose hashes.
+CPU potential-change tracking omits static depth passes entirely once pending
+work drains: it tracks actual world/light/camera/admission inputs, not a frozen-time
+special case. Normal static work uses a globally aligned two-face mask shared
+with GPU scheduling; only encoded faces can acquire valid metadata. Potential
+source/ranking/owner-admission changes permit the CPU to encode six faces, but
+the GPU uses all six only for mature cold-slot restoration; existing dirty
+cubes still use the globally aligned pair. Source/ranking/admission changes
+retain conservative work through the finite native departure-fade interval.
+A conservative caster broadphase includes the nearest 64 unowned candidate
+light volumes (ties included) plus every owned candidate volume; GPU admission
+still exclusively determines actual lights and geometry. Actor culling dispatches
+only dynamic-layer descriptors. With no conservative actor/push-vegetation
+descriptors, it omits actor culling and all actor passes; transition from possible
+casters to none performs one six-face clear first. Possible casters retain all
+six actor passes so current GPU admission loss is handled immediately; empty
+GPU-effective cubes disable actor-depth sampling via face validity.
+Native vegetation with **Foliage Push** enabled is excluded from
+the static texture: it uses current geometry in the dynamic layer, refreshing
+all six affected faces every frame, including frozen effect time, without
+adding private bend history. This preserves the existing foliage admission
+policy; its global pre-cap admission issue is owned separately by foliage.
+Sway-only vegetation hashes the actual independent foliage wind state, while
+alpha-scrolling cutouts hash effect time; pure RGB/flicker changes do not dirty
+depth. GPU indexed indirect commands additionally reject radius/frustum misses
+without vertex work. Near lamps
+(camera distance below 30) rasterize at 256², medium (below 80) at 128², and distant
+at 64² in bounded 256² array layers. Receiver metadata stores independent static
+and actor matrices and valid resolution per face; sampling combines both depths.
 
 Opaque/cutout loaded statics obey the existing hidden/native-visual admission
 rules. Actor casters reuse the directional shadow pass's current-pose buffers

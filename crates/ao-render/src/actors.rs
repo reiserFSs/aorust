@@ -103,6 +103,8 @@ struct ModelMesh {
 }
 
 struct Model {
+    /// Geometry/material incarnation, including in-place updates and reused model keys.
+    point_cache_revision: u64,
     meshes: Vec<Option<ModelMesh>>,
     mats: Vec<wgpu::BindGroup>,
     material_bindings: Vec<MaterialBinding>,
@@ -160,6 +162,8 @@ fn actor_visual_key(item: &Item, draw: &Draw) -> Option<VisualKey> {
 #[derive(Default)]
 pub(crate) struct ActorLayer {
     models: HashMap<u64, Model>,
+    /// Never reset by model retirement or zone clears: a reused key gets a fresh incarnation.
+    next_point_cache_revision: u64,
     /// Weak lookup only: the last owning model reclaims the GPU allocation.
     textures: HashMap<TextureIdentity, Weak<ActorTexture>>,
     texture_uploads: u64,
@@ -323,9 +327,12 @@ impl Renderer {
                 })
         });
         if eligible {
+            self.act.next_point_cache_revision = self.act.next_point_cache_revision.checked_add(1)
+                .expect("actor model revision exhausted");
             let device = &self.device;
             let queue = &self.queue;
             let model = self.act.models.get_mut(&key).unwrap();
+            model.point_cache_revision = self.act.next_point_cache_revision;
             let grows = &mut self.act.mesh_buffer_grows;
             for (i, mesh) in scene.meshes.iter().enumerate() {
                 let Some(gpu) = model.meshes[i].as_mut() else {
@@ -513,7 +520,10 @@ impl Renderer {
                 u64::from(bone) + 1
             }).max().unwrap_or(0),
         ));
-        self.act.models.insert(key, Model { meshes, mats, material_bindings, holo, views, view_of, textures, identities, topology, native_skin });
+        self.act.next_point_cache_revision = self.act.next_point_cache_revision.checked_add(1)
+            .expect("actor model revision exhausted");
+        self.act.models.insert(key, Model { point_cache_revision: self.act.next_point_cache_revision,
+            meshes, mats, material_bindings, holo, views, view_of, textures, identities, topology, native_skin });
         if !retain_textures {
             self.drawn_visuals.retain(|visual, _| !matches!(visual, VisualKey::Actor(_, model, _, _) if *model == key));
         }
@@ -1194,7 +1204,7 @@ mod tests {
     #[test]
     fn water_contacts_require_native_surface_and_current_primary_admission() {
         let mut layer = ActorLayer::default();
-        layer.models.insert(1, Model { meshes: vec![], mats: vec![], material_bindings: vec![], holo: None, views: vec![],
+        layer.models.insert(1, Model { point_cache_revision: 0, meshes: vec![], mats: vec![], material_bindings: vec![], holo: None, views: vec![],
             view_of: HashMap::new(), textures: vec![], identities: HashMap::new(),
             topology: vec![(0, vec![ao_scene::Submesh::new(vec![], None)])], native_skin: None });
         assert!(!ActorFrame::default().swimming);
@@ -1236,7 +1246,7 @@ mod tests {
         let mut layer = ActorLayer::default();
         layer.models.insert(1, Model { meshes: vec![], mats: vec![], material_bindings: vec![], holo: None, views: vec![],
             view_of: HashMap::new(), textures: vec![], identities: HashMap::new(),
-            topology: vec![(0, vec![ao_scene::Submesh::new(vec![], None)])], native_skin: None });
+            topology: vec![(0, vec![ao_scene::Submesh::new(vec![], None)])], native_skin: None, point_cache_revision: 0 });
         layer.items.push(Item { actor: 7, model: 1, mesh: 0, fog_depth: 9.0,
             bucket: 0, faded: false, rendering_effect: 0, priority: None, native_shadow_source: None, native_shadow_receiver: None, water_body: None, swimming: false, water_surface: None });
         let camera = Camera::look_at(Vec3::ZERO, -Vec3::Z);
@@ -1672,7 +1682,7 @@ mod tests {
     fn model_removal_keeps_unrelated_actors_and_is_idempotent() {
         let mut layer = ActorLayer::default();
         for (id, model) in [(1, 7), (2, 8), (3, 7)] {
-            layer.models.entry(model).or_insert_with(|| Model { meshes: vec![], mats: vec![], material_bindings: vec![], holo: None, views: vec![], view_of: HashMap::new(), textures: vec![], identities: HashMap::new(), topology: vec![], native_skin: None });
+            layer.models.entry(model).or_insert_with(|| Model { meshes: vec![], mats: vec![], material_bindings: vec![], holo: None, views: vec![], view_of: HashMap::new(), textures: vec![], identities: HashMap::new(), topology: vec![], native_skin: None, point_cache_revision: 0 });
             layer.actors.insert(id, ActorGpu { vb: None, seen: 1, model, skin: None, skin_bounds: None, pose: None });
             layer.frames.push(ActorFrame { id, model, skin: Some(std::sync::Arc::new(vec![ao_scene::Vertex::default()])), ..Default::default() });
             layer.items.push(Item { actor: id, model, mesh: 0, fog_depth: 0.0, bucket: 0, faded: false, rendering_effect: 0, priority: None, native_shadow_source: None, native_shadow_receiver: None, water_body: None, swimming: false, water_surface: None });

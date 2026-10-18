@@ -10,6 +10,16 @@ fn admitted(encoded: f32) -> bool {
     return group > 0u && group < arrayLength(&owners) && owners[group] != 0u;
 }
 
+// Native eligibility uses rounded f32 subtraction and length, not an exact
+// sphere: e.g. (-128, range 128) accepts x=1e-6. Sixteen relative epsilon
+// units cover subtraction/norm and grid-coordinate rounding; a unit scale
+// floor also covers squared distances flushed below the smallest normal f32.
+// This expands candidates only; receivers still use the original exact range.
+fn conservative_radius(light: vec4<f32>, grid_scale: f32) -> f32 {
+    let scale = max(1.0, max(max(max(abs(light.x), abs(light.y)), abs(light.z)), max(light.w, grid_scale)));
+    return light.w + scale * 0.0000019073486328125;
+}
+
 @compute @workgroup_size(1)
 fn build() {
     output[64u] = vec4<f32>(0.0);
@@ -53,9 +63,17 @@ fn build() {
         for (var row = 0u; row < 4u; row += 1u) { output[destination + row] = candidates[source + row]; }
         output[323u + k] = candidates[source + 4u];
         let light = candidates[source];
-        lo = min(lo, light.xyz - light.w);
-        hi = max(hi, light.xyz + light.w);
+        let radius = conservative_radius(light, 0.0);
+        lo = min(lo, light.xyz - radius);
+        hi = max(hi, light.xyz + radius);
     }
+    // The helper reconstructs upper = lo + dims * cell_size. Reserve global
+    // rounding margin too: a distant negative origin can cancel a small hi.
+    let bounds_scale = max(max(max(abs(lo.x), abs(lo.y)), abs(lo.z)),
+        max(max(max(abs(hi.x), abs(hi.y)), abs(hi.z)), max(max(hi.x - lo.x, hi.y - lo.y), hi.z - lo.z)));
+    let bounds_margin = max(1.0, bounds_scale) * 0.0000019073486328125;
+    lo -= vec3<f32>(bounds_margin);
+    hi += vec3<f32>(bounds_margin);
     var cell_size = 8.0;
     var dims = vec3<u32>(1u);
     loop {
@@ -68,6 +86,10 @@ fn build() {
     var indices = cells_start + cells_count;
     output[64u] = vec4<f32>(lo, cell_size);
     output[65u] = bitcast<vec4<f32>>(vec4<u32>(dims, cells_start));
+    // Include the global coordinate scale because cell construction/query
+    // arithmetic may cancel a distant grid origin near a small local light.
+    let grid_scale = max(max(max(abs(lo.x), abs(lo.y)), abs(lo.z)),
+        max(max(max(abs(hi.x), abs(hi.y)), abs(hi.z)), cell_size * f32(max(max(dims.x, dims.y), dims.z))));
     for (var z = 0u; z < dims.z; z += 1u) {
         for (var y = 0u; y < dims.y; y += 1u) {
             for (var x = 0u; x < dims.x; x += 1u) {
@@ -77,7 +99,8 @@ fn build() {
                 for (var k = 0u; k < count; k += 1u) {
                     let light = output[66u + k * 4u];
                     let delta = light.xyz - clamp(light.xyz, cmin, cmin + cell_size);
-                    if dot(delta, delta) <= light.w * light.w {
+                    let radius = conservative_radius(light, grid_scale);
+                    if dot(delta, delta) <= radius * radius {
                         output[indices] = bitcast<vec4<f32>>(vec4<u32>(k, 0u, 0u, 0u));
                         indices += 1u;
                     }

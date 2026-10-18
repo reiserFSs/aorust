@@ -761,6 +761,12 @@ pub struct Renderer {
     grade_pipelines: grade::GradePipelines,
     shadow_pipelines: std::sync::Arc<sun_shadows::Compiled>,
     point_program: point_shadows::Compiled,
+    /// Static geometry writes are invisible to matrix-only point-cache signatures.
+    point_world_revision: u64,
+    /// Uploaded world materials whose sampled alpha coverage changes with the simulation clock.
+    point_world_time_dependent: bool,
+    /// Primary admission also reads blended/liquid alpha coverage for owned lights.
+    point_primary_time_dependent: bool,
     ambient_occlusion: Option<ambient_occlusion::AmbientOcclusion>,
     contact_shadows: Option<contact_shadows::ContactShadows>,
     atmosphere: Option<atmosphere::Atmosphere>,
@@ -1267,6 +1273,9 @@ impl Renderer {
             device,
             queue,
             format,
+            point_world_revision: 0,
+            point_world_time_dependent: false,
+            point_primary_time_dependent: false,
             enhanced_settings: EnhancedSettings::default(),
             weather_input: WeatherInput::default(),
             rain_wet: None,
@@ -2043,6 +2052,8 @@ impl Renderer {
         let (mut opaque, mut blended, mut liquid) = (vec![], vec![], vec![]);
         let mut ground_materials: Vec<Vec<usize>> = scene.meshes.iter().map(|m| vec![usize::MAX; m.submeshes.len()]).collect();
         let mut ground_texture_materials = HashMap::new();
+        let mut time_dependent = false;
+        let mut primary_time_dependent = false;
         for (mi, mesh) in scene.meshes.iter().enumerate() {
             let list = std::mem::take(&mut by_mesh[mi]);
             let range = insts.len()..insts.len() + list.len();
@@ -2072,6 +2083,15 @@ impl Renderer {
                         let uniform = native_ground::material_uniform(s, patch);
                         ground_texture_materials.insert(mat, (key, uniform));
                     }
+                    // Shadow/primary passes ignore RGB-only animation and sky UV waves.
+                    // Glow-mask mode replaces sampled texture alpha with constant one.
+                    let alpha_time_dependent = (s.blend == Blend::AlphaTest || s.alpha_test.is_some() || s.sprite_alpha_test)
+                        && !(s.glow_mask && !s.prelit) && (s.uv_scroll != [0.0; 2] || s.liquid);
+                    time_dependent |= alpha_time_dependent && !s.liquid && !blended_material(s.blend)
+                        && !scene.ground_detail.iter().any(|patch| patch.mesh == mi)
+                        && self.shadow_pipelines.pipelines.get(&(false, world_material_pipe(s), false)).is_some_and(Option::is_some);
+                    primary_time_dependent |= alpha_time_dependent
+                        && self.shadow_pipelines.pipelines.get(&(false, world_material_pipe(s), true)).is_some_and(Option::is_some);
                     let d = Draw { mesh: mi, first_index: first, count, mat, pipe: world_material_pipe(s),
                         priority: s.render_priority, node: s.render_node, origin: s.render_origin, projection_pass: s.projection_pass,
                         vegetation };
@@ -2160,6 +2180,8 @@ impl Renderer {
         // Keep VisualWater's style order (water, acid, lava, star, shallow), including both coplanar passes.
         self.gpu = Gpu { meshes, inst_bufs, mats, opaque, blended, liquid, insts, mesh_range, radius, grid };
         self.material_bindings = material_bindings;
+        self.point_world_time_dependent = time_dependent;
+        self.point_primary_time_dependent = primary_time_dependent;
         self.foliage = foliage::Foliage::default();
         self.canopy_leaves.upload(&self.device, scene, &self.gpu);
         self.drawn_visuals.retain(|key, _| matches!(key, VisualKey::Actor(..)));
@@ -2479,6 +2501,7 @@ impl Renderer {
         for (key, texture) in native_ground::composite_images(&ground.composites, textures, &tile_mips) {
             views.insert(key, (self.texture_view(&texture.rgba, texture.width, texture.height, texture.source), self.material_source_build(key, &texture)));
         }
+        let mut changed = false;
         for (mat,key,u) in &ground.texture_materials {
             let Some((view, material)) = views.get(key).or_else(|| views.iter().find(|(k,_)| same(k,key)).map(|(_,v)| v)) else { continue; };
             let uniform = self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
@@ -2487,6 +2510,10 @@ impl Renderer {
             let binding = MaterialBinding { base: view.clone(), env: view.clone(), uniform, source: material.clone() };
             self.gpu.mats[*mat] = self.material_bind_group(&binding);
             self.material_bindings[*mat] = binding;
+            changed = true;
+        }
+        if changed {
+            self.point_world_revision = self.point_world_revision.checked_add(1).expect("point world revision exhausted");
         }
     }
 
@@ -2531,18 +2558,39 @@ impl Renderer {
     /// Re-poses the uploaded scene in place: `scene` must be the same scene with only vertex positions/normals and
     /// instance transforms changed (an animated character); textures, materials and indices are kept.
     pub fn repose(&mut self, scene: &Scene) {
-        let mut seen = vec![0; self.gpu.mesh_range.len()];
-        for i in &scene.instances {
-            let Some(r) = self.gpu.mesh_range.get(i.mesh) else { continue };
-            if let Some(inst) = self.gpu.insts.get_mut(r.start + seen[i.mesh]).filter(|_| seen[i.mesh] < r.len()) {
-                inst.m = i.transform;
-            }
-            seen[i.mesh] += 1;
-        }
-        for (m, gpu) in scene.meshes.iter().zip(&self.gpu.meshes) {
+        let mut bounds = vec![(0usize, None); self.gpu.mesh_range.len()];
+        let mut changed = false;
+        for ((mesh, gpu), (_, sphere)) in scene.meshes.iter().zip(&self.gpu.meshes).zip(&mut bounds) {
             if let Some((vb, _)) = gpu {
-                self.queue.write_buffer(vb, 0, bytemuck::cast_slice(&m.vertices));
+                if mesh.vertices.is_empty() { continue; }
+                let (lo, hi) = mesh.vertices.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), vertex| {
+                    (lo.min(Vec3::from(vertex.pos)), hi.max(Vec3::from(vertex.pos)))
+                });
+                let center = (lo + hi) * 0.5;
+                let radius = mesh.vertices.iter().map(|vertex| (Vec3::from(vertex.pos) - center).length()).fold(0.0, f32::max);
+                *sphere = Some((center, radius));
+                self.queue.write_buffer(vb, 0, bytemuck::cast_slice(&mesh.vertices));
+                changed = true;
             }
+        }
+        for instance in &scene.instances {
+            let Some(range) = self.gpu.mesh_range.get(instance.mesh) else { continue; };
+            let (seen, sphere) = &mut bounds[instance.mesh];
+            if let Some(inst) = self.gpu.insts.get_mut(range.start + *seen).filter(|_| *seen < range.len()) {
+                changed |= inst.m != instance.transform;
+                inst.m = instance.transform;
+                // Empty scene meshes are retained-world placeholders, not new zero-size geometry.
+                if let Some((center, radius)) = sphere {
+                    let transform = Mat4::from_cols_array_2d(&inst.m);
+                    let scale = transform.x_axis.truncate().length().max(transform.y_axis.truncate().length()).max(transform.z_axis.truncate().length());
+                    inst.center = transform.transform_point3(*center);
+                    inst.radius = *radius * scale;
+                }
+            }
+            *seen += 1;
+        }
+        if changed {
+            self.point_world_revision = self.point_world_revision.checked_add(1).expect("point world revision exhausted");
         }
     }
 

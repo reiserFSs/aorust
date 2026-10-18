@@ -146,7 +146,7 @@ impl Renderer {
             self.draw_actor_shadows(&mut pass, &shadows, true);
         }
         shadows.encode_actor_visibility(encoder);
-        self.encode_point_shadows(encoder, cam, &mut shadows);
+        self.encode_point_shadows(encoder, cam, &mut shadows, [env.fog_start, env.fog_end, far]);
         let Some(mut frame) = frame else {
             shadows.update(&self.queue, &CascadeFrame { uniform: bytemuck::Zeroable::zeroed() });
             self.sun_shadows = Some(shadows);

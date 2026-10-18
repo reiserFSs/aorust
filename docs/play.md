@@ -2086,6 +2086,11 @@ Local Lighting** switches default false (`AomacMoonShadows`,
 intensity sliders default 1 and are bounded 0–4; Restore All returns every
 registered Enhanced control, including these sliders, to its default.
 **Point Shadow Count** (`AomacPointShadowCount`) defaults to 4, bounded 1–16.
+Static world depth and admitted actor depth are cached separately. Changed faces
+normally refresh two per cube per frame (all six on cold bootstrap); admission
+loss clears/rebuilds every actor face immediately, never retained hidden history.
+Each face samples its stored render projection, with automatic 256/128/64
+resolution by distance; frozen simulation captures remain cache hits.
 Carried-light cubes exclude native characters from casting and receiving their
 point shadows, not every dynamic actor: moving doors and other non-character
 props still cast and receive. Static lamp cubes retain normal character shadows.

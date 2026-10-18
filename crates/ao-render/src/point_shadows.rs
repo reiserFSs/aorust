@@ -1,7 +1,10 @@
-//! Current-frame point/spot shadow cubes, after ao-vk rvk/pointshadow.cpp (MIT).
+//! Cached static and admitted actor point shadows, after ao-vk pointshadow.cpp (MIT).
 //! Source: wannabuh/ao-vk a0dc47ea2c853d26a4491d5a25ef0331f714b6ce.
 use super::*;
 use crate::sun_shadows::{ShadowUniform, SunShadows};
+#[path = "point_cache.rs"]
+mod point_cache;
+pub(crate) use point_cache::CacheCaster;
 
 const CUBES: usize = 16;
 const RESOLUTION: u32 = 256;
@@ -16,11 +19,13 @@ pub(crate) fn receiver_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
         wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
         wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::CubeArray, multisampled: false }, count: None },
+            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }, count: None },
         wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison), count: None },
         wgpu::BindGroupLayoutEntry { binding: 6, visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: wgpu::BufferSize::new((CUBES * 16) as u64) }, count: None },
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: wgpu::BufferSize::new(14336) }, count: None },
+        wgpu::BindGroupLayoutEntry { binding: 9, visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }, count: None },
     ]);
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("local and directional receivers"), entries: &entries })
 }
@@ -28,20 +33,24 @@ pub(crate) fn receiver_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 pub(crate) struct Compiled {
     layout: wgpu::BindGroupLayout,
     pipeline: crate::pipeline_creation::ComputePipeline,
+    cull: crate::pipeline_creation::ComputePipeline,
+    cull_actors: crate::pipeline_creation::ComputePipeline,
+    clear: wgpu::RenderPipeline,
 }
 impl Compiled {
     pub(crate) fn new(device: &wgpu::Device) -> Self {
-        let entries: Vec<_> = (0..5).map(|binding| wgpu::BindGroupLayoutEntry {
+        let entries: Vec<_> = (0..8).map(|binding| wgpu::BindGroupLayoutEntry {
             binding, visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
-                ty: if binding == 4 { wgpu::BufferBindingType::Uniform } else { wgpu::BufferBindingType::Storage { read_only: false } },
+                ty: if binding == 4 { wgpu::BufferBindingType::Uniform } else { wgpu::BufferBindingType::Storage { read_only: binding == 5 || binding == 7 } },
                 has_dynamic_offset: false, min_binding_size: None,
             }, count: None,
         }).collect();
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("GPU admitted cube selection"), entries: &entries });
+        let mut source = crate::shader_source::load("point_shadow_select.wgsl", include_str!("point_shadow_select.wgsl")).into_owned();
+        source.push_str(&crate::shader_source::load("point_cache.wgsl", include_str!("point_cache.wgsl")));
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("GPU admitted point shadow ranking and face matrices"),
-            source: wgpu::ShaderSource::Wgsl(crate::shader_source::load("point_shadow_select.wgsl", include_str!("point_shadow_select.wgsl"))),
+            label: Some("point cache scheduling and conservative indirect culling"), source: wgpu::ShaderSource::Wgsl(source.into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("GPU admitted cube selection"), bind_group_layouts: &[Some(&layout)], immediate_size: 0,
@@ -50,8 +59,29 @@ impl Compiled {
             label: Some("GPU admitted cube selection"), layout: Some(&pipeline_layout), module: &shader,
             entry_point: Some("select_cubes"), compilation_options: Default::default(), cache: None,
         });
+        let cull = crate::pipeline_creation::compute_deferred(device, &wgpu::ComputePipelineDescriptor {
+            label: Some("point face sphere and admission culling"), layout: Some(&pipeline_layout), module: &shader,
+            entry_point: Some("cull_casters"), compilation_options: Default::default(), cache: None,
+        });
+        let cull_actors = crate::pipeline_creation::compute_deferred(device, &wgpu::ComputePipelineDescriptor {
+            label: Some("point actor-only face culling"), layout: Some(&pipeline_layout), module: &shader,
+            entry_point: Some("cull_actor_casters"), compilation_options: Default::default(), cache: None,
+        });
+        let clear_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("indirect cache clear"), bind_group_layouts: &[], immediate_size: 0,
+        });
+        let clear = crate::pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
+            label: Some("indirect cache clear"), layout: Some(&clear_layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("clear_face"), compilation_options: Default::default(), buffers: &[] },
+            fragment: None, primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }),
+            multisample: Default::default(), multiview_mask: None, cache: None,
+        });
         pipeline.get();
-        Self { layout, pipeline }
+        cull.get();
+        cull_actors.get();
+        Self { layout, pipeline, cull, cull_actors, clear }
     }
 }
 
@@ -72,6 +102,16 @@ fn face_matrix(face: usize, position: Vec3, far: f32) -> Mat4 {
 pub(crate) struct PointShadows {
     pub receiver: Option<wgpu::BindGroup>,
     pub array: wgpu::TextureView,
+    pub actor_array: wgpu::TextureView,
+    _actor_maps: wgpu::Texture,
+    actor_faces: Vec<wgpu::TextureView>,
+    casters: Vec<CacheCaster>,
+    dynamic_world: Vec<CacheCaster>,
+    static_caster_count: usize,
+    caster_buffer: wgpu::Buffer,
+    caster_capacity: usize,
+    indirect: wgpu::Buffer,
+    indirect_stride: u64,
     pub sampler: wgpu::Sampler,
     pub metadata: wgpu::Buffer,
     _maps: wgpu::Texture,
@@ -88,37 +128,55 @@ pub(crate) struct PointShadows {
     count: usize,
     local_resources: bool,
     clock: Option<f32>,
+    dispatch: point_cache::Dispatch,
+    static_face_mask: u32,
+    actor_face_mask: u32,
+    had_dynamic_casters: bool,
 }
 impl PointShadows {
     fn new(device: &wgpu::Device, size: (u32, u32), local_resources: bool, count: usize) -> Self {
         let resolution = if local_resources { RESOLUTION } else { 1 };
         let face_count = if local_resources { count * 6 } else { 0 };
-        let maps = device.create_texture_tracked(&wgpu::TextureDescriptor {
-            label: Some("current-frame point shadow cubes"),
+        let descriptor = wgpu::TextureDescriptor {
+            label: Some("cached static point shadow faces"),
             size: wgpu::Extent3d { width: resolution, height: resolution, depth_or_array_layers: face_count.max(6) as u32 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
-        });
-        let array = maps.create_view_tracked(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::CubeArray), ..Default::default() });
-        let faces = (0..face_count).map(|layer| maps.create_view_tracked(&wgpu::TextureViewDescriptor {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+        };
+        let maps = device.create_texture_tracked(&descriptor);
+        let actor_maps = device.create_texture_tracked(&wgpu::TextureDescriptor { label: Some("cached admitted actor point faces"), ..descriptor });
+        let view = wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() };
+        let array = maps.create_view_tracked(&view);
+        let actor_array = actor_maps.create_view_tracked(&view);
+        let face_views = |texture: &wgpu::Texture| (0..face_count).map(|layer| texture.create_view_tracked(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2), base_array_layer: layer as u32, array_layer_count: Some(1), ..Default::default()
         })).collect();
+        let faces = face_views(&maps);
+        let actor_faces = face_views(&actor_maps);
         let alignment = u64::from(device.limits().min_uniform_buffer_offset_alignment);
         let face_stride = (std::mem::size_of::<ShadowUniform>() as u64).div_ceil(alignment) * alignment;
         let buffer = |label, size, usage| device.create_buffer_tracked(&wgpu::BufferDescriptor {
             label: Some(label), size, usage, mapped_at_creation: false,
         });
-        let face_data = buffer("GPU selected cube face matrices", face_stride * face_count.max(1) as u64,
+        let face_data = buffer("GPU selected cube face matrices", face_stride * (face_count * 2).max(1) as u64,
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::STORAGE);
-        let metadata = buffer("current cube fade and exact owner proof", (CUBES * 16) as u64,
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::STORAGE);
-        let state = buffer("persistent cube identities and fades", (CUBES * 32) as u64,
+        let metadata = buffer("cached point face receiver metadata", 14336,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
+        let state = buffer("persistent cube cache state", (CUBES * 96) as u64,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
-        let params = buffer("point shadow simulation clock", 32, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+        let params = buffer("point shadow simulation clock and encoded schedule", 64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+        let caster_buffer = buffer("point caster descriptors", 64, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
+        let indirect = buffer("point cache indirect commands", (face_count * 2).max(1) as u64 * 40,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST);
         let sampler = device.create_sampler_tracked(&wgpu::SamplerDescriptor { label: Some("point shadow comparison PCF"),
             compare: Some(wgpu::CompareFunction::LessEqual), mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear, ..Default::default() });
-        Self { receiver: None, array, sampler, metadata, _maps: maps, faces, face_data, face_stride, state, params,
+        Self { receiver: None, array, actor_array, _actor_maps: actor_maps, actor_faces,
+            casters: Vec::new(), dynamic_world: Vec::new(), static_caster_count: 0,
+            caster_buffer, caster_capacity: 1, indirect, indirect_stride: 40,
+            dispatch: point_cache::Dispatch::default(), static_face_mask: 0,
+            actor_face_mask: 0, had_dynamic_casters: false,
+            sampler, metadata, _maps: maps, faces, face_data, face_stride, state, params,
             groups: Vec::new(), selection: None, input_buffer: None, admission: None, size, count, local_resources, clock: None }
     }
 }
@@ -129,7 +187,7 @@ impl Renderer {
             self.point_shadows.as_ref().and_then(|points| points.receiver.as_ref()).expect("local receiver prepared before world")
         } else { &self.sun_shadows.as_ref().expect("directional receiver prepared before world").receiver }
     }
-    pub(crate) fn encode_point_shadows(&mut self, encoder: &mut wgpu::CommandEncoder, cam: &Camera, shadows: &mut SunShadows) {
+    pub(crate) fn encode_point_shadows(&mut self, encoder: &mut wgpu::CommandEncoder, cam: &Camera, shadows: &mut SunShadows, admission_planes: [f32; 3]) {
         if !self.enhanced_settings.needs_admitted_lights() { self.point_shadows = None; return; }
         let local = self.enhanced_settings.local_light_shadows;
         let count = self.enhanced_settings.point_shadow_count.clamp(1, CUBES as u32) as usize;
@@ -139,7 +197,8 @@ impl Renderer {
         points.clock = Some(self.time);
         if points.admission.as_ref() != Some(&shadows.actor_visibility) {
             points.admission = Some(shadows.actor_visibility.clone());
-            points.groups = (0..points.faces.len()).map(|layer| self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
+            points.selection = None;
+            points.groups = (0..points.faces.len() * 2).map(|layer| self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
                 label: Some("GPU current point face and actor admission"), layout: &shadows.compiled.caster_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -160,9 +219,57 @@ impl Renderer {
         // Owner proof is reduced on GPU before either the 64-light or cube caps.
         self.encode_clustered_lights(encoder, cam.pos, &shadows.actor_visibility);
         if local {
-            let params = [cam.pos.extend(0.0).to_array(), [elapsed / FADE_SECONDS, count as f32, (points.face_stride / 16) as f32, 0.0]];
+            self.prepare_point_static(shadows);
+            points.casters.clear();
+            let world_hash = self.point_static_casters(shadows, &mut points.casters);
+            let fingerprint = self.point_dispatch_inputs(cam, &mut points, world_hash, admission_planes);
+            points.static_face_mask = points.dispatch.mask(fingerprint, self.time);
+            points.dynamic_world.clear();
+            if self.enhanced_settings.foliage_push {
+                let dynamic_world = &mut points.dynamic_world;
+                points.casters.retain(|caster| {
+                    if !self.gpu.opaque[caster.key[1] as usize].vegetation { return true; }
+                    let mut dynamic = *caster;
+                    dynamic.key[3] = 2;
+                    dynamic_world.push(dynamic);
+                    false
+                });
+            }
+            let possible_lights = &points.dispatch.possible_lights;
+            let possible = |caster: &CacheCaster| possible_lights.iter().any(|light| {
+                Vec3::from_slice(&caster.sphere[..3]).distance(Vec3::from_slice(&light[..3])) <= caster.sphere[3] + light[3]
+            });
+            points.casters.retain(possible);
+            points.dynamic_world.retain(possible);
+            points.static_caster_count = points.casters.len();
+            self.point_actor_casters(shadows, &mut points.casters);
+            points.casters.append(&mut points.dynamic_world);
+            let potential_dynamic = points.casters.len() > points.static_caster_count;
+            points.actor_face_mask = if potential_dynamic || points.had_dynamic_casters { 63 } else { 0 };
+            points.had_dynamic_casters = potential_dynamic;
+            if points.casters.len() > points.caster_capacity {
+                points.caster_capacity = points.casters.len().next_power_of_two();
+                points.caster_buffer = self.device.create_buffer_tracked(&wgpu::BufferDescriptor {
+                    label: Some("point caster descriptors"), size: (points.caster_capacity * 64) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+                });
+                points.indirect = self.device.create_buffer_tracked(&wgpu::BufferDescriptor {
+                    label: Some("point cache indirect commands"), size: ((points.caster_capacity + 1) * 20 * count * 12) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+                });
+                points.selection = None;
+            }
+            points.indirect_stride = (points.casters.len() as u64 + 1) * 20;
+            if !points.casters.is_empty() {
+                self.queue.write_buffer(&points.caster_buffer, 0, bytemuck::cast_slice(&points.casters));
+            }
+            let params = [cam.pos.extend(points.static_face_mask as f32).to_array(),
+                [elapsed / FADE_SECONDS, count as f32, (points.face_stride / 16) as f32, points.static_caster_count as f32],
+                [points.casters.len() as f32, (world_hash & 65535) as f32, self.time, (world_hash >> 16) as f32],
+                [points.dispatch.normal_mask as f32, u8::from(points.dispatch.restoration_possible) as f32,
+                    u8::from(points.dispatch.allocation_cold) as f32, points.actor_face_mask as f32]];
             self.queue.write_buffer(&points.params, 0, bytemuck::cast_slice(&params));
-            if points.input_buffer.as_ref() != Some(&self.dyn_light_buf) {
+            if points.selection.is_none() || points.input_buffer.as_ref() != Some(&self.dyn_light_buf) {
                 points.input_buffer = Some(self.dyn_light_buf.clone());
                 points.selection = Some(self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
                     label: Some("admitted pool and persistent cube selection"), layout: &self.point_program.layout,
@@ -172,30 +279,50 @@ impl Renderer {
                         wgpu::BindGroupEntry { binding: 2, resource: points.state.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 3, resource: points.metadata.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 4, resource: points.params.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 5, resource: points.caster_buffer.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 6, resource: points.indirect.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 7, resource: shadows.actor_visibility.as_entire_binding() },
                     ],
                 }));
             }
+            encoder.clear_buffer(&points.indirect, 0, None);
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("GPU admitted cube ranking"), timestamp_writes: None });
                 pass.set_pipeline(&self.point_program.pipeline);
                 pass.set_bind_group(0, points.selection.as_ref().expect("cube selection bindings"), &[]);
                 pass.dispatch_workgroups(1, 1, 1);
+                if points.static_face_mask != 0 {
+                    pass.set_pipeline(&self.point_program.cull);
+                    pass.dispatch_workgroups((points.static_caster_count as u32 + 1).div_ceil(64), (count * 6) as u32, 1);
+                }
+                if points.actor_face_mask != 0 {
+                    pass.set_pipeline(&self.point_program.cull_actors);
+                    pass.dispatch_workgroups(((points.casters.len() - points.static_caster_count) as u32 + 1).div_ceil(64), (count * 6) as u32, 1);
+                }
             }
-            // ponytail: loaded static union per face; GPU draw compaction if measured CPU submission dominates.
-            // Selection is GPU-only: CPU culling by an owner's hidden position would leak admission through capacity.
-            self.prepare_point_static(shadows);
-            for layer in 0..points.faces.len() {
+            // Loaded-world broadphase is conservative; GPU proof and per-face culling own actual draws.
+            for layer in 0..points.faces.len() * 2 {
+                let actor = layer >= points.faces.len();
+                let face_mask = if actor { points.actor_face_mask } else { points.static_face_mask };
+                if (face_mask & (1 << (layer % 6))) == 0 { continue; }
+                let view = if actor { &points.actor_faces[layer - points.faces.len()] } else { &points.faces[layer] };
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("current-frame admitted local shadow face"), color_attachments: &[],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &points.faces[layer],
-                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
+                    label: Some("cached admitted local shadow face"), color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }), stencil_ops: None }),
                     timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
                 });
+                let base = layer as u64 * points.indirect_stride;
+                pass.set_pipeline(&self.point_program.clear);
+                pass.draw_indirect(&points.indirect, base);
                 pass.set_bind_group(0, &self.globals_bg, &[]);
                 pass.set_bind_group(3, &points.groups[layer], &[]);
-                self.draw_static_shadows(&mut pass, shadows, false);
-                // GPU face flags clip empty cubes and only character parts for carried sources.
-                self.draw_actor_shadows(&mut pass, shadows, false);
+                if actor {
+                    self.draw_point_actors(&mut pass, shadows, &points.indirect, base + 20, &points.casters);
+                    self.draw_point_static(&mut pass, shadows, &points.indirect, base + 20, &points.casters, 2);
+                } else {
+                    self.draw_point_static(&mut pass, shadows, &points.indirect, base + 20, &points.casters, 0);
+                }
             }
         }
         self.point_shadows = Some(points);
@@ -275,6 +402,7 @@ pub(crate) fn apply_shader(source: &mut String, local: bool, clustered: bool) {
         source.replace_range(start..end, &body);
     }
     source.push_str(&crate::shader_source::load("point_shadows.wgsl", include_str!("point_shadows.wgsl")));
+    source.push_str(&crate::shader_source::load("point_sampling.wgsl", include_str!("point_sampling.wgsl")));
 }
 
 fn admitted_native_pool(source: &mut String, name: &str) {
@@ -284,15 +412,23 @@ fn admitted_native_pool(source: &mut String, name: &str) {
     let statics = body.find("    if !(any(c").or_else(|| body.find("    if false && !(any(c")).expect("native static grid");
     let moving = body.find("    // Per-frame moving lights").expect("native moving lights");
     let dynamic = body[moving..].replace("let dyn_count = u32(g.dyn_info.x);", "let dyn_count = min(bitcast<u32>(dyn_lights[322u].x), 64u);")
+        .replace("for (var k = 0u; k < dyn_count && used < 8u; k = k + 1u) {",
+            "for (var candidate = 0u; candidate < min(dyn_count, local_list.y) && used < 8u; candidate += 1u) {\n        let k = bitcast<u32>(dyn_lights[local_list.x + candidate].x);")
         .replace("let li = k * 4u;", "let li = 66u + k * 4u;")
-        .replace("        let a = dyn_lights[li];", "        let a = dyn_lights[li];\n        if !owner_light_admitted(dyn_lights[li + 3u].w) { continue; }");
-    let replacement = format!("{}{}", &body[..statics], dynamic);
+        .replace("        let a = dyn_lights[li];", "        let a = dyn_lights[li];\n        if !owner_light_admitted(dyn_lights[li + 3u].w) { continue; }")
+        .replace("        let d = a.xyz - p;\n        let dist = length(d);",
+            "        let d = a.xyz - p;\n        if dot(d, d) > a.w * a.w * 1.000001 { continue; }\n        let dist = length(d);");
+    let replacement = format!("{}    let local_list = admitted_light_list(p);\n{}", &body[..statics], dynamic);
     source.replace_range(start..end, &replacement);
 }
 
 #[cfg(test)]
 #[path = "specular_admission_tests.rs"]
 mod specular_admission_tests;
+
+#[cfg(test)]
+#[path = "point_cache_tests.rs"]
+mod point_cache_tests;
 
 
 #[cfg(test)]
@@ -306,7 +442,7 @@ mod tests {
         }
     }
     fn cube_states(renderer: &Renderer) -> Vec<[u32; 8]> {
-        let size = (CUBES * 32) as u64;
+        let size = (CUBES * 96) as u64;
         let readback = renderer.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("test-only cube identity readback"), size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
@@ -319,7 +455,8 @@ mod tests {
         renderer.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         receiver.recv().unwrap().unwrap();
         let mapped = readback.slice(..).get_mapped_range();
-        bytemuck::cast_slice(&mapped).to_vec()
+        bytemuck::cast_slice::<u8, u32>(&mapped).as_chunks::<24>().0.iter()
+            .map(|state| state[..8].try_into().unwrap()).collect()
     }
     #[test]
     fn simulation_fade_clock_is_deterministic() {
