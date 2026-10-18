@@ -11,6 +11,11 @@ mod volumetric_clouds;
 mod cloud_shadows;
 mod sky_discs;
 mod grade;
+mod temporal;
+mod spatial_post;
+mod cube_lut;
+#[cfg(test)]
+mod post_temporal_tests;
 mod grass;
 pub use grass::{GrassBender, GrassExposure};
 mod gui;
@@ -670,6 +675,16 @@ pub struct Renderer {
     enhanced_frame: Option<enhanced::EnhancedFrame>,
     bloom: Option<bloom::Bloom>,
     grade: Option<grade::Grade>,
+    temporal: Option<temporal::Temporal>,
+    temporal_programs: Option<temporal::TemporalPrograms>,
+    post_target: Option<temporal::PostTarget>,
+    spatial_post: Option<spatial_post::SpatialPost>,
+    motion_vectors: Option<actors::motion_vectors::MotionVectors>,
+    motion_programs: Option<std::sync::Arc<actors::motion_vectors::Programs>>,
+    post_focus: Option<[f32; 3]>,
+    temporal_room: Option<usize>,
+    post_previous_view: Option<(Mat4, Vec3)>,
+    post_fog_color: Option<[f32;3]>,
     enhanced_pipelines: enhanced::EnhancedPipelines,
     bloom_pipelines: bloom::BloomPipelines,
     grade_pipelines: grade::GradePipelines,
@@ -1149,6 +1164,16 @@ impl Renderer {
             enhanced_frame: None,
             bloom: None,
             grade: None,
+            temporal: None,
+            temporal_programs: None,
+            post_target: None,
+            spatial_post: None,
+            motion_vectors: None,
+            motion_programs: None,
+            post_focus: None,
+            temporal_room: None,
+            post_previous_view: None,
+            post_fog_color: None,
             enhanced_pipelines,
             bloom_pipelines,
             grade_pipelines,
@@ -1259,6 +1284,9 @@ impl Renderer {
             && self.screen.is_ready()
             && self.heat_haze.is_ready()
             && self.skin_pipeline_is_ready()
+            && self.temporal_programs.as_ref().is_none_or(temporal::TemporalPrograms::is_ready)
+            && self.motion_programs.as_ref().is_none_or(|programs| programs.is_ready())
+            && self.spatial_post.as_ref().is_none_or(spatial_post::SpatialPost::is_ready)
     }
 
     /// Explicit readiness barrier for zone preparation and deterministic evidence, never a frame prerequisite.
@@ -1273,6 +1301,9 @@ impl Renderer {
         self.screen.wait();
         self.heat_haze.wait();
         self.wait_skin_pipeline();
+        if let Some(temporal) = &self.temporal_programs { temporal.wait(); }
+        if let Some(motion) = &self.motion_programs { motion.wait(); }
+        if let Some(spatial) = &self.spatial_post { spatial.wait(); }
     }
 
     /// Native quality is latched at startup; compression callbacks affect future loads. `better` is the aomac
@@ -1430,6 +1461,26 @@ impl Renderer {
         self.enhanced_settings = settings;
         self.moon_exposure.sync(&self.device, settings.night_mode == NightMode::Moonlit);
         if previous.night_mode != settings.night_mode { self.sun_shadows = None; }
+        if previous.taa != settings.taa || previous.motion_blur != settings.motion_blur {
+            self.reset_post_history();
+        }
+        if settings.taa && self.temporal_programs.is_none() {
+            self.temporal_programs = Some(temporal::TemporalPrograms::new(&self.device, self.format));
+        } else if !settings.taa {
+            self.temporal = None;
+            self.temporal_programs = None;
+        }
+        let spatial_enabled = settings.fxaa && !settings.taa || settings.cas || settings.depth_of_field || settings.motion_blur > 0.0;
+        if spatial_enabled && self.spatial_post.is_none() {
+            self.spatial_post = Some(spatial_post::SpatialPost::new(&self.device,self.format,self.enhanced_pipelines.source_layout()));
+        } else if !spatial_enabled { self.spatial_post = None; }
+        if !settings.post_enabled() { self.post_target = None; }
+        if settings.taa || settings.motion_blur > 0.0 {
+            self.warm_motion_vectors();
+        } else {
+            self.motion_vectors = None;
+            self.motion_programs = None;
+        }
         if !settings.ground_grass || settings.grass_density <= 0.0 { self.grass = None; }
         if !settings.ambient_occlusion {
             self.ambient_occlusion.as_mut().expect("startup AO pipelines").release_targets();
@@ -1440,6 +1491,7 @@ impl Renderer {
         if !settings.sun_shadows && !settings.moon_shadows && !settings.volumetric_shafts && settings.night_mode != NightMode::Moonlit { self.sun_shadows = None; }
         self.release_disabled_atmosphere(settings);
         if changed_frame {
+            self.reset_post_history();
             self.release_effect_targets();
             self.enhanced_frame = None; self.bloom = None; self.grade = None;
         }
@@ -1484,8 +1536,12 @@ impl Renderer {
         }) + self.ambient_occlusion.as_ref().map_or(0, ambient_occlusion::AmbientOcclusion::target_bytes)
             + self.contact_shadows.as_ref().map_or(0, contact_shadows::ContactShadows::target_bytes)
             + self.bloom.as_ref().map_or(0, |bloom| bloom.bytes)
-            + self.grade.as_ref().map_or(0, |grade| grade::Grade::bytes(grade.size))
+            + self.grade.as_ref().map_or(0, grade::Grade::bytes)
             + self.atmosphere_target_bytes()
+            + self.temporal.as_ref().map_or(0, temporal::Temporal::bytes)
+            + self.motion_vectors.as_ref().map_or(0, actors::motion_vectors::MotionVectors::bytes)
+            + self.post_target.as_ref().map_or(0, |target| u64::from(target.size.0) * u64::from(target.size.1) * 4)
+            + self.spatial_post.as_ref().map_or(0, spatial_post::SpatialPost::bytes)
     }
     /// Explicit offline instrumentation; disabled by default and owns no resources then.
     /// After each render, read the result before encoding another timed frame.
@@ -1521,6 +1577,7 @@ impl Renderer {
 
     /// Replaces the GPU-side scene.
     pub fn upload(&mut self, scene: &Scene) {
+        self.reset_post_history();
         self.sky_dot_counter = 0.0;
         self.sky.directional_epoch = self.time;
         self.water_light = scene.water_light;
@@ -2235,7 +2292,8 @@ impl Renderer {
             apply_camera_fog(&mut env, model, self.lens, far, cam.pos.to_array(), self.fog_density_scale);
         }
         let aspect = t.size.0 as f32 / t.size.1.max(1) as f32;
-        let vp = Mat4::perspective_rh(self.lens.vertical_fov(aspect), aspect, self.lens.near, far) * Mat4::look_to_rh(cam.pos, cam.forward(), cam.up());
+        let native_vp = Mat4::perspective_rh(self.lens.vertical_fov(aspect), aspect, self.lens.near, far) * Mat4::look_to_rh(cam.pos, cam.forward(), cam.up());
+        let vp = self.prepare_post_frame(t.size, cam, native_vp, env.fog_color);
         let v4 = |c: [f32; 3], w| Vec4::new(c[0], c[1], c[2], w).to_array();
         let g4 = |c: [f32; 3], w| v4(c.map(gamma), w);
         let w = ao_scene::wave_curves(self.time);
@@ -2303,6 +2361,7 @@ impl Renderer {
         let isolate_sky = self.isolate_sky();
         self.sky_beauty_only = isolate_sky;
         if self.enhanced_settings.any_enabled() && self.enhanced_frame.as_ref().is_none_or(|frame| frame.size != t.size || frame.sample_count != self.world.msaa) {
+            self.reset_post_history();
             self.release_effect_targets();
             self.bloom = None;
             self.grade = None;
@@ -2403,6 +2462,10 @@ impl Renderer {
         }
         self.sorted.sort_by(|a, b| actors::bucket_order(a.0, a.1, b.0, b.1)
             .then_with(|| b.4.cmp(&a.4)).then_with(|| a.3.cmp(&b.3)));
+        if self.enhanced_settings.taa || self.enhanced_settings.motion_blur > 0.0 {
+            let previous = self.post_previous_view.map_or(native_vp, |(matrix, _)| matrix);
+            self.prepare_motion_vectors(t.size, native_vp, previous);
+        }
         let shadow_start = timed.then(std::time::Instant::now);
         self.encode_enhanced_shadows(&mut enc, cam, t.size, env, far);
         if let Some(start) = shadow_start { cpu.shadow_prepare_encode_ms = start.elapsed().as_secs_f64() * 1000.0; }
@@ -2583,7 +2646,7 @@ impl Renderer {
         // After AO and contact shadows: expose first so the HDR pyramid reads the lifted scene; non-HDR bloom works on the native colour.
         let bloom_strength = if self.bloom.is_some() { self.enhanced_settings.bloom_strength } else { 0.0 };
         if let (Some(grade), Some(frame)) = (&self.grade, self.enhanced_frame.as_ref()) {
-            grade.expose(&self.queue, &mut enc, &frame.composite_bg, self.enhanced_settings.sun_boost, bloom_strength);
+            grade.expose(&self.queue, &mut enc, &frame.composite_bg, if self.enhanced_settings.hdr { self.enhanced_settings.sun_boost } else { 0.0 }, bloom_strength);
         }
         if let Some(bloom) = &mut self.bloom {
             let bloom_start = timed.then(std::time::Instant::now);
@@ -2591,14 +2654,16 @@ impl Renderer {
             if let Some(start) = bloom_start { cpu.bloom_ms = start.elapsed().as_secs_f64() * 1000.0; }
         }
         if let Some(frame) = self.enhanced_frame.as_ref() {
-            let timestamps = if self.heat_haze.source().is_none() && self.screen.layers.is_empty() { self.gpu_timer.as_mut().map(FrameGpuTimer::end_pass) } else { None };
-            let output = self.heat_haze.source().unwrap_or(resolve);
+            let post = self.post_target.as_ref();
+            let timestamps = if post.is_none() && self.heat_haze.source().is_none() && self.screen.layers.is_empty() { self.gpu_timer.as_mut().map(FrameGpuTimer::end_pass) } else { None };
+            let output = post.map_or_else(|| self.heat_haze.source().unwrap_or(resolve), |target| &target.view);
             if let Some(grade) = &self.grade {
                 grade.present(&mut enc, output, timestamps);
             } else {
                 frame.composite(&mut enc, output, self.bloom.as_ref().and_then(|bloom| bloom.present.as_ref()), timestamps);
             }
         }
+        self.encode_post_frame(&mut enc, resolve, cam, native_vp, far);
         let timestamps = if self.heat_haze.source().is_some() && self.screen.layers.is_empty() { self.gpu_timer.as_mut().map(FrameGpuTimer::end_pass) } else { None };
         self.heat_haze.draw(&mut enc, resolve, timestamps);
         let timestamps = if !self.screen.layers.is_empty() { self.gpu_timer.as_mut().map(FrameGpuTimer::end_pass) } else { None };

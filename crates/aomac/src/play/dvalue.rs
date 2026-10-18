@@ -204,6 +204,18 @@ impl DValues {
             emissive_bloom: self.flag("AomacEmissiveBloom"),
             ground_grass: self.flag("AomacGroundGrass"),
             hdr: self.flag("AomacHdr"),
+            grading_enabled: self.flag("AomacGradingEnabled"), zone_lut: self.flag("AomacZoneLut"),
+            vignette: self.get_f32("AomacVignette").unwrap_or(defaults.vignette),
+            contrast: self.get_f32("AomacContrast").unwrap_or(defaults.contrast),
+            saturation: self.get_f32("AomacSaturation").unwrap_or(defaults.saturation),
+            warmth: self.get_f32("AomacWarmth").unwrap_or(defaults.warmth),
+            night_cool: self.get_f32("AomacNightCool").unwrap_or(defaults.night_cool),
+            taa: self.flag("AomacTaa"), fxaa: self.flag("AomacFxaa"), cas: self.flag("AomacCas"),
+            cas_strength: self.get_f32("AomacCasStrength").unwrap_or(defaults.cas_strength),
+            motion_blur: self.get_f32("AomacMotionBlur").unwrap_or(defaults.motion_blur),
+            depth_of_field: self.flag("AomacDepthOfField"),
+            dof_aperture: self.get_f32("AomacDofAperture").unwrap_or(defaults.dof_aperture),
+            dof_max_radius: self.get_f32("AomacDofMaxRadius").unwrap_or(defaults.dof_max_radius),
             contact_shadows: self.flag("AomacContactShadows"),
             height_haze: self.flag("AomacHeightHaze"),
             land_haze: self.flag("AomacLandHaze"),
@@ -303,6 +315,10 @@ impl DValues {
     /// `None` before [`DValues::open_user`].
     pub fn char_dir(&self) -> Option<&Path> {
         self.files.as_ref().and_then(|f| f.chr.parent())
+    }
+
+    pub fn main_prefs_dir(&self) -> Option<&Path> {
+        self.files.as_ref().and_then(|f| f.main.parent())
     }
 
     /// `ControlCenterModule_c::SaveUserConfig` / `SaveAllConfig` (GUI 0x10067f57 / 0x1006806c): the three XML files and the two `.cfg`

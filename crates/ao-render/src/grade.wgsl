@@ -4,11 +4,20 @@ struct Params {
     control: vec4<f32>, // x: peak sun boost (0 = faithful), y: bloom strength (0 = no halo)
     grade: vec4<f32>,   // x: chroma grade strength, y: day, z: low-sun, w: night weights
     fog: vec4<f32>,     // native gamma-space terrain fog colour
+    extras: vec4<f32>,  // contrast, saturation, warmth (0.5 neutral), vignette
+    flags: vec4<f32>,   // LUT enabled, night cool, controls initialized, reserved
+    day_min: vec4<f32>,
+    day_max: vec4<f32>,
+    night_min: vec4<f32>,
+    night_max: vec4<f32>,
+    lut_size: vec4<f32>,
 }
 @group(0) @binding(0) var source: texture_2d<f32>;
 @group(1) @binding(0) var sun: texture_2d<f32>;
 @group(1) @binding(1) var<uniform> params: Params;
 @group(1) @binding(2) var halo: texture_2d<f32>;
+@group(1) @binding(3) var<storage, read> day_lut: array<vec4<f32>>;
+@group(1) @binding(4) var<storage, read> night_lut: array<vec4<f32>>;
 @vertex fn vs(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
     return vec4<f32>(vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u)) * 2.0 - 1.0, 0.0, 1.0);
 }
@@ -74,6 +83,76 @@ fn grade_chroma(rgb: vec3<f32>, sunlit: f32) -> vec3<f32> {
     }
     return vec3<f32>(y) + delta * gamut;
 }
+
+fn lut_fetch(q: vec3<u32>, size: u32, night: bool) -> vec3<f32> {
+    let i = q.x + size * (q.y + size * q.z);
+    if night { return night_lut[i].rgb; }
+    return day_lut[i].rgb;
+}
+// Eight bounded storage-buffer reads implement trilinear 3D .cube sampling.
+fn sample_lut(rgb: vec3<f32>, night: bool) -> vec3<f32> {
+    let lo = select(params.day_min.rgb, params.night_min.rgb, night);
+    let hi = select(params.day_max.rgb, params.night_max.rgb, night);
+    let size = u32(select(params.lut_size.x, params.lut_size.y, night));
+    let p = clamp((rgb - lo) / (hi - lo), vec3<f32>(0.0), vec3<f32>(1.0)) * f32(size - 1u);
+    let a = vec3<u32>(floor(p));
+    let b = min(a + vec3<u32>(1u), vec3<u32>(size - 1u));
+    let f = fract(p);
+    return mix(mix(mix(lut_fetch(a, size, night), lut_fetch(vec3<u32>(b.x, a.y, a.z), size, night), f.x),
+                   mix(lut_fetch(vec3<u32>(a.x, b.y, a.z), size, night), lut_fetch(vec3<u32>(b.xy, a.z), size, night), f.x), f.y),
+               mix(mix(lut_fetch(vec3<u32>(a.xy, b.z), size, night), lut_fetch(vec3<u32>(b.x, a.y, b.z), size, night), f.x),
+                   mix(lut_fetch(vec3<u32>(a.x, b.yz), size, night), lut_fetch(b, size, night), f.x), f.y), f.z);
+}
+fn same_luma(c: vec3<f32>, y: f32) -> vec3<f32> {
+    if y <= 0.0 { return vec3<f32>(0.0); }
+    if luma(c) <= 1e-6 { return vec3<f32>(y); }
+    let delta = c * (y / luma(c)) - vec3<f32>(y);
+    var gamut = 1.0;
+    for (var channel = 0; channel < 3; channel++) {
+        if delta[channel] > 0.0 { gamut = min(gamut, (1.0 - y) / delta[channel]); }
+        if delta[channel] < 0.0 { gamut = min(gamut, -y / delta[channel]); }
+    }
+    return vec3<f32>(y) + delta * gamut;
+}
+fn extra_grade(rgb: vec3<f32>) -> vec3<f32> {
+    let y = luma(rgb);
+    if y <= 0.0 { return rgb; }
+    var c = rgb;
+    if params.flags.z > 0.0 {
+        // User-selected contrast may change day/night surface radiance.
+        let curved = mix(vec3<f32>(0.5), c, min(params.extras.x, 1.0));
+        let contrasted = mix(curved, smoothstep(vec3<f32>(0.0), vec3<f32>(1.0), c), max(params.extras.x - 1.0, 0.0));
+        c = contrasted;
+        let contrast_y = luma(c);
+        c = vec3<f32>(contrast_y) + (c - vec3<f32>(contrast_y)) * params.extras.y;
+        let warmth = (params.extras.z - 0.5) * 0.4;
+        c *= vec3<f32>(1.0 + warmth, 1.0, 1.0 - warmth);
+        c *= vec3<f32>(1.0) + params.flags.y * params.grade.w * vec3<f32>(-0.06, -0.005, 0.10);
+        c = same_luma(c, contrast_y);
+    }
+    if params.flags.x > 0.0 {
+        c = mix(sample_lut(c, true), sample_lut(c, false), params.grade.y);
+    }
+    return c;
+}
+fn grade_surface(rgb: vec3<f32>, q: vec2<i32>, p: vec2<f32>) -> vec3<f32> {
+    let controls_neutral = params.flags.z <= 0.0 ||
+        (params.extras.x == 1.0 && params.extras.y == 1.0 && params.extras.z == 0.5 && params.flags.y == 0.0);
+    if controls_neutral && params.flags.x <= 0.0 && params.extras.w <= 0.0 { return rgb; }
+    let fog = clamp(textureLoad(sun, q, 0).b, 0.0, 1.0);
+    if fog >= 1.0 { return rgb; }
+    // Recover only the surface term; preserve the native extinction coefficient and fog radiance.
+    let transmission = 1.0 - fog;
+    let surface = (rgb - params.fog.rgb * fog) / max(transmission, 1e-6);
+    let bounded_surface = clamp(surface, vec3<f32>(0.0), vec3<f32>(1.0));
+    let uv = p / vec2<f32>(textureDimensions(source));
+    let edge = smoothstep(0.15, 0.72, length(uv - vec2<f32>(0.5)));
+    let vignette = 1.0 - 0.65 * params.extras.w * edge;
+    let graded = extra_grade(bounded_surface) * vignette;
+    // Delta composition retains the native fog/quantization residual and exact identity codes.
+    // For an in-gamut surface this is graded*T + fog*F with the identical native F.
+    return rgb + (graded - bounded_surface) * transmission;
+}
 // Bloom halo lands here in HDR, above white. Pixels it reaches get the tone curve's white lifted by the
 // halo's own size (`tone(x, beta + head)`): the pixel's own white then maps slightly below 1 and the halo's
 // energy rolls into the shoulder instead of clipping at the pixel's old white. head = 0 (no bloom, or no halo
@@ -86,5 +165,6 @@ fn grade_chroma(rgb: vec3<f32>, sunlit: f32) -> vec3<f32> {
     let beta = min(boost_at(q) + max(glare.r, max(glare.g, glare.b)), 0.6);
     let mapped = max(vec3<f32>(tone(x.r, beta), tone(x.g, beta), tone(x.b, beta)), vec3<f32>(0.0));
     let sunlit = sunlit_at(q);
-    return vec4<f32>(clamp(grade_chroma(mapped, sunlit) + vec3<f32>(dither(p.xy)), vec3<f32>(0.0), vec3<f32>(1.0)), clamp(h.a, 0.0, 1.0));
+    let graded = grade_surface(grade_chroma(mapped, sunlit), q, p.xy);
+    return vec4<f32>(clamp(graded + vec3<f32>(dither(p.xy)), vec3<f32>(0.0), vec3<f32>(1.0)), clamp(h.a, 0.0, 1.0));
 }

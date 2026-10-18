@@ -58,6 +58,11 @@ dither in crates/ao-render/src/grade.wgsl follow the approach of `tonemap.frag`
 (`Grade()`, `Dither8`) in ao-vk (https://github.com/wannabuh/ao-vk), MIT licensed.
 The WGSL is an independent reimplementation: the tone curve, the luminance-preserving
 grade and the sun-weight gating are original to this project.
+Independent saturation, warmth, cooler-night tint and vignette controls extend this
+same grading path. The bounded .cube parser, red-fastest trilinear storage-buffer
+sampling and user day/night/playfield LUT selection are original implementations;
+no upstream LUT files or artwork are included. The ao-vk MIT notice above applies
+to the grading/dither algorithms described here.
 
 The half-resolution contact-shadow march, depth-aware blur and upsample in
 crates/ao-render/src/contact_shadows.{rs,wgsl} follow the algorithm of
@@ -74,7 +79,7 @@ and rvk/shaders/bloom_up.frag in ao-vk (https://github.com/wannabuh/ao-vk), MIT
 licensed, including its soft-knee threshold above white. The WGSL is an independent
 reimplementation; the energy-preserving level mix, authored-emission seeds and
 HDR tonemap interaction are specific to this renderer.
-=======
+
 Enhanced ambient occlusion sampling
 ===================================
 
@@ -97,3 +102,18 @@ Scene inputs and visibility constraints are specific to this renderer; no
 ao-vk artwork or binary assets are redistributed.
 ao-vk is Copyright (c) 2026 wannabuh, under the MIT License. The complete copyright,
 permission and warranty notice reproduced above applies to these contributions.
+
+Enhanced temporal and spatial postprocessing
+==========================================
+
+The YCoCg variance clipping, Halton jitter and Catmull-Rom temporal reconstruction
+in crates/ao-render/src/taa.wgsl and temporal.rs adapt rvk/shaders/taa.frag
+and rvk/hdr.cpp from ao-vk, https://github.com/wannabuh/ao-vk, revision
+a0dc47ea2c853d26a4491d5a25ef0331f714b6ce.
+The display-space FXAA, contrast-adaptive sharpening, golden-angle bokeh gather
+and motion-blur gather in crates/ao-render/src/{fxaa,cas,depth_of_field,motion_blur}.wgsl
+adapt rvk/shaders/{fxaa.frag,sharpen.frag,dof_common.glsl,dof_gather.frag,motion_blur.frag}
+from the same revision. Copyright (c) 2026 wannabuh; the full MIT permission and
+warranty notice above applies to these ports. Exact native pose motion, per-tap
+admission identity validation, own-character focus and current-frame depth guards
+are specific to this renderer.

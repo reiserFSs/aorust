@@ -11,6 +11,8 @@ use std::sync::{Arc, Weak};
 mod skinning;
 #[path = "shadow_actors.rs"]
 mod shadow_actors;
+#[path = "motion_vectors.rs"]
+pub(crate) mod motion_vectors;
 #[cfg(test)]
 #[path = "native_skin_tests.rs"]
 mod native_skin_tests;
@@ -157,6 +159,7 @@ pub(crate) struct ActorLayer {
     bufs: Vec<wgpu::Buffer>,
     cap: usize,
     items: Vec<Item>,
+    motion_instances: Vec<ActorInstance>,
     commands: Vec<(i32, Option<usize>, i32, bool, usize)>,
     /// Evicted actors' skin vertex buffers, by model: every actor of a model shares its vertex count/byte size (see
     /// `set_actors`'s `s.len() == body.nverts` filter), so a freed buffer is safe to hand straight to the next new
@@ -245,6 +248,7 @@ impl Renderer {
     /// # Panics
     /// Panics if native skin attributes do not match mesh 0's vertex count.
     pub fn add_actor_model(&mut self, key: u64, scene: &Scene) {
+        self.retire_motion_model(key);
         self.upload_actor_model(key, scene, false);
     }
 
@@ -262,6 +266,7 @@ impl Renderer {
     /// # Panics
     /// Panics if native skin attributes do not match mesh 0's vertex count.
     pub fn update_actor_model(&mut self, key: u64, scene: &Scene) {
+        self.retire_motion_model(key);
         let eligible = self.act.models.get(&key).is_some_and(|model| {
             scene.native_skin.is_none() && model.native_skin.is_none()
                 && scene.textures.iter().all(|(k, texture)| model.identities.get(k) == Some(&TextureIdentity::new(*k, texture, self.texture_policy)))
@@ -284,7 +289,7 @@ impl Renderer {
                     continue;
                 };
                 let vbytes = (mesh.vertices.len() * 48) as u64;
-                if ensure_capacity(device, &mut gpu.vb, &mut gpu.vertex_capacity, vbytes, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, "actor body vertices") {
+                if ensure_capacity(device, &mut gpu.vb, &mut gpu.vertex_capacity, vbytes, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, "actor body vertices") {
                     *grows += 1;
                 }
                 if vbytes > 0 {
@@ -479,6 +484,7 @@ impl Renderer {
     /// Retires one model and its actors' skin buffers, submitted frames and draw items.
     /// Other models and actors remain available; missing keys are harmless.
     pub fn remove_actor_model(&mut self, key: u64) {
+        self.retire_motion_model(key);
         self.act.remove_model(key);
         self.drawn_visuals.retain(|visual, _| !matches!(visual, VisualKey::Actor(_, model, _, _) if *model == key));
         self.pending_visuals.get_mut().retain(|visual, _| !matches!(visual, VisualKey::Actor(_, model, _, _) if *model == key));
@@ -498,6 +504,7 @@ impl Renderer {
     /// Native visual destruction, independent of model sharing and temporary non-submission.
     pub fn retire_actor_visuals(&mut self, ranges: &[(u32, u32)]) {
         if ranges.is_empty() { return; }
+        self.retire_motion_actor_visuals(ranges);
         let keep = |key: &VisualKey, _: &mut i32| !matches!(key, VisualKey::Actor(id, ..)
             if ranges.iter().any(|&(first, count)| id.wrapping_sub(first) < count));
         self.drawn_visuals.retain(keep);
@@ -506,6 +513,7 @@ impl Renderer {
 
     /// Forgets every model and actor (a new zone).
     pub fn clear_actors(&mut self) {
+        self.reset_motion_vectors();
         self.drawn_visuals.retain(|key, _| matches!(key, VisualKey::World(..)));
         self.pending_visuals.get_mut().retain(|key, _| matches!(key, VisualKey::World(..)));
         self.actor_visual_retirements.clear();
@@ -582,6 +590,7 @@ impl Renderer {
         self.prepare_actor_skins(&frames);
         let (keep, evicted): (HashMap<_, _>, HashMap<_, _>) = std::mem::take(&mut self.act.actors).into_iter().partition(|(_, a)| a.seen == tick);
         self.act.actors = keep;
+        self.retain_motion_actors();
         for (_, a) in evicted {
             if let Some(vb) = a.vb { self.act.vb_pool.entry(a.model).or_default().push(vb); }
         }
@@ -683,6 +692,11 @@ impl Renderer {
         }
         if !xf.is_empty() {
             self.queue.write_buffer(&layer.bufs[self.frame], 0, bytemuck::cast_slice(&xf));
+        }
+        if self.enhanced_settings.taa || self.enhanced_settings.motion_blur > 0.0 {
+            layer.motion_instances = xf;
+        } else {
+            layer.motion_instances.clear();
         }
         layer.commands.clear();
         for (index,item) in layer.items.iter().enumerate() {

@@ -1417,6 +1417,7 @@ impl Frontend for Play {
     }
 
     fn frame(&mut self, dt: f32, size: (u32, u32), host: &mut Host) -> DrawList {
+        host.post_focus = None;
         if self.player.is_none() {
             host.grass_exposure = None;
             host.grass_benders.clear();
@@ -1435,6 +1436,10 @@ impl Frontend for Play {
             host.msaa_samples = Some(MSAA[msaa]);
             // Live switches warm unseen pipeline variants on a worker; fixtures retain the immediate channel.
             host.enhanced_switch = Some(hud.dvalues.enhanced_settings());
+            let lut_root = hud.dvalues.main_prefs_dir();
+            if host.grade_lut_root.as_deref() != lut_root {
+                host.grade_lut_root = lut_root.map(std::path::Path::to_path_buf);
+            }
             // live-apply while in game; the initial value (login screen) came from `Play::new`'s startup read.
             self.interface_scale = hud.dvalues.get_i64("AomacInterfaceScale").unwrap_or(0).clamp(0, 3) as u8;
             host.borderless_game = hud.dvalues.flag("AomacBorderlessFullscreen");

@@ -16,6 +16,21 @@ pub struct EnhancedSettings {
     pub ground_grass: bool,
     /// HDR scene + tonemap/grade/dither present; daylight sun and mild outdoor sky fill.
     pub hdr: bool,
+    pub grading_enabled: bool,
+    pub zone_lut: bool,
+    pub vignette: f32,
+    pub contrast: f32,
+    pub saturation: f32,
+    pub warmth: f32,
+    pub night_cool: f32,
+    pub taa: bool,
+    pub fxaa: bool,
+    pub cas: bool,
+    pub cas_strength: f32,
+    pub motion_blur: f32,
+    pub depth_of_field: bool,
+    pub dof_aperture: f32,
+    pub dof_max_radius: f32,
     /// Half-resolution screen-space march towards the directional light; darkening only.
     pub contact_shadows: bool,
     pub height_haze: bool,
@@ -55,6 +70,9 @@ impl Default for EnhancedSettings {
             height_haze: false, land_haze: false, valley_mist: false, volumetric_shafts: false,
             cloud_gap_shafts: false, volumetric_clouds: false, cloud_shadows: false, sky_discs: false,
             moon_shadows: false, night_mode: NightMode::AsGame, moon_intensity: 1.0, dark_night_strength: 0.6,
+            grading_enabled: false, zone_lut: false, vignette: 0.0, contrast: 1.0, saturation: 1.0, warmth: 0.5,
+            night_cool: 0.0,
+            taa: false, fxaa: false, cas: false, cas_strength: 0.5, motion_blur: 0.0, depth_of_field: false, dof_aperture: 2.0, dof_max_radius: 8.0,
             shadow_map_size: 2048, shadow_strength: 0.45, shadow_softness: 1.5, ao_radius: 1.75, ao_strength: 1.5, bloom_strength: 0.6,
             grass_density: 1.0, grass_distance: 160.0, sun_boost: 0.6, grade_strength: 0.8, contact_strength: 0.8,
         }
@@ -63,15 +81,26 @@ impl Default for EnhancedSettings {
 
 impl EnhancedSettings {
     pub fn any_enabled(self) -> bool {
-        self.sun_shadows || self.ambient_occlusion || self.emissive_bloom || self.ground_grass || self.hdr || self.contact_shadows
+        self.sun_shadows || self.ambient_occlusion || self.emissive_bloom || self.ground_grass || self.needs_grade() || self.contact_shadows
             || self.height_haze || self.land_haze || self.valley_mist || self.volumetric_shafts
             || self.cloud_gap_shafts || self.volumetric_clouds || self.cloud_shadows || self.sky_discs
             || self.moon_shadows || self.night_mode != NightMode::AsGame
+            || self.post_enabled()
     }
 
-    /// Directional share and authoritative admitted-world coverage (alpha); native sky/cloud depth is not world geometry.
+    pub fn needs_grade(self) -> bool {
+        self.hdr || self.grading_enabled || self.zone_lut || self.vignette > 0.0
+            || self.contrast != 1.0 || self.saturation != 1.0 || self.warmth != 0.5 || self.night_cool > 0.0
+    }
+
+    pub fn post_enabled(self) -> bool {
+        self.taa || self.fxaa || self.cas || self.motion_blur > 0.0 || self.depth_of_field
+    }
+
+    /// Directional share, native fog fraction and authoritative admitted-world coverage (alpha); native sky/cloud depth is not world geometry.
     pub fn needs_sun_mask(self) -> bool {
-        self.hdr || self.contact_shadows || self.cloud_shadows || self.volumetric_shafts || self.cloud_gap_shafts
+        self.needs_grade() || self.contact_shadows || self.post_enabled()
+            || self.cloud_shadows || self.volumetric_shafts || self.cloud_gap_shafts
             || self.height_haze || self.land_haze || self.valley_mist || self.volumetric_clouds || self.sky_discs
     }
 
@@ -95,6 +124,15 @@ impl EnhancedSettings {
             sun_boost: finite(self.sun_boost, 0.6, defaults.sun_boost),
             grade_strength: finite(self.grade_strength, 1.0, defaults.grade_strength),
             contact_strength: finite(self.contact_strength, 1.0, defaults.contact_strength),
+            vignette: finite(self.vignette, 1.0, defaults.vignette),
+            contrast: finite(self.contrast, 2.0, defaults.contrast),
+            saturation: finite(self.saturation, 2.0, defaults.saturation),
+            warmth: finite(self.warmth, 1.0, defaults.warmth),
+            night_cool: finite(self.night_cool, 1.0, defaults.night_cool),
+            cas_strength: finite(self.cas_strength, 1.0, defaults.cas_strength),
+            motion_blur: finite(self.motion_blur, 1.0, defaults.motion_blur),
+            dof_aperture: finite(self.dof_aperture, 8.0, defaults.dof_aperture),
+            dof_max_radius: finite(self.dof_max_radius, 16.0, defaults.dof_max_radius),
             ..self
         }
     }
@@ -103,6 +141,34 @@ impl EnhancedSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn post_controls_are_off_independent_and_bounded() {
+        let defaults = EnhancedSettings::default();
+        for settings in [
+            EnhancedSettings { grading_enabled: true, ..defaults },
+            EnhancedSettings { zone_lut: true, ..defaults },
+            EnhancedSettings { vignette: 0.5, ..defaults },
+            EnhancedSettings { contrast: 1.5, ..defaults }, EnhancedSettings { saturation: 1.5, ..defaults },
+            EnhancedSettings { warmth: 0.8, ..defaults }, EnhancedSettings { night_cool: 0.8, ..defaults },
+        ] {
+            assert!(!settings.hdr && settings.needs_grade() && settings.needs_sun_mask() && settings.any_enabled());
+        }
+        for settings in [
+            EnhancedSettings { taa: true, ..defaults }, EnhancedSettings { fxaa: true, ..defaults },
+            EnhancedSettings { cas: true, ..defaults }, EnhancedSettings { motion_blur: 0.5, ..defaults },
+            EnhancedSettings { depth_of_field: true, ..defaults },
+        ] { assert!(settings.post_enabled() && settings.any_enabled() && !settings.needs_grade()); }
+        assert!(!EnhancedSettings { cas_strength: 1.0, ..defaults }.any_enabled());
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(EnhancedSettings { vignette: invalid, contrast: invalid, saturation: invalid, warmth: invalid, night_cool: invalid,
+                cas_strength: invalid, motion_blur: invalid, dof_aperture: invalid, dof_max_radius: invalid, ..defaults }.clamped(), defaults);
+        }
+        let bounded = EnhancedSettings { vignette: 9.0, contrast: 9.0, saturation: -1.0, warmth: 9.0, night_cool: 9.0,
+            cas_strength: 9.0, motion_blur: 9.0, dof_aperture: 9.0, dof_max_radius: 99.0, ..defaults }.clamped();
+        assert_eq!((bounded.vignette, bounded.contrast, bounded.saturation, bounded.warmth, bounded.night_cool), (1.0, 2.0, 0.0, 1.0, 1.0));
+        assert_eq!((bounded.cas_strength, bounded.motion_blur, bounded.dof_aperture, bounded.dof_max_radius), (1.0, 1.0, 8.0, 16.0));
+    }
 
     #[test]
     fn defaults_flags_and_quality_bounds() {

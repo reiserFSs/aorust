@@ -1,12 +1,23 @@
 //! Enhanced HDR scene: authored-day sun brightening into RGBA16F, then tonemap + dither to the 8-bit output.
-//! Owns no resources unless `EnhancedSettings::hdr` is on; the faithful path never reaches it.
+//! Independent grading/LUT/vignette use the same present path, without enabling HDR exposure.
 use crate::gpu_stats::GpuStatsExt;
 use crate::pipeline_creation::RenderPipeline;
+use crate::cube_lut::CubeLut;
+
+struct LutSource {
+    key: Option<(Option<std::path::PathBuf>, Option<u32>, bool)>,
+    day: CubeLut,
+    night: CubeLut,
+    revision: u64,
+}
 
 const HDR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 pub(super) struct Grade {
     pub size: (u32, u32),
+    revision: u64,
+    lut_params: [[f32; 4]; 5],
+    lut_bytes: u64,
     hdr_bg: wgpu::BindGroup,
     hdr: wgpu::TextureView,
     halo: wgpu::TextureView,
@@ -18,6 +29,7 @@ pub(super) struct Grade {
 
 pub(super) struct GradePipelines {
     aux_layout: wgpu::BindGroupLayout,
+    luts: parking_lot::Mutex<LutSource>,
     expose: RenderPipeline,
     present: RenderPipeline,
 }
@@ -34,6 +46,10 @@ impl GradePipelines {
                 ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
             wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
         ] });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Enhanced grade"), bind_group_layouts: &[Some(source_layout), Some(&aux_layout)], immediate_size: 0 });
         let make = |entry, format| crate::pipeline_creation::render_deferred(device, &wgpu::RenderPipelineDescriptor {
@@ -42,7 +58,8 @@ impl GradePipelines {
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(entry), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
         });
-        Self { expose: make("expose", HDR), present: make("present", output), aux_layout }
+        Self { expose: make("expose", HDR), present: make("present", output), aux_layout,
+            luts: parking_lot::Mutex::new(LutSource { key: None, day: CubeLut::identity(), night: CubeLut::identity(), revision: 0 }) }
     }
 }
 impl Grade {
@@ -50,6 +67,12 @@ impl Grade {
     pub fn new(device: &wgpu::Device, size: (u32, u32), source_layout: &wgpu::BindGroupLayout,
         sun: &wgpu::TextureView, compiled: &GradePipelines) -> Self {
         let aux_layout = &compiled.aux_layout;
+        let luts = compiled.luts.lock();
+        let day = device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor { label: Some("Day .cube LUT"), contents: bytemuck::cast_slice(&luts.day.values), usage: wgpu::BufferUsages::STORAGE });
+        let night = device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor { label: Some("Night .cube LUT"), contents: bytemuck::cast_slice(&luts.night.values), usage: wgpu::BufferUsages::STORAGE });
+        let lut_bytes = (luts.day.values.len() + luts.night.values.len()) as u64 * 16;
+        let vector = |v: [f32; 3]| [v[0], v[1], v[2], 0.0];
+        let lut_params = [vector(luts.day.min), vector(luts.day.max), vector(luts.night.min), vector(luts.night.max), [luts.day.size as f32, luts.night.size as f32, 0.0, 0.0]];
         let hdr = device.create_texture_tracked(&wgpu::TextureDescriptor {
             label: Some("Enhanced HDR scene"), size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: HDR,
@@ -63,20 +86,22 @@ impl Grade {
                 | if cfg!(test) { wgpu::TextureUsages::COPY_DST } else { wgpu::TextureUsages::empty() },
             view_formats: &[],
         }).create_view(&Default::default());
-        let params = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("Enhanced grade parameters"), size: 48, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let params = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("Enhanced grade parameters"), size: 160, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let hdr_bg = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("Enhanced HDR scene"), layout: source_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr) }] });
         let aux_bg = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("Enhanced grade inputs"), layout: aux_layout, entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(sun) },
             wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&halo) },
+            wgpu::BindGroupEntry { binding: 3, resource: day.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: night.as_entire_binding() },
         ] });
-        Self { size, hdr_bg, hdr, halo, aux_bg, params, expose: compiled.expose.clone(), present: compiled.present.clone() }
+        Self { size, revision: luts.revision, lut_params, lut_bytes, hdr_bg, hdr, halo, aux_bg, params, expose: compiled.expose.clone(), present: compiled.present.clone() }
     }
 
-    pub fn bytes(size: (u32, u32)) -> u64 {
-        let halo = crate::bloom::halo_size(size);
-        (u64::from(size.0) * u64::from(size.1) + u64::from(halo.0) * u64::from(halo.1)) * 8 + 48
+    pub fn bytes(&self) -> u64 {
+        let halo = crate::bloom::halo_size(self.size);
+        (u64::from(self.size.0) * u64::from(self.size.1) + u64::from(halo.0) * u64::from(halo.1)) * 8 + 160 + self.lut_bytes
     }
 
     /// Grade strength and day / low-sun / night weights (see [`time_of_day`]); day also gates sun exposure.
@@ -87,6 +112,14 @@ impl Grade {
     /// Framebuffer-space terrain fog colour, excluded from daylight exposure.
     pub fn set_fog_color(&self, queue: &wgpu::Queue, color: [f32; 3]) {
         queue.write_buffer(&self.params, 32, bytemuck::cast_slice(&[color[0], color[1], color[2], 1.0]));
+        queue.write_buffer(&self.params, 80, bytemuck::cast_slice(&self.lut_params));
+    }
+
+    pub fn set_controls(&self, queue: &wgpu::Queue, settings: crate::EnhancedSettings) {
+        queue.write_buffer(&self.params, 48, bytemuck::cast_slice(&[
+            settings.contrast, settings.saturation, settings.warmth, settings.vignette,
+            f32::from(u8::from(settings.zone_lut)), settings.night_cool, 1.0, 0.0,
+        ]));
     }
 
     /// The exposed scene (colour above 1 only where the sun lifted it): the bloom pyramid's input.
@@ -133,15 +166,33 @@ pub(super) fn time_of_day(daylight: Option<f32>, sun_dir: [f32; 3]) -> [f32; 3] 
 }
 
 impl crate::Renderer {
+    /// Called by both frontends after live options and the native playfield resource are known.
+    pub fn set_grade_lut_source(&mut self, root: Option<&std::path::Path>, zone: Option<u32>) {
+        let enabled = self.enhanced_settings.zone_lut;
+        let mut state = self.grade_pipelines.luts.lock();
+        if state.key.as_ref().is_some_and(|(old_root, old_zone, old_enabled)| old_root.as_deref() == root && *old_zone == zone && *old_enabled == enabled) { return; }
+        let load = |phase: &str| {
+            if !enabled { return CubeLut::identity(); }
+            let Some(root) = root else { return CubeLut::identity(); };
+            CubeLut::for_zone(root, zone, phase).unwrap_or_else(|error| { eprintln!("LUT rejected: {error}"); CubeLut::identity() })
+        };
+        state.day = load("day");
+        state.night = load("night");
+        state.key = Some((root.map(std::path::Path::to_path_buf), zone, enabled));
+        state.revision = state.revision.wrapping_add(1);
+    }
     pub(super) fn prepare_enhanced_grade(&mut self, fog_color: [f32; 3]) {
-        if !self.enhanced_settings.hdr { self.grade = None; return; }
+        if !self.enhanced_settings.needs_grade() { self.grade = None; return; }
         let Some(frame) = self.enhanced_frame.as_ref() else { self.grade = None; return; };
-        if self.grade.as_ref().is_none_or(|grade| grade.size != frame.size) {
-            let sun = frame.sun.as_ref().expect("HDR owns its world sun mask");
+        let revision = self.grade_pipelines.luts.lock().revision;
+        if self.grade.as_ref().is_none_or(|grade| grade.size != frame.size || grade.revision != revision) {
+            let sun = frame.sun.as_ref().expect("grading owns its world sun mask");
             self.grade = Some(Grade::new(&self.device, frame.size, self.enhanced_pipelines.source_layout(), sun, &self.grade_pipelines));
+            self.bloom = None;
         }
         if let Some(grade) = &self.grade {
-            grade.set_grade(&self.queue, self.enhanced_settings.grade_strength, time_of_day(self.sky.pose.daylight, self.env.sun_dir));
+            grade.set_grade(&self.queue, if self.enhanced_settings.hdr || self.enhanced_settings.grading_enabled { self.enhanced_settings.grade_strength } else { 0.0 }, time_of_day(self.sky.pose.daylight, self.env.sun_dir));
+            grade.set_controls(&self.queue, self.enhanced_settings);
             grade.set_fog_color(&self.queue, fog_color.map(crate::gamma));
         }
     }
@@ -153,7 +204,15 @@ mod tests {
 
     /// Colour ramp through expose + present with no sun boost, returning (native, graded) RGB.
     fn grade_colours(strength: f32, tod: [f32; 3]) -> (Vec<[u8; 3]>, Vec<[u8; 3]>) {
-        let native: Vec<[u8; 3]> = (0..=255u8).map(|i| [i, i / 2, 255 - i]).collect();
+        controlled_colours(strength, tod, crate::EnhancedSettings::default(), false, 0.0)
+    }
+
+    fn controlled_colours(strength: f32, tod: [f32; 3], settings: crate::EnhancedSettings, coloured_luts: bool, fog: f32) -> (Vec<[u8; 3]>, Vec<[u8; 3]>) {
+        let fog_color = [0.2, 0.3, 0.4];
+        let native: Vec<[u8; 3]> = (0..=255u8).map(|i| {
+            let surface = [i, i / 2, 255 - i];
+            std::array::from_fn(|channel| ((f32::from(surface[channel]) * (1.0 - fog)) + fog_color[channel] * fog * 255.0).round() as u8)
+        }).collect();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let r = crate::Renderer::new(&instance, None).expect("grade regression needs an offscreen GPU");
         let texture = |format, usage| r.device.create_texture(&wgpu::TextureDescriptor {
@@ -164,7 +223,7 @@ mod tests {
         let sun_tex = texture(wgpu::TextureFormat::Rgba32Float, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
         let out = texture(r.format, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
         let pixels: Vec<u8> = native.iter().flat_map(|p| [p[0], p[1], p[2], 255]).collect();
-        let sun_data: Vec<f32> = (0..256).flat_map(|_| [0.0_f32, 0.0, 0.0, 1.0]).collect();
+        let sun_data: Vec<f32> = (0..256).flat_map(|_| [0.0_f32, 0.0, fog, 1.0]).collect();
         let copy = wgpu::Extent3d { width: 256, height: 1, depth_or_array_layers: 1 };
         r.queue.write_texture(base.as_image_copy(), &pixels, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(1024), rows_per_image: Some(1) }, copy);
         r.queue.write_texture(sun_tex.as_image_copy(), bytemuck::cast_slice(&sun_data), wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4096), rows_per_image: Some(1) }, copy);
@@ -174,8 +233,15 @@ mod tests {
         let base_view = base.create_view(&Default::default());
         let base_bg = r.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&base_view) }] });
         let compiled = GradePipelines::new(&r.device, r.format, &layout);
+        if coloured_luts {
+            let mut luts = compiled.luts.lock();
+            luts.day = CubeLut::parse(&("LUT_3D_SIZE 2\n".to_owned() + &"1 0 0\n".repeat(8))).unwrap();
+            luts.night = CubeLut::parse(&("LUT_3D_SIZE 2\n".to_owned() + &"0 0 1\n".repeat(8))).unwrap();
+        }
         let grade = Grade::new(&r.device, (256, 1), &layout, &sun_tex.create_view(&Default::default()), &compiled);
         grade.set_grade(&r.queue, strength, tod);
+        grade.set_controls(&r.queue, settings);
+        grade.set_fog_color(&r.queue, fog_color);
         let mut encoder = r.device.create_command_encoder(&Default::default());
         grade.expose(&r.queue, &mut encoder, &base_bg, 0.0, 0.0);
         grade.present(&mut encoder, &out.create_view(&Default::default()), None);
@@ -183,6 +249,56 @@ mod tests {
         let rgba = crate::texture_to_rgba(&r, &out, 256, 1).unwrap();
         let bgra = r.format == wgpu::TextureFormat::Bgra8Unorm;
         (native, rgba.chunks(4).map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }).collect())
+    }
+
+    #[test]
+    fn independent_controls_identity_lut_day_night_blend_and_fog() {
+        let defaults = crate::EnhancedSettings::default();
+        let capture = |settings, luts, fog, day| controlled_colours(0.0, [day, 0.0, 1.0 - day], settings, luts, fog);
+        let identity = crate::EnhancedSettings { zone_lut: true, ..defaults };
+        let (native, output) = capture(identity, false, 0.0, 0.5);
+        assert_eq!(native, output, "identity LUT must reproduce all 8-bit codes");
+        let (_, day) = capture(identity, true, 0.0, 1.0);
+        let (_, night) = capture(identity, true, 0.0, 0.0);
+        let (_, middle) = capture(identity, true, 0.0, 0.5);
+        assert_eq!(day[128], [255, 0, 0]);
+        assert_eq!(night[128], [0, 0, 255]);
+        assert!((126..=129).contains(&middle[128][0]) && middle[128][1] == 0 && (126..=129).contains(&middle[128][2]));
+        let extras = crate::EnhancedSettings { contrast: 1.8, saturation: 1.5, warmth: 0.9, night_cool: 1.0, zone_lut: true, ..defaults };
+        assert_ne!(capture(extras, false, 0.0, 0.0).1, native, "controls operate without HDR");
+        let (fogged_native, fogged_grade) = capture(extras, true, 0.25, 0.0);
+        assert_ne!(fogged_grade, fogged_native, "partial fog still allows surface grading");
+        for settings in [
+            crate::EnhancedSettings { contrast: 1.8, ..defaults }, crate::EnhancedSettings { saturation: 0.2, ..defaults },
+            crate::EnhancedSettings { warmth: 0.9, ..defaults }, crate::EnhancedSettings { night_cool: 1.0, ..defaults },
+        ] {
+            assert!(!settings.hdr && !settings.grading_enabled && settings.needs_grade());
+            assert_ne!(capture(settings, false, 0.0, 0.0).1, native, "each knob acts without a master switch");
+        }
+        let (_, vignette) = capture(crate::EnhancedSettings { vignette: 1.0, ..defaults }, false, 0.0, 1.0);
+        assert!(vignette.iter().zip(&native).all(|(a, b)| a.iter().zip(b).all(|(x, y)| x <= y)));
+        assert_ne!(vignette, native);
+    }
+
+    #[test]
+    fn partial_fog_grades_only_surface_and_fully_fogged_pixels_stay_exact() {
+        let defaults = crate::EnhancedSettings::default();
+        let lut = crate::EnhancedSettings { zone_lut: true, ..defaults };
+        let capture = |settings, coloured, fog| controlled_colours(0.0, [1.0, 0.0, 0.0], settings, coloured, fog);
+        let (native, neutral) = capture(defaults, false, 0.5);
+        assert_eq!(neutral, native, "neutral controls retain partial-fog codes exactly");
+        let (native, identity) = capture(lut, false, 0.5);
+        assert_eq!(identity, native, "identity LUT retains partial-fog codes exactly");
+        let (_, red_surface) = capture(lut, true, 0.5);
+        assert_ne!(red_surface, native);
+        for pixel in red_surface {
+            for (actual, expected) in pixel.into_iter().zip([153u8, 38, 51]) {
+                assert!(actual.abs_diff(expected) <= 1, "same native F=0.5 must recompose red surface + fog, got {actual} expected {expected}");
+            }
+        }
+        let controls = crate::EnhancedSettings { contrast: 1.8, saturation: 1.5, warmth: 0.9, night_cool: 1.0, vignette: 1.0, zone_lut: true, ..defaults };
+        let (native, graded) = capture(controls, true, 1.0);
+        assert_eq!(graded, native, "fully fogged pixels retain the exact native fog colour, even at vignette edges");
     }
 
     /// Runs the real expose + present shaders over a 256x1 grey ramp; `sun` is the sun weight written to every pixel.
@@ -344,5 +460,23 @@ mod tests {
         assert!(lit[200] < 255 && lit[220] < 255, "halo energy rolls into the shoulder instead of clipping at the pixel's old white: {} {}", lit[200], lit[220]);
         let plain = ramp(0.35, 1.0, [1.0, 0.0, 0.0]);
         for (i, (&with, &without)) in lit.iter().zip(&plain).enumerate() { assert!(i32::from(with) + 1 >= i32::from(without), "halo never darkens a pixel: {i} {with} {without}"); }
+    }
+
+    #[test]
+    fn lut_revision_rebinds_bloom_to_new_grade_targets() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = crate::Renderer::new(&instance, None).unwrap();
+        renderer.set_enhanced_settings(crate::EnhancedSettings { hdr: true, emissive_bloom: true, ..Default::default() });
+        renderer.enhanced_frame = Some(crate::enhanced::EnhancedFrame::new(&renderer.device, renderer.format, (32,32), 1, renderer.enhanced_settings, &renderer.enhanced_pipelines));
+        renderer.prepare_enhanced_grade([0.0;3]);
+        renderer.prepare_enhanced_bloom();
+        assert!(renderer.bloom.is_some());
+        let old = renderer.grade.as_ref().unwrap().halo_view().clone();
+        renderer.set_grade_lut_source(None, Some(800));
+        renderer.prepare_enhanced_grade([0.0;3]);
+        assert_ne!(&old, renderer.grade.as_ref().unwrap().halo_view());
+        assert!(renderer.bloom.is_none(), "LUT revision must retire bind groups referencing old HDR/halo targets");
+        renderer.prepare_enhanced_bloom();
+        assert!(renderer.bloom.as_ref().unwrap().is_hdr());
     }
 }

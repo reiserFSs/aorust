@@ -734,6 +734,121 @@ use the existing ICC, Borealis and Newland views, including dusk/night and the
 Subway interior control. This selects the real fixture scene without altering its
 camera or authored clock. No atmosphere visual acceptance is claimed here.
 
+`AOMAC_GFX_FEATURE` layers independent postprocessing onto that profile. Accepted
+names are `taa`, `fxaa`, `cas`, `motion_blur`, `dof`, and `grading`; combine with
+commas (for example `taa,cas,motion_blur,dof,grading`). TAA takes precedence over
+FXAA when both are selected. Motion blur uses strength 0.5; grading uses contrast
+1.1, saturation 1.1, warmth 0.55, night-cool 0.2, vignette 0.15 and the identity
+day/night LUT, without enabling HDR or loading an external file. Other knobs
+retain their explicit defaults.
+With DoF enabled, each view contains an actual captured own-character Avatar.
+Existing actor/light-bar views retain their authored placement; other views place
+that Avatar twelve world units along the fixed camera's forward ray. Focus is
+always taken from the submitted actor frame's actual scene transform, recorded
+in `<view>-focus.txt`; eight frozen post frames warm history before capture.
+This deterministic placement is separate from play: the real frontend publishes the actual own
+character's current scene position, even when first-person hides its body, and
+clears focus when there is no own player. No `always` actor is treated as the player.
+`AOMAC_GFX_MSAA=1|2|4|8` selects the exact requested sample count (default 1).
+The fixture fails rather than silently accepting adapter down-clamping, including
+for requested 4x. Per-view `-msaa.txt` and whole-frame timing reports record
+requested and actual counts; the manifest records the exact-count contract.
+Set `AOMAC_GFX_OWN_AVATAR=1` for **both** the control and each post-feature
+capture to keep identical own-avatar geometry/placement when DoF is switched off.
+It forces the same actual Avatar/focus producer independently of post settings,
+and is recorded in the manifest. Leave it unset for legacy faithful baselines.
+
+Temporal raster coverage uses the jittered native projection; velocity uses
+unjittered current/previous projections and exact last-displayed rigid/skinned
+poses. Motion ownership is tested against the native per-sample depth attachment,
+then explicitly resolved with integer surface identity from the nearest native
+depth sample. Mixed coverage and additive effects are reactive. Every Catmull-Rom
+history tap checks identity and depth; eviction, room changes and teleports reject
+history. Positive spatial gathers admit only neighbors with at least the centre's
+native fog fraction, preserving minimum extinction even through composed filters.
+TAA retains 16-tap Catmull-Rom reconstruction at every native fog fraction.
+Grading, CAS and TAA reconstruct bounded underlying surface colours, then restore
+the same current native fog fraction/colour and preserve its quantization residual.
+Fog-colour changes reset temporal history; fully fogged and reactive TAA pixels
+remain current-only. FXAA, depth of field and motion blur retain positive gathers
+with native-fog guards. Uniform fog does not disable antialiasing or bokeh.
+Clear pixels retain ordinary filtering rather than the superseded night ceiling.
+
+TAA also compares exact GPU-visible actor-pose IDs across frames, reduced from
+all native-depth-admitted MSAA identity samples. A visible-set change rejects
+history for the whole frame so old actor shadows/glow cannot survive on unchanged
+world receivers. Hidden CPU membership/room changes do not reset history: stable
+reused slots store semantic IDs (not hashes), and growing buffers preserve the
+previous GPU words with a zero tail. This GPU comparison is skipped for blur-only
+frames.
+
+Reuse the same ICC, Borealis day/night and Newland views and whole-frame GPU
+timing rather than creating a separate postprocessing scene matrix:
+
+```sh
+AOMAC_GFX_OUT="$HOME/aomac-handoff/gfx/post-combined-unique" \
+AOMAC_GFX_SETTINGS=faithful \
+AOMAC_GFX_FEATURE=taa,fxaa,cas,motion_blur,dof,grading \
+AOMAC_GFX_MSAA=4 \
+AOMAC_GFX_OWN_AVATAR=1 \
+AOMAC_GFX_FRAME_TIMING=1 AOMAC_GFX_TIMING_PAN=1 AOMAC_GFX_PNG_ONLY=1 \
+cargo test --profile fast -p aomac graphics_offline_fixture -j 2 -- \
+  --ignored --nocapture --test-threads=1
+```
+
+Omit `AOMAC_GFX_VIEW` for the complete existing matrix, or set an exact existing
+view for iteration; use a fresh output directory per isolated feature/control.
+The manifest records the selectors, full settings, focus policy and warmup.
+`AOMAC_GFX_TIMING_PAN=1` measures the same deterministic camera yaw sweep in every
+profile (`yaw = fixed + sin(frame * 0.02) * 0.1`) so camera-motion gathers execute;
+the original capture/repeat images remain at the fixed pose. An additional
+`<view>-motion.png` reads the last timed pan frame directly from the persistent
+target after timers stop, without rerendering a stationary frame or losing its
+motion vectors. Readback and PNG encoding are outside the measured samples.
+Frozen views measure pass cost and reproducibility, not moving-actor quality.
+The runnable headless production-frame regressions cover rigid movement,
+CPU-deformed and native GPU-skinned bodies, disappearance with no ghost,
+same-ID model replacement, camera teleport, resize, explicit reset and all-off
+byte identity:
+
+```sh
+cargo test --profile fast -p ao-render post_temporal_ -j 2 -- --nocapture --test-threads=1
+cargo test --profile fast -p ao-render post_focus_handoff_is_explicit_and_clears_without_a_producer -j 2 -- --test-threads=1
+cargo test --profile fast -p aomac graphics_fixture_post_selectors_are_independent_and_composable -j 2
+```
+
+The exact temporal tests are
+`post_temporal_moving_rigid_and_skinned_disappearance_and_model_identity` and
+`post_temporal_camera_cut_resize_reset_and_all_off_are_clean`. Their controls
+render through the same production renderer with cold history, not a mocked
+resolve. Raster-boundary neighborhoods are excluded only from moving-surface
+interior comparisons; disappearance, reset/cut/resize and all-off checks compare
+complete RGBA frames byte-for-byte.
+`post_temporal_static_sloped_msaa_motion_excludes_jitter` additionally renders a
+close, strongly sloped static quad at actual 1x and 4x MSAA over twelve jittered
+TAA frames. A diagnostic fullscreen pass reads the production motion/identity
+attachments into RGBA8: static interior IDs must remain nonzero and nonreactive,
+with approximately zero velocity despite jitter. A subsequently moving actor
+must produce nonzero physical velocity, and disappearing it must restore the
+static identity without leaving velocity. Explicit retirement immediately followed
+by the same actor ID/model must mint a new surface identity, reject history on
+its first rendered frame, and admit history on its second. The probe visualizes attachments only;
+it does not replace the production motion raster or multisample resolve.
+`post_temporal_native_fog_accumulates_and_color_density_change_rejects_history`
+renders a sloped vertex-coloured checker under native fog (start 0.1, end 10).
+Its same-jitter control invalidates production motion poses each frame, forcing
+current-only colour without replacing the resolve algorithm. Fogged checker
+interiors must show some actual history accumulation, ruling out blanket fog
+bypass. Changing fog end to 4 and changing its colour must immediately match the
+current-only full RGBA frame byte-for-byte, rejecting the older atmosphere.
+`post_temporal_actor_admission_change_erases_receiver_shadow_history` combines
+TAA and sun shadows over a textured ground receiver and opaque wall. Sixteen
+initial history frames with growing wall-hidden actor submissions must match
+absent actors byte-for-byte. A subsequently visible actor must demonstrably
+shadow an exposed receiver; after warmup, removal or movement behind the wall
+must immediately match same-jitter current-only receiver pixels, even though the
+ground surface identity itself did not change. Fine receiver texture prevents
+a uniform-neighborhood clamp from concealing missing history invalidation.
 
 `AOMAC_GFX_VIEW=<exact-name>` filters before scene loading and rendering; this
 existing filter renders only that view (including its two independent repeats).

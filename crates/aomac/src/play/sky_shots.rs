@@ -379,7 +379,14 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
     use std::fmt::Write;
     let out = PathBuf::from(std::env::var_os("AOMAC_GFX_OUT").context("set AOMAC_GFX_OUT to a new handoff directory")?);
     let profile = std::env::var("AOMAC_GFX_SETTINGS").unwrap_or_else(|_| "faithful".into());
-    let settings = graphics_fixture_settings(&profile)?;
+    let features = std::env::var("AOMAC_GFX_FEATURE").unwrap_or_default();
+    let settings = graphics_fixture_post_features(graphics_fixture_settings(&profile)?, &features)?;
+    let msaa = graphics_fixture_msaa(&std::env::var("AOMAC_GFX_MSAA").unwrap_or_else(|_| "1".into()))?;
+    let own_avatar = match std::env::var("AOMAC_GFX_OWN_AVATAR").as_deref() {
+        Ok("1") => true,
+        Ok("0") | Err(std::env::VarError::NotPresent) => false,
+        _ => anyhow::bail!("AOMAC_GFX_OWN_AVATAR must be 0 or 1"),
+    };
     ensure!(!out.exists(), "refusing to overwrite evidence {}", out.display());
     std::fs::create_dir_all(&out)?;
     let status = out.join("status.txt");
@@ -398,14 +405,12 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         let resource = command("shasum", &["-a".as_ref(), "256".as_ref(), dir.join("cd_image/rdb.db").as_os_str()])?;
         let weather = ao_formats::weather::State::clear();
         let size = (1920, 1200);
-        let samples: u32 = std::env::var("AOMAC_GFX_MSAA").unwrap_or_else(|_| "1".into()).parse()
-            .context("AOMAC_GFX_MSAA must be 1, 2, 4 or 8")?;
-        ensure!(matches!(samples, 1 | 2 | 4 | 8), "AOMAC_GFX_MSAA must be 1, 2, 4 or 8");
-        let mut manifest = format!("fixture_version=1\nrevision={}\nprofile={profile}\nsize={}x{}\npixel_format=RGBA8\nrow_order=top_to_bottom\nrenderer_time=0\neffect_time=0\ngame_day=0\ncrt_seed=1\ncloud_seed=1\nweather={weather:?}\nmsaa={samples}\nanisotropy=1\nwide=0\nscenery=1\nvisual_acceptance=unexercised\n",
+        let mut manifest = format!("fixture_version=1\nrevision={}\nprofile={profile}\nsize={}x{}\npixel_format=RGBA8\nrow_order=top_to_bottom\nrenderer_time=0\neffect_time=0\ngame_day=0\ncrt_seed=1\ncloud_seed=1\nweather={weather:?}\nmsaa_requested={msaa}\nmsaa_actual={msaa}\nanisotropy=1\nwide=0\nscenery=1\nvisual_acceptance=unexercised\n",
             revision, size.0, size.1);
         writeln!(manifest, "source_diff={source_diff:?}\nresource_sha256={resource}")?;
         writeln!(manifest, "icc_clock=authored_frozen2648.69\nsun_low_high_night_source=Borealis800")?;
         writeln!(manifest, "enhanced_settings={settings:?}")?;
+        writeln!(manifest, "post_features={features:?}\nforce_own_avatar={own_avatar}\npost_focus_policy=actual_fixture_avatar_position_when_present\npost_warmup_frames=8")?;
         let baseline = std::env::var_os("AOMAC_GFX_BASELINE").map(PathBuf::from);
         let png_only = std::env::var_os("AOMAC_GFX_PNG_ONLY").is_some();
         writeln!(manifest, "png_only={png_only}")?;
@@ -463,16 +468,19 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 let mut shot = Shot { gui: Gui::new(&dir, None)?, scene: Some(scene.clone()), camera: fixed, lens };
                 let mut off = Offscreen::evidence(&shot, size)?;
                 off.fixed_camera(Some(fixed));
-                off.host.msaa_samples = Some(samples);
+                off.host.msaa_samples = Some(msaa);
                 off.host.anisotropy = Some(1);
                 off.host.fog_density_scale = Some(1.0);
                 off.host.enhanced_settings = Some(settings);
                 off.host.grass_exposure = grass_exposure.clone();
                 off.host.grass_wind = weather.wind;
                 let mut list = off.frame(&mut shot, 0.0);
-                ensure!(off.msaa_samples() == samples, "requested {samples}x MSAA, adapter selected {}x", off.msaa_samples());
+                let actual_msaa = off.msaa_samples();
+                ensure!(actual_msaa == msaa, "requested MSAA {msaa}, adapter selected {actual_msaa}; evidence requires the requested sample count");
+                if measure { std::fs::write(out.join(format!("{name}-msaa.txt")), format!("requested={msaa}\nactual={actual_msaa}\n"))?; }
                 let lightbar = matches!(name.as_str(), "borealis-lightbar-night" | "borealis-lightbar-night-close");
-                if name.starts_with("icc-actor-") || lightbar {
+                let authored_actor = name.starts_with("icc-actor-") || lightbar;
+                if authored_actor || settings.depth_of_field || own_avatar {
                     let mut appearance = actor.clone();
                     if lightbar {
                         appearance.attractors.retain(|mount| mount.place != 5);
@@ -481,17 +489,28 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     let mut avatar = super::avatar::Avatar::new(&store, &dir, 25988, &appearance,
                         ao_formats::character::actor::ActorAssets::new(&store)?)?;
                     if lightbar { avatar.set_transform([679.6, 72.8, -482.7], 0.0); }
+                    else if !authored_actor {
+                        avatar.set_transform((fixed.pos + fixed.forward() * 12.0).to_array(), 0.0);
+                    }
                     off.host.dynamic_lights.extend(avatar.lights());
                     off.host.actor_models.push((super::avatar::MODEL_KEY, std::sync::Arc::new(avatar.model().clone())));
                     let frame = avatar.frame();
+                    let [x, y, z, _] = frame.transform[3];
+                    let focus = [x, y, z];
+                    if measure { std::fs::write(out.join(format!("{name}-focus.txt")), format!("actor_id=25988\nscene_position={focus:?}\n"))?; }
                     if grass_exposure.is_some() {
                         let [x, y, z, _] = frame.transform[3];
                         off.host.grass_benders.push(ao_render::GrassBender { actor: None, position: [x, y, z] });
                     }
                     off.host.actors.push(frame);
+                    off.host.post_focus = Some(focus);
                     list = off.frame(&mut shot, 0.0);
                 }
                 if grass_exposure.is_some() { off.warm_grass_tiles(); }
+                if settings.post_enabled() {
+                    off.prepare_frozen_rendering();
+                    for _ in 0..8 { off.render_frozen()?; }
+                }
                 let raw = off.rgba(&shot, &list)?;
                 if !sky_pixels.is_empty() {
                     let report = off.sky_pixel_probe(17, &sky_pixels, scene, None)?;
@@ -506,16 +525,23 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     off.prepare_frozen_rendering();
                     off.set_gpu_timing(true)?;
                     let mut frames = Vec::with_capacity(600);
+                    let camera_pan = std::env::var_os("AOMAC_GFX_TIMING_PAN").is_some();
                     for sample in 0..720 {
+                        if camera_pan { off.host.camera.yaw = fixed.yaw + (sample as f32 * 0.02).sin() * 0.1; }
                         off.render_frozen()?;
                         let ms = off.read_frame_gpu_ms()?.context("frame GPU timer did not record")?;
                         if sample >= 120 { frames.push(ms); }
                     }
                     off.set_gpu_timing(false)?;
+                    if camera_pan {
+                        let motion = off.frozen_rgba()?;
+                        image::save_buffer(out.join(format!("{name}-motion.png")),
+                            &motion, size.0, size.1, image::ColorType::Rgba8)?;
+                    }
                     frames.sort_by(f64::total_cmp);
                     let percentiles = [0.50_f64, 0.95, 0.99].map(|p| frames[(p * frames.len() as f64).ceil() as usize - 1]);
                     std::fs::write(out.join(format!("{name}-frame-gpu.txt")),
-                        format!("profile={profile}\nresolution=1920x1200\nwarmup=120\nsamples=600\nunits=milliseconds\nframe_p50_p95_p99={percentiles:?}\n"))?;
+                        format!("profile={profile}\npost_features={features:?}\nmsaa_requested={msaa}\nmsaa_actual={actual_msaa}\ncamera_pan={camera_pan}\nresolution=1920x1200\nwarmup=120\nsamples=600\nunits=milliseconds\nframe_p50_p95_p99={percentiles:?}\n"))?;
                 }
                 if measure && profile == "shadows" && std::env::var_os("AOMAC_GFX_SHADOW_TIMING").is_some() {
                     graphics_shadow_timing(&mut off, &out, &name)?;
@@ -851,6 +877,59 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
         _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|shadow-edges|shadow-edges-hdr|shadow-edges-hdr-only|ao|bloom|grass|hdr|hdr-bloom|hdr-bloom-max|hdr-max|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|height_haze|land_haze|valley_mist|volumetric_shafts|cloud_gap_shafts|volumetric_clouds|cloud_shadows|sky_discs|atmosphere|all|all-no-bloom|all-before"),
     }
     Ok(settings)
+}
+
+fn graphics_fixture_msaa(value: &str) -> anyhow::Result<u32> {
+    let samples: u32 = value.parse()?;
+    anyhow::ensure!([1, 2, 4, 8].contains(&samples), "AOMAC_GFX_MSAA must be 1, 2, 4 or 8");
+    Ok(samples)
+}
+
+#[test]
+fn graphics_fixture_msaa_selector_is_explicit_and_bounded() {
+    for count in [1, 2, 4, 8] { assert_eq!(graphics_fixture_msaa(&count.to_string()).unwrap(), count); }
+    for invalid in ["", "0", "3", "16", "-1", "invalid"] { assert!(graphics_fixture_msaa(invalid).is_err()); }
+}
+
+/// Independent post selectors layer on any existing immutable scene/profile.
+fn graphics_fixture_post_features(mut settings: ao_render::EnhancedSettings, features: &str) -> anyhow::Result<ao_render::EnhancedSettings> {
+    if features.is_empty() { return Ok(settings); }
+    for feature in features.split([',', '+']) {
+        match feature {
+            "taa" => settings.taa = true,
+            "fxaa" => settings.fxaa = true,
+            "cas" => settings.cas = true,
+            "motion_blur" => settings.motion_blur = 0.5,
+            "dof" => settings.depth_of_field = true,
+            "grading" => {
+                settings.grading_enabled = true;
+                settings.zone_lut = true;
+                settings.vignette = 0.15;
+                settings.contrast = 1.1;
+                settings.saturation = 1.1;
+                settings.warmth = 0.55;
+                settings.night_cool = 0.2;
+            }
+            _ => anyhow::bail!("unknown AOMAC_GFX_FEATURE {feature:?}; use comma-separated taa,fxaa,cas,motion_blur,dof,grading"),
+        }
+    }
+    Ok(settings)
+}
+
+#[test]
+fn graphics_fixture_post_selectors_are_independent_and_composable() {
+    let defaults = ao_render::EnhancedSettings::default();
+    assert_eq!(graphics_fixture_post_features(defaults, "").unwrap(), defaults);
+    for feature in ["taa", "fxaa", "cas", "motion_blur", "dof", "grading"] {
+        let s = graphics_fixture_post_features(defaults, feature).unwrap();
+        assert_eq!([s.taa, s.fxaa, s.cas, s.motion_blur > 0.0, s.depth_of_field, s.grading_enabled],
+            ["taa", "fxaa", "cas", "motion_blur", "dof", "grading"].map(|name| name == feature));
+        assert!(!s.hdr && !s.sun_shadows && !s.ambient_occlusion && !s.ground_grass);
+    }
+    let s = graphics_fixture_post_features(defaults, "taa,fxaa,cas,motion_blur,dof,grading").unwrap();
+    assert!(s.taa && s.fxaa && s.cas && s.motion_blur > 0.0 && s.depth_of_field && s.grading_enabled);
+    assert!(graphics_fixture_post_features(defaults, "unknown").is_err());
+    assert!(graphics_fixture_post_features(defaults, "taa,").is_err());
 }
 
 #[test]

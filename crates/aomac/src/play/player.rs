@@ -729,6 +729,7 @@ impl Player {
             }
         }
         self.avatar.set_transform(scene_pos(pos), scene_yaw(yaw));
+        host.post_focus = Some(scene_pos(pos));
         self.avatar.update(dt);
 
         let head_local = self.avatar.head_local();
@@ -1501,6 +1502,7 @@ mod tests {
             host.dynamic_lights.clear();
             player.frame(0.0, &mut host, &mut zone, false);
             assert!(host.actors.is_empty(), "first-person must really hide the body");
+            assert_eq!(host.post_focus, Some(scene_pos(pos)), "focus must follow the actual own position even when first-person hides its actor");
             assert!(host.dynamic_lights.is_empty(), "disabled CAT visibility must also stop mounted light processing");
             player.camera.set_prefs(&ControlPrefs { show_my_character: true, ..Default::default() });
             player.frame(0.0, &mut host, &mut zone, false);

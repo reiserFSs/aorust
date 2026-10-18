@@ -46,6 +46,10 @@ pub struct Host {
     pub enhanced_settings: Option<crate::EnhancedSettings>,
     /// Live option request: keep drawing the current variant until the worker finishes.
     pub enhanced_switch: Option<crate::EnhancedSettings>,
+    /// Root containing the user's day/night LUTs and optional per-playfield overrides.
+    pub grade_lut_root: Option<std::path::PathBuf>,
+    /// Actual own-character scene position, supplied every frame; never inferred from actor admission.
+    pub post_focus: Option<[f32; 3]>,
     /// Interface scale (aomac Enhanced option, audit item 2): `None`/`Some(0)` = Auto (today's whole backing-scale
     /// rounding), `Some(1..=3)` = a fixed GUI-pixel scale, honoured regardless of window size ([`gui_scale`]).
     /// Drained every frame by the viewer; the very first frame (before the window exists) reads
@@ -169,6 +173,7 @@ impl Host {
     }
     /// Hands the queued actor models and the frame's actors to the renderer.
     fn apply_actors(&mut self, r: &mut Renderer) {
+        r.set_grade_lut_source(self.grade_lut_root.as_deref(), self.effect_playfield.map(|(id, _)| id));
         if std::mem::take(&mut self.clear_actors) {
             r.clear_actors();
         }
@@ -185,6 +190,7 @@ impl Host {
             r.update_actor_model(key, &scene);
         }
         r.set_actors(std::mem::take(&mut self.actors));
+        r.set_post_focus(self.post_focus.take());
         r.set_enhanced_grass_inputs(&mut self.grass_benders, [self.grass_wind[0], self.grass_wind[1], -self.grass_wind[2]]);
         r.set_enhanced_grass_exposure(self.grass_exposure.clone());
         r.set_dynamic_lights(&std::mem::take(&mut self.dynamic_lights));
@@ -197,7 +203,8 @@ impl Host {
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { enhanced_settings: None, enhanced_switch: None, grass_wind: [0.0; 3], grass_exposure: None, grass_benders: vec![], actor_visual_resets: vec![], actor_visual_retirements: vec![], pointer_warp: None, smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
+        let grade_lut_root = None;
+        Host { post_focus: None, grade_lut_root, enhanced_settings: None, enhanced_switch: None, grass_wind: [0.0; 3], grass_exposure: None, grass_benders: vec![], actor_visual_resets: vec![], actor_visual_retirements: vec![], pointer_warp: None, smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -1148,7 +1155,7 @@ impl OffscreenPerf {
             label: Some("offscreen performance target"),
             size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-            format: r.format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: r.format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view_tracked(&Default::default());
@@ -1237,6 +1244,12 @@ impl Offscreen {
         let perf = self.perf.as_ref().ok_or_else(|| anyhow::anyhow!("render_frozen requires a persistent evidence target"))?;
         self.r.render(&perf.view, &self.targets, &self.host.camera);
         Ok(())
+    }
+
+    /// Reads the last persistent rendered frame without rerendering or changing motion history.
+    pub fn frozen_rgba(&self) -> Result<Vec<u8>> {
+        let perf = self.perf.as_ref().ok_or_else(|| anyhow::anyhow!("frozen_rgba requires a persistent evidence target"))?;
+        crate::texture_to_rgba(&self.r, &perf._texture, self.size.0, self.size.1)
     }
 
     pub fn set_gpu_timing(&mut self, enabled: bool) -> Result<()> { self.r.set_gpu_timing(enabled) }
@@ -1690,6 +1703,22 @@ mod tests {
         assert_eq!(host.effect_dungeon, None);
     }
 
+
+    #[test]
+    fn post_focus_handoff_is_explicit_and_clears_without_a_producer() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = Renderer::new(&instance, None).expect("focus handoff requires GPU");
+        let mut host = Host::headless();
+        assert_eq!(host.post_focus, None);
+        host.post_focus = Some([3.0, 4.0, -5.0]);
+        host.apply_actors(&mut renderer);
+        assert_eq!(renderer.post_focus, Some([3.0, 4.0, -5.0]));
+        assert_eq!(host.post_focus, None);
+        // Even an always-admitted effect must not manufacture own-character focus.
+        host.actors.push(ao_scene::ActorFrame { always: true, ..Default::default() });
+        host.apply_actors(&mut renderer);
+        assert_eq!(renderer.post_focus, None);
+    }
 
     #[test]
     fn actor_model_handoff_keeps_the_original_scene_allocation() {
