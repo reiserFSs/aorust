@@ -1143,32 +1143,30 @@ showed foliage and Newland positive energy beyond one display code (`gfx/v3/Look
 | Borealis street / light bar / light bar close | all-no-bloom | 0 | 0.7192 |
 
 Those historical numbers use Rec.709 luminance of sRGB byte codes and the per-pixel metric
-`mean(max(0, Y_after - Y_faithful - 1))`; they are not measurements of the current block-mean criterion.
+`mean(max(0, Y_after - Y_faithful - 1))`; the former block-mean brightness criterion is also superseded.
 
-Night grass uses native terrain-corner lamp evaluation, saturation and interpolation at its root, with a
-post-fog native-root bound. The remaining brightness mismatch comes from magnifying a full-resolution root
-texel over a different covered ground pixel, not incorrect palette composition or gamma.
-Night blades therefore use component-wise Min blending against the completed native ground, preserving
-that pixel's mip, palette, lighting, fog and two-pass quantization without a framebuffer copy.
-The Min pass keeps depth testing but disables depth writes: native foliage and statels drawn later must not
-be rejected behind blade depth, which would otherwise hide darker native fragments and brighten Borealis.
-A stable per-blade hash partitions normal and Min passes; the Min fraction is
-`1 - smoothstep(0.0, 0.25, ambient_g.w)`, with lighting and the root bound interpolating over the same range.
-Only Min runs at authored night, only normal at full daylight, and both at twilight; blade population is unchanged.
-Night blades remain visible geometry rather than being removed by a daylight fade.
+Night lighting is no longer capped to the faithful image. The approved Enhanced
+direction is ao-vk-like: moonlight may illuminate open terrain and cast shadows,
+lamps and carried lights may illuminate nearby surfaces, and authored windows,
+signs and screens may glow. Darker-night choices may retain the game's lighting,
+use moonlit lighting or make nights dark. This does not permit reduced fog
+extinction or signals from hidden/non-admitted actors.
 
-The ignored, headless `graphics_offline_night_is_never_brighter_than_faithful` regression captures
-`borealis-foliage-night` and `newland-night`, each with `grass` and `all-no-bloom`, against the same view's
-`faithful` render. At fixed 1920×1200, MSAA one and bloom off, it partitions the full image into aligned,
-non-overlapping 16×16 blocks. For every block it requires
-`mean(Y_enhanced) - mean(Y_faithful) <= 1` code, with
-`Y = 0.2126 R + 0.7152 G + 0.0722 B` on encoded sRGB byte values (not linearized RGB).
-No extra tolerance, failing-block allowance, or global averaging is applied.
-`night-brightness.txt` and stderr report each view/profile's maximum signed block delta, worst block's top-left
-pixel coordinate, and count of blocks above one code. All four comparisons and their PNGs are retained before
-a brightness failure is returned; `status=pass` is written only when every comparison passes.
+The ignored headless regression
+`graphics_offline_night_preserves_fog_and_hidden_actor_isolation` uses
+`borealis-foliage-night` and `newland-night`, at 1920×1200 and MSAA one, with
+`faithful`, `grass` and `all-no-bloom`. A zero-alpha captured
+character and its actor-tagged bender must produce exactly the absent image.
+Two saturated, untextured captured-body colour probes must differ without fog
+(the non-vacuous control), then become byte-identical with full native fog.
+The probes preserve geometry and explicitly enable material fog; this does not
+change the native exemptions for real authored fog-disabled materials.
+PNG pairs and `night-fog-admission.txt` record the comparisons; `status=pass`
+is written only after all succeed. This is a fog/admission test, not a bound
+on approved moon, lamp, glow, or grading brightness.
 
-Measured 1920×1200 block regression, `e4d3881b` grass baseline → final fix:
+Historical measurements under the superseded night-brightness rule,
+`e4d3881b` grass baseline → the former Min-blend fix (not current acceptance):
 
 | Night view | Profile | Maximum block delta before → after (Y codes) | Blocks above 1 before → after |
 |---|---|---:|---:|
@@ -1184,8 +1182,8 @@ only `borealis-foliage-night` and `newland-night` changed. These fixture measure
 Run with the installed client data and a new output directory; no application window or live login is needed:
 
 ```sh
-AOMAC_GFX_OUT=/tmp/night-block-regression \
-  cargo test --profile fast -p aomac graphics_offline_night_is_never_brighter_than_faithful -j 2 -- --ignored --nocapture --test-threads=1
+AOMAC_GFX_OUT=/tmp/night-fog-admission \
+  cargo test --profile fast -p aomac graphics_offline_night_preserves_fog_and_hidden_actor_isolation -j 2 -- --ignored --nocapture --test-threads=1
 ```
 
 The earlier daylight-gated captures in `gfx/v3/NightGrass-fix/metrics.txt` made grass byte-identical to faithful
@@ -1393,16 +1391,11 @@ requires native `GAME.CurrentDayIntensity` and raw sun visibility before the
 artistic retained-shadow floor; night and roof umbra cannot qualify. Native fog
 still attenuates the resulting surface radiance.
 Authored night retains visible blades rather than fading their geometry away.
-Night blade lighting follows native terrain-corner lamp evaluation, saturation
-and interpolation at the root, with a post-fog native-root bound. Component-wise
-Min blending against completed native ground also prevents a magnified root
-texel from brightening a different covered pixel; native palette and gamma
-composition are unchanged. Complementary normal/Min passes partition blades by
-a stable hash, with Min fraction `1 - smoothstep(0.0, 0.25, ambient_g.w)`.
-Lighting and root-bound strength interpolate over the same range. Only one pass
-runs at day/night endpoints, both at twilight; no blade population is removed.
-The Min pass depth-tests without writing depth, allowing later native foliage
-and statels to draw rather than rejecting their darker fragments behind blades.
+Night blades retain terrain-root lighting and native fog: approved moonlight
+and nearby lamps may light them, but their material must not glow independently.
+The old component-wise Min-blend brightness cap is superseded by the approved
+ao-vk-like night lighting direction. Native palette/gamma composition and the
+root fog floor remain relevant; a raised blade tip must not reduce extinction.
 Regression:
 `AOMAC_GFX_OUT=<new dir> cargo test --profile fast -p aomac
 graphics_offline_night_is_never_brighter_than_faithful -- --ignored --nocapture --test-threads=1`

@@ -28,7 +28,6 @@ const GRASS_MAX_HEIGHT: f32 = 0.5;
 const NOISE_PERIOD: f32 = 64.0;
 const MEADOW_LUMA: f32 = 0.42;
 const LUMA: vec3<f32> = vec3<f32>(0.299, 0.587, 0.114);
-override GRASS_NIGHT_PASS: bool = false;
 
 fn grass_hash(input: u32) -> u32 {
     var v = input ^ (input >> 16u); v *= 0x7feb352du;
@@ -160,10 +159,7 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     let hk = grass_hash(seed ^ (k * 0x9e3779b9u + 0x68bc21ebu));
     let hv = grass_hash(hk ^ 0x5bf03635u);
     let hw = grass_hash(hv ^ 0x1b873593u);
-    // Complementary, root-stable passes: dusk changes the fraction using MIN,
-    // never the blade population, and never switches the whole carpet at once.
     let darkness = 1.0 - smoothstep(0.0, 0.25, g.ambient_g.w);
-    if (grass_unit(grass_hash(hk ^ 0xe315da7bu)) < darkness) != GRASS_NIGHT_PASS { return o; }
     // Low-discrepancy scatter (R2): any prefix of the cell's blades is evenly spread, so the distance thinning
     // below removes blades without clumps or bare gaps.
     let uv = fract(vec2<f32>(grass_unit(seed), grass_unit(grass_hash(seed ^ 0xabcdu))) + f32(k + 1u) * vec2<f32>(0.7548776662, 0.5698402910));
@@ -450,17 +446,6 @@ fn fs_grass(i: GOut) -> GrassOutput {
     if i.path > 1u {
         // Preserve native two-pass fog multiplication, not the fused approximation.
         color = mix(albedo, g.fog_g.rgb, fog) * mix(light, vec3<f32>(1.0), fog);
-    }
-    // Night blades inherit the native root's complete gamma-space texture-stage result.
-    // Clamp after fog (and after both stages on the two-pass path), not the albedo or
-    // the pre-palette diffuse: those are not framebuffer brightness bounds.
-    if g.ambient_g.w < 0.25 {
-        var native_root = mix(ground * light, g.fog_g.rgb, fog);
-        if i.path > 1u {
-            native_root = mix(ground, g.fog_g.rgb, fog) * mix(light, vec3<f32>(1.0), fog);
-        }
-        let daylight_weight = smoothstep(0.0, 0.25, g.ambient_g.w);
-        color = mix(min(color, native_root), color, daylight_weight);
     }
     var output: GrassOutput;
     // Hardware alpha-to-coverage dithers the outer field without fragment discard.

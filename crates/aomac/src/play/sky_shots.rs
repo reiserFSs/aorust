@@ -698,13 +698,10 @@ fn graphics_fixture_snapshot_keys_share_only_matching_playfield_and_time() -> an
     Ok(())
 }
 
-/// Enhanced night rule regression: every aligned 16x16 block's mean Rec.709 luminance
-/// of sRGB byte codes must be at most one code brighter than faithful, with bloom off.
-/// `AOMAC_GFX_OUT=<new directory>`; captures faithful, grass and all-no-bloom for both
-/// night views through the same offline fixture path as `graphics_offline_fixture`.
+/// Night lighting may exceed faithful; fog extinction and non-admitted actor isolation may not.
 #[test]
-#[ignore = "offline night brightness regression; requires installed client and a new AOMAC_GFX_OUT"]
-fn graphics_offline_night_is_never_brighter_than_faithful() -> anyhow::Result<()> {
+#[ignore = "offline night fog/admission regression; requires installed client and a new AOMAC_GFX_OUT"]
+fn graphics_offline_night_preserves_fog_and_hidden_actor_isolation() -> anyhow::Result<()> {
     use anyhow::{Context, ensure};
     use std::fmt::Write;
     let out = PathBuf::from(std::env::var_os("AOMAC_GFX_OUT").context("set AOMAC_GFX_OUT to a new handoff directory")?);
@@ -715,14 +712,11 @@ fn graphics_offline_night_is_never_brighter_than_faithful() -> anyhow::Result<()
     let weather = ao_formats::weather::State::clear();
     let size = (1920, 1200);
     let actor = graphics_fixture_actor()?;
-    let views = graphics_fixture_views(&actor);
-    // The authored-night snapshots: Newland 566 and Borealis 800 at time 0 (`scene.daylight == 0`).
-    let nights: Vec<_> = views.into_iter().filter(|(name, _, time, _)| {
+    let nights: Vec<_> = graphics_fixture_views(&actor).into_iter().filter(|(name, _, time, _)| {
         *time == 0.0 && matches!(name.as_str(), "newland-night" | "borealis-foliage-night")
     }).collect();
     ensure!(nights.len() == 2, "the night-view set changed");
-    let mut report = String::from("metric=mean Rec.709 Y from sRGB codes per aligned 16x16 block; every enhanced-faithful delta <=1 code; no extra tolerance\n");
-    let mut passed = true;
+    let mut report = String::from("rule=night lighting may brighten; native fog must extinguish body colour; non-admitted actors must equal absence\n");
     for (name, pf, time, fixed) in nights {
         ao_scene::crt_srand(1);
         let (mut scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
@@ -733,12 +727,23 @@ fn graphics_offline_night_is_never_brighter_than_faithful() -> anyhow::Result<()
             graphics_fixture_newland_camera(|point| collision.terrain_height(point))?
         } else { fixed };
         let exposure = super::player::grass_exposure_surface(std::rc::Rc::new(std::cell::RefCell::new(collision)));
-        let render = |profile: &str| -> anyhow::Result<Vec<u8>> {
+        let mut avatar = super::avatar::Avatar::new(&store, &dir, 25988, &actor,
+            ao_formats::character::actor::ActorAssets::new(&store)?)?;
+        let position = fixed.pos + fixed.forward() * 3.0 - Vec3::Y;
+        avatar.set_transform(position.to_array(), 0.0);
+        // Keep real captured body geometry but remove material fog exemptions and textures:
+        // two saturated body colours provide a positive control for the extinction comparison.
+        let render = |profile: &str, fog: bool, body: u8| -> anyhow::Result<Vec<u8>> {
             let settings = graphics_fixture_settings(profile)?;
+            let mut snapshot = scene.clone();
+            snapshot.fog_model = None;
+            let environment = snapshot.environment.as_mut().context("night fixture has no authored environment")?;
+            environment.fog_start = if fog { 0.0 } else { 10_000.0 };
+            environment.fog_end = if fog { 0.01 } else { 20_000.0 };
             ao_scene::crt_srand(1);
-            let mut lens = camera::lens(scene.lens.unwrap_or_default(), false);
+            let mut lens = camera::lens(snapshot.lens.unwrap_or_default(), false);
             lens.far = Some(camera::far_plane(camera::VIEW_DISTANCE));
-            let mut shot = Shot { gui: Gui::new(&dir, None)?, scene: Some(scene.clone()), camera: fixed, lens };
+            let mut shot = Shot { gui: Gui::new(&dir, None)?, scene: Some(snapshot), camera: fixed, lens };
             let mut off = Offscreen::evidence(&shot, size)?;
             off.fixed_camera(Some(fixed));
             off.host.msaa_samples = Some(1);
@@ -747,54 +752,49 @@ fn graphics_offline_night_is_never_brighter_than_faithful() -> anyhow::Result<()
             off.host.enhanced_settings = Some(settings);
             off.host.grass_exposure = Some(exposure.clone());
             off.host.grass_wind = weather.wind;
+            off.frame(&mut shot, 0.0);
+            if body != 0 {
+                let mut model = avatar.model().clone();
+                for mesh in &mut model.meshes {
+                    for material in &mut mesh.submeshes {
+                        material.texture = None;
+                        material.base_color = if body == 3 { [0.0, 1.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0, 1.0] };
+                        material.fog_enabled = true;
+                        material.overlay = false;
+                        material.emissive = [1.0; 3];
+                        material.specular = [0.0; 3];
+                    }
+                }
+                off.host.actor_models.push((super::avatar::MODEL_KEY, std::sync::Arc::new(model)));
+                let mut frame = avatar.frame();
+                frame.id = 25988;
+                frame.emissive = None;
+                frame.part_materials.clear();
+                frame.alpha = if body == 1 { 0.0 } else { 1.0 };
+                off.host.grass_benders.push(ao_render::GrassBender { actor: Some(frame.id), position: position.to_array() });
+                off.host.actors.push(frame);
+            }
             let list = off.frame(&mut shot, 0.0);
             if settings.ground_grass { off.warm_grass_tiles(); }
             off.rgba(&shot, &list)
         };
-        let faithful = render("faithful")?;
-        image::save_buffer(out.join(format!("{name}-faithful.png")), &faithful, size.0, size.1, image::ColorType::Rgba8)?;
-        // Compare encoded display codes, not linear-light luminance.
-        let y = |raw: &[u8], pixel: usize| -> f64 {
-            let rgb = &raw[pixel * 4..pixel * 4 + 3];
-            0.2126 * f64::from(rgb[0]) + 0.7152 * f64::from(rgb[1]) + 0.0722 * f64::from(rgb[2])
-        };
-        for profile in ["grass", "all-no-bloom"] {
-            let after = render(profile)?;
-            ensure!(after.len() == faithful.len(), "{name}: {profile} image size changed");
-            let (width, height) = (size.0 as usize, size.1 as usize);
-            let mut maximum = f64::NEG_INFINITY;
-            let mut worst_block = (0, 0);
-            let mut failing_blocks = 0;
-            for top in (0..height).step_by(16) {
-                for left in (0..width).step_by(16) {
-                    let (right, bottom) = ((left + 16).min(width), (top + 16).min(height));
-                    let mut difference = 0.0;
-                    for row in top..bottom {
-                        for column in left..right {
-                            let pixel = row * width + column;
-                            difference += y(&after, pixel) - y(&faithful, pixel);
-                        }
-                    }
-                    difference /= ((right - left) * (bottom - top)) as f64;
-                    if difference > maximum {
-                        maximum = difference;
-                        worst_block = (left, top);
-                    }
-                    if difference > 1.0 {
-                        failing_blocks += 1;
-                    }
-                }
+        for profile in ["faithful", "grass", "all-no-bloom"] {
+            let absent = render(profile, false, 0)?;
+            let hidden = render(profile, false, 1)?;
+            ensure!(absent == hidden, "{name}/{profile}: zero-alpha non-admitted body or its bender changed the image");
+            let red = render(profile, false, 2)?;
+            let green = render(profile, false, 3)?;
+            ensure!(red != green, "{name}/{profile}: body-colour positive control is not visible");
+            let fog_red = render(profile, true, 2)?;
+            let fog_green = render(profile, true, 3)?;
+            ensure!(fog_red == fog_green, "{name}/{profile}: fully fogged body colour leaked through extinction");
+            for (suffix, raw) in [("absent", &absent), ("hidden", &hidden), ("red", &red), ("green", &green), ("fog-red", &fog_red), ("fog-green", &fog_green)] {
+                image::save_buffer(out.join(format!("{name}-{profile}-{suffix}.png")), raw, size.0, size.1, image::ColorType::Rgba8)?;
             }
-            passed &= failing_blocks == 0;
-            writeln!(report, "{name} profile={profile} max_block_delta_Y={maximum:.9} worst_block_origin={worst_block:?} blocks_above1={failing_blocks}")?;
-            writeln!(report, "{name} profile={profile} differing_bytes={}",
-                faithful.iter().zip(&after).filter(|(a, b)| a != b).count())?;
-            image::save_buffer(out.join(format!("{name}-{profile}.png")), &after, size.0, size.1, image::ColorType::Rgba8)?;
-            std::fs::write(out.join("night-brightness.txt"), &report)?;
-            eprintln!("{name} {profile}: max 16x16 block delta {maximum:.9} Y codes at {worst_block:?}; {failing_blocks} blocks above 1");
+            writeln!(report, "{name} profile={profile} non_admitted_equals_absent=true unfogged_colour_control_differs=true fully_fogged_colours_equal=true")?;
+            std::fs::write(out.join("night-fog-admission.txt"), &report)?;
         }
     }
-    ensure!(passed, "Enhanced night 16x16 block mean exceeds faithful by more than 1 Y code; see {}", out.join("night-brightness.txt").display());
     std::fs::write(out.join("status.txt"), "status=pass\n")?;
     Ok(())
 }
