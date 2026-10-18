@@ -245,6 +245,7 @@ impl Compiled {
             wgpu::BindGroupLayoutEntry { binding: 8, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }, count: None },
         ];
         if shadows {
+            // Root exposure comes from Cell.normals[0].w, not the world's lattice.
             entries.extend(crate::sun_shadows::receiver_entries().into_iter().filter(|entry| entry.binding != 7).map(|mut entry| { entry.binding += 2; entry }));
         }
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -584,7 +585,9 @@ fn shader_source(channels: (bool, bool, bool), shadows: bool) -> String {
         .replace("//__AO_RECEIVE__", if channels.0 {
             "let indirect = select(i.dlight, max(clamp(i.light + palette, vec3<f32>(0.0), vec3<f32>(1.0)) - i.light, vec3<f32>(0.0)), i.path > 0u);\n    let extinction = (1.0 - fog) * select(1.0, 1.0 - fog, i.path > 1u);\n    let sky_fraction = clamp(indirect / max(light, vec3<f32>(0.001)), vec3<f32>(0.0), vec3<f32>(1.0));\n    let ao_lod = i.coverage.y;\n    let receiving = albedo * light * ao_share(sky_fraction) * extinction * ao_lod;\n    output.ambient = vec4<f32>(min(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), max(receiving, vec3<f32>(0.0))), mix(-16.0, 1.0, ao_lod));"
         } else { "" })
-        .replace("//__SHADOW_VISIBILITY__", if shadows { "visibility = grass_sun_visibility(i.root + i.normal.xyz * 0.05, i.normal.xyz);" } else { "" })
+        .replace("//__SHADOW_VISIBILITY__", if shadows {
+            "if shadow_frame.moon_direction.w > 0.0 {\n        if g.moon_direction.w > 0.0 && dot(shadow_frame.moon_direction.xyz, g.moon_direction.xyz) > 0.9999 {\n            moon_visibility = grass_sun_visibility(i.root + i.normal.xyz * 0.05, i.normal.xyz);\n            grass_direct_visibility = 1.0;\n        }\n    } else {\n        visibility = grass_sun_visibility(i.root + i.normal.xyz * 0.05, i.normal.xyz);\n    }"
+        } else { "" })
         .replace("//__EMISSIVE_WRITE__", if channels.1 { "output.emissive = vec4<f32>(0.0);" } else { "" })
         // Same roof-tested terrain alpha and fog contract as the ground receiver.
         .replace("//__SUN_WRITE__", if channels.2 { "let sun_luma = dot(sun_share, vec3<f32>(0.2126, 0.7152, 0.0722));\n    output.sun = vec4<f32>(sun_luma * grass_direct_visibility * (1.0 - fog), i.normal.w * (1.0 - fog), fog, 1.0);" } else { "" });
@@ -721,7 +724,7 @@ impl super::Renderer {
             if let Some(shadows) = &mut self.sun_shadows { shadows.grass_receiver = None; }
             return;
         };
-        if self.grass.as_ref().is_none_or(|grass| grass.samples != self.msaa_samples() || grass.channels != (settings.ambient_occlusion, settings.emissive_bloom, settings.needs_sun_mask()) || grass.shadows != settings.sun_shadows) {
+        if self.grass.as_ref().is_none_or(|grass| grass.samples != self.msaa_samples() || grass.channels != (settings.ambient_occlusion, settings.emissive_bloom, settings.needs_sun_mask()) || grass.shadows != (settings.sun_shadows || settings.moon_shadows)) {
             let mut grass = Grass::new(&self.device, &self.queue, &ground.green, &self.world.grass);
             (grass.wind_phase, grass.filtered_wind) = self.foliage.wind_state();
             self.grass = Some(grass);
@@ -1262,6 +1265,82 @@ mod blade_appearance_tests {
                 }
             }
             assert!(visible > 0, "{expected:?}: lit night blades must remain visible, not culled or blacked out");
+        }
+    }
+
+    #[test]
+    fn native_grass_moon_uses_root_exposure_without_reducing_fog() {
+        use crate::{Camera, EnhancedSettings, GroundPath, NightMode, Renderer, Targets, Vec3};
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = Renderer::new(&instance, None).expect("grass moon requires an offscreen GPU");
+        renderer.set_msaa_samples(1);
+        let camera = Camera::look_at(Vec3::new(4.0, 5.0, 1.0), Vec3::new(4.0, 0.0, -4.0));
+        let out = renderer.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("native grass moon regression"),
+            size: wgpu::Extent3d { width: 128, height: 128, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: renderer.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = out.create_view(&Default::default());
+        for fogged in [false, true] {
+            let mut scene = night_grass_scene();
+            scene.environment.as_mut().unwrap().sun_dir = [0.0, -1.0, 0.0];
+            scene.moons[0] = Some(ao_scene::MoonSource {
+                toward_light: [0.0, 1.0, 0.0], ..Default::default()
+            });
+            // Keep the shared terrain receiver closed: every changed pixel must
+            // come from grass's existing cell exposure, not global lattice fill.
+            for vertex in &mut scene.meshes[0].vertices { vertex.color[3] = 1.0; }
+            if fogged {
+                let environment = scene.environment.as_mut().unwrap();
+                environment.fog_start = 0.0;
+                environment.fog_end = 0.1;
+            }
+            renderer.upload(&scene);
+            for (mode, expected) in [(3, GroundPath::Fused), (1, GroundPath::ShadowsTwoPass), (0, GroundPath::Simple)] {
+                renderer.set_ground_rendering(mode);
+                assert_eq!(renderer.ground_rendering_path(), expected);
+                let settings = EnhancedSettings {
+                    ground_grass: true, grass_density: 1.0, grass_distance: 60.0,
+                    night_mode: NightMode::Moonlit, moon_intensity: 0.0,
+                    sun_shadows: false, moon_shadows: false, ..Default::default()
+                };
+                renderer.set_enhanced_settings(settings);
+                renderer.set_enhanced_grass_exposure(Some(super::GrassExposure {
+                    generation: 1, query: std::rc::Rc::new(|_| true),
+                    line_of_sight: std::rc::Rc::new(|_, _| true),
+                }));
+                renderer.warm_grass_tiles(&camera);
+                assert!(!renderer.grass.as_ref().unwrap().cells.is_empty());
+                let targets = Targets::new(&renderer, 128, 128);
+                let mut images = Vec::new();
+                for (exposed, intensity) in [(0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0)] {
+                    renderer.set_enhanced_settings(EnhancedSettings { moon_intensity: intensity, ..settings });
+                    let grass = renderer.grass.as_mut().unwrap();
+                    for cell in &mut grass.cells { cell.normals[0][3] = exposed; }
+                    renderer.queue.write_buffer(&grass.cells_buffer, 0, bytemuck::cast_slice(&grass.cells));
+                    renderer.render(&view, &targets, &camera);
+                    images.push(crate::texture_to_rgba(&renderer, &out, 128, 128).unwrap());
+                }
+                assert_eq!(images[0], images[1], "{expected:?}: closed roots cannot receive moon");
+                assert_eq!(images[0], images[2], "{expected:?}: exposure alone adds no ambient/local energy");
+                if fogged {
+                    assert_eq!(images[2], images[3], "{expected:?}: moon cannot reveal fully fogged roots or tips");
+                } else {
+                    let brighter = images[2].chunks_exact(4).zip(images[3].chunks_exact(4))
+                        .filter(|(off, on)| on[..3].iter().zip(&off[..3]).any(|(a, b)| a > b)).count();
+                    assert!(brighter > 0, "{expected:?}: open native grass must receive unshadowed moon with sun shadows off");
+                }
+                renderer.set_enhanced_grass_exposure(Some(super::GrassExposure {
+                    generation: 2, query: std::rc::Rc::new(|_| false),
+                    line_of_sight: std::rc::Rc::new(|_, _| false),
+                }));
+                renderer.warm_grass_tiles(&camera);
+                assert!(renderer.grass.as_ref().unwrap().cells.is_empty(),
+                    "moon cannot admit hidden/non-admitted grass");
+            }
         }
     }
 

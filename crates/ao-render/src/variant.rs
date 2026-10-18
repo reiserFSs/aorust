@@ -197,7 +197,7 @@ impl Request {
         let grass = super::grass::Compiled::new(
             &self.device, &self.g_layout, &self.tex_layout, &self.holo_layout, self.key.msaa,
             (self.settings.ambient_occlusion, self.settings.emissive_bloom, self.settings.needs_sun_mask()),
-            self.settings.sun_shadows, self.format);
+            self.settings.sun_shadows || self.settings.moon_shadows, self.format);
         Pipes { #[cfg(test)] shader, msaa: self.key.msaa, native_sky_pipes,
             pipes, actor_pipes, ground_pipes, depth_clear_pipe, grass }
     }

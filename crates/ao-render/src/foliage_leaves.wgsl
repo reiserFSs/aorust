@@ -1,5 +1,5 @@
 // Native material sprigs, inspired by ao-vk rvk/leaves.cpp (MIT).
-// Native shader and sun-shadow entrypoints are prepended by foliage_leaves.rs.
+// Native shader, shared moon receiver and sun-shadow entrypoints are assembled by foliage_leaves.rs.
 struct CanopyParams {
     // Stable effect phase; attached, flutter and falling switches.
     control: vec4<f32>,
@@ -62,8 +62,9 @@ struct CanopyOutput {
 }
 @fragment fn fs_canopy(i: VOut) -> CanopyOutput {
     var output: CanopyOutput;
-    // Exact native texture, material, Gouraud lighting, alpha test and fog.
-    output.beauty = shade(i, 1u);
+    // Shared lighting adjustment precedes exact native material, alpha test and fog.
+    //__MOON_RECEIVER__
+    output.beauty = shade(receiver, 1u);
     if i.color.a <= 0.0 { discard; }
     // Added leaves never emit an HDR/bloom signal or alter native fog extinction.
     //__AMBIENT_WRITE__

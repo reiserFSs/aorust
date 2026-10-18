@@ -392,10 +392,17 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
         let local = vertex_lights(root, ground_n, 0.0)[0];
         let without_sun = clamp(local, vec3<f32>(0.0), vec3<f32>(1.0));
         o.spec = select(without_sun, clamp(without_sun + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), simple);
+        if g.moon_g.w > 0.0 { o.spec = mix(o.spec, without_sun, g.moon_g.w); }
         for (var j = 0u; j < 4u; j += 1u) {
             let light = clamp(g.sun_g.rgb * max(dot(c.normals[j].xyz, g.sun_dir.xyz), 0.0) + local, vec3<f32>(0.0), vec3<f32>(1.0));
-            o.light += w4[j] * select(light, clamp(light + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), simple);
-            o.dlight += w4[j] * (clamp(light + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) - light);
+            var corner_light = select(light, clamp(light + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), simple);
+            var corner_ambient = clamp(light + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) - light;
+            if g.moon_g.w > 0.0 {
+                corner_light = mix(corner_light, without_sun, g.moon_g.w);
+                corner_ambient *= 1.0 - g.moon_g.w;
+            }
+            o.light += w4[j] * corner_light;
+            o.dlight += w4[j] * corner_ambient;
         }
     }
     if darkness > 0.0 {
@@ -410,9 +417,20 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
             let lamps = vertex_lights(corner, n, 0.0)[0];
             let diffuse = clamp(g.sun_g.rgb * max(dot(n, g.sun_dir.xyz), 0.0) + lamps, vec3<f32>(0.0), vec3<f32>(1.0));
             let ambient = clamp(diffuse + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
-            native_light += w4[j] * select(diffuse, ambient, simple);
-            native_dlight += w4[j] * (ambient - diffuse);
-            native_spec += w4[j] * select(clamp(lamps, vec3<f32>(0.0), vec3<f32>(1.0)), clamp(lamps + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), simple);
+            var corner_light = select(diffuse, ambient, simple);
+            var corner_ambient = ambient - diffuse;
+            var corner_spec = select(clamp(lamps, vec3<f32>(0.0), vec3<f32>(1.0)), clamp(lamps + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), simple);
+            if g.moon_g.w > 0.0 {
+                // Dark retains exactly the native saturated local energy, before
+                // Gouraud interpolation; it never subtracts a lamp a second time.
+                let retained = clamp(lamps, vec3<f32>(0.0), vec3<f32>(1.0));
+                corner_light = mix(corner_light, retained, g.moon_g.w);
+                corner_spec = mix(corner_spec, retained, g.moon_g.w);
+                corner_ambient *= 1.0 - g.moon_g.w;
+            }
+            native_light += w4[j] * corner_light;
+            native_dlight += w4[j] * corner_ambient;
+            native_spec += w4[j] * corner_spec;
         }
         o.light = mix(o.light, native_light, darkness);
         o.dlight = mix(o.dlight, native_dlight, darkness);
@@ -441,13 +459,20 @@ fn fs_grass(i: GOut) -> GrassOutput {
     } else {
         ground = textureSampleLevel(tex, samp, i.uv, coarse_level).rgb;
     }
-    let palette = sample_clamped(holo0, vec2<f32>(i.root.x, -i.root.z) * mat.wave.xz).rgb;
+    let palette = sample_clamped(holo0, vec2<f32>(i.root.x, -i.root.z) * mat.wave.xz).rgb * (1.0 - g.moon_g.w);
     var light = i.light;
     var visibility = 1.0;
+    var moon_visibility = 1.0;
     //__SHADOW_VISIBILITY__
     // Match native ground: remove the pre-palette direct sun, THEN add/clamp the baked palette.
     let sun_share = max(i.light - i.spec, vec3<f32>(0.0));
     light = max(light - sun_share * (1.0 - visibility), vec3<f32>(0.0));
+    // Root openness is the authored terrain lattice already carried by this cell.
+    // Add moon once, before the native palette clamp and both native fog equations.
+    if g.moon_direction.w > 0.0 {
+        light += g.moon_g.rgb * max(dot(i.normal.xyz, g.moon_direction.xyz), 0.0)
+            * clamp(i.normal.w, 0.0, 1.0) * moon_visibility;
+    }
     light = select(light, clamp(light + palette, vec3<f32>(0.0), vec3<f32>(1.0)), i.path > 0u);
     // Blade colour: the meadow's green at the ground texel's brightness, the root growing out of the texel itself,
     // each over its blade's area averaging 1 so the field is as bright as the ground it stands on.
@@ -463,7 +488,7 @@ fn fs_grass(i: GOut) -> GrassOutput {
     let body = hue * (target_luma / max(dot(hue, LUMA), 1e-3)) * i.mixes.w;
     let vein = 1.04 - 0.14 * exp(-i.shape.y * i.shape.y * 12.0);
     var albedo = mix(mix(body, ground, i.mixes.x) * i.shape.z, i.head.rgb, i.head.w) * vein;
-    var colour = albedo * light * i.shape.w + albedo * vec3<f32>(1.2, 1.25, 0.7) * g.sun_g.rgb * (i.mixes.z * visibility);
+    var colour = albedo * light * i.shape.w + albedo * vec3<f32>(1.2, 1.25, 0.7) * g.sun_g.rgb * (i.mixes.z * visibility) * (1.0 - g.moon_g.w);
     colour = mix(colour, ground * light, i.mixes.y);
     albedo = mix(albedo, ground, i.mixes.y);
     let fog = i.fog;
