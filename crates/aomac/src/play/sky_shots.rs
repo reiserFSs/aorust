@@ -491,6 +491,12 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 }
             };
             let fixed = grounded_camera.unwrap_or(fixed);
+            let fixed = if matches!(name.as_str(), "borealis-foliage-ground-sun-high" | "newland-foliage-ground-day") {
+                graphics_fixture_ground_foliage_camera(scene, fixed,
+                    |point| collision.borrow().terrain_height(point),
+                    |eye, target| collision.borrow().line(eye, target).is_none(),
+                    &mut manifest)?
+            } else { fixed };
             let fixed = if name == "newland-backlit-day" {
                 let (camera, instance, submesh, canopy, alignment) = graphics_fixture_backlit_camera(
                     scene, fixed.pos, |point| collision.borrow().terrain_height(point),
@@ -802,11 +808,108 @@ fn graphics_fixture_views(actor: &ao_net::n3::dynel::SimpleCharFullUpdate) -> Ve
     }
     views.push(("newland-backlit-day".into(), 566, 3240.0,
         Camera::look_at([414.0, 2.5, -320.0].into(), [440.0, 1.0, -335.0].into())));
+    for (name, pf, eye, at) in [
+        ("borealis-foliage-ground-sun-high", 800, [652.0, 65.3, -420.0], [651.8296, 73.42179, -428.4731]),
+        ("newland-foliage-ground-day", 566, [414.0, 2.5, -320.0], [440.0, 1.0, -335.0]),
+    ] {
+        views.push((name.into(), pf, 3240.0, Camera::look_at(eye.into(), at.into())));
+    }
     views.push(("borealis-lightbar-night".into(), 800, 0.0,
         Camera::look_at([679.6, 74.5, -476.7].into(), [679.6, 74.0, -482.7].into())));
     views.push(("borealis-lightbar-night-close".into(), 800, 0.0,
         Camera::look_at([679.6, 74.0, -480.2].into(), [679.6, 74.0, -482.7].into())));
     views
+}
+
+fn graphics_fixture_ground_foliage_camera(
+    scene: &Scene,
+    original: Camera,
+    terrain_height: impl Fn([f32; 3]) -> Option<f32>,
+    clear: impl Fn([f32; 3], [f32; 3]) -> bool,
+    manifest: &mut String,
+) -> anyhow::Result<Camera> {
+    use std::fmt::Write;
+    struct Selection {
+        distance: f32,
+        camera: Camera,
+        instance: usize,
+        submesh: usize,
+        lo: Vec3,
+        hi: Vec3,
+        aim: Vec3,
+        landing: [Vec3; 4],
+    }
+    let heading = Vec3::new(original.forward().x, 0.0, original.forward().z).normalize_or_zero();
+    anyhow::ensure!(heading.length_squared() > 0.0, "ground foliage view has no horizontal heading");
+    let vertical_tan = (camera::lens(scene.lens.unwrap_or_default(), false).vertical_fov(1920.0 / 1200.0) * 0.5).tan();
+    let mut best: Option<Selection> = None;
+    for (index, instance) in scene.instances.iter().enumerate() {
+        let mesh = &scene.meshes[instance.mesh];
+        let transform = glam::Mat4::from_cols_array_2d(&instance.transform);
+        for (material, submesh) in mesh.submeshes.iter().enumerate() {
+            if !submesh.vegetation || !submesh.lighting_enabled || !submesh.fog_enabled { continue; }
+            let mut lo = Vec3::splat(f32::INFINITY);
+            let mut hi = Vec3::splat(f32::NEG_INFINITY);
+            for &vertex in &submesh.indices {
+                let point = transform.transform_point3(Vec3::from(mesh.vertices[vertex as usize].pos));
+                lo = lo.min(point); hi = hi.max(point);
+            }
+            if !lo.is_finite() || !hi.is_finite() || hi.y - lo.y < 2.5 { continue; }
+            let center = (lo + hi) * 0.5;
+            let distance = center.distance_squared(original.pos);
+            if distance > 80.0 * 80.0 || best.as_ref().is_some_and(|best| distance >= best.distance) { continue; }
+            let mut landing = [
+                Vec3::new(lo.x, 0.0, lo.z), Vec3::new(hi.x + 5.0, 0.0, lo.z),
+                Vec3::new(lo.x, 0.0, hi.z + 5.0), Vec3::new(hi.x + 5.0, 0.0, hi.z + 5.0),
+            ];
+            let mut grounded = true;
+            for point in &mut landing {
+                if let Some(height) = terrain_height(point.to_array()).filter(|height| height.is_finite()) {
+                    point.y = height;
+                } else { grounded = false; break; }
+            }
+            if !grounded { continue; }
+            let ground_low = landing.iter().map(|point| point.y).fold(f32::INFINITY, f32::min);
+            let ground_high = landing.iter().map(|point| point.y).fold(f32::NEG_INFINITY, f32::max);
+            let crown = Vec3::new(center.x, lo.y + (hi.y - lo.y) * 0.75, center.z);
+            let aim = Vec3::new(center.x + 2.5, ground_low + (hi.y - ground_low) * 0.35, center.z + 2.5);
+            let retreat = ((hi.y - ground_low) * 1.5).max((hi.x - lo.x).max(hi.z - lo.z) + 5.0);
+            for scale in [1.0, 1.3, 1.7, 2.2] {
+                let mut eye = aim - heading * retreat * scale;
+                let Some(ground) = terrain_height(eye.to_array()).filter(|height| height.is_finite()) else { continue; };
+                eye.y = ground + 1.7;
+                let camera = Camera::look_at(eye, aim);
+                let forward = camera.forward();
+                let right = forward.cross(Vec3::Y).normalize_or_zero();
+                let up = right.cross(forward);
+                let fits = |point: Vec3| {
+                    let delta = point - eye;
+                    let depth = delta.dot(forward);
+                    depth > 0.2 && delta.dot(right).abs() < depth * 0.85
+                        && delta.dot(up).abs() < depth * vertical_tan * 0.85
+                };
+                let mut fits_crown = true;
+                for x in [lo.x, hi.x] {
+                    for y in [lo.y, hi.y] {
+                        for z in [lo.z, hi.z] { fits_crown &= fits(Vec3::new(x, y, z)); }
+                    }
+                }
+                let ground_center = Vec3::new(aim.x, ground_high, aim.z) - eye;
+                let ground_ndc = ground_center.dot(up) / (ground_center.dot(forward) * vertical_tan);
+                if !fits_crown || !landing.iter().all(|point| fits(*point))
+                    || !(-0.85..=-0.25).contains(&ground_ndc)
+                    || !clear(eye.to_array(), crown.to_array())
+                    || !landing.iter().all(|point| clear(eye.to_array(), (*point + Vec3::Y * 0.15).to_array())) { continue; }
+                best = Some(Selection { distance, camera, instance: index, submesh: material, lo, hi, aim, landing });
+                break;
+            }
+        }
+    }
+    let selected = best.ok_or_else(|| anyhow::anyhow!("no nearby native tall canopy fits crown and collision-grounded fall footprint with clear LOS"))?;
+    writeln!(manifest, "ground_foliage instance={} mesh={} submesh={} world_lo={:?} world_hi={:?} eye={:?} aim={:?} landing_scene={:?} source=native_transformed_canopy_and_collision_terrain heading=existing_view drift_extent_positive_xz=5 ground_margin=lower_third collision_los=clear",
+        selected.instance, scene.instances[selected.instance].mesh, selected.submesh, selected.lo, selected.hi,
+        selected.camera.pos, selected.aim, selected.landing)?;
+    Ok(selected.camera)
 }
 
 fn graphics_fixture_shrub(
@@ -954,6 +1057,16 @@ fn graphics_fixture_backlit_view_requires_native_canopy_ground_and_los() {
     assert_eq!(canopy, Vec3::new(0.0, 5.0, 0.0));
     assert_eq!(camera.pos.y, 1.8);
     assert!(alignment >= 0.6);
+    let original = Camera::look_at(Vec3::new(0.0, 1.7, 15.0), Vec3::new(0.0, 4.0, 0.0));
+    let mut report = String::new();
+    let ground_camera = graphics_fixture_ground_foliage_camera(
+        &scene, original, |_| Some(0.0), |_, _| true, &mut report).unwrap();
+    assert_eq!(ground_camera.pos.y, 1.7);
+    assert!(report.contains("landing_scene=") && report.contains("instance=0"));
+    assert!(graphics_fixture_ground_foliage_camera(
+        &scene, original, |_| None, |_, _| true, &mut String::new()).is_err());
+    assert!(graphics_fixture_ground_foliage_camera(
+        &scene, original, |_| Some(0.0), |_, _| false, &mut String::new()).is_err());
     assert!(graphics_fixture_backlit_camera(&scene, Vec3::ZERO, |_| None, |_, _| true).is_err());
     assert!(graphics_fixture_backlit_camera(&scene, Vec3::ZERO, |_| Some(0.0), |_, _| false).is_err());
     scene.instances[0].transform = glam::Mat4::from_translation(Vec3::new(20.0, 10.0, 30.0)).to_cols_array_2d();
@@ -1118,14 +1231,14 @@ fn graphics_fixture_snapshot_keys_share_only_matching_playfield_and_time() -> an
     for (_, pf, time, _) in &views {
         *keys.entry((*pf, time.to_bits())).or_default() += 1;
     }
-    assert_eq!(views.len(), 19);
+    assert_eq!(views.len(), 21);
     assert_eq!(keys.len(), 9);
     assert_eq!(keys[&(4582, 2648.69_f32.to_bits())], 4);
     assert_eq!(keys[&(800, 0.0_f32.to_bits())], 4);
-    assert_eq!(keys[&(800, 3240.0_f32.to_bits())], 2);
+    assert_eq!(keys[&(800, 3240.0_f32.to_bits())], 3);
     assert_eq!(keys[&(127, 3240.0_f32.to_bits())], 1);
     for time in [3240.0_f32, 4860.0, 0.0] {
-        assert_eq!(keys[&(566, time.to_bits())], if time == 3240.0 { 2 } else { 1 });
+        assert_eq!(keys[&(566, time.to_bits())], if time == 3240.0 { 3 } else { 1 });
     }
     Ok(())
 }
@@ -1497,7 +1610,7 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
     let actor = graphics_fixture_actor().unwrap();
     assert_eq!(actor.name, "Testy");
     let views = graphics_fixture_views(&actor);
-    assert_eq!(views.iter().map(|view| &view.0).collect::<std::collections::HashSet<_>>().len(), 19);
+    assert_eq!(views.iter().map(|view| &view.0).collect::<std::collections::HashSet<_>>().len(), 21);
     for (light, expected_time) in [("day", 3240.0), ("dusk", 4860.0), ("night", 0.0)] {
         let newland = views.iter().find(|view| view.0 == format!("newland-{light}")).unwrap();
         assert_eq!((newland.1, newland.2), (566, expected_time));
