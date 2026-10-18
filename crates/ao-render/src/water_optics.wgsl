@@ -27,6 +27,21 @@ fn world_at(pixel: vec2<i32>, depth: f32) -> vec3<f32> {
     let h = p.inverse_vp * vec4<f32>(uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), depth, 1.0);
     return h.xyz / h.w;
 }
+// Rain's world hash, smoothly interpolated in both horizontal axes.
+fn foam_hash(xz: vec2<f32>) -> f32 {
+    return fract(sin(dot(xz, vec2<f32>(127.1, 311.7))) * 43758.5453);
+}
+fn foam_coverage(xz: vec2<f32>, time: f32, footprint: f32) -> f32 {
+    let q = xz * 2.0 + time * vec2<f32>(0.07, -0.05);
+    let cell = floor(q);
+    let f = fract(q);
+    let u = f * f * (3.0 - 2.0 * f);
+    let noise = mix(mix(foam_hash(cell), foam_hash(cell + vec2<f32>(1.0, 0.0)), u.x),
+                    mix(foam_hash(cell + vec2<f32>(0.0, 1.0)), foam_hash(cell + vec2<f32>(1.0, 1.0)), u.x), u.y);
+    // Unresolved cells retain mean coverage, not a flickering binary grating.
+    let detail = 1.0 - smoothstep(0.15, 0.4, footprint);
+    return mix(0.5, smoothstep(0.25, 0.75, noise), detail);
+}
 @fragment fn copy(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     return textureLoad(scene, vec2<i32>(pos.xy), 0);
 }
@@ -202,11 +217,20 @@ fn world_at(pixel: vec2<i32>, depth: f32) -> vec3<f32> {
         if d < 1.0 {
             let separation = length(world_at(pixel, d) - mask.xyz);
             let shore = max(1.0 - smoothstep(0.05, 0.65, separation), 1.0 - smoothstep(0.0, 1.2, n.w));
-            let bubbles = 0.5 + 0.5 * sin(mask.x * 13.0 + sin(mask.z * 11.0) + p.eye_time.w * 1.5);
+            // Explicit valid-water taps: derivatives are unsafe in this branch.
+            var footprint = 0.0;
+            for (var axis = 0u; axis < 2u; axis += 1u) {
+                let offset = select(vec2<i32>(1, 0), vec2<i32>(0, 1), axis == 1u);
+                let tap = textureLoad(positions, clamp(pixel + offset, vec2<i32>(0), dimensions - 1), 0);
+                if tap.w > 0.0 {
+                    footprint = max(footprint, length(tap.xz - mask.xz));
+                }
+            }
+            let coverage = foam_coverage(mask.xz, p.eye_time.w, footprint);
             let illumination = max(p.sky_colour.rgb, vec3<f32>(0.0)) * p.sky_colour.w + max(p.sun_colour.rgb, vec3<f32>(0.0)) * p.sun_colour.w;
             let whitewater = mix(illumination, vec3<f32>(dot(illumination, vec3<f32>(0.2126, 0.7152, 0.0722))), 0.65);
             let foam = whitewater * 0.9;
-            colour = mix(colour, foam, shore * smoothstep(0.35, 0.75, bubbles) * 0.55);
+            colour = mix(colour, foam, shore * coverage * 0.55);
         }
     }
     if p.effects.w > 0.0 || p.effects.z > 0.0 {

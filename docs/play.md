@@ -1394,6 +1394,18 @@ An exact-triangle surface mask supplies eight Gerstner waves, detail normals,
 depth-derived absorption, current-frame SSR with authored-sky fallback, and
 load-time shoreline-distance foam. Near-eye subdivision is cached per 8m cell;
 the faithful geometry and collision mesh are never displaced.
+The final-native-AA ICC authored Modern sheet exposed white shoreline
+checker/stair bands from Water Foam's unfiltered world-axis sine grating
+(`gfx/parity/Presets/final-native-aa/sheets/icc-landmark-authored-Modern.png`).
+Foam now uses slowly advected 2D value-noise coverage, with explicit clamped,
+valid-water neighbour position loads measuring the pixel footprint (no implicit
+derivatives in the shoreline branch). Detail fades from 0.15m to 0.4m footprints
+to constant 0.5 coverage, preserving distant foam instead of aliasing or removing
+it. Shore admission, lighting, native fog extinction and the disabled path are
+unchanged. The `ao-render` regression
+`foam_coverage_is_two_dimensional_and_unresolved_detail_keeps_its_mean` executes
+the shader's coverage helper on the GPU and checks both resolved axes, time
+advection, constant unresolved coverage and byte-identical disabled compositing.
 Because native liquid layers write depth, bottom depth is rasterized separately
 from current visible static opaque/cutout meshes; no actor or liquid enters that
 depth target. This avoids treating the surface as the seabed or exposing a hidden

@@ -336,6 +336,86 @@ mod tests {
         }
     }
     #[test]
+    fn foam_coverage_is_two_dimensional_and_unresolved_detail_keeps_its_mean() {
+        let source = include_str!("water_optics.wgsl");
+        let helpers = source.split_once("fn foam_hash(").unwrap().1.split_once("@fragment fn copy").unwrap().0;
+        // Execute the production coverage helper, not a separate CPU noise model.
+        let shader = format!("fn foam_hash({helpers}{}", r#"
+@group(0) @binding(0) var<storage, read_write> result: array<vec4<f32>>;
+@compute @workgroup_size(64)
+fn probe(@builtin(global_invocation_id) id: vec3<u32>) {
+    let xz = vec2<f32>(f32(id.x % 16u), f32(id.x / 16u)) * 0.13;
+    result[id.x] = vec4<f32>(foam_coverage(xz, 0.0, 0.01),
+        foam_coverage(xz, 0.0, 0.4), foam_coverage(xz, 19.0, 4.0),
+        foam_coverage(xz, 19.0, 0.01));
+}
+"#);
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let renderer = crate::Renderer::new(&instance, None).expect("foam coverage regression GPU");
+        let device = &renderer.device;
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("production foam coverage regression"), source: wgpu::ShaderSource::Wgsl(shader.into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("foam coverage regression"), layout: None, module: &module, entry_point: Some("probe"),
+            compilation_options: Default::default(), cache: None,
+        });
+        let output = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size: 256 * 16, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false,
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size: output.size(), usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+        });
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: output.as_entire_binding() }],
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(4, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, output.size());
+        renderer.queue.submit([encoder.finish()]);
+        let (send, receive) = std::sync::mpsc::channel();
+        readback.slice(..).map_async(wgpu::MapMode::Read, move |result| send.send(result).unwrap());
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        receive.recv().unwrap().unwrap();
+        let mapped = readback.slice(..).get_mapped_range();
+        let values: &[[f32; 4]] = bytemuck::cast_slice(&mapped);
+        assert!(values.iter().all(|v| v[1] == 0.5 && v[2] == 0.5), "coarse foam must retain constant mean coverage");
+        assert!(values.windows(2).enumerate().any(|(i, v)| i % 16 != 15 && (v[0][0] - v[1][0]).abs() > 0.05), "resolved foam varies along x");
+        assert!((0..240).any(|i| (values[i][0] - values[i + 16][0]).abs() > 0.05), "resolved foam varies along z");
+        assert!(values.iter().any(|v| (v[0] - v[3]).abs() > 0.05), "existing time slowly advects resolved foam");
+        assert!(values.iter().all(|v| v.iter().all(|x| (0.0..=1.0).contains(x))));
+
+        // The all-off compositor must not write a single faithful scene byte.
+        let mut optics = WaterOptics::new(device, renderer.format);
+        let untouched = device.create_texture(&wgpu::TextureDescriptor {
+            label: None, size: wgpu::Extent3d { width: 16, height: 16, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: renderer.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+        });
+        let view = untouched.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view, resolve_target: None, depth_slice: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.25, g: 0.5, b: 0.75, a: 1.0 }), store: wgpu::StoreOp::Store },
+                })], ..Default::default()
+            });
+        }
+        renderer.queue.submit([encoder.finish()]);
+        let before = crate::texture_to_rgba(&renderer, &untouched, 16, 16).unwrap();
+        let mut encoder = device.create_command_encoder(&Default::default());
+        optics.encode(device, &mut encoder, &view, &view);
+        renderer.queue.submit([encoder.finish()]);
+        assert_eq!(crate::texture_to_rgba(&renderer, &untouched, 16, 16).unwrap(), before, "disabled optics changed native bytes");
+    }
+    #[test]
     fn finite_triangle_membership_handles_shore_holes_slopes_and_edges() {
         let triangle = [Vec3::new(0.0, 2.0, 0.0), Vec3::new(10.0, 4.0, 0.0), Vec3::new(0.0, 2.0, 10.0)];
         assert_eq!(surface_height(triangle, Vec3::new(5.0, -100.0, 0.0)), Some(3.0));
