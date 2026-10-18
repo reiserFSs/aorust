@@ -631,6 +631,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                         off.frame(&mut shot, 0.0);
                     }
                     if grass_exposure.is_some() { off.warm_grass_tiles(); }
+                    off.wait_for_pipeline_warmup();
                     off.prepare_frozen_rendering();
                     off.render_frozen()?;
                     off.wait_for_pipeline_warmup();
@@ -769,6 +770,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     for _ in 0..120 { list = off.frame(&mut shot, 1.0 / 60.0); }
                 }
                 if grass_exposure.is_some() { off.warm_grass_tiles(); }
+                off.wait_for_pipeline_warmup();
                 if post_warmup_frames > 0 {
                     off.prepare_frozen_rendering();
                     for _ in 0..post_warmup_frames { off.render_frozen()?; }
@@ -1988,6 +1990,7 @@ fn graphics_offline_night_preserves_fog_and_hidden_actor_isolation() -> anyhow::
             }
             let list = off.frame(&mut shot, 0.0);
             if settings.ground_grass { off.warm_grass_tiles(); }
+            off.wait_for_pipeline_warmup();
             if settings.foliage_leaves || settings.foliage_flutter || settings.foliage_falling {
                 off.rgba(&shot, &list)?;
                 off.wait_for_pipeline_warmup();

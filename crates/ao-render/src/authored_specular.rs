@@ -101,7 +101,7 @@ pub(super) fn append_materials(source: &mut String, settings: crate::EnhancedSet
     if source.contains("fn clustered_pixel_lights(") {
         shader = shader.replace(
             "vertex_lights(i.wpos, n, 0.0)[0] - vertex_lights(i.wpos, base, 0.0)[0]",
-            "clustered_pixel_lights(i.wpos, n, material_footprint) - clustered_pixel_lights(i.wpos, base, material_footprint) + clustered_directional(n) - clustered_directional(base) - g.sun_g.rgb * (max(dot(n, g.sun_dir.xyz), 0.0) - max(dot(base, g.sun_dir.xyz), 0.0))",
+            "clustered_pixel_lights(i.wpos, n, material_footprint) - clustered_local_value + clustered_directional(n) - clustered_directional(base) - g.sun_g.rgb * (max(dot(n, g.sun_dir.xyz), 0.0) - max(dot(base, g.sun_dir.xyz), 0.0))",
         );
     }
     source.push_str(&shader);

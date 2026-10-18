@@ -100,6 +100,72 @@ fn function(source: &str, name: &str) -> String {
     source[start..end].to_owned()
 }
 
+#[test]
+fn clustered_material_base_reuse_is_initialized_on_every_receiver_path() {
+    for material_pbr in [false, true] {
+        for shadows in [false, true] {
+            for moon in [false, true] {
+                let mut source = crate::enhanced_shader::source(crate::EnhancedSettings {
+                    clustered_lighting: true, generated_normals: true, material_maps: true,
+                    material_pbr, sun_shadows: shadows, local_light_shadows: shadows,
+                    moon_shadows: shadows,
+                    night_mode: if moon { crate::NightMode::Moonlit } else { crate::NightMode::AsGame },
+                    ..Default::default()
+                });
+                if moon { source = crate::moon_shadows::shader(source, shadows, true); }
+                crate::foliage_edges::append(&mut source);
+                assert!(source.contains("var<private> clustered_local_value: vec3<f32>;"));
+                assert_eq!(source.matches("clustered_local_value = local;").count(), 2);
+                for name in ["clustered_receiver", "clustered_ground"] {
+                    let receiver = function(&source, name);
+                    let local = receiver.find("    let local = clustered_pixel_lights(").unwrap();
+                    let assignment = receiver.find("    clustered_local_value = local;").unwrap();
+                    assert_eq!(receiver[local..assignment].lines().count(), 1);
+                    assert!(!receiver[..assignment].contains("if "), "cache write must precede every guard");
+                    assert!(!receiver[..assignment].contains("return "));
+                    assert!(receiver.contains("clustered_normal / max(length(clustered_normal), 1e-6)"));
+                    assert!(receiver.contains("early_footprint"));
+                }
+                let diffuse = function(&source, "material_diffuse");
+                assert!(diffuse.contains("clustered_pixel_lights(i.wpos, n, material_footprint) - clustered_local_value"));
+                assert!(!diffuse.contains("clustered_pixel_lights(i.wpos, base"));
+                assert!(function(&source, "material_prepare_derivatives").contains("material_base_normal = material_safe_normal(i.n);"));
+                assert!(function(&source, "material_prepare_derivatives").contains("material_footprint = early_footprint;"));
+                assert!(function(&source, "material_safe_normal").contains("n / max(length(n), 1e-6)"));
+                // Exhaust the callers, including the copied foliage shade. Each
+                // direct call or ground trampoline follows receiver initialization.
+                let mut diffuse_callers = 0;
+                for part in source.split("fn ").skip(1) {
+                    let name = part.split('(').next().unwrap();
+                    let body = part.split_once('{').unwrap().1.split("\n}").next().unwrap();
+                    if let Some(read) = body.find("material_diffuse(i, light)") {
+                        diffuse_callers += 1;
+                        if name == "material_ground" { continue; }
+                        assert!(matches!(name, "shade" | "foliage_edge_shade"));
+                        assert!(body.find("light = clustered_receiver(i, light);").unwrap() < read);
+                    }
+                    if let Some(read) = body.find("material_ground(i,") {
+                        assert!(matches!(name, "enhanced_original_fs_ground_fused" | "enhanced_original_fs_ground_shadow" | "enhanced_original_fs_ground_simple"));
+                        assert!(body.find("let cluster_light = clustered_ground(i,").unwrap() < read);
+                    }
+                    if body.contains("let beauty = enhanced_original_") || body.contains("let beauty = foliage_edge_shade(") {
+                        let beauty = body.find("    let beauty = ").unwrap();
+                        assert!(body.find("clustered_normal = i.n;").unwrap() < beauty);
+                        assert!(body.find("material_prepare_derivatives(i);").unwrap() < beauty);
+                        assert!(!body[..beauty].contains(".wpos ="), "moon/geometric wrappers must retain the receiver position");
+                    }
+                }
+                assert_eq!(diffuse_callers, 3);
+                for name in ["enhanced_original_fs_ground_fused", "enhanced_original_fs_ground_shadow", "enhanced_original_fs_ground_simple"] {
+                    let ground = function(&source, name);
+                    assert!(ground.split_once('{').unwrap().1.starts_with("\n    let cluster_light = clustered_ground(i,"),
+                        "every ground variant initializes the cache, even when it has no material call");
+                }
+            }
+        }
+    }
+}
+
 fn numeric_pixels(renderer: &crate::Renderer, source: String) -> Vec<u8> {
     let shader = renderer.device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("clustered local-light numeric controls"), source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -183,29 +249,46 @@ fn gpu_clustered_ground_subtracts_directional_shadow_once() {
     let generated = crate::enhanced_shader::source(crate::EnhancedSettings { clustered_lighting: true, sun_shadows:true, ..Default::default() });
     let ground = function(&generated, "enhanced_original_fs_ground_fused");
     let helper = function(&generated, "clustered_ground");
+    let material = crate::enhanced_shader::source(crate::EnhancedSettings { clustered_lighting: true, material_pbr: true, ..Default::default() });
+    let diffuse = function(&material, "material_diffuse");
     let source = format!(r#"
 struct VOut {{ wpos:vec3<f32>, n:vec3<f32>, clip:vec4<f32>, color:vec4<f32>, light:vec4<f32>, sun_share:vec4<f32> }}
-struct Globals {{ ambient_g:vec4<f32>, fog_g:vec4<f32> }}
+struct Globals {{ ambient_g:vec4<f32>, fog_g:vec4<f32>, sun_g:vec4<f32>, sun_dir:vec4<f32> }}
 var<private> g:Globals;
 var<private> clustered_normal:vec3<f32>;
+var<private> clustered_local_value:vec3<f32>;
+var<private> query_count:u32;
+var<private> material_base_normal:vec3<f32>;
+var<private> material_footprint:f32;
+var<private> material_visibility_value:f32;
+var<private> material_orm_value:vec3<f32>;
+const MATERIAL_PBR:bool=true;
+fn material_shading_normal(i:VOut)->vec3<f32>{{return material_base_normal;}}
+fn material_metallic(i:VOut)->f32{{return 0.0;}}
+fn material_mask(i:VOut)->u32{{return 0u;}}
+fn clustered_directional(n:vec3<f32>)->vec3<f32>{{return vec3<f32>(0.0);}}
 var<private> visibility:f32;
 var<private> early_footprint:f32;
 fn sun_visibility(p:vec3<f32>, n:vec3<f32>, pixel:vec2<f32>)->f32{{return visibility;}}
-fn clustered_pixel_lights(p:vec3<f32>, n:vec3<f32>, footprint:f32)->vec3<f32>{{return vec3<f32>(0.2);}}
+fn clustered_pixel_lights(p:vec3<f32>, n:vec3<f32>, footprint:f32)->vec3<f32>{{query_count+=1u; return vec3<f32>(0.2);}}
 fn clustered_night_light(i:VOut,n:vec3<f32>,ground:bool,light:vec3<f32>,retained:vec3<f32>)->vec3<f32>{{return light;}}
 fn ground_palette(i:VOut)->vec3<f32>{{return vec3<f32>(0.0);}}
 fn ground_tile(i:VOut)->vec3<f32>{{return vec3<f32>(1.0);}}
 fn ground_fog(i:VOut)->f32{{return 0.0;}}
 {helper}
 {ground}
+{diffuse}
 {NUMERIC_VERTEX}
 @fragment fn fs(@builtin(position) p:vec4<f32>)->@location(0) vec4<f32>{{
     clustered_normal=vec3<f32>(0.0,1.0,0.0); visibility=select(0.0,1.0,p.x>=1.0);
     var i:VOut; i.color=vec4<f32>(0.6); i.sun_share=vec4<f32>(0.4); i.n=clustered_normal;
-    return enhanced_original_fs_ground_fused(i);
+    material_base_normal=clustered_normal; material_orm_value=vec3<f32>(1.0);
+    let ground_light=enhanced_original_fs_ground_fused(i);
+    let light=material_diffuse(i,ground_light.rgb);
+    return vec4<f32>(light,f32(query_count)*0.25);
 }}
 "#);
     let pixels = numeric_pixels(&renderer, source);
-    assert_eq!(&pixels[..4], &[102,102,102,255], "0.6 base minus 0.4 direct shadow plus 0.2 local = 0.4, not zero");
-    assert_eq!(&pixels[4..], &[204,204,204,255], "unshadowed positive control retains the same local light");
+    assert_eq!(&pixels[..4], &[102,102,102,128], "shadowed ground stays 0.4; receiver plus material-normal evaluation performs exactly two queries");
+    assert_eq!(&pixels[4..], &[204,204,204,128], "unshadowed ground stays 0.8 with the same two queries, not a repeated base scan");
 }

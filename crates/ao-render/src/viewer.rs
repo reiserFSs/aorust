@@ -1399,8 +1399,9 @@ impl Offscreen {
     pub fn frame_pipeline_waits(&self) -> u64 { self.r.frame_pipeline_waits() }
     /// Readiness of both the world/effect pipelines and the GUI pipeline used by this frontend.
     pub fn pipeline_warmup_complete(&self) -> bool { self.r.pipeline_warmup_complete() && self.gr.is_ready() }
-    /// Explicit loading boundary; ordinary frames wait only for the pipelines they actually use.
-    pub fn wait_for_pipeline_warmup(&self) {
+    /// Explicit loading boundary; prepare lazy canopy pipelines before any capture can seed history.
+    pub fn wait_for_pipeline_warmup(&mut self) {
+        self.r.prepare_canopy_leaves();
         self.r.wait_for_pipeline_warmup();
         self.gr.wait();
     }
@@ -1628,6 +1629,15 @@ impl Offscreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evidence_warmup_prepares_lazy_canopy_before_waiting() {
+        let source = include_str!("viewer.rs");
+        let warmup = source.split("pub fn wait_for_pipeline_warmup(&mut self)").nth(1).unwrap().split("pub fn world_variant_cache_len").next().unwrap();
+        assert!(warmup.find("self.r.prepare_canopy_leaves()").unwrap()
+            < warmup.find("self.r.wait_for_pipeline_warmup()").unwrap(),
+            "evidence must not seed temporal history with compilation-dependent missing leaves");
+    }
 
     #[test]
     fn runtime_suspend_preserves_requests_and_restores_via_worker() {

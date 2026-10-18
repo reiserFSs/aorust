@@ -206,7 +206,7 @@ fn capture(out: &std::path::Path, selected_view: Option<&str>, selected_preset: 
                 ensure!(effect_admitted_frames[index] > 0, "combined native effect {index} never admitted");
                 writeln!(manifest, "view={name} profile=combined-all native_effect_index={index} admitted_frames={} {}", effect_admitted_frames[index], effect.metadata())?;
             }
-            fog_and_admission(&dir, &scene, placement.0, lens, settings, &avatar, exposure.clone())
+            fog_and_admission(&dir, &out.join(format!("{name}-{profile}-admission")), &scene, (placement.0, lens), settings, &avatar, exposure.clone())
                 .with_context(|| format!("{name}/{profile} fog/admission"))?;
             writeln!(manifest, "checked_view={name} preset={profile:?} msaa_requested={msaa} msaa_actual={} temporal_frames=120 temporal_pairs=119 sheet_frames=9,19,29,39,49,59,69,79,89,99,109,119 temporal_dt=1/60 camera_yaw_per_frame=0.0005 actor_path_m=1 invariant_resolution=384x240 invariant_msaa_requested=4 invariant_msaa_actual=4 fully_fogged_colours_equal=true unfogged_colours_differ=true non_admitted_equals_absent=true", off.msaa_samples())?;
             std::fs::write(out.join("temporal.csv"), &temporal)?;
@@ -238,7 +238,7 @@ fn consecutive_diff(previous: &[u8], current: &[u8]) -> (f64, u8, usize, usize) 
     (sum as f64 / (previous.len() / 4 * 3) as f64, max, over_two, different)
 }
 
-fn fog_and_admission(dir: &std::path::Path, scene: &Scene, fixed: Camera, lens: Lens, settings: ao_render::EnhancedSettings,
+fn fog_and_admission(dir: &std::path::Path, evidence: &std::path::Path, scene: &Scene, (fixed, lens): (Camera, Lens), settings: ao_render::EnhancedSettings,
     avatar: &super::super::avatar::Avatar, exposure: ao_render::GrassExposure) -> anyhow::Result<()> {
     // Existing night regression's saturated-body positive control, applied to every preset.
     let render = |fog: bool, body: u8| -> anyhow::Result<Vec<u8>> {
@@ -279,13 +279,26 @@ fn fog_and_admission(dir: &std::path::Path, scene: &Scene, fixed: Camera, lens: 
         }
         let list = off.frame(&mut shot, 0.0);
         off.warm_grass_tiles();
+        off.wait_for_pipeline_warmup();
         off.rgba(&shot, &list)?;
         off.wait_for_pipeline_warmup();
         let rgba = off.rgba(&shot, &list)?;
         ensure!(off.msaa_samples() == 4, "fog/admission invariant actual MSAA {} != 4", off.msaa_samples());
         Ok(rgba)
     };
-    ensure!(render(false, 0)? == render(false, 1)?, "non-admitted body/bender leaks a signal");
+    let absent = render(false, 0)?;
+    let excluded = render(false, 1)?;
+    if absent != excluded {
+        let (_, max, pixels_over_two, different_bytes) = consecutive_diff(&absent, &excluded);
+        let first: Vec<_> = absent.iter().zip(&excluded).enumerate().filter(|(_, (a, b))| a != b)
+            .take(16).map(|(offset, (&a, &b))| (offset, (offset / 4) % 384, offset / (384 * 4), offset % 4, a, b)).collect();
+        let report = format!("different_rgba_bytes={different_bytes} max_rgb_codes={max} pixels_gt2={pixels_over_two}\nfirst_differences=(byte_offset,x,y,channel,absent,excluded) {first:?}\n");
+        for (suffix, raw) in [("absent", &absent), ("excluded", &excluded)] {
+            image::save_buffer(evidence.with_extension(format!("{suffix}.png")), raw, 384, 240, image::ColorType::Rgba8)?;
+        }
+        std::fs::write(evidence.with_extension("txt"), &report)?;
+        anyhow::bail!("non-admitted body/bender leaks a signal: {report}evidence={}", evidence.display());
+    }
     ensure!(render(false, 2)? != render(false, 3)?, "unfogged body positive control invisible");
     ensure!(render(true, 2)? == render(true, 3)?, "fully fogged body colour leaks through extinction");
     Ok(())
@@ -298,6 +311,10 @@ fn preset_matrix_contract() {
     assert_eq!(PRESETS.map(GraphicsPreset::msaa), [1, 4, 1, 1]);
     assert_eq!(GraphicsPreset::Ultra.msaa(), 1); // combined-all inherits Ultra AA.
     assert_eq!(consecutive_diff(&[10, 20, 30, 255], &[11, 24, 30, 255]), (5.0 / 3.0, 4, 1, 2));
+    let source = include_str!("preset_matrix.rs");
+    let invariant = source.split("fn fog_and_admission(").nth(1).unwrap().split("#[test]").next().unwrap();
+    assert!(invariant.find("off.wait_for_pipeline_warmup()").unwrap()
+        < invariant.find("off.rgba(").unwrap(), "no compilation-dependent frame may seed invariant history");
     for preset in PRESETS {
         assert_eq!(graphics_fixture_settings(preset.name()).unwrap(), {
             let mut values = DValues::new(&ao_gui::client_dir());

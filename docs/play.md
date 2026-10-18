@@ -767,6 +767,14 @@ pattern separately at **384×240, requested-and-checked actual 4× MSAA**; the m
 labels this invariant sample count independently of the preset's main render.
 A zero-alpha actor and its owner-tagged bender must equal absence, unfogged red/green
 body colours must differ, and fully fogged red/green bodies must be identical.
+Before the first rendered invariant frame, the explicit Offscreen warmup boundary
+prepares and waits for lazy canopy pipelines, and grass exposure tiles are fully
+warmed. Waiting only after that frame can seed TAA/reflection/cloud history with
+compilation-dependent missing leaves; actor-model upload time must not choose the
+initial image. Live asynchronous canopy transitions are unchanged. Admission
+failures retain the absent/excluded PNG pair plus differing RGBA-byte count,
+maximum RGB delta and first 16 `(byte_offset,x,y,channel,absent,excluded)` locations
+in `<view>-<profile>-admission.txt`; equality remains exact.
 No full RGBA files or frame PNG sequences are retained; output is capped at 100 MB
 per invocation. `status.txt` distinguishes
 completed numerical checks from still-unexercised human visual acceptance.
@@ -2045,6 +2053,10 @@ history-admission GPU regressions still cover those contracts with real shadow m
 Source contracts retain verbatim cascade/fog/admission math and derivative hoisting.
 PBR omits the overwritten `clustered_receiver_spec` call (including its local-light
 shadow scan); non-PBR calls and native unlit/effect/room specular pass-through remain.
+Material diffuse reuses the receiver's invocation-private base clustered-light
+value instead of repeating its identical smooth-normal scan. Both mesh and ground
+receivers write it unconditionally before receiver guards; material-normal and
+GGX scans, admission and point-shadow sampling remain unchanged.
 Whole-frame performance still requires the acceptance/marginal fixtures above.
 
 Sun cascades admit loaded static geometry, including terrain patches, by their

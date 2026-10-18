@@ -1,3 +1,6 @@
+// The receiver's smooth-normal scan is also material_diffuse's base term.
+var<private> clustered_local_value: vec3<f32>;
+
 // Native gamma-space local lighting, with conservative one-pixel range-edge
 // coverage instead of an invented broad radial falloff. Spatial lists contain
 // only the current frame's 64 admitted sources; no actor history is retained.
@@ -48,6 +51,7 @@ fn clustered_receiver(i: VOut, envelope: vec3<f32>) -> vec3<f32> {
     let n = clustered_normal / max(length(clustered_normal), 1e-6);
     let footprint = max(length(fwidth(i.wpos)), 1e-6);
     let local = clustered_pixel_lights(i.wpos, n, footprint);
+    clustered_local_value = local;
     if native_unlit() || (i.effect != 0u && i.effect != 3u && i.effect != 7u) {
         return envelope;
     }
@@ -59,6 +63,7 @@ fn clustered_receiver(i: VOut, envelope: vec3<f32>) -> vec3<f32> {
 fn clustered_ground(i: VOut, ambient: bool) -> vec3<f32> {
     let n = clustered_normal / max(length(clustered_normal), 1e-6);
     let local = clustered_pixel_lights(i.wpos, n, max(length(fwidth(i.wpos)), 1e-6));
+    clustered_local_value = local;
     let base = max(i.color.rgb - CLUSTER_SUN_SHADOW, vec3<f32>(0.0)) + select(vec3<f32>(0.0), g.ambient_g.rgb, ambient);
     return min(clustered_night_light(i, n, true, base + local, local), vec3<f32>(1.0));
 }
