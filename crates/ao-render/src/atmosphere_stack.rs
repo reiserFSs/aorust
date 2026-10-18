@@ -51,6 +51,7 @@ impl Renderer {
         self.atmosphere_layers.clear();
         self.atmosphere_layers.extend(self.atmosphere_native_layers.iter().map(|layer| crate::volumetric_clouds::density_layer(layer, eye, far, self.time)));
         let clouds = self.volumetric_clouds.as_mut().expect("startup cloud pipelines");
+        clouds.set_quality(settings.cloud_quality);
         if settings.volumetric_clouds || settings.cloud_shadows {
             clouds.prepare(&self.device, &self.queue, encoder, &frame.resolved_depth,
                 frame.sun.as_ref(), frame.water_cloud.as_ref(), frame.size, vp, eye,

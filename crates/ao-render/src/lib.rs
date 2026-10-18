@@ -3146,11 +3146,7 @@ impl Renderer {
             });
             pass.set_bind_group(0, &self.globals_bg, &[]);
             // Sky, ground and actors retain this receiver across pipeline changes.
-            if self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows || self.enhanced_settings.needs_admitted_lights()
-                || (self.enhanced_settings.ground_grass && self.enhanced_settings.grass_sun_shadows)
-                || self.enhanced_settings.night_mode == NightMode::Moonlit {
-                pass.set_bind_group(3, self.shadow_receiver(), &[]);
-            }
+            self.bind_world_receiver(&mut pass);
             let (pipe, mesh, mat) = (std::cell::Cell::new(usize::MAX), std::cell::Cell::new((false, usize::MAX, false)), std::cell::Cell::new((false, usize::MAX)));
             let draw = |pass: &mut wgpu::RenderPass, d: &Draw, insts: std::ops::Range<u32>, sky: bool| {
                 if pipe.get() != d.pipe {
@@ -3198,11 +3194,7 @@ impl Renderer {
             let world_phase = |pass: &mut wgpu::RenderPass, priority: i32| {
                 pass.set_bind_group(0, &self.globals_bg, &[]);
                 // Grass replaces group 3; restore the shared receiver at phase entry.
-                if self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows || self.enhanced_settings.needs_admitted_lights()
-                    || (self.enhanced_settings.ground_grass && self.enhanced_settings.grass_sun_shadows)
-                    || self.enhanced_settings.night_mode == NightMode::Moonlit {
-                    pass.set_bind_group(3, self.shadow_receiver(), &[]);
-                }
+                self.bind_world_receiver(pass);
                 pipe.set(usize::MAX); mesh.set((false, usize::MAX, false)); mat.set((false, usize::MAX));
                 if let Some(inst) = inst_buf {
                     pass.set_vertex_buffer(1, inst.slice(..));
@@ -3222,9 +3214,7 @@ impl Renderer {
                 calls.set(calls.get() + self.draw_actors(pass, priority));
                 if let Some(inst) = inst_buf.filter(|_| split_foliage) {
                     pass.set_bind_group(0, &self.globals_bg, &[]);
-                    if self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows || self.enhanced_settings.night_mode == NightMode::Moonlit {
-                        pass.set_bind_group(3, &self.sun_shadows.as_ref().expect("shadow maps prepared before world").receiver, &[]);
-                    }
+                    self.bind_world_receiver(pass);
                     pass.set_vertex_buffer(1, inst.slice(..));
                     pipe.set(usize::MAX); mesh.set((false, usize::MAX, false)); mat.set((false, usize::MAX));
                     let first = self.sorted.partition_point(|command| command.0 < priority);

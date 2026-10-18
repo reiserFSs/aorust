@@ -9,7 +9,7 @@ struct Params {
     eye_time: vec4<f32>, control: vec4<f32>, fog: vec4<f32>,
     effects: vec4<f32>, sun_direction: vec4<f32>, sun_colour: vec4<f32>,
     sky_colour: vec4<f32>, fog_colour: vec4<f32>,
-    raster: vec4<f32>,
+    raster: vec4<f32>, // MSAA samples, unused, unused, reflection quality tier
     lamps: array<Lamp, 64>,
 };
 @group(0) @binding(0) var<uniform> p: Params;
@@ -105,8 +105,11 @@ fn world_at(pixel: vec2<i32>, depth: f32) -> vec3<f32> {
         let sky = mix(p.fog_colour.rgb, p.sky_colour.rgb, sqrt(clamp(ray.y, 0.0, 1.0)));
         var reflected = mix(original.rgb, max(sky, vec3<f32>(0.0)), p.sky_colour.w);
         var previous_delta = -1.0;
-        for (var i = 1; i <= 24; i += 1) {
-            let t = 0.15 + 0.085 * f32(i * i);
+        // Denser samples, not a longer ray: both tiers end at 49.11 metres.
+        let quality = u32(p.raster.w);
+        for (var i = 1u; i <= 24u * quality; i += 1u) {
+            let sample = f32(i) / f32(quality);
+            let t = 0.15 + 0.085 * (sample * sample);
             let q = mask.xyz + normal * 0.06 + ray * t;
             let clip = p.vp * vec4<f32>(q, 1.0);
             if clip.w <= 0.0 { break; }

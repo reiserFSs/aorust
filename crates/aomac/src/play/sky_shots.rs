@@ -9,6 +9,7 @@ use ao_scene::{Lens, Scene};
 use std::path::PathBuf;
 
 mod ao_grain;
+mod preset_matrix;
 
 struct Shot {
     gui: Gui,
@@ -2014,6 +2015,11 @@ fn graphics_offline_night_preserves_fog_and_hidden_actor_isolation() -> anyhow::
 }
 
 fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::EnhancedSettings> {
+    if let Some(preset) = super::enhanced::GraphicsPreset::from_name(profile) {
+        let mut values = super::dvalue::DValues::new(&ao_gui::client_dir());
+        super::enhanced::apply_preset(&mut values, preset);
+        return Ok(values.enhanced_settings());
+    }
     let mut settings = ao_render::EnhancedSettings::default();
     match profile {
         "faithful" => {}

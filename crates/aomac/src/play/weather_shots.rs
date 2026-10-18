@@ -4,7 +4,7 @@ use anyhow::{Context, ensure};
 use ao_render::{Camera, Offscreen, Vec3};
 use std::{cell::RefCell, fmt::Write, path::PathBuf, rc::Rc};
 #[path = "weather_effects.rs"]
-mod weather_effects;
+pub(super) mod weather_effects;
 
 #[test]
 #[ignore = "installed-client headless weather/particles PNG and paired ABBA acceptance; requires GPU lock"]
@@ -288,10 +288,10 @@ fn native_weather_at(store: &ao_rdb::RecordStore, pf: u32, day: u32, time: f32) 
     Ok(weather.state())
 }
 
-type NativeWeatherCase = (usize, u32, u32, f32, ao_formats::weather::State);
+pub(super) type NativeWeatherCase = (usize, u32, u32, f32, ao_formats::weather::State);
 
 /// Bounded native schedule discovery, without overwriting native channels or wind.
-fn native_weather_cases(store: &ao_rdb::RecordStore, required: &[usize]) -> anyhow::Result<Vec<NativeWeatherCase>> {
+pub(super) fn native_weather_cases(store: &ao_rdb::RecordStore, required: &[usize]) -> anyhow::Result<Vec<NativeWeatherCase>> {
     let mut found = Vec::new();
     if required.is_empty() { return Ok(found); }
     let mut ids = vec![800, 566, 4582];

@@ -18,10 +18,11 @@ pub(super) struct WaterOpticsSwitches {
     pub wakes: bool,
     pub rain_mask: bool,
     pub realism: f32,
+    pub quality: u32,
 }
 impl Default for WaterOpticsSwitches {
     fn default() -> Self {
-        Self { refraction: false, reflections: false, underwater: false, ripples: false, caustics: false, sun_glint: false, waterfalls: false, foam: false, waves: false, wakes: false, rain_mask: false, realism: 0.5 }
+        Self { refraction: false, reflections: false, underwater: false, ripples: false, caustics: false, sun_glint: false, waterfalls: false, foam: false, waves: false, wakes: false, rain_mask: false, realism: 0.5, quality: 1 }
     }
 }
 #[derive(Clone, Copy)]
@@ -247,7 +248,7 @@ impl WaterOptics {
             sun_colour: [eligibility.sun_colour[0], eligibility.sun_colour[1], eligibility.sun_colour[2], u32::from(eligibility.daylight && eligibility.outdoors) as f32],
             sky_colour: [eligibility.sky_colour[0], eligibility.sky_colour[1], eligibility.sky_colour[2], u32::from(eligibility.outdoors) as f32],
             fog_colour: [eligibility.fog_colour[0], eligibility.fog_colour[1], eligibility.fog_colour[2], self.lamp_count as f32],
-            raster: [eligibility.samples.max(1) as f32, 0.0, 0.0, 0.0],
+            raster: [eligibility.samples.max(1) as f32, 0.0, 0.0, switches.quality.clamp(1, 2) as f32],
             lamps: self.lamps,
         }));
         true
@@ -305,7 +306,34 @@ mod tests {
         let switches = WaterOpticsSwitches::default();
         assert!(!switches.refraction && !switches.reflections && !switches.underwater && !switches.ripples && !switches.caustics && !switches.sun_glint && !switches.waterfalls && !switches.foam && !switches.waves && !switches.wakes);
         assert_eq!(switches.realism, 0.5);
+        assert_eq!(switches.quality, 1);
         assert!(!switches.rain_mask);
+    }
+    #[test]
+    fn water_quality_doubles_samples_without_extending_reach() {
+        let shader = include_str!("water_optics.wgsl");
+        assert!(shader.contains("let quality = u32(p.raster.w);"));
+        assert!(shader.contains("i <= 24u * quality"));
+        assert!(shader.contains("let sample = f32(i) / f32(quality);"));
+        assert!(shader.contains("let t = 0.15 + 0.085 * (sample * sample);"));
+        let defaults = crate::EnhancedSettings::default();
+        let distance = |i: u32, tier: u32| {
+            let sample = i as f32 / tier as f32;
+            0.15 + 0.085 * (sample * sample)
+        };
+        for (input, samples) in [(0, 24), (1, 24), (2, 48), (u32::MAX, 48)] {
+            let tier = crate::EnhancedSettings { water_quality: input, ..defaults }.clamped().water_quality;
+            assert_eq!(24 * tier, samples);
+            let mut previous = 0.15;
+            for i in 1..=samples {
+                let t = distance(i, tier);
+                assert!(t > previous && t <= distance(24, 1));
+                previous = t;
+            }
+            assert!((previous - 49.11).abs() < 0.00001);
+            // Ultra retains every original sample, only inserting midpoints.
+            for i in 1..=24 { assert_eq!(distance(i * tier, tier), 0.15 + 0.085 * (i * i) as f32); }
+        }
     }
     #[test]
     fn finite_triangle_membership_handles_shore_holes_slopes_and_edges() {

@@ -94,6 +94,10 @@ pub struct EnhancedSettings {
     pub water_sun_glint: bool,
     /// 0 keeps the richer native colour; 1 favours physically restrained water.
     pub water_realism: f32,
+    /// 1 = Modern, 2 = Ultra (twice the cloud view/light march steps).
+    pub cloud_quality: u32,
+    /// 1 = Modern, 2 = Ultra (twice the reflection samples, unchanged reach).
+    pub water_quality: u32,
     pub water_wake_strength: f32,
     pub water_wake_visibility: f32,
     pub water_wake_duration: f32,
@@ -147,6 +151,7 @@ impl Default for EnhancedSettings {
             water_waves: false, water_ripples: false, water_refraction: false, water_reflections: false,
             water_foam: false, water_wakes: false, waterfalls: false, underwater: false,
             water_caustics: false, water_sun_glint: false, water_realism: 0.5,
+            cloud_quality: 1, water_quality: 1,
             water_wake_strength: 2.0, water_wake_visibility: 2.0, water_wake_duration: 0.3,
             water_wake_speed: 3.6, water_wake_treading: 1.0, water_wake_splash: 1.0,
             shadow_map_size: 2048, shadow_strength: 0.45, shadow_softness: 1.5, ao_radius: 1.75, ao_strength: 1.5, bloom_strength: 0.6,
@@ -227,6 +232,8 @@ impl EnhancedSettings {
         let defaults = Self::default();
         Self {
             shadow_map_size: self.shadow_map_size.clamp(256, 4096),
+            cloud_quality: self.cloud_quality.clamp(1, 2),
+            water_quality: self.water_quality.clamp(1, 2),
             point_shadow_count: self.point_shadow_count.clamp(1, 16),
             lamp_intensity: finite(self.lamp_intensity, 4.0, defaults.lamp_intensity),
             carried_light_intensity: finite(self.carried_light_intensity, 4.0, defaults.carried_light_intensity),
@@ -383,6 +390,13 @@ mod tests {
         assert_eq!(defaults.bloom_strength, 0.6);
         assert_eq!(defaults.clamped(), defaults);
         assert_eq!(defaults.point_shadow_count, 4);
+        assert_eq!((defaults.cloud_quality, defaults.water_quality), (1, 1));
+        for (input, expected) in [(0, 1), (1, 1), (2, 2), (3, 2), (u32::MAX, 2)] {
+            let bounded = EnhancedSettings { cloud_quality: input, water_quality: input, ..defaults }.clamped();
+            assert_eq!((bounded.cloud_quality, bounded.water_quality), (expected, expected));
+            assert!(!bounded.any_enabled() && !bounded.needs_sun_mask());
+            assert_eq!(crate::variant::Key::of(bounded, 4), crate::variant::Key::of(defaults, 4));
+        }
         for (input, expected) in [(0, 1), (1, 1), (4, 4), (16, 16), (u32::MAX, 16)] {
             assert_eq!(EnhancedSettings { point_shadow_count: input, ..defaults }.clamped().point_shadow_count, expected);
         }

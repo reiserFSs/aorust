@@ -102,6 +102,7 @@ impl Renderer {
             waterfalls: settings.waterfalls, underwater: settings.underwater,
             caustics: settings.water_caustics, sun_glint: settings.water_sun_glint,
             realism: settings.water_realism,
+            quality: settings.water_quality,
             rain_mask: settings.enhanced_rain,
         };
         if !settings.water_enabled() || !self.liquids.iter().any(|run| matches!(run.source.style, 0 | 4)) {

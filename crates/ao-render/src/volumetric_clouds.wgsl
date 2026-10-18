@@ -6,7 +6,7 @@ struct Params {
     eye: vec4<f32>,
     control: vec4<f32>, // layer count, reach, checker phase, history valid
     enabled: vec4<f32>, // clouds, shadows
-    fog: vec4<f32>, // native start/end
+    fog: vec4<f32>, // native start/end, cloud quality tier
     fog_colour: vec4<f32>,
     shadow_area: vec4<f32>,
     shadow_sun: vec4<f32>,
@@ -51,10 +51,11 @@ fn cloud_march(direction: vec3<f32>) -> vec4<f32> {
         if interval.y <= interval.x { continue; }
         // Half resolution plus four checker phases amortizes the curved march;
         // the short light ray needs fewer samples than the visible silhouette.
-        let step = (interval.y - interval.x) / 16.0;
+        let steps = 16u * u32(params.fog.z);
+        let step = (interval.y - interval.x) / f32(steps);
         let sun_length = length(layer.sun.xyz);
         let sun = layer.sun.xyz / max(sun_length, 0.001);
-        for (var i = 0; i < 16; i++) {
+        for (var i = 0u; i < steps; i++) {
             if transmittance <= 0.005 { break; }
             let p = direction * (interval.x + (f32(i) + 0.5) * step);
             let density = cloud_density(p, layer);
@@ -65,7 +66,7 @@ fn cloud_march(direction: vec3<f32>) -> vec4<f32> {
             // neither decode them to linear nor inject primary-world fog.
             var direct = 0.0;
             if sun_length > 0.001 {
-                direct = cloud_transmittance_steps(p, sun, layer, layer.shape.y * 8.0, 4u)
+                direct = cloud_transmittance_steps(p, sun, layer, layer.shape.y * 8.0, 4u * u32(params.fog.z))
                     * (0.5 + 0.5 * max(dot(direction, sun), 0.0));
             }
             let grey = layer.ambient.w;

@@ -1423,6 +1423,40 @@ as retail Video sub-pages. Add controls to this registry, not page layout or dup
 DValue registration. Existing names, defaults, ranges and DV Main `Prefs.xml` persistence
 are unchanged; `ChatFontSize` continues using its retail definition.
 
+**Enhanced → Presets** uses the same native radio dispatch and DV Main persistence as
+the other pages. `play/enhanced.rs::{GraphicsPreset,apply_preset}` is the shared preset API
+for the UI and headless scene matrix; the registry remains the only control inventory.
+`AomacGraphicsPreset` stores **0 Original, 1 Classic+, 2 Modern, 3 Ultra, 4 Custom**.
+The five preset choices share a horizontal radio row, keeping every choice reachable
+without a radio group taller than the minimum-sized Enhanced scroll viewport.
+Selecting a named preset deterministically writes every graphical flag and quality value,
+including currently inactive qualities. It does not change interface scale, fullscreen,
+pinch zoom, widescreen camera FOV, text preferences or session diagnostics/suspension.
+
+| Preset | Semantics |
+| --- | --- |
+| Original | All graphical effect switches off; registry quality defaults, 1× MSAA, 1× anisotropy. |
+| Classic+ | Sun shadows, AO, contact shadows, HDR, grading, bloom, clustered local lighting, authored material specular and local light shadows only; no added grass, sky, water or foliage content. Sun boost 0.15, grade 0.25, bloom 0.2, AO strength 0.6, contact strength 0.4; 4× MSAA and 8× anisotropy. |
+| Modern | Recommended materials/reflections, night/local lighting, weather/clouds, water, foliage/grass and grading effects, with TAA + CAS sharpening and 4× MSAA. FXAA, cinematic depth of field/motion blur and user LUTs remain off. Registry quality defaults, Moonlit night, night tint 0.15, vignette 0.1; 16× anisotropy. |
+| Ultra | Same effects as Modern, plus 4096 shadow map, 8 point shadows, AO radius 2.5 / strength 1.8, grass density 2 / distance 180 m, High cloud/water quality; same MSAA and anisotropy. Cinematic effects and user LUTs remain opt-in. |
+
+Night modes are mutually exclusive, so Modern/Ultra select Moonlit rather than Dark.
+FXAA, depth of field, motion blur and zone LUTs can be enabled manually. Zone LUTs and side-loaded material
+maps remain dependent on user-provided assets. No preset expands scenery distance:
+all set its multiplier to 1; the renderer's admission and fog rules remain unchanged.
+Cloud Quality Normal (1) uses 16 view / 4 lighting samples; High (2) uses 32 / 8.
+Both keep the same half-resolution/history targets; tier changes invalidate cloud history,
+and cloud shadows retain 12 samples. Water Quality Normal (1) uses 24 SSR samples,
+High (2) uses 48 over the identical approximately 49.11 m reach. Neither extends fog or sight.
+Every manual graphical control write selects Custom, even a write of the same value or
+changing back to the preset's value. Custom never auto-matches a named preset and
+selecting Custom itself preserves current settings. Loading saved controls bypasses
+manual-edit tracking, retaining the saved selection; older files without a selection
+retain their controls and become Custom when any graphical value is non-default.
+Regression coverage: `enhanced::tests::presets_cover_every_graphical_control_and_manual_edits_stay_custom`
+and `options::tests::enhanced_preset_radio_dispatch_and_custom_roundtrip`.
+
+
 The optional Sun Shadows (`AomacSunShadows`), Ambient Occlusion (`AomacAmbientOcclusion`),
 Emissive Bloom (`AomacEmissiveBloom`), Ground Grass (`AomacGroundGrass`) and HDR Sunlight and
 Tonemap (`AomacHdr`) and Contact Shadows (`AomacContactShadows`) checkboxes are
@@ -1918,9 +1952,10 @@ bloomed pixels roll into the shoulder instead of clipping at their own old white
 
 These are aomac-only artistic controls, not reconstructed retail settings. Values are bounded
 at the renderer settings boundary; non-finite floats use the documented defaults.
-**Restore Original** restores the selected Enhanced page's registered defaults through
-ordinary DValue writes. **Restore All** restores all Enhanced controls, including quality,
-camera and interface preferences; neither changes unrelated retail preferences. Both
+**Restore Original** restores the selected Enhanced page's registered defaults and marks
+the graphical selection Custom. On the Presets page it applies the Original preset instead.
+**Restore All** retains the existing full-registry reset, including quality, camera and
+interface preferences, and selects Original; neither changes unrelated retail preferences. Both
 persist through the ordinary preference save. Zero strength/density does not clear an
 enabled flag (offline fixtures can explicitly request neutral Enhanced execution).
 

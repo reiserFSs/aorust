@@ -215,7 +215,9 @@ fn page_xml(page: &Page, idx: usize, n: &mut usize) -> String {
                         )
                     }
                     Ctl::Radio(rs) => {
-                        *out += &format!("<View view_layout=\"vertical\" h_alignment=\"left\"{}{tip}><TextView value=\"{}\"/><RadioButtonGroup name=\"r{i}\" layout_borders=\"Rect(10,3,0,0)\" h_alignment=\"left\">", borders(&o.borders), esc(&o.label));
+                        // A preset is one compact choice row, not a tall quality-option list.
+                        let layout = if o.var == "AomacGraphicsPreset" { " view_layout=\"horizontal\"" } else { "" };
+                        *out += &format!("<View view_layout=\"vertical\" h_alignment=\"left\"{}{tip}><TextView value=\"{}\"/><RadioButtonGroup name=\"r{i}\"{layout} layout_borders=\"Rect(10,3,0,0)\" h_alignment=\"left\">", borders(&o.borders), esc(&o.label));
                         for (l, v) in rs {
                             *out += &format!("<RadioButton name=\"r{i}_{v}\" label=\"{}\" value=\"{v}\"/>", esc(l));
                         }

@@ -4,6 +4,84 @@ use super::dvalue::{DValues, Kind, Variant};
 use super::options::model::{Ctl, Item, Opt, Page, Ty};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GraphicsPreset { Original, ClassicPlus, Modern, Ultra }
+
+impl GraphicsPreset {
+    pub const ALL: [Self; 4] = [Self::Original, Self::ClassicPlus, Self::Modern, Self::Ultra];
+
+    #[cfg(test)]
+    pub fn name(self) -> &'static str {
+        match self { Self::Original => "Original", Self::ClassicPlus => "Classic+", Self::Modern => "Modern", Self::Ultra => "Ultra" }
+    }
+
+    #[cfg(test)]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|preset| preset.name() == name)
+    }
+
+    pub fn msaa(self) -> u32 { if self == Self::Original { 1 } else { 4 } }
+    pub fn anisotropy(self) -> u16 {
+        match self { Self::Original => 1, Self::ClassicPlus => 8, Self::Modern | Self::Ultra => 16 }
+    }
+
+    pub fn index(self) -> i64 { self as i64 }
+}
+
+/// UI, camera and diagnostic preferences are independent of graphical presets.
+pub(super) fn graphical(name: &str) -> bool {
+    name.starts_with("Aomac") && !matches!(name,
+        "AomacGraphicsPreset" | "AomacEnhancedSuspended" | "AomacEffectGpuOverlay" | "AomacSlowFrameLog"
+        | "AomacInterfaceScale" | "AomacBorderlessFullscreen" | "AomacPinchZoom"
+        | "AomacWidescreenFOV" | "AomacSmoothText")
+}
+
+/// Apply the entire graphical inventory, including inactive quality values, deterministically.
+pub(super) fn apply_preset(d: &mut DValues, preset: GraphicsPreset) {
+    for control in controls().into_iter().filter(|control| graphical(control.name)) {
+        let value = if matches!(preset, GraphicsPreset::Modern | GraphicsPreset::Ultra)
+            && matches!(control.kind, ControlKind::Check) { Variant::Bool(true) } else { control.default };
+        d.set_raw(control.name, value);
+    }
+    if preset != GraphicsPreset::Original {
+        for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom",
+            "AomacHdr", "AomacGradingEnabled", "AomacContactShadows",
+            "AomacClusteredLighting", "AomacMaterialSpecular", "AomacLocalLightShadows"] {
+            d.set_raw(name, Variant::Bool(true));
+        }
+    }
+    if preset == GraphicsPreset::ClassicPlus {
+        for (name, value) in [("AomacSunBoost", 0.15), ("AomacGrade", 0.25),
+            ("AomacBloomStrength", 0.2), ("AomacAoStrength", 0.6), ("AomacContactStrength", 0.4)] {
+            d.set_raw(name, Variant::Float(value));
+        }
+    }
+    if matches!(preset, GraphicsPreset::Modern | GraphicsPreset::Ultra) {
+        d.set_raw("AomacNightMode", Variant::Int(1));
+        d.set_raw("AomacNightCool", Variant::Float(0.15));
+        d.set_raw("AomacVignette", Variant::Float(0.1));
+        d.set_raw("AomacSceneryDistance", Variant::Float(1.0));
+        // TAA + CAS is the recommended temporal path; cinematic/user-asset effects stay opt-in.
+        for name in ["AomacFxaa", "AomacDepthOfField", "AomacZoneLut"] {
+            d.set_raw(name, Variant::Bool(false));
+        }
+        d.set_raw("AomacMotionBlur", Variant::Float(0.0));
+    }
+    if preset == GraphicsPreset::Ultra {
+        for (name, value) in [("AomacShadowMapSize", 4096), ("AomacPointShadowCount", 8),
+            ("AomacCloudQuality", 2), ("AomacWaterQuality", 2)] {
+            d.set_raw(name, Variant::Int(value));
+        }
+        for (name, value) in [("AomacAoRadius", 2.5), ("AomacAoStrength", 1.8),
+            ("AomacGrassDensity", 2.0), ("AomacGrassDistance", 180.0)] {
+            d.set_raw(name, Variant::Float(value));
+        }
+    }
+    d.set_raw("AomacTextureSharpening", Variant::Int(match preset.anisotropy() { 1 => 0, 8 => 3, _ => 4 }));
+    d.set_raw("AomacEdgeSmoothing", Variant::Int(if preset.msaa() == 1 { 0 } else { 2 }));
+    d.set_raw("AomacGraphicsPreset", Variant::Int(preset.index()));
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PageId {
     Presets,
     Lighting,
@@ -83,6 +161,8 @@ impl Control {
 pub(super) fn controls() -> Vec<Control> {
     use PageId::*;
     vec![
+        Control::radio(Presets, "Graphics Preset", "AomacGraphicsPreset", "Graphics Preset",
+            &[("Original", 0), ("Classic+", 1), ("Modern", 2), ("Ultra", 3), ("Custom", 4)], 0, 0, 4),
         Control::check(Lighting, "Sun Shadows", "AomacSunShadows", "Sun Shadows"),
         Control::radio(Lighting, "Sun Shadows", "AomacShadowMapSize", "Shadow Map Size", &[("256", 256), ("512", 512), ("1024", 1024), ("2048", 2048), ("4096", 4096)], 2048, 256, 4096),
         Control::slider(Lighting, "Sun Shadows", "AomacShadowStrength", "Sun Shadow Strength", "%.2f", 0.45, 0.0, 1.0),
@@ -121,6 +201,7 @@ pub(super) fn controls() -> Vec<Control> {
         Control::check(Sky, "Clouds & Sky", "AomacVolumetricClouds", "Volumetric Clouds"),
         Control::check(Sky, "Clouds & Sky", "AomacCloudShadows", "Cloud Shadows"),
         Control::check(Sky, "Clouds & Sky", "AomacSkyDiscs", "Sky Discs"),
+        Control::radio(Sky, "Clouds & Sky", "AomacCloudQuality", "Cloud Quality", &[("Normal", 1), ("High", 2)], 1, 1, 2),
         Control::check(Water, "Surface", "AomacWaterWaves", "Water Waves"),
         Control::check(Water, "Surface", "AomacWaterRipples", "Water Ripples"),
         Control::check(Water, "Surface", "AomacWaterFoam", "Water Foam"),
@@ -128,6 +209,7 @@ pub(super) fn controls() -> Vec<Control> {
         Control::check(Water, "Optics", "AomacWaterReflections", "Water Reflections"),
         Control::check(Water, "Optics", "AomacWaterCaustics", "Water Caustics"),
         Control::check(Water, "Optics", "AomacWaterSunGlint", "Water Sun Glint"),
+        Control::radio(Water, "Optics", "AomacWaterQuality", "Water Quality", &[("Normal", 1), ("High", 2)], 1, 1, 2),
         Control::slider(Water, "Optics", "AomacWaterRealism", "Water Realism (native colour to realistic)", "%.2f", 0.5, 0.0, 1.0),
         Control::check(Water, "Wakes", "AomacWaterWakes", "Water Wakes"),
         Control::slider(Water, "Wakes", "AomacWaterWakeStrength", "Water Wake Strength", "%.2f", 2.0, 0.0, 4.0),
@@ -201,9 +283,9 @@ pub(super) fn pages() -> Vec<Page> {
     PageId::ALL.into_iter().map(|page| {
         let mut items = Vec::new();
         if page == PageId::Presets {
-            items.push(Item::Text { value: "Enhanced effects are individually opt-in.".into(), borders: "Rect(0,5,0,5)".into() });
-            items.push(Item::Text { value: "Choose a category to adjust its settings.".into(), borders: "Rect(0,0,0,5)".into() });
-            items.push(Item::Text { value: "Restore All resets every Enhanced control.".into(), borders: "Rect(0,0,0,10)".into() });
+            items.push(Item::Text { value: "Original: faithful graphics. Classic+: mild lighting, no new scenery.".into(), borders: "Rect(0,5,0,5)".into() });
+            items.push(Item::Text { value: "Modern: recommended effects. Ultra: same effects, higher scene quality.".into(), borders: "Rect(0,0,0,5)".into() });
+            items.push(Item::Text { value: "Manual graphical edits select Custom, even when changed back.".into(), borders: "Rect(0,0,0,10)".into() });
         }
         let mut section = None;
         for control in controls.iter().filter(|control| control.page == page) {
@@ -225,8 +307,17 @@ pub(super) fn pages() -> Vec<Page> {
 
 /// Reset only registered Enhanced controls; unrelated retail preferences are untouched.
 pub(super) fn reset(d: &mut DValues, page: Option<PageId>) {
+    if page == Some(PageId::Presets) {
+        apply_preset(d, GraphicsPreset::Original);
+        return;
+    }
     for control in controls().into_iter().filter(|control| page.is_none_or(|page| page == control.page)) {
-        d.set(control.name, control.default);
+        d.set_raw(control.name, control.default);
+    }
+    if page.is_none() {
+        d.set_raw("AomacGraphicsPreset", Variant::Int(0));
+    } else if page != Some(PageId::Presets) {
+        d.set_raw("AomacGraphicsPreset", Variant::Int(4));
     }
 }
 
@@ -333,7 +424,7 @@ mod tests {
         for control in &controls {
             assert_eq!(d.get(control.name), Some(&control.default));
             assert_eq!(d.min_max(control.name), (control.min.clone().unwrap_or(Variant::Void), control.max.clone().unwrap_or(Variant::Void)));
-            assert!(d.set(control.name, changed(control)));
+            assert!(d.set_raw(control.name, changed(control)));
         }
         let saved = d.save_config(CAT_MAIN);
         let mut loaded = values();
@@ -344,12 +435,12 @@ mod tests {
             assert_eq!(loaded.persists(control.name), !control.session_only());
             if control.session_only() { assert!(!saved.contains(control.name)); }
         }
-        for page in PageId::ALL {
+        for page in PageId::ALL.into_iter().filter(|page| *page != PageId::Presets) {
             for control in &controls {
-                loaded.set(control.name, changed(control));
+                loaded.set_raw(control.name, changed(control));
             }
             reset(&mut loaded, Some(page));
-            for control in &controls {
+            for control in controls.iter().filter(|control| control.name != "AomacGraphicsPreset") {
                 let expected = if control.page == page { control.default.clone() } else { changed(control) };
                 assert_eq!(loaded.get(control.name), Some(&expected));
             }
@@ -360,5 +451,78 @@ mod tests {
             assert_eq!(loaded.get(control.name), Some(&control.default));
         }
         assert_eq!(loaded.get("UnrelatedRetailPreference"), Some(&Variant::Int(7)));
+    }
+
+    #[test]
+    fn presets_cover_every_graphical_control_and_manual_edits_stay_custom() {
+        let mut d = values();
+        for preset in GraphicsPreset::ALL {
+            assert_eq!(GraphicsPreset::from_name(preset.name()), Some(preset));
+            d.set("AomacGraphicsPreset", Variant::Int(preset.index()));
+            let expected = d.enhanced_settings();
+            let saved = d.save_config(CAT_MAIN);
+            let mut loaded = values();
+            loaded.load_config(&saved, CAT_MAIN, false);
+            assert_eq!(loaded.get_i64("AomacGraphicsPreset"), Some(preset.index()));
+            assert_eq!(loaded.enhanced_settings(), expected);
+            for control in controls().into_iter().filter(|control| graphical(control.name)) {
+                let original = d.get(control.name).unwrap().clone();
+                d.set(control.name, changed(&control));
+                assert_eq!(d.get_i64("AomacGraphicsPreset"), Some(4), "{}", control.name);
+                d.set(control.name, original);
+                assert_eq!(d.get_i64("AomacGraphicsPreset"), Some(4));
+                apply_preset(&mut d, preset);
+                assert_eq!(d.enhanced_settings(), expected);
+            }
+            for control in controls().into_iter().filter(|control|
+                !graphical(control.name) && control.name != "AomacGraphicsPreset") {
+                d.set(control.name, changed(&control));
+                assert_eq!(d.get_i64("AomacGraphicsPreset"), Some(preset.index()), "{}", control.name);
+            }
+            assert_eq!(d.get_i64("AomacEdgeSmoothing"), Some(if preset.msaa() == 1 { 0 } else { 2 }));
+        }
+        assert_eq!(GraphicsPreset::from_name("unknown"), None);
+        apply_preset(&mut d, GraphicsPreset::Original);
+        assert!(!d.enhanced_settings().any_enabled());
+        apply_preset(&mut d, GraphicsPreset::ClassicPlus);
+        let classic = d.enhanced_settings();
+        assert!(classic.hdr && classic.sun_shadows && classic.ambient_occlusion && classic.contact_shadows);
+        assert!(classic.clustered_lighting && classic.material_specular && classic.local_light_shadows);
+        assert!(!classic.ground_grass && !classic.volumetric_clouds && !classic.water_waves);
+        apply_preset(&mut d, GraphicsPreset::Modern);
+        assert!(d.flag("AomacTaa") && d.flag("AomacCas") && !d.flag("AomacFxaa"));
+        assert!(!d.flag("AomacDepthOfField") && !d.flag("AomacZoneLut"));
+        assert_eq!(d.get_f32("AomacMotionBlur"), Some(0.0));
+        let modern = d.enhanced_settings();
+        apply_preset(&mut d, GraphicsPreset::Ultra);
+        let ultra = d.enhanced_settings();
+        for control in controls().into_iter().filter(|control|
+            graphical(control.name) && matches!(control.kind, ControlKind::Check)) {
+            let expected = !matches!(control.name, "AomacFxaa" | "AomacDepthOfField" | "AomacZoneLut");
+            assert_eq!(d.flag(control.name), expected, "{}", control.name);
+        }
+        assert_eq!(ultra.motion_blur, 0.0);
+        assert!(ultra.shadow_map_size > modern.shadow_map_size);
+        assert!(ultra.ao_radius > modern.ao_radius && ultra.ao_strength > modern.ao_strength);
+        assert!(ultra.grass_density > modern.grass_density && ultra.grass_distance > modern.grass_distance);
+        assert_eq!(d.get_i64("AomacCloudQuality"), Some(2));
+        assert_eq!(d.get_i64("AomacWaterQuality"), Some(2));
+        assert_eq!((ultra.cloud_quality, ultra.water_quality), (2, 2));
+        let mut quality = values();
+        assert_eq!((quality.enhanced_settings().cloud_quality, quality.enhanced_settings().water_quality), (1, 1));
+        for input in [0, 1, 2, 3] {
+            for name in ["AomacCloudQuality", "AomacWaterQuality"] {
+                quality.set(name, Variant::Int(input));
+            }
+            let expected = input.clamp(1, 2) as u32;
+            let mut restored = values();
+            restored.load_config(&quality.save_config(CAT_MAIN), CAT_MAIN, false);
+            let settings = restored.enhanced_settings();
+            assert_eq!((settings.cloud_quality, settings.water_quality), (expected, expected));
+        }
+        let mut legacy = values();
+        legacy.load_config("<Root><Value name=\"AomacWaterWaves\" value=\"true\"/></Root>", CAT_MAIN, false);
+        assert!(legacy.flag("AomacWaterWaves"));
+        assert_eq!(legacy.get_i64("AomacGraphicsPreset"), Some(4));
     }
 }

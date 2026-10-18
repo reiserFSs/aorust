@@ -1316,7 +1316,7 @@ fn enhanced_page_restore_changes_only_its_page_and_restore_all_resets_every_page
     let defaults = DValues::new(&ao_gui::client_dir());
     let pages = super::super::enhanced::pages();
     assert_eq!(pages.len(), super::super::enhanced::PageId::ALL.len());
-    for page in &pages {
+    for page in pages.iter().filter(|page| page.label != "Enhanced/Presets") {
         // Change every page, so a page reset cannot accidentally pass by resetting everything.
         for option in pages.iter().flat_map(Page::opts) {
             match option.ctl {
@@ -1342,6 +1342,34 @@ fn enhanced_page_restore_changes_only_its_page_and_restore_all_resets_every_page
             assert_eq!(option.value(&r.d), option.value(&defaults), "{}: Restore All left {}", page.label, option.var);
         }
     }
+}
+
+#[test]
+fn enhanced_preset_radio_dispatch_and_custom_roundtrip() {
+    use super::super::enhanced::GraphicsPreset;
+    let page = super::super::enhanced::pages().remove(0);
+    let source = page_xml(&page, 0, &mut 0);
+    assert!(source.contains("<RadioButtonGroup name=\"r0\" view_layout=\"horizontal\""));
+    let Some(mut r) = Rig::new() else { return };
+    let group = r.show("AomacGraphicsPreset");
+    assert_eq!(r.opt.pages[r.opt.win.as_ref().unwrap().selected].label, "Enhanced/Presets");
+    for preset in GraphicsPreset::ALL {
+        r.click(&format!("{group}_{}", preset.index()));
+        assert_eq!(r.d.get_i64("AomacGraphicsPreset"), Some(preset.index()));
+        let mut expected = DValues::new(&ao_gui::client_dir());
+        super::super::enhanced::apply_preset(&mut expected, preset);
+        assert_eq!(r.d.enhanced_settings(), expected.enhanced_settings());
+    }
+    let flag = r.show("AomacWaterWaves");
+    r.click(&flag);
+    r.click(&flag);
+    assert_eq!(r.d.get_i64("AomacGraphicsPreset"), Some(4));
+    r.show("AomacGraphicsPreset");
+    assert_eq!(r.gui.radio_value(r.win(), &group), Some(4));
+    let selected = r.opt.win.as_ref().unwrap().selected;
+    r.click(&format!("restore_enhanced_page_{selected}"));
+    assert!(!r.d.enhanced_settings().any_enabled());
+    assert_eq!(r.d.get_i64("AomacGraphicsPreset"), Some(0));
 }
 
 #[test]

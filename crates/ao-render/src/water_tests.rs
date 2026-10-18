@@ -47,7 +47,6 @@ fn water_switch_roundtrip_preserves_exact_faithful_pixels() {
     renderer.set_enhanced_settings(EnhancedSettings { water_waves: true, water_ripples: true, water_refraction: true,
         water_reflections: true, water_foam: true, water_wakes: true, waterfalls: true, underwater: true,
         water_caustics: true, water_sun_glint: true, ..Default::default() });
-    let enhanced = capture(&mut renderer);
     let actor = Scene { meshes: vec![Mesh {
         vertices: [[-1.0, 0.0, -1.0], [1.0, 0.0, -1.0], [1.0, 0.0, 1.0], [-1.0, 0.0, 1.0]]
             .map(|pos| Vertex { pos, normal: [0.0, 1.0, 0.0], ..Default::default() }).to_vec(),
@@ -55,10 +54,16 @@ fn water_switch_roundtrip_preserves_exact_faithful_pixels() {
             ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None) }],
     }], ..Default::default() };
     renderer.add_actor_model(1, &actor);
-    renderer.set_actors(vec![ao_scene::ActorFrame { id: 1, model: 1, swimming: true,
-        transform: Mat4::from_translation(Vec3::new(120.0, 4.0, -120.0)).to_cols_array_2d(), ..Default::default() }]);
-    assert_eq!(capture(&mut renderer), enhanced, "opaque water must not reveal a non-admitted swimmer via bottom depth or wakes");
-    renderer.set_actors(Vec::new());
+    let hidden = ao_scene::ActorFrame { id: 1, model: 1, swimming: true,
+        transform: Mat4::from_translation(Vec3::new(120.0, 4.0, -120.0)).to_cols_array_2d(), ..Default::default() };
+    for quality in [1, 2] {
+        let settings = EnhancedSettings { water_quality: quality, ..renderer.enhanced_settings() };
+        renderer.set_enhanced_settings(settings);
+        let baseline = capture(&mut renderer);
+        renderer.set_actors(vec![hidden.clone()]);
+        assert_eq!(capture(&mut renderer), baseline, "neither water quality may reveal a non-admitted swimmer via reflections, bottom depth or wakes");
+        renderer.set_actors(Vec::new());
+    }
     assert!(renderer.water.target_bytes() > 0);
     renderer.set_enhanced_settings(EnhancedSettings::default());
     assert_eq!(renderer.water.target_bytes(), 0);

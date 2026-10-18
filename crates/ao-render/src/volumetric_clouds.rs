@@ -72,6 +72,7 @@ pub(super) struct VolumetricClouds {
     previous_eye: Vec3,
     previous_fog: [f32; 6],
     previous_time: f32,
+    quality: u32,
     previous_layers: Vec<CloudLayer>,
     phase: u32,
 }
@@ -119,13 +120,20 @@ impl VolumetricClouds {
             .map(|samples| (samples, make("sky_background", format, Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING), wgpu::ColorWrites::COLOR, samples))).collect();
         let params = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("cloud parameters"), size: std::mem::size_of::<Params>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let layers = Self::layer_buffer(device, 1);
-        Self { layout, sky_layout, params, layers, capacity: 1, prepared: Vec::new(), estimate, composite, cloud_shadows, shadow_fallback, sky_composites, sky_active: false, shadows_active: false, targets: None, previous_vp: Mat4::IDENTITY, previous_eye: Vec3::ZERO, previous_time: f32::NAN, previous_layers: Vec::new(), previous_fog: [f32::NAN; 6], phase: 0 }
+        Self { layout, sky_layout, params, layers, capacity: 1, prepared: Vec::new(), estimate, composite, cloud_shadows, shadow_fallback, sky_composites, sky_active: false, shadows_active: false, targets: None, previous_vp: Mat4::IDENTITY, previous_eye: Vec3::ZERO, previous_time: f32::NAN, previous_layers: Vec::new(), previous_fog: [f32::NAN; 6], quality: 1, phase: 0 }
     }
     fn layer_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
         device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("native cloud layers"), size: (capacity * std::mem::size_of::<CloudDensityLayer>()) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })
     }
     pub(super) fn is_ready(&self) -> bool { self.estimate.is_ready() && self.composite.is_ready() && self.cloud_shadows.is_ready() && self.sky_composites.iter().all(|(_, pipeline)| pipeline.is_ready()) }
     pub(super) fn wait(&self) { self.estimate.get(); self.composite.get(); self.cloud_shadows.wait(); for (_, pipeline) in &self.sky_composites { pipeline.get(); } }
+    pub(super) fn set_quality(&mut self, quality: u32) {
+        let quality = quality.clamp(1, 2);
+        if self.quality != quality {
+            if let Some(targets) = &mut self.targets { targets.valid = false; }
+            self.quality = quality;
+        }
+    }
     pub(super) fn release_targets(&mut self) { self.targets = None; self.cloud_shadows.release_targets(); self.sky_active = false; self.shadows_active = false; }
     pub(super) fn release_history(&mut self) {
         if self.targets.as_ref().is_some_and(|t| t.history.is_some()) { self.targets = None; }
@@ -214,7 +222,7 @@ impl VolumetricClouds {
         let weather_matches = self.previous_layers.len() == layers.len() && self.previous_layers.iter().zip(layers).all(|(a, b)| a.altitude == b.altitude && a.wind == b.wind && a.storm == b.storm && a.thick == b.thick);
         let valid = t.valid && weather_matches && self.previous_fog == fog && time >= self.previous_time && time - self.previous_time < 0.25 && eye.distance(self.previous_eye) < 10.0;
         let relative_inverse = glam::DMat4::from_translation(-eye.as_dvec3()) * vp.as_dmat4().inverse();
-        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&Params { inverse_vp: relative_inverse.as_mat4().to_cols_array_2d(), previous_vp: self.previous_vp.to_cols_array_2d(), eye: eye.extend(0.0).to_array(), control: [layers.len() as f32, far * 2.0, self.phase as f32, if valid { 1.0 } else { 0.0 }], enabled: [if clouds { 1.0 } else { 0.0 }, if shadows { 1.0 } else { 0.0 }, self.prepared.iter().map(|l| l.shape[0]).fold(f32::INFINITY, f32::min), if *water_cloud == self.shadow_fallback { 0.0 } else { 1.0 }], fog: [env.fog_start, env.fog_end, 0.0, 0.0], fog_colour: [env.fog_color[0], env.fog_color[1], env.fog_color[2], 0.0], shadow_area: field.as_ref().map_or([0.0; 4], |f| f.area), shadow_sun: field.as_ref().map_or([0.0; 4], |f| f.sun) }));
+        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&Params { inverse_vp: relative_inverse.as_mat4().to_cols_array_2d(), previous_vp: self.previous_vp.to_cols_array_2d(), eye: eye.extend(0.0).to_array(), control: [layers.len() as f32, far * 2.0, self.phase as f32, if valid { 1.0 } else { 0.0 }], enabled: [if clouds { 1.0 } else { 0.0 }, if shadows { 1.0 } else { 0.0 }, self.prepared.iter().map(|l| l.shape[0]).fold(f32::INFINITY, f32::min), if *water_cloud == self.shadow_fallback { 0.0 } else { 1.0 }], fog: [env.fog_start, env.fog_end, self.quality as f32, 0.0], fog_colour: [env.fog_color[0], env.fog_color[1], env.fog_color[2], 0.0], shadow_area: field.as_ref().map_or([0.0; 4], |f| f.area), shadow_sun: field.as_ref().map_or([0.0; 4], |f| f.sun) }));
         let next = 1 - t.current;
         if clouds {
             Self::draw(encoder, &self.estimate, &t.binds[t.current], &t.history.as_ref().expect("enabled cloud history")[next], wgpu::LoadOp::Clear(wgpu::Color::WHITE));
@@ -278,9 +286,23 @@ mod tests {
         let shader = include_str!("volumetric_clouds.wgsl");
         let march = shader.split("fn cloud_march(").nth(1).expect("cloud march")
             .split("@fragment fn estimate").next().expect("cloud estimate");
-        assert!(!march.contains("params.fog"), "native unfogged sheets cannot import world fog colour/extinction");
+        // fog.z is only the quality budget, never native colour/extinction.
+        assert!(!march.replace("params.fog.z", "").contains("params.fog"), "native unfogged sheets cannot import world fog colour/extinction");
         assert!(!march.contains("pow("), "native gamma colours must not be decoded into the gamma UNORM target");
         assert!(march.contains("layer.ambient.w"), "native sun_y/thick sheet shade is the cloud lighting baseline");
+    }
+    #[test]
+    fn cloud_quality_budgets_are_uniform_only() {
+        let shader = include_str!("volumetric_clouds.wgsl");
+        assert!(shader.contains("let steps = 16u * u32(params.fog.z);"));
+        assert!(shader.contains("/ f32(steps)"));
+        assert!(shader.contains("i < steps"));
+        assert!(shader.contains("4u * u32(params.fog.z)"));
+        let defaults = crate::EnhancedSettings::default();
+        for (quality, view, light) in [(0, 16, 4), (1, 16, 4), (2, 32, 8), (u32::MAX, 32, 8)] {
+            let tier = crate::EnhancedSettings { cloud_quality: quality, ..defaults }.clamped().cloud_quality;
+            assert_eq!((16 * tier, 4 * tier), (view, light));
+        }
     }
     #[test]
     fn curved_native_bounds_intersect_horizontal_rays_on_gpu() {
@@ -511,6 +533,12 @@ mod tests {
                 let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("world coverage with zero directional share"), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &sun, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }), store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
             }
             let layers = if frame == 0 { &[][..] } else { std::slice::from_ref(&native) };
+            // Exercise both budgets and a live history tier switch while
+            // retaining the foreground/no-directional-share admission oracle.
+            clouds.set_quality(if frame < 3 { 1 } else { 2 });
+            if frame == 3 {
+                assert!(!clouds.targets.as_ref().expect("existing cloud history").valid, "quality changes must invalidate history");
+            }
             clouds.prepare(&r.device, &r.queue, &mut encoder, &depth, Some(&sun), None, size, vp, Vec3::ZERO, layers, frame as f32 * 0.016, 100.0, true, true, env);
             clouds.composite_world(&mut encoder, &colour);
             r.queue.submit([encoder.finish()]);

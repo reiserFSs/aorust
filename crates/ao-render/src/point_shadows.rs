@@ -198,10 +198,17 @@ impl PointShadows {
 }
 
 impl Renderer {
-    pub(super) fn shadow_receiver(&self) -> &wgpu::BindGroup {
-        if self.enhanced_settings.needs_admitted_lights() {
-            self.point_shadows.as_ref().and_then(|points| points.receiver.as_ref()).expect("local receiver prepared before world")
-        } else { &self.sun_shadows.as_ref().expect("directional receiver prepared before world").receiver }
+    /// Restore the world layout after grass or canopy-specific group 3 bindings.
+    pub(super) fn bind_world_receiver(&self, pass: &mut wgpu::RenderPass) {
+        let settings = self.enhanced_settings;
+        if settings.sun_shadows || settings.moon_shadows || settings.needs_admitted_lights()
+            || (settings.ground_grass && settings.grass_sun_shadows)
+            || settings.night_mode == crate::NightMode::Moonlit {
+            let receiver = if settings.needs_admitted_lights() {
+                self.point_shadows.as_ref().and_then(|points| points.receiver.as_ref()).expect("local receiver prepared before world")
+            } else { &self.sun_shadows.as_ref().expect("directional receiver prepared before world").receiver };
+            pass.set_bind_group(3, receiver, &[]);
+        }
     }
 
     /// Explicit fixture diagnostic; never consulted by rendering or admission.

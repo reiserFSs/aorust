@@ -191,6 +191,85 @@ fn grass_point_toggle_preserves_world_source() {
 }
 
 #[test]
+fn combined_enhanced_ground_restores_admitted_receiver_after_foliage() {
+    use ao_scene::ground_detail::{GroundCell, GroundPatch};
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let mut renderer = Renderer::new(&instance, None).expect("headless combined receiver GPU");
+    renderer.set_msaa_samples(4);
+    let tile = ao_scene::TextureKey { rdb_type: 1_010_006, id: 91 };
+    let palette = ao_scene::TextureKey { rdb_type: 1_000_007, id: 92 };
+    let mut ground = quad([[0.0, 0.0, 0.0], [8.0, 0.0, 0.0], [0.0, 0.0, -8.0], [8.0, 0.0, -8.0]], [0.0, 1.0, 0.0]);
+    ground.submeshes[0].indices = vec![0, 1, 2, 1, 3, 2];
+    ground.submeshes[0].texture = Some(tile);
+    for vertex in &mut ground.vertices { vertex.color[3] = 0.0; }
+    let sun = [0.0, 0.8, -0.6];
+    renderer.upload(&Scene {
+        textures: [
+            (tile, ao_scene::Texture { width: 8, height: 8, rgba: [60, 104, 40, 255].repeat(64), source: ao_scene::TextureSource::GroundRgb }),
+            (palette, ao_scene::Texture { width: 1, height: 1, rgba: vec![128, 128, 128, 255], source: Default::default() }),
+        ].into(),
+        meshes: vec![ground],
+        instances: vec![ao_scene::Instance { mesh: 0, transform: ao_scene::IDENTITY }],
+        ground_detail: vec![GroundPatch {
+            mesh: 0, cells: 1, cell_size: 8.0, height_scale: 1.0, heights: vec![0; 4],
+            lattice_start: 0, coarse_submesh: 0, shadow_texture: Some(palette), shadow_uv_scale: [0.125; 2],
+            fine_cells: vec![GroundCell { submesh: 0, vertices: [0, 1, 2, 3], ..Default::default() }],
+            ..Default::default()
+        }],
+        sun_authored: true, ground_light: Some(([0.5; 3], sun)), daylight: Some(1.0),
+        ..Default::default()
+    });
+    renderer.set_ground_rendering(3);
+    let combined = EnhancedSettings {
+        sun_shadows: true, moon_shadows: true, local_light_shadows: true,
+        ambient_occlusion: true, emissive_bloom: true, hdr: true, contact_shadows: true,
+        ground_grass: true, grass_tufts: true, grass_species: true, grass_path_thinning: true,
+        grass_gust_bands: true, grass_sunlight: true, grass_sun_shadows: true, grass_point_shadows: true,
+        grass_trails: true, character_smoothing: true,
+        foliage_edges: true, foliage_sway: true, foliage_push: true, foliage_leaves: true,
+        foliage_flutter: true, foliage_falling: true, foliage_subdivision: true,
+        foliage_translucency: true, foliage_lod: true,
+        material_specular: true, generated_normals: true, material_maps: true, material_pbr: true,
+        material_reflections: true, environment_probe: true, clustered_lighting: true,
+        height_haze: true, land_haze: true, valley_mist: true, volumetric_shafts: true,
+        cloud_gap_shafts: true, volumetric_clouds: true, cloud_shadows: true, sky_discs: true,
+        grading_enabled: true, zone_lut: true, taa: true, fxaa: true, cas: true,
+        motion_blur: 0.25, depth_of_field: true,
+        enhanced_rain: true, wet_surfaces: true, weather_particles: true,
+        gpu_spell_particles: true, fluid_smoke: true,
+        water_waves: true, water_ripples: true, water_refraction: true, water_reflections: true,
+        water_foam: true, water_wakes: true, waterfalls: true, underwater: true,
+        water_caustics: true, water_sun_glint: true,
+        shadow_map_size: 256, ..Default::default()
+    };
+    let output = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("combined fused ground receiver"), size: wgpu::Extent3d { width: 32, height: 32, depth_or_array_layers: 1 },
+        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: renderer.format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+    });
+    let camera = Camera::look_at(Vec3::new(4.0, 9.0, 3.0), Vec3::new(4.0, 0.0, -4.0));
+    // The foliage replay runs even with no plant draw. It must not replace the
+    // admitted receiver with the smaller sun-only layout before native ground.
+    // Also cover admission-only and directional-only layouts without TAA.
+    for settings in [
+        combined,
+        EnhancedSettings { foliage_edges: true, material_specular: true, ..Default::default() },
+        EnhancedSettings { foliage_edges: true, sun_shadows: true, shadow_map_size: 256, ..Default::default() },
+    ] {
+        renderer.set_enhanced_settings(settings);
+        assert_eq!(renderer.msaa_samples(), 4);
+        let targets = Targets::new(&renderer, 32, 32);
+        for _ in 0..2 { renderer.render(&output.create_view(&Default::default()), &targets, &camera); }
+        assert_eq!(renderer.ground_state.path(), GroundPath::Fused);
+        assert!(renderer.ground.as_ref().unwrap().has_shadow[0]);
+        assert!(!renderer.vis_range[0].is_empty(), "regression must submit native ground");
+        assert!(renderer.gpu.opaque.iter().any(|draw| draw.mesh == 0 && draw.count > 0));
+        let pixels = texture_to_rgba(&renderer, &output, 32, 32).unwrap();
+        assert!(pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[..3] != [0, 0, 0]));
+    }
+}
+
+#[test]
 fn real_grass_shadow_pipeline_is_opt_in_and_reuses_visible_geometry() {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let mut renderer = Renderer::new(&instance, None).expect("headless grass caster GPU");

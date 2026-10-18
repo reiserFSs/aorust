@@ -659,6 +659,100 @@ AOMAC_GFX_PNG_ONLY=1 \
   graphics_offline_fixture --ignored --nocapture --test-threads=1
 ```
 
+## Headless preset acceptance matrix
+
+`graphics_preset_acceptance` reuses the offline fixture's native snapshots and
+cameras for **Original, Classic+, Modern, Ultra × ICC, Borealis day, Borealis
+night, Newland day**. Presets come from the same `enhanced::apply_preset` registry
+as the UI, including every renderer control, anisotropy and better mip filtering.
+Every measurement requests **1920×1200, actual 4× MSAA**, including Original:
+this deliberate benchmark override differs from Original's normal 1× default.
+The test fails rather than silently accepting a lower adapter sample count.
+
+Build once (no GPU execution), then use the exact executable Cargo prints:
+
+```sh
+CARGO_TARGET_DIR=/tmp/Presets/target cargo test --profile fast -p aomac -j 2 \
+  graphics_preset_acceptance --no-run
+```
+
+Run **one scene per GPU-lock acquisition**, with a new output directory each
+time. Acquire `/tmp/aomac-gputime.lock` per the shared timing-lock policy before
+the following headless command; release within five minutes, and wait at least
+three minutes before reacquiring. Set `AOMAC_GFX_PRESET` as well when a scene's
+four-preset run would exceed that window:
+
+```sh
+AOMAC_AUDIO_MUTE=1 \
+AOMAC_GFX_OUT="$HOME/aomac-handoff/gfx/presets/icc-unique" \
+AOMAC_GFX_VIEW=icc-landmark-authored \
+AOMAC_GFX_ACCEPTANCE_PHASE=timing \
+  /absolute/path/printed/by/cargo/aomac-<hash> \
+  graphics_preset_acceptance --ignored --nocapture --test-threads=1
+```
+
+Repeat with exact view names `borealis-foliage-sun-high`,
+`borealis-foliage-night`, and `newland-day`. Optional `AOMAC_GFX_PRESET` is an
+exact name: `Original`, `Classic+`, `Modern`, or `Ultra` (quote `Classic+` in
+shells if necessary). Omitting both filters measures the complete 16-cell matrix;
+prefer filtered invocations to respect the GPU-lock window. `AOMAC_SHADER_DIR`
+remains the existing optional absolute shader override; unset it for embedded
+shaders. The fixture requires installed client data, never a login or window.
+
+First use `AOMAC_GFX_ACCEPTANCE_PHASE=timing` to measure all cells without the
+slower temporal/admission checks. After tuning, use a new output directory with
+`AOMAC_GFX_ACCEPTANCE_PHASE=interactions`; this skips GPU measurement and captures
+preset and separate **combined-all** interaction sheets after 120 warmup frames.
+For a shorter all-effects-only run, also set `AOMAC_GFX_PRESET=combined-all`.
+The default phase `both` measures presets and captures their interactions plus
+the combined-all profile. Combined-all is never counted as a fifth measured preset.
+
+Ultra keeps Modern's recommended content with increased quality: cloud view/light
+steps rise from 16/4 to 32/8 (shadow-field steps stay 12); cloud output remains
+half-resolution, and tier changes reset history. Water SSR rises from 24 to 48
+steps over the same 49.11 m maximum reach, not an extended reflection distance.
+
+Each cell runs 120 warmup frames followed by **600 GPU timestamp samples**;
+simulation advances 1/60 s per frame while the authored game clock, clear weather
+and day remain fixed. There is no screenshot/readback in measured samples beyond
+the GPU timestamp readback. `frames.csv` retains all 600 unsorted frame times;
+`summary.csv` reports actual count, actual MSAA, anisotropy and nearest-rank
+p50/p95 milliseconds. Both are checkpointed after each preset. `manifest.txt`
+records resource SHA-256, revision/source diff, shader override, native playfield,
+game time, resolved camera/lens, environment, instance counts and exact settings.
+
+One full-resolution beauty PNG per cell and a compact `beauties.png` grid support
+comparison (columns Original/Classic+/Modern/Ultra; rows ICC/Borealis day/night/
+Newland; filtered-out cells remain blank). Every preset also gets a 120-frame
+moving-camera/visible-actor interaction sequence at 60 Hz, retained only as a
+12-thumbnail contact sheet (`*-temporal120.png`, frames 9,19,…,119) and objective
+consecutive-frame statistics for **all 119 pairs** in `temporal.csv`. The separate
+`combined-all` profile starts from Ultra quality and explicitly enables all
+registered graphical checkboxes plus nonzero motion blur, independently of the
+recommended presets. Mutually exclusive night modes use Moonlit. Combined strips
+also supply the existing weather fixture's unmodified native rain/storm channels
+as an explicitly controlled combination (not a claim that this climate occurs in
+the measured scene), plus actual authored Smoke1009, Sparks1018 and
+GlobalSmoke3017 emitters. Their source playfield/day/clock, native fields, effect
+record/material IDs, authored rates/lifetimes, elapsed clocks and current native
+admission counts are written to the manifest; each emitter must be admitted at
+least once. Rain uses the scene's real collision/weather surface. The four
+measured presets remain clear-weather snapshots.
+
+Enabled does **not** mean every feature receives valid stimulus: manifest entries
+explicitly mark native liquid count, unasserted water visibility, no underwater/
+swimming-wake stimulus, and no user-supplied LUT asset. Dedicated water/underwater,
+weather and foliage fixtures below remain necessary for their content-specific
+acceptance; these landscape strips do not pretend to replace them. A sheet is
+visual evidence, not an automatic aesthetic pass.
+
+Each interaction cell additionally exercises the existing fog/admission positive-control
+pattern at compact resolution: a zero-alpha actor and its owner-tagged bender
+must equal absence, unfogged red/green body colours must differ, and fully fogged
+red/green bodies must be identical. No full RGBA files or frame PNG sequences are
+retained; output is capped at 100 MB per invocation. `status.txt` distinguishes
+completed numerical checks from still-unexercised human visual acceptance.
+
 ## Deterministic offline graphics fixture
 
 Run the ignored `graphics_offline_fixture` test with installed client assets, no
@@ -1760,9 +1854,16 @@ when its pipeline, mesh or material changes. The union of the original cascade
 admission tests is retained: existing instance spheres are not guaranteed
 conservative after arbitrary shear or repose, so narrowing each cascade's list
 from those bounds would not establish pixel identity. Primary actor-admission
-draws retain their original order and draw granularity. World/actor sun receiver
-bindings are shared across pipeline changes and restored at world-phase entry
-after grass uses its own receiver layout.
+draws retain their original order and draw granularity. World/actor receiver
+bindings are shared across pipeline changes. One restore path selects the full
+admitted-local-plus-directional layout whenever the world variant needs admitted
+lights, otherwise the directional layout. It is used at pass/phase entry and
+foliage soft-coverage replay, including the replay immediately before native
+ground; a sun-only restore there is incompatible with combined Modern materials.
+`combined_enhanced_ground_restores_admitted_receiver_after_foliage` submits fused
+native ground with combined Enhanced effects, 4× MSAA and TAA, plus standalone
+admitted-material and directional receiver controls. It does not change source
+admission, native fog, preset membership or the separate grass/canopy layouts.
 
 Sun cascades admit loaded static geometry, including terrain patches, by their
 light volume rather than the camera-visible instance list. Their depth range

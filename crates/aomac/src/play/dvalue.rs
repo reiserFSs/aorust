@@ -276,6 +276,8 @@ impl DValues {
             water_caustics: self.flag("AomacWaterCaustics"),
             water_sun_glint: self.flag("AomacWaterSunGlint"),
             water_realism: self.get_f32("AomacWaterRealism").unwrap_or(defaults.water_realism),
+            cloud_quality: self.get_i64("AomacCloudQuality").unwrap_or(i64::from(defaults.cloud_quality)).clamp(1, 2) as u32,
+            water_quality: self.get_i64("AomacWaterQuality").unwrap_or(i64::from(defaults.water_quality)).clamp(1, 2) as u32,
             water_wake_strength: self.get_f32("AomacWaterWakeStrength").unwrap_or(defaults.water_wake_strength),
             water_wake_visibility: self.get_f32("AomacWaterWakeVisibility").unwrap_or(defaults.water_wake_visibility),
             water_wake_duration: self.get_f32("AomacWaterWakeDuration").unwrap_or(defaults.water_wake_duration),
@@ -318,7 +320,7 @@ impl DValues {
                         Some(Variant::Archive(d)) => xml::parse(d).ok().map_or_else(|| e.clone(), |d| merge_archive(e, &d)),
                         _ => e.clone(),
                     };
-                    self.set(name, Variant::Archive(element_xml(&merged)));
+                    self.set_raw(name, Variant::Archive(element_xml(&merged)));
                 }
             } else if e.name.eq_ignore_ascii_case("Value") {
                 let Some(v) = e.attr("value").and_then(Variant::from_text) else { continue };
@@ -326,9 +328,16 @@ impl DValues {
                     let (min, max) = (e.attr("min").and_then(Variant::from_text), e.attr("max").and_then(Variant::from_text));
                     self.add(name, v, keep, cat, min, max, true);
                 } else {
-                    self.set(name, v);
+                    self.set_raw(name, v);
                 }
             }
+        }
+        // Older files have no selection: preserve their controls rather than applying Original.
+        if !defaults && cat == CAT_MAIN
+            && !root.children.iter().any(|e| e.attr("name") == Some("AomacGraphicsPreset"))
+            && super::enhanced::controls().iter().any(|control|
+                super::enhanced::graphical(control.name) && self.get(control.name) != Some(&control.default)) {
+            self.set_raw("AomacGraphicsPreset", Variant::Int(4));
         }
         true
     }
@@ -433,6 +442,20 @@ impl DValues {
     /// `DistributedValue_c::SetDValue(name, value)` (0x25a7): unknown names are ignored; the value is clamped to min / max, and only a
     /// different value (or type) is stored and signalled. True when the variable exists.
     pub fn set(&mut self, name: &str, value: Variant) -> bool {
+        if !self.set_raw(name, value) { return false; }
+        if name == "AomacGraphicsPreset" {
+            if let Some(preset) = self.get_i64(name).and_then(|index|
+                super::enhanced::GraphicsPreset::ALL.into_iter().find(|preset| preset.index() == index)) {
+                super::enhanced::apply_preset(self, preset);
+            }
+        } else if super::enhanced::graphical(name) {
+            self.set_raw("AomacGraphicsPreset", Variant::Int(4));
+        }
+        true
+    }
+
+    /// Loading and preset application write controls without treating them as manual edits.
+    pub(super) fn set_raw(&mut self, name: &str, value: Variant) -> bool {
         let Some(n) = self.nodes.get_mut(name) else { return false };
         let v = n.clamped(&value);
         if n.value != v {

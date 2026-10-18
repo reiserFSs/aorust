@@ -103,7 +103,7 @@ pub(super) fn append_shader(source: &mut String, translucency: bool, lod: bool) 
         );
     }
     if translucency {
-        *source = source.replace("    let lit = min(texture_color + spec, vec3<f32>(1.0));", "    let foliage_transfer = foliage_detail_transmission(i.wpos, i.n, i.clip.xy);\n    texture_color = min(texture_color + foliage_transfer * clamp(t.rgb * i.tint, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0));\n    let lit = min(texture_color + spec, vec3<f32>(1.0));");
+        *source = source.replace("    let lit = min(texture_color + spec, vec3<f32>(1.0));", "    let foliage_transfer = foliage_detail_transmission(i.wpos, i.n, i.clip.xy);\n    texture_color = min(texture_color + foliage_transfer * clamp(t.rgb * i.tint.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0));\n    let lit = min(texture_color + spec, vec3<f32>(1.0));");
     }
 }
 
@@ -168,6 +168,16 @@ mod tests {
             });
             assert!(pollster::block_on(errors.pop()).is_none(), "valid foliage detail shader");
         }
+        // Local-light/specular augmentation changes the tint varying to RGBA.
+        let source = crate::enhanced_shader::source(crate::EnhancedSettings {
+            sun_shadows: true, material_specular: true, clustered_lighting: true,
+            foliage_translucency: true, foliage_lod: true, ..Default::default()
+        });
+        let errors = renderer.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _shader = renderer.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("combined foliage lighting regression"), source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        assert!(pollster::block_on(errors.pop()).is_none(), "valid combined foliage and lighting shader");
     }
     #[test]
     fn transmission_is_sun_gated_and_keeps_native_fog() {

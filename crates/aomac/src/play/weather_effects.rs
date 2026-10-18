@@ -4,7 +4,7 @@ use glam::{Mat4, Vec3};
 use std::path::Path;
 use crate::play::combat::effects::{Binding, EffectConfig, Renderer, Templates};
 
-pub(super) struct NativeEffect {
+pub(in super::super) struct NativeEffect {
     renderer: Renderer,
     handle: u32,
     record: i32,
@@ -18,7 +18,7 @@ pub(super) struct NativeEffect {
     elapsed: f32,
 }
 impl NativeEffect {
-    pub(super) fn new(dir: &Path, kind: i32, position: Vec3) -> Result<Self> {
+    pub(in super::super) fn new(dir: &Path, kind: i32, position: Vec3) -> Result<Self> {
         ensure!(matches!(kind, 1009 | 1018 | 3017), "capture source must be native Smoke1009, Sparks1018 or GlobalSmoke3017");
         let templates = Templates::open(dir)?;
         // Select real authored, sustained, visible emitters. Never edit a template, colour,
@@ -56,7 +56,7 @@ impl NativeEffect {
         }
         anyhow::bail!("no viable authored sustained effect class {kind}: {}", failures.join("; "))
     }
-    pub(super) fn frame(&mut self, dt: f32, host: &mut ao_render::Host) -> Result<()> {
+    pub(in super::super) fn frame(&mut self, dt: f32, host: &mut ao_render::Host) -> Result<()> {
         ensure!(dt.is_finite() && dt >= 0.0, "invalid native effect fixture step");
         ensure!(self.renderer.is_active(self.handle), "authored effect {} retired before capture", self.record);
         self.renderer.frame(dt, host, None);
@@ -77,7 +77,7 @@ impl NativeEffect {
         }
         Ok(())
     }
-    pub(super) fn metadata(&self) -> String {
+    pub(in super::super) fn metadata(&self) -> String {
         format!("gfxtweak record={} class={} material={} native_rate={} native_life={} native_duration={} native_elapsed={} authored_replays={}",
             self.record, self.kind, self.material, self.rate, self.life, self.duration, self.elapsed, self.replays)
     }
