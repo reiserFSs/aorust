@@ -13,6 +13,7 @@ mod controls;
 mod create;
 mod delete;
 mod dvalue;
+mod enhanced;
 mod dynels;
 mod dynels_doors;
 mod fightmode;

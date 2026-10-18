@@ -187,45 +187,11 @@ impl DValues {
         for n in ["got_ip", "got_perk", "got_tech"] {
             s.add(n, Variant::Bool(false), false, CAT_VARIABLES, None, None, false);
         }
-        // aomac-only "Enhanced" options page (not retail: no `Root.xml` control, no `MainPrefs.xml` template entry). Persisted
-        // like any other `DV Main` control (account-independent, survives restart in the root `Prefs.xml`); indices map to
-        // concrete renderer values in `options.rs::enhanced_page`/`flow.rs` (audit item 2 texture anisotropy, MSAA-option decision).
-        s.add("AomacTextureSharpening", Variant::Int(0), true, CAT_MAIN, Some(Variant::Int(0)), Some(Variant::Int(4)), false);
-        s.add("AomacEdgeSmoothing", Variant::Int(0), true, CAT_MAIN, Some(Variant::Int(0)), Some(Variant::Int(3)), false);
-        for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows"] {
-            s.add(name, Variant::Bool(false), true, CAT_MAIN, None, None, false);
+        // Enhanced controls share their saved keys, defaults and bounds with the native pages.
+        // ChatFontSize is retail-owned: its MainPrefs.xml registration is left untouched.
+        for control in super::enhanced::controls().into_iter().filter(|control| control.name.starts_with("Aomac")) {
+            s.add(control.name, control.default, true, CAT_MAIN, control.min, control.max, false);
         }
-        s.add("AomacShadowMapSize", Variant::Int(2048), true, CAT_MAIN, Some(Variant::Int(256)), Some(Variant::Int(4096)), false);
-        for (name, default, max) in [
-            ("AomacShadowStrength", 0.45, 1.0), ("AomacShadowSoftness", 1.5, 4.0),
-            ("AomacAoRadius", 1.75, 5.0), ("AomacAoStrength", 1.5, 2.0), ("AomacBloomStrength", 0.6, 1.0),
-            ("AomacGrassDensity", 1.0, 2.0), ("AomacGrassDistance", 160.0, 180.0), ("AomacSunBoost", 0.6, 0.6), ("AomacContactStrength", 0.8, 1.0), ("AomacGrade", 0.8, 1.0),
-        ] {
-            s.add(name, Variant::Float(default), true, CAT_MAIN, Some(Variant::Float(0.0)), Some(Variant::Float(max)), false);
-        }
-        // Interface scale (audit item 2): 0 Auto (today's whole backing-scale rounding), 1/2/3 fixed GUI pixel scale;
-        // read at startup (`Play::new` below, `ao_render::Frontend::interface_scale`) so the login screen honours it too.
-        s.add("AomacInterfaceScale", Variant::Int(0), true, CAT_MAIN, Some(Variant::Int(0)), Some(Variant::Int(3)), false);
-        // Audit item 6: skip the Spaces fullscreen animation and hide the menu bar/dock (winit `with_borderless_game`)
-        // when Ctrl+Cmd+F or the green button enters fullscreen. Off by default (today's animated native fullscreen).
-        s.add("AomacBorderlessFullscreen", Variant::Bool(false), true, CAT_MAIN, None, None, false);
-        // Audit item 8: trackpad pinch gesture zooms the third-person camera (same 0.78-25 m range as the mouse wheel).
-        // Opt-in: not retail, and a pinch over the 3D view has no other meaning to conflict with.
-        s.add("AomacPinchZoom", Variant::Bool(false), true, CAT_MAIN, None, None, false);
-        // Audit item 12: gamma-correct downsample + coverage-preserving alpha mips (`native_texture::build_texture_mips`).
-        // Default off: retail's plain sRGB-byte box filter (randy31 `FUN_100193e4`).
-        s.add("AomacBetterMipFiltering", Variant::Bool(false), true, CAT_MAIN, None, None, false);
-        // Audit item 16, PRK-signed-off (`agent://EnhanceReview`): keeps the 4:3 vertical angle (`camera::lens`); default
-        // off: retail's fixed 90 degree horizontal FOV (`camera::FOV_HORIZONTAL`, N3 `n3Camera_t` ctor).
-        s.add("AomacWidescreenFOV", Variant::Bool(false), true, CAT_MAIN, None, None, false);
-        // Audit item 15: multiplies the player camera's far plane (terrain/statel LOD + fog end move with it, see
-        // `camera::far_plane`/`Renderer::set_lens`); never touches `char_view_distance` (dynels.rs) or the 30 m name-tag
-        // radius (ao-net `nametag.rs`), which use their own separate distance checks. Default 1.0x = retail `ViewDistance`.
-        s.add("AomacSceneryDistance", Variant::Float(1.0), true, CAT_MAIN, Some(Variant::Float(1.0)), Some(Variant::Float(2.0)), false);
-        // Audit item 13: rasterizes TrueType glyphs at the window's backing scale with real coverage antialiasing
-        // (`ao_gui::font::TtFont::glyph`'s `scale` parameter / `Flatten::fill_aa`) instead of retail's hinted 1-bit
-        // bitmap; bitmap fonts (tooltips, shell, chat, name tags) are always pixel art regardless. Default off.
-        s.add("AomacSmoothText", Variant::Bool(false), true, CAT_MAIN, None, None, false);
         s
     }
 
@@ -253,11 +219,9 @@ impl DValues {
         }.clamped()
     }
 
-    /// Disable effects without changing quality knobs, MSAA or unrelated preferences.
+    /// Restore every Enhanced control to its registry default, including quality and interface settings.
     pub fn restore_original_graphics(&mut self) {
-        for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows"] {
-            self.set(name, Variant::Bool(false));
-        }
+        super::enhanced::reset(self, None);
     }
 
     /// `DistributedValue_c::LoadConfig(file, cat, defaults)` on already read XML text. `defaults` = true adds the variables

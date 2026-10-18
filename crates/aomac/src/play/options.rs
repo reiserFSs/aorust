@@ -9,17 +9,17 @@
 mod keypage;
 pub(super) mod keys;
 mod live;
-mod model;
+pub(super) mod model;
 #[cfg(test)]
 mod probe;
 
 pub(super) use live::{audio_prefs, login_audio_prefs};
 
-use super::dvalue::{DValues, Kind, Variant};
+use super::dvalue::{DValues, Variant};
 use ao_formats::screens::{TextDb, CAT_GUI};
 use ao_gui::view::ListItem;
 use ao_gui::{xml, Event, Gui, InputEvent, MouseButton, WindowId, WindowSize};
-use model::{Ctl, Item, Opt, Page, Ty};
+use model::{Ctl, Item, Opt, Page};
 use std::path::Path;
 
 /// `Window(Rect(200,200,600,400), ..)` of `FUN_100c3c44` (floats `_DAT_101a959c` / `_DAT_101b3db8` / `_DAT_101b1840`), used when the config has no `WindowFrame`.
@@ -225,7 +225,7 @@ fn page_xml(page: &Page, idx: usize, n: &mut usize) -> String {
             }
         }
     }
-    let enhanced = page.label == "Enhanced";
+    let enhanced = page.label.starts_with("Enhanced/");
     let mut s = if enhanced { "<View view_layout=\"vertical\">".to_string() } else { String::new() };
     // Reserve the scrollbar width in the Enhanced minimum, not just after the viewport shrinks.
     let (mode, height) = if enhanced { ("auto_reserve", 16000) } else { ("auto", -1) };
@@ -235,101 +235,9 @@ fn page_xml(page: &Page, idx: usize, n: &mut usize) -> String {
     }
     s += "</View></ScrollViewChild></ScrollView>";
     if enhanced {
-        s += "<View view_layout=\"horizontal\" layout_borders=\"Rect(0,5,10,0)\"><Button name=\"restore_original_graphics\" label=\"Restore Original\" tooltip=\"Disable sun shadows, ambient occlusion, emissive bloom and ground grass; other preferences are unchanged.\"/><HLayoutSpacer/></View></View>";
+        s += &format!("<View view_layout=\"horizontal\" layout_borders=\"Rect(0,5,10,0)\"><Button name=\"restore_enhanced_page_{idx}\" label=\"Restore Original\" tooltip=\"Restore this page's original settings.\"/><HLayoutSpacer/><Button name=\"restore_original_graphics_{idx}\" label=\"Restore All\" tooltip=\"Restore original settings on every Enhanced page.\"/></View></View>");
     }
     s
-}
-
-/// aomac-only controls, separate from the retail inventory. All effects default off;
-/// quality knobs and flags use the existing account-independent DV Main persistence.
-fn enhanced_page() -> Page {
-    let opt = |var: &str, label: &str, radios: &[(&str, i32)]| Opt {
-        ctl: Ctl::Radio(radios.iter().map(|&(l, v)| (l.to_string(), v)).collect()),
-        var: var.to_string(),
-        ty: Ty::Variant,
-        kind: Kind::Login, // unused by Ty::Variant (`Opt::{value,range,set_value}` only read `kind` for Ty::Int/Float)
-        label: label.to_string(),
-        tooltip: None,
-        enable: String::new(),
-        bit: None,
-        fmt: String::new(),
-        scale: 1.0,
-        borders: String::new(),
-    };
-    let check = |var: &str, label: &str| Opt {
-        ctl: Ctl::Check,
-        var: var.to_string(),
-        ty: Ty::Variant,
-        kind: Kind::Login,
-        label: label.to_string(),
-        tooltip: None,
-        enable: String::new(),
-        bit: None,
-        fmt: String::new(),
-        scale: 1.0,
-        borders: String::new(),
-    };
-    // `ChatFontSize` is a *retail* DValue (`MainPrefs.xml` template, tenths of a point, range 50-480, read live by
-    // `chat/win.rs::WinPrefs::from_dvalues`); retail never gave it an on-screen control (only `/setoption`). The slider
-    // here is aomac-only, writing the same retail variable.
-    let chat_font = Opt {
-        ctl: Ctl::Slider,
-        var: "ChatFontSize".to_string(),
-        ty: Ty::Variant,
-        kind: Kind::Login,
-        label: "Chat Font Size".to_string(),
-        tooltip: None,
-        enable: String::new(),
-        bit: None,
-        fmt: "%.0f pt".to_string(),
-        scale: 0.1,
-        borders: String::new(),
-    };
-    let slider = |var: &str, label: &str, fmt: &str| Opt {
-        ctl: Ctl::Slider,
-        var: var.to_string(),
-        ty: Ty::Variant,
-        kind: Kind::Login,
-        label: label.to_string(),
-        tooltip: None,
-        enable: String::new(),
-        bit: None,
-        fmt: fmt.to_string(),
-        scale: 1.0,
-        borders: String::new(),
-    };
-    Page {
-        label: "Enhanced".to_string(),
-        items: vec![
-            Item::Opt(check("AomacSunShadows", "Sun Shadows")),
-            Item::Opt(opt("AomacShadowMapSize", "Shadow Map Size", &[("256", 256), ("512", 512), ("1024", 1024), ("2048", 2048), ("4096", 4096)])),
-            Item::Opt(slider("AomacShadowStrength", "Sun Shadow Strength", "%.2f")),
-            Item::Opt(slider("AomacShadowSoftness", "Sun Shadow Softness", "%.2f")),
-            Item::Opt(check("AomacAmbientOcclusion", "Ambient Occlusion")),
-            Item::Opt(slider("AomacAoRadius", "Ambient Occlusion Radius", "%.2f m")),
-            Item::Opt(slider("AomacAoStrength", "Ambient Occlusion Strength", "%.2f")),
-            Item::Opt(check("AomacEmissiveBloom", "Emissive Bloom")),
-            Item::Opt(slider("AomacBloomStrength", "Emissive Bloom Strength", "%.2f")),
-            Item::Opt(check("AomacHdr", "HDR Sunlight and Tonemap")),
-            Item::Opt(slider("AomacSunBoost", "Sunlight Brightness", "%.2f")),
-            Item::Opt(slider("AomacGrade", "Colour Grade (warm sun, cool shade)", "%.2f")),
-            Item::Opt(check("AomacContactShadows", "Contact Shadows")),
-            Item::Opt(slider("AomacContactStrength", "Contact Shadow Strength", "%.2f")),
-            Item::Opt(check("AomacGroundGrass", "Ground Grass")),
-            Item::Opt(slider("AomacGrassDensity", "Ground Grass Density", "%.2fx")),
-            Item::Opt(slider("AomacGrassDistance", "Ground Grass Distance", "%.1f m")),
-            Item::Opt(opt("AomacTextureSharpening", "Texture Sharpening (anisotropic filtering)", &[("Off (1x, retail)", 0), ("2x", 1), ("4x", 2), ("8x", 3), ("16x", 4)])),
-            Item::Opt(opt("AomacEdgeSmoothing", "Edge Smoothing (MSAA)", &[("Off (retail)", 0), ("2x", 1), ("4x", 2), ("8x", 3)])),
-            Item::Opt(opt("AomacInterfaceScale", "Interface Scale", &[("Auto (retail-equivalent)", 0), ("1x", 1), ("2x", 2), ("3x", 3)])),
-            Item::Opt(check("AomacBorderlessFullscreen", "Instant Fullscreen (skip animation, hide menu bar/dock)")),
-            Item::Opt(check("AomacPinchZoom", "Pinch to Zoom (trackpad)")),
-            Item::Opt(chat_font),
-            Item::Opt(check("AomacBetterMipFiltering", "Better Mip Filtering (gamma-correct, coverage-preserving foliage)")),
-            Item::Opt(check("AomacWidescreenFOV", "Widescreen FOV (keep the 4:3 vertical angle)")),
-            Item::Opt(slider("AomacSceneryDistance", "Extended Scenery Distance (terrain/statels only, 1.0x = retail)", "%.2fx")),
-            Item::Opt(check("AomacSmoothText", "Anti-aliased Text (Retina, TrueType fonts only)")),
-        ],
-    }
 }
 
 impl HudOptions {
@@ -346,7 +254,7 @@ impl HudOptions {
         });
         let texts = TextDb::load(dir)?;
         let keypages = keypage::KeyPages::new(dir, &texts, screen);
-        let pages = { let mut p = model::parse(&root); p.push(enhanced_page()); p };
+        let pages = { let mut p = model::parse(&root); p.extend(super::enhanced::pages()); p };
         Ok(Self { pages, texts, template, screen, screen_changed: false, win: None, closed: false, actions: vec![], live: live::Live::default(), dir: dir.to_path_buf(), esc: vec![], keypages })
     }
 
@@ -487,7 +395,7 @@ impl HudOptions {
                 if *leaf {
                     let parent = lv.iter().rev().nth(1).map(|(pid, ..)| pid.as_str());
                     gui.list_add(id, TREE, parent, ListItem::new(lid, text, 0xd8, 0));
-                    if *lid == cfg.selected {
+                    if *lid == cfg.selected || (cfg.selected == "Enhanced" && p.label == "Enhanced/Presets") {
                         selected = pi;
                     }
                     leaves.push(lid.clone());
@@ -498,7 +406,7 @@ impl HudOptions {
                     let mut f = ListItem::new(lid, text, 0xd5, 0xd4);
                     f.folder = true;
                     f.selectable = false;
-                    f.open = cfg.folders.contains(lid);
+                    f.open = cfg.folders.contains(lid) || (lid == "Enhanced" && cfg.selected == "Enhanced");
                     gui.list_add(id, TREE, parent, f);
                     folders.push(lid.clone());
                 }
@@ -634,7 +542,14 @@ impl HudOptions {
                 match view.as_str() {
                     "b1" => self.actions.push(Action::Quit),
                     "b2" => self.actions.push(Action::Camp),
-                    "restore_original_graphics" => d.restore_original_graphics(),
+                    v if v.starts_with("restore_original_graphics_") => d.restore_original_graphics(),
+                    v if v.starts_with("restore_enhanced_page_") => {
+                        if let Some(page) = self.pages.get(w.selected) {
+                            if let Some(id) = super::enhanced::PageId::ALL.into_iter().find(|id| page.label == format!("Enhanced/{}", id.label())) {
+                                super::enhanced::reset(d, Some(id));
+                            }
+                        }
+                    }
                     v => {
                         // `c<i>` check box, `r<i>_<value>` radio button
                         if let Some(i) = v.strip_prefix('c').and_then(|n| n.parse::<usize>().ok()) {

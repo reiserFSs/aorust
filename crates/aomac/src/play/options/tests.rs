@@ -59,6 +59,19 @@ impl Rig {
         self.opt.window().unwrap()
     }
 
+    fn show_page(&mut self, page: usize) {
+        let leaf = self.opt.win.as_ref().unwrap().leaves[page].clone();
+        let id = self.win();
+        for folder in self.opt.win.as_ref().unwrap().folders.clone() {
+            if leaf.starts_with(&folder) {
+                self.gui.list_open_folder(id, TREE, &folder, true);
+            }
+        }
+        self.gui.list_select(id, TREE, &leaf, true, true);
+        self.send(InputEvent::MouseMove { x: 0.0, y: 0.0 });
+        assert_eq!(self.opt.win.as_ref().unwrap().selected, page);
+    }
+
     /// Selects the page showing the option `var` (a tree click) and returns the control's view name.
     fn show(&mut self, var: &str) -> String {
         let (page, name) = {
@@ -66,16 +79,8 @@ impl Rig {
             let c = w.controls.iter().find(|c| c.opt.var == var).unwrap_or_else(|| panic!("no control for {var}"));
             (c.page, c.name.clone())
         };
-        let leaf = self.opt.win.as_ref().unwrap().leaves[page].clone();
+        self.show_page(page);
         let id = self.win();
-        // a leaf inside a closed folder: open its folders first, as the user does
-        for f in self.opt.win.as_ref().unwrap().folders.clone() {
-            if leaf.starts_with(&f) {
-                self.gui.list_open_folder(id, TREE, &f, true);
-            }
-        }
-        self.gui.list_select(id, TREE, &leaf, true, true);
-        self.send(InputEvent::MouseMove { x: 0.0, y: 0.0 });
         // scroll the page (its `ScrollView`) until the control is inside the viewport
         let pg = format!("pg{page}");
         for _ in 0..3 {
@@ -126,7 +131,57 @@ fn label_paths_split_into_folder_levels() {
     let l = levels("GUI/Control Center");
     assert_eq!(l, [("GUI".into(), "GUI".into(), false), ("GUIControl Center".into(), "Control Center".into(), true)]);
     assert_eq!(levels("Audio"), [("Audio".into(), "Audio".into(), true)]);
-    assert_eq!(enhanced_page().label, "Enhanced");
+    for page in super::super::enhanced::PageId::ALL {
+        assert_eq!(levels(&format!("Enhanced/{}", page.label())), [
+            ("Enhanced".into(), "Enhanced".into(), false),
+            (format!("Enhanced{}", page.label()), page.label().into(), true),
+        ]);
+    }
+}
+
+#[test]
+fn closed_enhanced_folder_reserves_native_label_width_without_reflow_when_opened() {
+    let Some(mut r) = Rig::new() else { return };
+    r.opt.close(&mut r.gui, &mut r.d);
+    let Some(Variant::Archive(archive)) = r.d.get(CONFIG) else { panic!("missing Options configuration") };
+    let mut config = Config::parse(archive).unwrap();
+    config.folders.retain(|folder| folder != "Enhanced");
+    r.d.set(CONFIG, Variant::Archive(config.archive()));
+    r.opt.open(&mut r.gui, &r.d);
+    r.tick();
+    let id = r.win();
+    assert!(!r.gui.list_item(id, TREE, "Enhanced").unwrap().open);
+    let outer = r.gui.window_outer_frame(id).unwrap();
+    let tree = r.gui.view_rect(id, TREE).unwrap();
+    let categories = r.gui.view_rect(id, "categories").unwrap();
+    let pages = r.gui.view_rect(id, PAGES).unwrap();
+    // Exercise the ordinary folder click, not a forced remeasurement by the test.
+    r.click_tree("Enhanced");
+    assert!(r.gui.list_item(id, TREE, "Enhanced").unwrap().open);
+    assert_eq!(r.gui.window_outer_frame(id), Some(outer));
+    assert_eq!(r.gui.view_rect(id, TREE), Some(tree));
+    assert_eq!(r.gui.view_rect(id, "categories"), Some(categories));
+    assert_eq!(r.gui.view_rect(id, PAGES), Some(pages));
+    let mut longest = ("", 0);
+    for page in super::super::enhanced::PageId::ALL {
+        let label = page.label();
+        let width = r.gui.text_width(ao_gui::FontId::Normal, label);
+        if width > longest.1 {
+            longest = (label, width);
+        }
+        // Native row bounds include the icon, icon gap, and font-measured label.
+        let row = r.gui.list_item_rect(id, TREE, &format!("Enhanced{label}")).unwrap();
+        assert!(row.width() + 1.0 >= width as f32, "{label}: row {row:?} narrower than native text width {width}");
+        assert!(row.l >= tree.l && row.r < tree.r - ao_gui::layout::SCROLLBAR_W,
+            "{label}: native label row {row:?} clipped by tree {tree:?}");
+    }
+    assert!(longest.1 > 0);
+    assert!(tree.width() + 1.0 > longest.1 as f32, "{} must fit at its native measured width {}", longest.0, longest.1);
+    r.click_tree("Enhanced");
+    assert!(!r.gui.list_item(id, TREE, "Enhanced").unwrap().open);
+    assert_eq!(r.gui.view_rect(id, "categories"), Some(categories));
+    assert_eq!(r.gui.view_rect(id, TREE), Some(tree));
+    assert_eq!(r.gui.view_rect(id, PAGES), Some(pages));
 }
 
 #[test]
@@ -462,10 +517,12 @@ fn options_border_drag_survives_hud_updates() {
     assert_eq!(gui.window_outer_frame(id), Some(frame));
 }
 
-/// `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac -- options_shots`: retail pages plus Enhanced at large and small viewports.
+/// `AOMAC_OPTIONS_OUT=/tmp/x cargo test --release -p aomac options_shots -- --ignored --nocapture --test-threads=1`
+/// writes retail references and all eight Enhanced subpages using offscreen rendering only.
 #[test]
+#[ignore = "offscreen PNG capture; requires installed client assets and a GPU"]
 fn options_shots() {
-    let Some(mut r) = Rig::new() else { return };
+    let mut r = Rig::new().expect("options captures require installed client assets");
     let size = (900, 740);
     let mut off = Offscreen::new(&r, size).unwrap();
     r.opt.set_screen(size);
@@ -474,26 +531,30 @@ fn options_shots() {
         for _ in 0..3 {
             list = off.frame(r, 0.016);
         }
-        if let Some(dir) = std::env::var_os("AOMAC_SHOT_DIR") {
-            std::fs::create_dir_all(&dir).unwrap();
-            off.png(r, &list, &std::path::Path::new(&dir).join(format!("{name}.png"))).unwrap();
-        }
+        let dir = std::env::var_os("AOMAC_OPTIONS_OUT").or_else(|| std::env::var_os("AOMAC_SHOT_DIR"))
+            .expect("set AOMAC_OPTIONS_OUT (or AOMAC_SHOT_DIR) for options captures");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = std::path::Path::new(&dir).join(format!("{name}.png"));
+        off.png(r, &list, &path).unwrap();
+        eprintln!("options capture: {}", path.display());
     };
     snap(&mut off, &mut r, "options_first");
     for (var, name) in [("cc_compass", "options_cc"), ("Wildlife", "options_effects"), ("BattlemusicMode", "options_audio"), ("ChatTextShadowOffset", "options_chat"), ("MouseWheel", "options_mouse")] {
         r.show(var);
         snap(&mut off, &mut r, name);
     }
+    let size = (1280, 800);
+    off.resize(size);
+    r.opt.set_screen(size);
     let id = r.win();
-    r.gui.set_window_outer_frame(id, (10, 10, 880, 720));
-    r.show("AomacSunShadows");
-    snap(&mut off, &mut r, "options_enhanced_large");
-    let small = (800, 600);
-    off.resize(small);
-    r.opt.set_screen(small);
-    r.gui.set_window_outer_frame(id, (10, 10, 780, 580));
-    r.show("AomacSmoothText");
-    snap(&mut off, &mut r, "options_enhanced_small");
+    r.gui.set_window_outer_frame(id, (10, 10, 1100, 740));
+    for page in super::super::enhanced::PageId::ALL {
+        let label = format!("Enhanced/{}", page.label());
+        let selected = r.opt.pages.iter().position(|p| p.label == label).unwrap();
+        r.show_page(selected);
+        r.gui.set_scroll_offset(id, &format!("pg{selected}"), 0.0);
+        snap(&mut off, &mut r, &format!("options_enhanced_{page:?}").to_ascii_lowercase());
+    }
 }
 
 #[test]
@@ -787,8 +848,8 @@ fn ok_without_a_key_binds_input_zero() {
     assert_eq!(c.on_key(ao_render::KeyCode::Space, true), vec![]);
 }
 
-/// aomac's "Enhanced" page (not retail; `docs/gui.md` "aomac-only additions (non-retail, Enhanced page)"): every control
-/// defaults to the retail-faithful value it replaces (or, for the window/camera additions, off/Auto), is reachable through
+/// aomac's Enhanced subpages (not retail): controls default to the retail-faithful value they replace
+/// (or, for the window/camera additions, off/Auto), are reachable through
 /// the ordinary category tree like any other page, writes through the generic radio/checkbox/slider dispatch, and persists
 /// through the same `DValues`/`Prefs.xml` mechanism as every retail control (survives a restart).
 #[test]
@@ -906,14 +967,12 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
     }
     d.set("AomacTextureSharpening", Variant::Int(4));
     d.set("AomacEdgeSmoothing", Variant::Int(2));
-    let quality = d.enhanced_settings();
     d.restore_original_graphics();
-    assert_eq!(d.enhanced_settings(), EnhancedSettings {
-        sun_shadows: false, ambient_occlusion: false, emissive_bloom: false, ground_grass: false, hdr: false, contact_shadows: false, ..quality
-    });
+    let defaults = DValues::new(&tmp);
+    for option in super::super::enhanced::pages().iter().flat_map(Page::opts) {
+        assert_eq!(option.value(&d), option.value(&defaults), "{} was not restored", option.var);
+    }
     assert!(!d.enhanced_settings().any_enabled());
-    assert_eq!(d.get_i64("AomacTextureSharpening"), Some(4));
-    assert_eq!(d.get_i64("AomacEdgeSmoothing"), Some(2));
     d.save_user();
     let mut again = DValues::new(&tmp);
     again.open_user(&tmp, "account", 7);
@@ -930,7 +989,7 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
         r.click(&view);
         assert!(r.d.flag(name));
     }
-    // MSAA remains independent of all four effects.
+    // MSAA remains independent when enabling effects, but Restore All also resets it.
     let view = r.show("AomacEdgeSmoothing");
     r.click(&format!("{view}_2"));
     assert_eq!(r.d.get_i64("AomacEdgeSmoothing"), Some(2));
@@ -946,14 +1005,13 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
         assert!(r.opt.event(&mut r.gui, &event, &mut r.d));
         assert_eq!(r.d.get_f32(name), Some(value as f32));
     }
-    let id = r.win();
-    assert!(r.opt.event(&mut r.gui, &Event::Clicked {
-        window: id, view: "restore_original_graphics".into(), item: None,
-    }, &mut r.d));
-    r.tick();
-    assert!(!r.d.enhanced_settings().any_enabled());
-    assert_eq!(r.d.enhanced_settings().shadow_map_size, 2048);
-    assert_eq!(r.d.get_i64("AomacEdgeSmoothing"), Some(2));
+    let selected = r.opt.win.as_ref().unwrap().selected;
+    r.click(&format!("restore_original_graphics_{selected}"));
+    assert_eq!(r.d.get_i64("AomacEdgeSmoothing"), Some(0));
+    let defaults = DValues::new(&ao_gui::client_dir());
+    for option in super::super::enhanced::pages().iter().flat_map(Page::opts) {
+        assert_eq!(option.value(&r.d), option.value(&defaults), "{} was not restored", option.var);
+    }
     for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows"] {
         let view = r.show(name);
         assert!(!r.gui.checked(r.win(), &view));
@@ -961,70 +1019,125 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
 }
 
 #[test]
-fn enhanced_page_bounds_and_scrolling_at_large_minimum_and_small_sizes() {
-    let source = page_xml(&enhanced_page(), 7, &mut 0);
-    assert!(!source.contains("aomac-only additions"));
-    assert!(!source.contains("<TextView value=\"aomac-only"));
-    assert!(source.contains("name=\"pg7\""));
-    assert!(source.contains("</ScrollView><View view_layout=\"horizontal\" layout_borders=\"Rect(0,5,10,0)\"><Button name=\"restore_original_graphics\""));
+fn enhanced_page_restore_changes_only_its_page_and_restore_all_resets_every_page() {
+    let Some(mut r) = Rig::new() else { return };
+    let defaults = DValues::new(&ao_gui::client_dir());
+    let pages = super::super::enhanced::pages();
+    assert_eq!(pages.len(), 8);
+    for page in &pages {
+        // Change every page, so a page reset cannot accidentally pass by resetting everything.
+        for option in pages.iter().flat_map(Page::opts) {
+            match option.ctl {
+                Ctl::Check => option.set_checked(&mut r.d, !option.checked(&defaults)),
+                _ => {
+                    let (low, high) = option.range(&r.d);
+                    option.set_value(&mut r.d, if option.value(&defaults) == low { high } else { low });
+                }
+            }
+        }
+        let before: Vec<_> = pages.iter().flat_map(Page::opts).map(|o| o.value(&r.d)).collect();
+        let selected = r.opt.pages.iter().position(|p| p.label == page.label).unwrap();
+        r.show_page(selected);
+        let id = r.win();
+        r.gui.set_scroll_offset(id, &format!("pg{selected}"), 100000.0);
+        r.click(&format!("restore_enhanced_page_{selected}"));
+        for (option, previous) in pages.iter().flat_map(Page::opts).zip(before) {
+            let expected = if page.opts().into_iter().any(|o| o.var == option.var) { option.value(&defaults) } else { previous };
+            assert_eq!(option.value(&r.d), expected, "{}: {}", page.label, option.var);
+        }
+        r.click(&format!("restore_original_graphics_{selected}"));
+        for option in pages.iter().flat_map(Page::opts) {
+            assert_eq!(option.value(&r.d), option.value(&defaults), "{}: Restore All left {}", page.label, option.var);
+        }
+    }
+}
+
+#[test]
+fn enhanced_subpage_bounds_and_scrolling_at_large_minimum_and_small_sizes() {
+    let pages = super::super::enhanced::pages();
+    assert_eq!(pages.len(), 8);
+    for (idx, page) in pages.iter().enumerate() {
+        let source = page_xml(page, idx, &mut 0);
+        assert!(!source.contains("aomac-only additions"));
+        assert!(source.contains(&format!("name=\"pg{idx}\"")));
+        assert!(source.contains(&format!("</ScrollView><View view_layout=\"horizontal\" layout_borders=\"Rect(0,5,10,0)\"><Button name=\"restore_enhanced_page_{idx}\"")));
+        assert!(source.contains(&format!("name=\"restore_original_graphics_{idx}\"")));
+    }
     let Some(mut r) = Rig::new() else { return };
     let id = r.win();
-    let first = r.show("AomacSunShadows");
-    let page = r.opt.win.as_ref().unwrap().selected;
-    let pg = format!("pg{page}");
-    let last = r.opt.win.as_ref().unwrap().controls.iter().find(|c| c.opt.var == "AomacSmoothText").unwrap().name.clone();
     let (minimum, _) = r.gui.window_preferred_size_limits(id).unwrap();
-    for (screen, outer) in [
-        ((1280, 800), (1100, 740)),
-        ((1280, 800), (minimum.0 + CHROME.0, minimum.1 + CHROME.1)),
-        ((800, 600), (780, 580)),
-    ] {
-        r.opt.set_screen(screen);
-        r.gui.set_window_outer_frame(id, (10, 10, outer.0, outer.1));
-        r.tick();
-        r.gui.set_scroll_offset(id, &pg, 0.0);
-        let frame = r.gui.window_outer_frame(id).unwrap();
-        assert!(frame.0 >= 0 && frame.1 >= 0);
-        assert!(frame.0 + frame.2 as i32 <= screen.0 as i32 && frame.1 + frame.3 as i32 <= screen.1 as i32, "{screen:?}: {frame:?}");
-        let bounds = r.gui.view_rect(id, PAGES).unwrap();
-        let viewport = r.gui.view_rect(id, &pg).unwrap();
-        let button = r.gui.view_rect(id, "restore_original_graphics").unwrap();
-        for rect in [bounds, viewport, button, r.gui.view_rect(id, TREE).unwrap()] {
-            assert!(rect.l >= frame.0 as f32 && rect.t >= frame.1 as f32 && rect.r < (frame.0 + frame.2 as i32) as f32 && rect.b < (frame.1 + frame.3 as i32) as f32, "{screen:?}: {rect:?} outside {frame:?}");
+    let mut scrolled = false;
+    for page in &pages {
+        let selected = r.opt.pages.iter().position(|p| p.label == page.label).unwrap();
+        r.show_page(selected);
+        assert_eq!(r.opt.pages[selected].label, page.label);
+        assert_eq!(r.opt.win.as_ref().unwrap().leaves[selected], format!("Enhanced{}", page.label.strip_prefix("Enhanced/").unwrap()));
+        let pg = format!("pg{selected}");
+        let controls: Vec<_> = r.opt.win.as_ref().unwrap().controls.iter().filter(|c| c.page == selected).map(|c| c.name.clone()).collect();
+        let footer_names = [format!("restore_enhanced_page_{selected}"), format!("restore_original_graphics_{selected}")];
+        for (screen, outer) in [
+            ((1280, 800), (1100, 740)),
+            ((1280, 800), (minimum.0 + CHROME.0, minimum.1 + CHROME.1)),
+            ((800, 600), (780, 580)),
+        ] {
+            r.opt.set_screen(screen);
+            r.gui.set_window_outer_frame(id, (10, 10, outer.0, outer.1));
+            r.tick();
+            r.gui.set_scroll_offset(id, &pg, 0.0);
+            let frame = r.gui.window_outer_frame(id).unwrap();
+            assert!(frame.0 >= 0 && frame.1 >= 0);
+            assert!(frame.0 + frame.2 as i32 <= screen.0 as i32 && frame.1 + frame.3 as i32 <= screen.1 as i32, "{} {screen:?}: {frame:?}", page.label);
+            let bounds = r.gui.view_rect(id, PAGES).unwrap();
+            let viewport = r.gui.view_rect(id, &pg).unwrap();
+            let footers = footer_names.each_ref().map(|name| r.gui.view_rect(id, name).unwrap());
+            for rect in [bounds, viewport, footers[0], footers[1], r.gui.view_rect(id, TREE).unwrap()] {
+                assert!(rect.l >= frame.0 as f32 && rect.t >= frame.1 as f32 && rect.r < (frame.0 + frame.2 as i32) as f32 && rect.b < (frame.1 + frame.3 as i32) as f32, "{} {screen:?}: {rect:?} outside {frame:?}", page.label);
+            }
+            for rect in [viewport, footers[0], footers[1]] {
+                assert!(rect.l >= bounds.l && rect.t >= bounds.t && rect.r <= bounds.r && rect.b <= bounds.b, "{rect:?} outside page {bounds:?}");
+            }
+            assert!(viewport.height() > 0.0);
+            let rows: Vec<_> = controls.iter().map(|name| r.gui.view_rect(id, name).unwrap()).collect();
+            for rect in &rows {
+                assert!(rect.l >= viewport.l && rect.r < viewport.r - ao_gui::layout::SCROLLBAR_W, "{} spills horizontally: {rect:?} in {viewport:?}", page.label);
+            }
+            for pair in rows.windows(2) {
+                assert!(pair[0].b < pair[1].t, "{} controls overlap: {pair:?}", page.label);
+            }
+            assert!(footers[0].r < footers[1].l, "{} footer buttons overlap: {footers:?}", page.label);
+            for footer in footers {
+                assert!(footer.t >= viewport.b + 5.0, "{viewport:?} overlaps footer {footer:?}");
+            }
+            let top = rows.first().copied();
+            if let Some(top) = top {
+                assert!(top.t >= viewport.t);
+            }
+            // Scroll extent includes section headers, radio children and trailing row spacing.
+            r.gui.set_scroll_offset(id, &pg, 100000.0);
+            let needs_scroll = r.gui.scroll_offset(id, &pg) > 0.0;
+            r.gui.set_scroll_offset(id, &pg, 0.0);
+            r.send(InputEvent::Wheel { x: viewport.l + 2.0, y: viewport.t + 2.0, dy: -1.0 });
+            if needs_scroll {
+                scrolled = true;
+                assert!(r.gui.scroll_offset(id, &pg) > 0.0, "{} must scroll at {screen:?}", page.label);
+                if let (Some(first), Some(top)) = (controls.first(), top) {
+                    assert!(r.gui.view_rect(id, first).unwrap().t < top.t);
+                }
+            } else {
+                assert_eq!(r.gui.scroll_offset(id, &pg), 0.0);
+            }
+            r.gui.set_scroll_offset(id, &pg, 100000.0);
+            if let Some(last) = controls.last() {
+                let bottom = r.gui.view_rect(id, last).unwrap();
+                assert!(bottom.t >= viewport.t && bottom.b <= viewport.b, "{}: last row {bottom:?} outside {viewport:?}", page.label);
+                assert!(footers.iter().all(|footer| bottom.b < footer.t));
+            }
+            for (name, footer) in footer_names.iter().zip(footers) {
+                assert_eq!(r.gui.view_rect(id, name), Some(footer), "{} footer moved with scrolling", page.label);
+            }
         }
-        for rect in [viewport, button] {
-            assert!(rect.l >= bounds.l && rect.t >= bounds.t && rect.r <= bounds.r && rect.b <= bounds.b, "{rect:?} outside page {bounds:?}");
-        }
-        assert!(viewport.height() > 0.0);
-        for control in r.opt.win.as_ref().unwrap().controls.iter().filter(|c| c.page == page) {
-            let rect = r.gui.view_rect(id, &control.name).unwrap();
-            assert!(rect.l >= viewport.l && rect.r < viewport.r - ao_gui::layout::SCROLLBAR_W, "{} spills horizontally: {rect:?} in {viewport:?}", control.opt.var);
-        }
-        assert!(button.t >= viewport.b + 5.0, "{viewport:?} overlaps footer {button:?}");
-        let top = r.gui.view_rect(id, &first).unwrap();
-        assert!(top.t >= viewport.t);
-        let needs_scroll = r.gui.view_rect(id, &last).unwrap().b > viewport.b;
-        if outer.1 == minimum.1 + CHROME.1 {
-            assert!(needs_scroll, "minimum-sized Enhanced page must exercise scrolling");
-        }
-        r.send(InputEvent::Wheel { x: viewport.l + 2.0, y: viewport.t + 2.0, dy: -1.0 });
-        if needs_scroll {
-            assert!(r.gui.scroll_offset(id, &pg) > 0.0, "Enhanced list must scroll at {screen:?}");
-            assert!(r.gui.view_rect(id, &first).unwrap().t < top.t);
-        } else {
-            assert_eq!(r.gui.scroll_offset(id, &pg), 0.0);
-        }
-        r.gui.set_scroll_offset(id, &pg, 100000.0);
-        let bottom = r.gui.view_rect(id, &last).unwrap();
-        assert!(bottom.t >= viewport.t && bottom.b <= viewport.b, "last row {bottom:?} outside {viewport:?}");
-        assert!(bottom.b < button.t);
-        assert_eq!(r.gui.view_rect(id, "restore_original_graphics"), Some(button));
-        // A real footer click still reaches the normal restore dispatch after scrolling.
-        r.d.set("AomacSunShadows", Variant::Bool(true));
-        r.tick();
-        r.click("restore_original_graphics");
-        assert!(!r.d.flag("AomacSunShadows"));
     }
+    assert!(scrolled, "layout regression must exercise a scrollable Enhanced subpage");
     // Shrinking the application viewport must re-fit an already open Options window,
     // without a caller supplying a replacement Preferences frame.
     r.opt.set_screen((1280, 800));

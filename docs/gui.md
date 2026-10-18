@@ -1370,12 +1370,15 @@ Headless acceptance hooks (`play/flow/live.rs`, added but not exercised by this 
 These rows are **not** part of the retail `OptionPanel/Root.xml` inventory above: performance audit item 2 (texture
 anisotropy) and the MSAA-option decision (`docs/screens.md` "max anisotropy 1"; no AA option exists anywhere in the client's
 `cd_image/gui`/`text`/`twk` data for either control), plus the windowing/camera Enhanced items 2, 6, 8 and 9, and the visual
-options items 12, 13, 15 and 16 (`docs/gui.md` this section / `agent://EnhanceReview`). `options.rs::enhanced_page`
-builds a synthetic [`Page`] (same `model::{Opt,Ctl,Item}` shapes the retail `Root.xml` parser produces) and appends it to the
-category tree as a separate leaf labelled "Enhanced", reusing every generic page mechanism (tree
-entry, XML control generation, value sync, click/slider dispatch) unmodified. Every control defaults to the retail value it
-replaces, or to off/Auto for the ones with no retail equivalent, and persists through the same `DValues` → `Prefs.xml`
-mechanism as `DisplayCompressedTextures` (`DV Main`, account-independent, survives restart).
+options items 12, 13, 15 and 16 (`docs/gui.md` this section / `agent://EnhanceReview`).
+`play/enhanced.rs::controls()` is the single declarative inventory: every `Control` declares
+`page`, `section`, persisted `name`, `label`, `kind`, `default`, `min` and `max`.
+`ControlKind` supports `Check`, `Slider { format, scale }` and `Radio` choices.
+`PageId::{Presets,Lighting,Ambient,Sky,Water,Foliage,Camera,Performance}` builds native
+`Enhanced/…` pages through `pages()`, using the same `model::{Opt,Ctl,Item}` and tree mechanism
+as retail Video sub-pages. Add controls to this registry, not page layout or duplicate
+DValue registration. Existing names, defaults, ranges and DV Main `Prefs.xml` persistence
+are unchanged; `ChatFontSize` continues using its retail definition.
 
 The optional Sun Shadows (`AomacSunShadows`), Ambient Occlusion (`AomacAmbientOcclusion`),
 Emissive Bloom (`AomacEmissiveBloom`), Ground Grass (`AomacGroundGrass`) and HDR Sunlight and
@@ -1666,29 +1669,29 @@ bloomed pixels roll into the shoulder instead of clipping at their own old white
 
 These are aomac-only artistic controls, not reconstructed retail settings. Values are bounded
 at the renderer settings boundary; non-finite floats use the documented defaults.
-**Restore Original** clears only the effect flags via ordinary DValue writes, preserving
-quality values, anisotropy, MSAA, camera and text preferences; the next frame returns to all-off
-execution and the ordinary preference save persists it. Zero strength/density does not clear
-an enabled flag (offline fixtures can explicitly request neutral Enhanced execution).
+**Restore Original** restores the selected Enhanced page's registered defaults through
+ordinary DValue writes. **Restore All** restores all Enhanced controls, including quality,
+camera and interface preferences; neither changes unrelated retail preferences. Both
+persist through the ordinary preference save. Zero strength/density does not clear an
+enabled flag (offline fixtures can explicitly request neutral Enhanced execution).
 
-The Enhanced page has no introductory header. In `play/options.rs::page_xml`, its vertical
-wrapper gives the `pg{idx}` scroll view the remaining height above a fixed **Restore Original**
-row, separated by a five-pixel gap. The footer never scrolls over the last option. Enhanced
-uses `auto_reserve` so the native scrollbar's 11-pixel width contributes to the minimum
-preferred width instead of narrowing an already minimum-width list below its widest label
-(`ao-gui/layout.rs::calc` / `layout_scroll`). Retail page XML and click dispatch are unchanged.
+Each Enhanced sub-page has section headers and consistent control spacing. In
+`play/options.rs::page_xml`, its vertical wrapper gives the `pg{idx}` scroll view the remaining
+height above a fixed restore footer, separated by five pixels. The footer never scrolls over
+the last option. Enhanced uses `auto_reserve`, including the native scrollbar's 11-pixel width
+in minimum sizing (`ao-gui/layout.rs::calc` / `layout_scroll`). Retail page XML is unchanged.
 Options is not tracked by `HudWinCfg`'s screen-resize path, so its own update fits the
 requested size once on viewport changes, then applies `hud_wincfg::inside_screen` to the
 actual minimum-clamped outer frame. This repositions a 799-pixel minimum frame at x=1 on
 an 800-pixel screen. Ordinary updates preserve intentional user drags, including negative
 positions needed to reach controls when a scaled logical viewport is below that minimum.
 Opening uses outer-frame coordinates throughout, avoiding mixing client and frame origins.
-Source regressions cover all 16 flag combinations, account-independent persistence,
-quality dispatch/reset preservation, and Enhanced bounds, wheel scrolling and footer clicks
-at large, minimum and 800×600 viewport sizes. `options_shots` also emits
-`options_enhanced_large.png` and `options_enhanced_small.png` (the latter scrolled to the last
-row). These are source coverage and optional offscreen captures, not a claim of executed
-tests, real-window verification or enabled-effect image/performance validation.
+Source regressions cover registry uniqueness and page membership, account-independent
+persistence, page/global reset isolation and native page bounds/footer separation at
+1280×800. The ignored `options_shots` harness emits each Enhanced sub-page headlessly.
+These are source coverage and optional offscreen captures, not real-window verification or
+enabled-effect image/performance validation.
+Capture with `AOMAC_OPTIONS_OUT="$HOME/aomac-handoff/gfx/menu" cargo test --profile fast -j 2 -p aomac options_shots -- --ignored --nocapture --test-threads=1`.
 
 The renderer's optional boundary (`ao-render/enhanced.rs`, `enhanced_shader.rs`) keeps the
 same native ordered world draws. Any enabled effect selects a colour attachment with the
