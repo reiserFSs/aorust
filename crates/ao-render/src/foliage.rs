@@ -71,6 +71,13 @@ impl Foliage {
         }
         out
     }
+    pub fn owners(&self, slot: impl Fn(Option<u32>) -> u32) -> [[u32; 4]; 4] {
+        let mut owners = [[0; 4]; 4];
+        for (index, contact) in self.contacts.iter().rev().take(PUSHERS).enumerate() {
+            owners[index / 4][index % 4] = slot(contact.source);
+        }
+        owners
+    }
 }
 
 /// Bounds occupy otherwise sky-only material lanes, and are read only by the
@@ -93,7 +100,7 @@ pub(super) fn material_bounds(mut uniform: [f32; 32], material: &ao_scene::Subme
 pub(super) fn append_shader(source: &mut String) {
     let globals = source.find("struct G {").expect("native globals");
     let end = globals + source[globals..].find("\n}").expect("native globals end");
-    source.insert_str(end, "\n    foliage_wind: vec4<f32>,\n    foliage_flags: vec4<f32>,\n    foliage_pushers: array<vec4<f32>, 16>,");
+    source.insert_str(end, "\n    foliage_wind: vec4<f32>,\n    foliage_flags: vec4<f32>,\n    foliage_pushers: array<vec4<f32>, 16>,\n    foliage_owners: array<vec4<u32>, 4>,");
     let start = source.find("fn vs(v: VIn)").expect("native static vertex");
     let end = start + source[start..].find("\n}").expect("native static vertex end");
     let body = source[start..end].replace("    var o = vtx(v);", "    var o = vtx(v);\n    if (u32(mat.native.z) & 64u) != 0u { o = foliage_vertex(v, o); }");
@@ -103,6 +110,7 @@ pub(super) fn append_shader(source: &mut String) {
     let end = grass[start..].find("// A sideways bend").expect("stabilized grass wind end") + start;
     source.push_str(&grass[start..end]);
     source.push_str(&crate::shader_source::load("foliage.wgsl", include_str!("foliage.wgsl")));
+    source.push_str("\n@group(0) @binding(8) var<storage, read> interaction_visibility: array<u32>;\n");
 }
 
 #[cfg(test)]
@@ -126,6 +134,162 @@ mod tests {
         state.prepare(Vec3::ZERO, Mat4::IDENTITY, std::iter::empty(), true);
         assert!(state.contacts.is_empty());
         assert_eq!(state.pushers(), [[0.0; 4]; PUSHERS]);
+    }
+    #[test]
+    fn hidden_crowds_cannot_evict_visible_benders_or_contact_history() {
+        let eye = Vec3::new(0.0, 1.0, 0.0);
+        let vp = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.2, 100.0)
+            * Mat4::look_at_rh(eye, -Vec3::Z, Vec3::Y);
+        let mut baseline = Foliage::default();
+        let mut crowded = Foliage::default();
+        for state in [&mut baseline, &mut crowded] {
+            state.set_exposure(Some(GrassExposure {
+                generation: 1, query: std::rc::Rc::new(|_| true),
+                line_of_sight: std::rc::Rc::new(|_, target| target[0] <= 0.0),
+            }));
+        }
+        for step in 0..6 {
+            let visible: Vec<_> = (0..PUSHERS as u32).map(|id| GrassBender {
+                actor: Some(id), position: [-1.0, 0.0, -5.0 - step as f32 * 0.3],
+            }).collect();
+            // More occluded and non-admitted candidates than either capacity,
+            // all closer than the visible actors and ordered before them.
+            let mut inputs: Vec<_> = (100..260).map(|id| GrassBender {
+                actor: Some(id), position: [if id < 180 { 0.1 } else { -0.1 }, 0.0, -1.0],
+            }).collect();
+            inputs.extend_from_slice(&visible);
+            baseline.set_inputs(&visible, [0.0; 3]);
+            crowded.set_inputs(&inputs, [0.0; 3]);
+            baseline.prepare(eye, vp, 0..PUSHERS as u32, true);
+            crowded.prepare(eye, vp, (100..180).chain(0..PUSHERS as u32), true);
+            assert_eq!(baseline.selected(), crowded.selected());
+            assert_eq!(baseline.pushers(), crowded.pushers());
+            let contacts = |state: &Foliage| state.contacts.iter()
+                .map(|p| (p.source, p.position, p.age)).collect::<Vec<_>>();
+            assert_eq!(contacts(&baseline), contacts(&crowded));
+            baseline.advance(0.1);
+            crowded.advance(0.1);
+        }
+        assert_eq!(baseline.selected.len(), PUSHERS);
+        assert_eq!(baseline.contacts.len(), HISTORY);
+        crowded.prepare(eye, vp, std::iter::empty(), true);
+        assert!(crowded.contacts.is_empty(), "admission revocation erases the full history");
+    }
+    #[test]
+    fn gpu_occluded_crowd_cannot_consume_bender_or_history_capacity() {
+        use ao_scene::{ActorFrame, Instance, Mesh, Scene, Submesh, Vertex, IDENTITY};
+        let quad = |lo: [f32; 3], hi: [f32; 3]| Mesh {
+            vertices: [[lo[0], lo[1], lo[2]], [hi[0], lo[1], lo[2]],
+                [hi[0], hi[1], hi[2]], [lo[0], hi[1], hi[2]]].map(|pos|
+                Vertex { pos, normal: [0.0, 0.0, 1.0], color: [1.0; 4], ..Default::default() }).to_vec(),
+            submeshes: vec![Submesh { two_sided: true, ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None) }],
+        };
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = crate::Renderer::new(&instance, None).expect("headless foliage admission GPU");
+        renderer.upload(&Scene {
+            meshes: vec![quad([-1.0, 0.0, -2.0], [1.0, 4.0, -2.0])],
+            instances: vec![Instance { mesh: 0, transform: IDENTITY }], ..Default::default()
+        });
+        renderer.add_actor_model(1, &Scene { meshes: vec![quad([-0.15, 0.0, 0.0], [0.15, 1.8, 0.0])], ..Default::default() });
+        renderer.env.fog_start = 100.0;
+        renderer.env.fog_end = 120.0;
+        renderer.set_enhanced_settings(crate::EnhancedSettings { foliage_push: true, ..Default::default() });
+        // Deliberately admit every CPU LOS: only actual primary GPU occlusion can
+        // distinguish the hidden crowd, including its nearer feet, from the control.
+        renderer.set_enhanced_grass_exposure(Some(GrassExposure {
+            generation: 1, query: std::rc::Rc::new(|_| true), line_of_sight: std::rc::Rc::new(|_, _| true),
+        }));
+        let targets = crate::Targets::new(&renderer, 128, 96);
+        let output = renderer.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("foliage admission regression"), size: wgpu::Extent3d { width: 128, height: 96, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: renderer.format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+        });
+        let view = output.create_view(&Default::default());
+        let camera = crate::Camera::look_at(Vec3::new(0.0, 1.0, 4.0), Vec3::new(0.0, 1.0, -2.0));
+        let mut run = |crowd: bool| {
+            renderer.foliage.contacts.clear();
+            // Both scenarios must start without a previous-frame visibility result.
+            // Otherwise the second run inherits the first run's visible control
+            // and creates one extra contact before its own first GPU admission.
+            renderer.interaction_admission.invalidate();
+            let mut result = Vec::new();
+            for step in 0..=HISTORY + 2 {
+                let position = [-2.0 - (step % 2) as f32 * 0.3, 0.0, -4.0];
+                let mut actors = Vec::new();
+                let mut inputs = Vec::new();
+                if crowd {
+                    for id in 100..180 {
+                        let feet = [0.0, 0.0, -2.5];
+                        actors.push(ActorFrame { id, model: 1, transform: Mat4::from_translation(feet.into()).to_cols_array_2d(), ..Default::default() });
+                        inputs.push(GrassBender { actor: Some(id), position: feet });
+                    }
+                }
+                actors.push(ActorFrame { id: 1, model: 1, transform: Mat4::from_translation(position.into()).to_cols_array_2d(), ..Default::default() });
+                inputs.push(GrassBender { actor: Some(1), position });
+                renderer.set_actors(actors);
+                renderer.set_enhanced_grass_inputs(&mut inputs, [0.0; 3]);
+                renderer.render(&view, &targets, &camera);
+                // Test-only synchronization: production Admission uses Poll, never Wait.
+                renderer.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                if step > 1 {
+                    assert_eq!(renderer.foliage.selected(), &[GrassBender { actor: Some(1), position }]);
+                    assert!(renderer.foliage.contacts.iter().all(|p| p.source == Some(1)));
+                    result.push(renderer.foliage.pushers());
+                }
+            }
+            assert_eq!(renderer.foliage.contacts.len(), HISTORY);
+            result
+        };
+        let baseline = run(false);
+        assert_eq!(baseline, run(true), "more than both caps of GPU-hidden actors must match their absence");
+        let shader = include_str!("foliage.wgsl");
+        assert!(shader.find("if !foliage_owner_admitted(owner)").unwrap() < shader.find("let source = g.foliage_pushers[k]").unwrap(),
+            "current admission must revoke previous-frame contacts before their displacement");
+        let helper = shader.split("fn foliage_vertex(").next().unwrap();
+        let source = format!("@group(0) @binding(0) var<storage,read> interaction_visibility:array<u32>;
+@group(0) @binding(1) var<storage,read_write> output:array<u32>;
+{helper}
+@compute @workgroup_size(1) fn main() {{
+ output[0]=select(0u,1u,foliage_owner_admitted(0u));
+ output[1]=select(0u,1u,foliage_owner_admitted(1u));
+ output[2]=select(0u,1u,foliage_owner_admitted(2u));
+ output[3]=select(0u,1u,foliage_owner_admitted(0xffffffffu));
+}}");
+        let device = &renderer.device;
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("actual foliage current owner gate"), source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None, layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        });
+        use wgpu::util::DeviceExt;
+        let visible = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::cast_slice(&[0u32, 1, 0]), usage: wgpu::BufferUsages::STORAGE,
+        });
+        let output = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let staging = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: visible.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: output.as_entire_binding() },
+        ] });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline); pass.set_bind_group(0, &group, &[]); pass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, 16);
+        renderer.queue.submit([encoder.finish()]);
+        let (send, receive) = std::sync::mpsc::channel();
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |value| send.send(value).unwrap());
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        receive.recv().unwrap().unwrap();
+        assert_eq!(bytemuck::cast_slice::<u8, u32>(&staging.slice(..).get_mapped_range()), [1, 1, 0, 0],
+            "current GPU rejection must override previous admission, while own control remains admitted");
+        staging.unmap();
+        println!("foliage_admission hidden_actors=80 bender_cap=16 contact_cap=64 hidden_vs_absent=equal current_hidden_rejected=true");
     }
     #[test]
     fn motion_reuses_stabilized_grass_wind() {

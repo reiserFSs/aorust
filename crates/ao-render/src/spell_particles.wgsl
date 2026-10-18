@@ -21,6 +21,7 @@ fn curl(x: vec3<f32>) -> vec3<f32> {
 @compute @workgroup_size(64)
 fn simulate(@builtin(global_invocation_id) gid: vec3<u32>) {
  let i=gid.x; if(i>=128u){return;} var c=input[i]; let dt=p.clock.x;
+ if(!owner_admitted(p.admission.x)){var empty:Cell;output[i]=empty;return;}
  if(c.thermal_pressure.w<=0.0 || c.position_age.w>=c.thermal_pressure.w) {
   // Deterministic per-slot staggering; frozen frames never spontaneously respawn.
   if(dt>0.0 && random(i+u32(max(p.clock.y,0.0)*60.0)*2891336453u)<dt*8.0) {

@@ -185,7 +185,7 @@ impl crate::Renderer {
                 label: Some("admitted clustered light output"), size: output_bytes,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
             });
-            self.globals_bg = crate::globals_bind(&self.device, &self.g_layout, &self.globals, &self.light_buf, &self.light_cells_buf, &self.light_idx_buf, &self.dyn_light_buf, &self.sampler, &self.clamp_sampler);
+            self.globals_bg = crate::globals_bind(&self.device, &self.g_layout, &self.globals, &self.light_buf, &self.light_cells_buf, &self.light_idx_buf, &self.dyn_light_buf, &self.sampler, &self.clamp_sampler, &self.interaction_admission.buffer);
         }
         let bytes: &[u8] = bytemuck::cast_slice(data);
         let recreate = self.cluster_frame.gpu.as_ref().is_none_or(|gpu| gpu.input.size() < bytes.len() as u64 || gpu.output != self.dyn_light_buf || gpu.owners != *owners);

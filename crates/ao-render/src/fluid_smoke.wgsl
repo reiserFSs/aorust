@@ -24,6 +24,7 @@ fn sample_cell(at:vec3<f32>)->Cell {
 @compute @workgroup_size(64)
 fn advect(@builtin(global_invocation_id) gid:vec3<u32>){
  let i=gid.x;if(i>=COUNT){return;}let c=coord(i);let h=p.corner_size.w/f32(N);let dt=p.clock.x;
+ if(!owner_admitted(p.admission.x)){var empty:Cell;output[i]=empty;return;}
  let world=p.corner_size.xyz+(vec3<f32>(c)+0.5)*h;
  let shift=vec3(p.right.w,p.up.w,p.clock.w);
  let old=sample_cell(vec3<f32>(c)+shift/h);
@@ -37,7 +38,8 @@ fn advect(@builtin(global_invocation_id) gid:vec3<u32>){
  let feed=exp(-dot(r,r))*puff;
  v.y=mix(v.y,max(v.y,p.clock.z),feed*min(dt*60.0,1.0));
  for(var b=0u;b<8u;b++){
-  let body=p.bodies[b];let motion=p.bodies[b+8u];if(motion.w<=0.0){continue;}
+  let body=p.bodies[b];let motion=p.bodies[b+8u];
+  if(motion.w<=0.0 || !owner_admitted(p.body_owners[b/4u][b%4u])){continue;}
   let axis=vec3(body.x,clamp(world.y,body.y+motion.w,max(body.y+body.w-motion.w,body.y+motion.w)),body.z);
   let distance=length(world-axis);let inside=1.0-smoothstep(motion.w-h,motion.w+h,distance);
   v=mix(v,motion.xyz,inside*min(dt*60.0,1.0));

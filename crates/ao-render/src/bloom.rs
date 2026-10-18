@@ -11,12 +11,13 @@ pub(super) struct Bloom {
     /// Non-HDR only: the UNORM-range composite handed to the presentation pass.
     pub present: Option<wgpu::BindGroup>,
     hdr: bool,
+    seed: Pass,
     down: Vec<Pass>,
     up: Vec<Pass>,
     composite: Option<Pass>,
     params: wgpu::Buffer,
     strength: f32,
-    pipelines: [RenderPipeline; 4],
+    pipelines: [RenderPipeline; 5],
     pub bytes: u64,
 }
 struct Pass {
@@ -51,10 +52,14 @@ pub(super) fn glare() -> std::borrow::Cow<'static, str> {
 }
 impl Pass {
     fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout,
-        inputs: [&wgpu::TextureView; 3], params: &wgpu::Buffer, target: wgpu::TextureView) -> Self {
-        let entries = std::array::from_fn::<_, 4, _>(|i| wgpu::BindGroupEntry {
+        inputs: [&wgpu::TextureView; 3], params: &wgpu::Buffer, sampler: &wgpu::Sampler, target: wgpu::TextureView) -> Self {
+        let entries = std::array::from_fn::<_, 5, _>(|i| wgpu::BindGroupEntry {
             binding: i as u32,
-            resource: if i == 3 { params.as_entire_binding() } else { wgpu::BindingResource::TextureView(inputs[i]) },
+            resource: match i {
+                3 => params.as_entire_binding(),
+                4 => wgpu::BindingResource::Sampler(sampler),
+                _ => wgpu::BindingResource::TextureView(inputs[i]),
+            },
         });
         let bind = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("Bloom pass"), layout, entries: &entries });
         Self { bind, target }
@@ -74,7 +79,8 @@ impl Pass {
 }
 pub(super) struct BloomPipelines {
     layout: wgpu::BindGroupLayout,
-    pipelines: [RenderPipeline; 4],
+    sampler: wgpu::Sampler,
+    pipelines: [RenderPipeline; 5],
 }
 impl BloomPipelines {
     pub fn is_ready(&self) -> bool { self.pipelines.iter().all(RenderPipeline::is_ready) }
@@ -83,24 +89,31 @@ impl BloomPipelines {
     pub fn new(device: &wgpu::Device) -> Self {
         let source = [glare().as_ref(), crate::shader_source::load("bloom.wgsl", include_str!("bloom.wgsl")).as_ref()].concat();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Visible-source bounded bloom"), source: wgpu::ShaderSource::Wgsl(source.into()) });
-        let entries = std::array::from_fn::<_, 4, _>(|i| wgpu::BindGroupLayoutEntry {
+        let entries = std::array::from_fn::<_, 5, _>(|i| wgpu::BindGroupLayoutEntry {
             binding: i as u32, visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: if i == 3 {
+            ty: if i == 4 {
+                wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)
+            } else if i == 3 {
                 wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }
             } else {
-                wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true },
                     view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }
             }, count: None,
         });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("Bloom inputs"), entries: &entries });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Bloom kernels"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
-        let pipelines = ["seed_down", "down", "up", "composite"].map(|entry| crate::pipeline_creation::render_deferred(device, &wgpu::RenderPipelineDescriptor {
+        let pipelines = ["seed_down", "down", "up", "composite", "seed_extract"].map(|entry| crate::pipeline_creation::render_deferred(device, &wgpu::RenderPipelineDescriptor {
             label: Some(entry), layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("fullscreen"), compilation_options: Default::default(), buffers: &[] },
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(entry), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
         }));
-        Self { layout, pipelines }
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Bloom linear filtering"),
+            mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        Self { layout, sampler, pipelines }
     }
 }
 impl Bloom {
@@ -112,18 +125,19 @@ impl Bloom {
         let pipelines = compiled.pipelines.clone();
         let hdr = halo.is_some();
         let params = device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor { label: Some("Bloom strength"), contents: bytemuck::cast_slice(&[0.0_f32, f32::from(u8::from(hdr)), 0.0, 0.0]), usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST });
+        let seed = Pass::new(device, layout, [emission, emission, beauty], &params, &compiled.sampler, target(device, size));
         let levels = sizes(size);
         let mut down: Vec<Pass> = Vec::with_capacity(levels.len());
         for (i, &level) in levels.iter().enumerate() {
-            let source = if i == 0 { emission } else { &down[i - 1].target };
+            let source = if i == 0 { &seed.target } else { &down[i - 1].target };
             let out = if i == 0 && levels.len() == 1 { halo.cloned() } else { None };
-            down.push(Pass::new(device, layout, [source, emission, beauty], &params, out.unwrap_or_else(|| target(device, level))));
+            down.push(Pass::new(device, layout, [source, emission, beauty], &params, &compiled.sampler, out.unwrap_or_else(|| target(device, level))));
         }
         let mut up: Vec<Pass> = Vec::with_capacity(levels.len().saturating_sub(1));
         for i in (0..levels.len() - 1).rev() {
             let coarse = up.last().map_or(&down[i + 1].target, |pass| &pass.target);
             let out = if i == 0 { halo.cloned() } else { None };
-            up.push(Pass::new(device, layout, [&down[i].target, coarse, emission], &params, out.unwrap_or_else(|| target(device, levels[i]))));
+            up.push(Pass::new(device, layout, [&down[i].target, coarse, emission], &params, &compiled.sampler, out.unwrap_or_else(|| target(device, levels[i]))));
         }
         let pyramid: u64 = levels.iter().enumerate().map(|(i, &(w, h))| u64::from(w) * u64::from(h) * if i + 1 == levels.len() { 1 } else { 2 }).sum();
         let (present, composite, bytes) = if hdr {
@@ -134,10 +148,11 @@ impl Bloom {
             let output = target(device, size);
             let present = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("Bloom presentation"),
                 layout: presentation, entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&output) }] });
-            (Some(present), Some(Pass::new(device, layout, [beauty, halo, emission], &params, output)),
+            (Some(present), Some(Pass::new(device, layout, [beauty, halo, emission], &params, &compiled.sampler, output)),
                 8 * (u64::from(size.0) * u64::from(size.1) + pyramid))
         };
-        Self { size, present, hdr, down, up, composite, params, strength: 0.0, pipelines, bytes }
+        let bytes = bytes + u64::from(size.0) * u64::from(size.1) * 8;
+        Self { size, present, hdr, seed, down, up, composite, params, strength: 0.0, pipelines, bytes }
     }
     pub fn is_hdr(&self) -> bool { self.hdr }
     pub fn encode(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, strength: f32) {
@@ -146,6 +161,7 @@ impl Bloom {
             queue.write_buffer(&self.params, 0, bytemuck::cast_slice(&[strength, f32::from(u8::from(self.hdr)), 0.0, 0.0]));
             self.strength = strength;
         }
+        self.seed.encode(encoder, &self.pipelines[4], None);
         for (i, pass) in self.down.iter().enumerate() { pass.encode(encoder, &self.pipelines[usize::from(i != 0)], None); }
         for pass in &self.up { pass.encode(encoder, &self.pipelines[2], None); }
         if let Some(composite) = &self.composite { composite.encode(encoder, &self.pipelines[3], None); }
@@ -200,6 +216,109 @@ pub(crate) mod tests {
         assert_eq!(sizes((1920, 1200)), [(960,600),(480,300),(240,150),(120,75),(60,38),(30,19),(15,10)]);
         assert_eq!(sizes((3,5)), [(2,3),(1,2),(1,1)]);
         assert_eq!(sizes((1,1)), [(1,1)]);
+    }
+    #[test]
+    fn paired_bloom_filters_preserve_tent_halo_and_zero_border() {
+        // Impulse bases cover every linear input, both upsample phases, odd sizes and the zero rim.
+        for (w, h) in [(1, 1), (3, 5), (8, 6)] {
+            for sy in 0..h {
+                for sx in 0..w {
+                    let load = |x: i32, y: i32| f32::from(u8::from(x == sx && y == sy));
+                    let bilinear = |x: f32, y: f32| {
+                        let (ix, iy) = (x.floor() as i32, y.floor() as i32);
+                        let (fx, fy) = (x - x.floor(), y - y.floor());
+                        let a = load(ix, iy) * (1.0 - fx) + load(ix + 1, iy) * fx;
+                        let b = load(ix, iy + 1) * (1.0 - fx) + load(ix + 1, iy + 1) * fx;
+                        a * (1.0 - fy) + b * fy
+                    };
+                    for y in 0..(h + 1) / 2 {
+                        for x in 0..(w + 1) / 2 {
+                            let mut reference = 0.0;
+                            for dy in -1..=2 {
+                                for dx in -1..=2 {
+                                    let wx = if dx == -1 || dx == 2 { 1.0 } else { 3.0 };
+                                    let wy = if dy == -1 || dy == 2 { 1.0 } else { 3.0 };
+                                    reference += load(x * 2 + dx, y * 2 + dy) * wx * wy / 64.0;
+                                }
+                            }
+                            let mut paired = 0.0;
+                            for dy in [-0.25, 1.25] {
+                                for dx in [-0.25, 1.25] {
+                                    paired += bilinear((x * 2) as f32 + dx, (y * 2) as f32 + dy) * 0.25;
+                                }
+                            }
+                            assert!((reference - paired).abs() < 1e-6, "down impulse ({sx},{sy}), pixel ({x},{y})");
+                        }
+                    }
+                    let mut halo_energy = 0.0;
+                    for y in 0..h * 2 {
+                        for x in 0..w * 2 {
+                            let cx = (x as f32 + 0.5) * 0.5 - 0.5;
+                            let cy = (y as f32 + 0.5) * 0.5 - 0.5;
+                            let mut reference = 0.0;
+                            for dy in -1..=1 {
+                                for dx in -1..=1 {
+                                    let wx = if dx == 0 { 2.0 } else { 1.0 };
+                                    let wy = if dy == 0 { 2.0 } else { 1.0 };
+                                    reference += bilinear(cx + dx as f32, cy + dy as f32) * wx * wy / 16.0;
+                                }
+                            }
+                            let pair = |c: f32| {
+                                let base = c.floor();
+                                let f = c - base;
+                                [(base - 1.0 + (2.0 - f) / (3.0 - 2.0 * f), (3.0 - 2.0 * f) * 0.25),
+                                    (base + 1.0 + f / (1.0 + 2.0 * f), (1.0 + 2.0 * f) * 0.25)]
+                            };
+                            let mut paired = 0.0;
+                            for (py, wy) in pair(cy) {
+                                for (px, wx) in pair(cx) { paired += bilinear(px, py) * wx * wy; }
+                            }
+                            assert!((reference - paired).abs() < 1e-6, "up impulse ({sx},{sy}), pixel ({x},{y})");
+                            halo_energy += paired;
+                        }
+                    }
+                    assert!(halo_energy <= 4.00001, "zero border must lose, not invent, halo energy");
+                }
+            }
+        }
+    }
+    #[test]
+    fn extracted_f16_seed_preserves_karis_energy_and_highlight_share() {
+        let karis_down = |s: &[[f32; 4]; 36]| {
+            let box_at = |x: usize, y: usize| -> [f32; 4] {
+                std::array::from_fn(|c| (s[y * 6 + x][c] + s[y * 6 + x + 1][c]
+                    + s[(y + 1) * 6 + x][c] + s[(y + 1) * 6 + x + 1][c]) * 0.25)
+            };
+            let taps = [(1,1),(3,1),(1,3),(3,3),(0,0),(2,0),(0,2),(2,2),
+                (4,0),(4,2),(0,4),(2,4),(4,4)].map(|(x,y)| box_at(x,y));
+            let groups = [[0,1,2,3],[4,5,6,7],[5,8,7,9],[6,7,10,11],[7,9,11,12]]
+                .map(|g| -> [f32; 4] { std::array::from_fn(|c| g.iter().map(|&i| taps[i][c]).sum::<f32>() * 0.25) });
+            let weights: [f32; 5] = std::array::from_fn(|i| {
+                let b = groups[i];
+                (if i == 0 { 0.5 } else { 0.125 }) / (1.0 + b[0].max(b[1]).max(b[2]))
+            });
+            let total = weights.iter().sum::<f32>();
+            std::array::from_fn::<_, 4, _>(|c| groups.iter().zip(weights).map(|(b,w)| b[c] * w).sum::<f32>() / total)
+        };
+        for pattern in 0..64 {
+            let seeds: [[f32; 4]; 36] = std::array::from_fn(|i| {
+                let v = if pattern < 36 {
+                    if i == pattern { 3.12573 } else { 0.0 }
+                } else { ((i * 17 + pattern * 13) % 113) as f32 / 16.0 };
+                // Coloured HDR highlight: alpha is its luma, never an independent Karis channel.
+                [v * 0.2, v * 0.4, v, v * (0.2 * 0.2126 + 0.4 * 0.7152 + 0.0722)]
+            });
+            let rounded = seeds.map(|p| p.map(|v| f16_value(f16_bits(v))));
+            let reference = karis_down(&seeds);
+            let prepass = karis_down(&rounded);
+            for c in 0..4 {
+                // f16_bits truncates (a conservative error bound for the GPU's nearest rounding).
+                assert!((reference[c] - prepass[c]).abs() <= reference[c] * 0.003 + 1e-6,
+                    "seed prepass changes the 13-box Karis halo: {reference:?} vs {prepass:?}");
+            }
+            let luma = prepass[0] * 0.2126 + prepass[1] * 0.7152 + prepass[2] * 0.0722;
+            assert!((prepass[3] - luma).abs() <= luma * 0.003 + 1e-6, "highlight tag must follow filtered colour");
+        }
     }
     #[test]
     fn authored_source_color_addition_is_not_inferred_from_brightness() {
@@ -332,7 +451,7 @@ pub(crate) mod tests {
     fn gpu_bloom_is_emissive_only_occluded_and_energy_bounded() {
         let mut rig = Rig::new(false);
         let (count, center) = (rig.count(), rig.centre());
-        assert_eq!(rig.bloom.bytes, 12_384, "odd-size texture storage and one output, no history");
+        assert_eq!(rig.bloom.bytes, 19_576, "odd-size pyramid, extracted seed and one output, no history");
         let none = vec![[0.0; 4]; count];
         let red = |v: &[[f32; 4]]| v.iter().map(|p| p[0]).collect::<Vec<_>>();
         assert!(red(&rig.run(&vec![WHITE; count], &none, 0.5)).iter().all(|&v| v == 1.0),
@@ -986,9 +1105,9 @@ pub(crate) mod tests {
         let mut samples = Vec::with_capacity(600);
         for _ in 0..600 {
             let mut encoder = r.device.create_command_encoder(&Default::default());
+            bloom.seed.encode(&mut encoder, &bloom.pipelines[4], Some(timer.begin_pass(false)));
             for (i, pass) in bloom.down.iter().enumerate() {
-                let timestamps = if i == 0 { Some(timer.begin_pass(false)) } else { None };
-                pass.encode(&mut encoder, &bloom.pipelines[usize::from(i != 0)], timestamps);
+                pass.encode(&mut encoder, &bloom.pipelines[usize::from(i != 0)], None);
             }
             for pass in &bloom.up { pass.encode(&mut encoder, &bloom.pipelines[2], None); }
             bloom.composite.as_ref().unwrap().encode(&mut encoder, &bloom.pipelines[3], Some(timer.end_pass()));

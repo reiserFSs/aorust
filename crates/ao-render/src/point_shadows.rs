@@ -38,7 +38,7 @@ fn local_receiver_entries() -> [wgpu::BindGroupLayoutEntry; 5] {
 
 pub(crate) fn grass_receiver_entries() -> [wgpu::BindGroupLayoutEntry; 5] {
     local_receiver_entries().map(|mut entry| {
-        entry.binding = if entry.binding == 9 { 13 } else { entry.binding + 6 };
+        entry.binding = match entry.binding { 4 => 17, 9 => 13, binding => binding + 6 };
         entry.visibility = wgpu::ShaderStages::VERTEX;
         entry
     })
@@ -596,7 +596,7 @@ mod tests {
     fn grass_receiver_reuses_static_and_actor_cube_binding_contract() {
         let local = local_receiver_entries();
         let grass = grass_receiver_entries();
-        assert_eq!(grass.map(|entry| entry.binding), [9, 10, 11, 12, 13]);
+        assert_eq!(grass.map(|entry| entry.binding), [9, 17, 11, 12, 13]);
         for (world, blade) in local.into_iter().zip(grass) {
             assert_eq!(world.visibility, if world.binding == 3 { wgpu::ShaderStages::VERTEX_FRAGMENT } else { wgpu::ShaderStages::FRAGMENT });
             assert_eq!(blade.visibility, wgpu::ShaderStages::VERTEX);

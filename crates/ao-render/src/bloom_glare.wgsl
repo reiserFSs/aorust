@@ -17,6 +17,15 @@ fn glare_bilinear(t: texture_2d<f32>, c: vec2<f32>) -> vec4<f32> {
     let b = mix(glare_load(t, base + vec2<i32>(0, 1)), glare_load(t, base + vec2<i32>(1, 1)), f.x);
     return mix(a, b, f.y);
 }
+// Hardware filtering in the interior; keep the exact zero border (not clamp-to-edge) at the rim.
+// The explicit sampler keeps HDR presentation's existing sampler-free bindings unchanged.
+fn glare_filtered(t: texture_2d<f32>, s: sampler, c: vec2<f32>) -> vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(t));
+    if all(c >= vec2<f32>(0.0)) && all(c < dims - 1.0) {
+        return textureSampleLevel(t, s, (c + 0.5) / dims, 0.0);
+    }
+    return glare_bilinear(t, c);
+}
 // Fine-pixel centre `p` (fragment position) into the half-resolution `halo`.
 fn glare_reconstruct(t: texture_2d<f32>, p: vec2<f32>) -> vec4<f32> {
     return glare_bilinear(t, p * 0.5 - 0.5);

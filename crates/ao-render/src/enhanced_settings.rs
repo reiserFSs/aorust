@@ -182,6 +182,10 @@ impl EnhancedSettings {
             || self.water_caustics || self.water_sun_glint || self.enhanced_rain
     }
 
+    pub(crate) fn needs_interaction_admission(self) -> bool {
+        self.foliage_push || self.foliage_subdivision || self.ground_grass || self.fluid_smoke || self.gpu_spell_particles
+    }
+
     pub fn foliage_enabled(self) -> bool {
         self.foliage_edges || self.foliage_sway || self.foliage_push || self.foliage_leaves
             || self.foliage_flutter || self.foliage_falling || self.grass_trails

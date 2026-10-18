@@ -50,6 +50,7 @@ mod water_tests;
 mod pipelines;
 mod foliage_edges;
 mod foliage;
+mod interaction_admission;
 mod foliage_detail;
 mod foliage_leaves;
 use pipelines::{Pipelines, Slot as PipelineSlot, Spec as PipelineSpec};
@@ -245,6 +246,7 @@ struct Globals {
     foliage_wind: [f32; 4],
     foliage_flags: [f32; 4],
     foliage_pushers: [[f32; 4]; 16],
+    foliage_owners: [[u32; 4]; 4],
 }
 
 /// One submesh draw. Scene pipes use `material_pipe`; sky draws use `sky_material_pipe`.
@@ -798,6 +800,7 @@ pub struct Renderer {
     pub time: f32,
     globals: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
+    interaction_admission: interaction_admission::Admission,
     g_layout: wgpu::BindGroupLayout,
     tex_layout: wgpu::BindGroupLayout,
     holo_layout: wgpu::BindGroupLayout,
@@ -1206,6 +1209,7 @@ impl Renderer {
                 storage_entry(2),
                 storage_entry(3),
                 storage_entry(4),
+                storage_entry(8),
                 // Both material samplers live here (not per-material): `Renderer::set_anisotropy` rebuilds only this one
                 // bind group, so every existing world/actor/sky/ground material picks up the change without a bind-group
                 // rebuild (`shader.wgsl`'s `sample_clamped` picks repeat vs clamp per material from `Mat::flags.x`).
@@ -1217,7 +1221,8 @@ impl Renderer {
         let clamp_sampler = make_clamp_sampler(&device, 1);
         let (light_buf, light_cells_buf, light_idx_buf) = light_storage_buffers(&device, &LightGrid::new(&[]));
         let dyn_light_buf = make_dyn_light_buffer(&device);
-        let globals_bg = globals_bind(&device, &g_layout, &globals, &light_buf, &light_cells_buf, &light_idx_buf, &dyn_light_buf, &sampler, &clamp_sampler);
+        let interaction_admission = interaction_admission::Admission::new(&device);
+        let globals_bg = globals_bind(&device, &g_layout, &globals, &light_buf, &light_cells_buf, &light_idx_buf, &dyn_light_buf, &sampler, &clamp_sampler, &interaction_admission.buffer);
         let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding, visibility: wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
@@ -1350,6 +1355,7 @@ impl Renderer {
             day_time_rate: 1.0,
             globals,
             globals_bg,
+            interaction_admission,
             g_layout,
             tex_layout,
             holo_layout,
@@ -1662,7 +1668,7 @@ impl Renderer {
         self.anisotropy = level;
         self.sampler = make_world_sampler(&self.device, level);
         self.clamp_sampler = make_clamp_sampler(&self.device, level);
-        self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &self.light_buf, &self.light_cells_buf, &self.light_idx_buf, &self.dyn_light_buf, &self.sampler, &self.clamp_sampler);
+        self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &self.light_buf, &self.light_cells_buf, &self.light_idx_buf, &self.dyn_light_buf, &self.sampler, &self.clamp_sampler, &self.interaction_admission.buffer);
     }
 
     /// Changes MSAA synchronously, except that an in-flight live switch stays asynchronous.
@@ -1850,6 +1856,9 @@ impl Renderer {
             || previous.needs_sun_mask() != settings.needs_sun_mask()
             || (previous.material_reflections || previous.environment_probe) != (settings.material_reflections || settings.environment_probe);
         self.enhanced_settings = settings;
+        if previous.needs_interaction_admission() != settings.needs_interaction_admission() {
+            self.interaction_admission.invalidate();
+        }
         if previous.material_reflections != settings.material_reflections || previous.environment_probe != settings.environment_probe { self.material_reflections = None; }
         if settings.enhanced_rain || settings.wet_surfaces || settings.weather_particles {
             if self.rain_wet.is_none() { self.rain_wet = Some(rain_wet::RainWet::new(&self.device, self.format)); }
@@ -1888,7 +1897,7 @@ impl Renderer {
             self.dyn_light_count = self.dyn_light_count.min(MAX_DYN_LIGHTS as i32);
             let count = (self.dyn_light_count as usize * 4).min(self.dynamic_packed.len());
             if count > 0 { self.queue.write_buffer(&self.dyn_light_buf, 0, bytemuck::cast_slice(&self.dynamic_packed[..count])); }
-            self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &self.light_buf, &self.light_cells_buf, &self.light_idx_buf, &self.dyn_light_buf, &self.sampler, &self.clamp_sampler);
+            self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &self.light_buf, &self.light_cells_buf, &self.light_idx_buf, &self.dyn_light_buf, &self.sampler, &self.clamp_sampler, &self.interaction_admission.buffer);
         }
         self.configure_water();
         if !settings.ground_grass || settings.grass_density <= 0.0 { self.grass = None; }
@@ -2287,7 +2296,7 @@ impl Renderer {
         self.dynamic_packed.clear();
         self.dynamic_owners.clear();
         self.cluster_frame = Default::default();
-        self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &self.light_buf, &self.light_cells_buf, &self.light_idx_buf, &self.dyn_light_buf, &self.sampler, &self.clamp_sampler);
+        self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &self.light_buf, &self.light_cells_buf, &self.light_idx_buf, &self.dyn_light_buf, &self.sampler, &self.clamp_sampler, &self.interaction_admission.buffer);
         self.light_zones = grid.zones.clone();
         self.static_owners = grid.owners;
         self.light_base = grid.lights.clone();
@@ -2874,6 +2883,7 @@ impl Renderer {
             foliage_wind: { let (phase, wind) = self.foliage.wind(); [wind[0], wind[1], wind[2], phase] },
             foliage_flags: [f32::from(u8::from(self.enhanced_settings.foliage_sway)), f32::from(u8::from(self.enhanced_settings.foliage_push)), 0.0, 0.0],
             foliage_pushers: [[0.0; 4]; 16],
+            foliage_owners: [[0; 4]; 4],
         };
 
         // Frustum cull per instance (bounding spheres), compacting survivors per mesh.
@@ -2894,9 +2904,21 @@ impl Renderer {
         }
         self.frame = (self.frame + 1) % INST_RING;
         self.prepare_actors(cam.pos, cam.forward(), &planes);
-        self.foliage.prepare(cam.pos, vp, self.act.enhanced_grass_actor_ids(env.fog_end.max(env.fog_start + 1e-3)), self.enhanced_settings.foliage_enabled() || self.enhanced_settings.fluid_smoke);
+        if self.enhanced_settings.needs_interaction_admission() {
+            self.interaction_admission.begin_frame(&self.device);
+            // Match the primary-admission buffer's retained power-of-two actor capacity.
+            let bytes = self.act.interaction_buffer_bytes();
+            let bytes = self.sun_shadows.as_ref().map_or(bytes, |shadows| bytes.max(shadows.actor_visibility.size()));
+            if self.interaction_admission.resize(&self.device, bytes) {
+                self.act.reset_interaction_effects();
+                self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &self.light_buf, &self.light_cells_buf, &self.light_idx_buf, &self.dyn_light_buf, &self.sampler, &self.clamp_sampler, &self.interaction_admission.buffer);
+            }
+        }
+        self.foliage.prepare(cam.pos, vp, self.act.enhanced_grass_actor_ids(env.fog_end.max(env.fog_start + 1e-3))
+            .filter(|id| self.interaction_admission.admitted.contains(id)), self.enhanced_settings.foliage_enabled() || self.enhanced_settings.fluid_smoke);
         self.foliage_detail_state.prepare(&self.device, self.enhanced_settings.foliage_subdivision);
         g.foliage_pushers = self.foliage.pushers();
+        g.foliage_owners = self.foliage.owners(|actor| self.act.interaction_slot(actor));
         self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
         self.sorted.clear();
         for (list, draws) in [&self.gpu.opaque, &self.gpu.blended, &self.gpu.liquid].into_iter().enumerate() {
@@ -2943,7 +2965,6 @@ impl Renderer {
         let encode_start = timed.then(std::time::Instant::now);
         let mut enc = self.device.create_command_encoder(&Default::default());
         self.encode_actor_skins(&mut enc);
-        self.encode_enhanced_effects(&mut enc, cam);
         if let Some(buf) = self.gpu.inst_bufs.get(self.frame) {
             if !self.vis.is_empty() {
                 self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&self.vis));
@@ -3024,6 +3045,7 @@ impl Renderer {
         self.prepare_canopy_leaves();
         let shadow_start = timed.then(std::time::Instant::now);
         self.encode_enhanced_shadows(&mut enc, cam, t.size, env, far);
+        self.encode_enhanced_effects(&mut enc, cam);
         if let Some(start) = shadow_start { cpu.shadow_prepare_encode_ms = start.elapsed().as_secs_f64() * 1000.0; }
         self.prepare_grass_shadow_receiver();
         self.prepare_atmosphere_stack(&mut enc, vp, cam.pos, far, env);
@@ -3316,6 +3338,7 @@ impl Renderer {
         if let Some(start) = finish_start { cpu.finish_ms = start.elapsed().as_secs_f64() * 1000.0; }
         let submit_start = timed.then(std::time::Instant::now);
         let submission = self.queue.submit([commands]);
+        if self.enhanced_settings.needs_interaction_admission() { self.interaction_admission.submitted(); }
         if let (Some(prepare), Some(encode), Some(submit)) = (prepare_start, encode_start, submit_start) {
             cpu.prepare_ms = (encode - prepare).as_secs_f64() * 1000.0;
             cpu.encode_ms = (submit - encode).as_secs_f64() * 1000.0;
@@ -3518,7 +3541,7 @@ fn make_dyn_light_buffer(device: &wgpu::Device) -> wgpu::Buffer {
 /// material samplers). Samplers live here rather than per-material so [`Renderer::set_anisotropy`] only rebuilds this one
 /// bind group.
 #[allow(clippy::too_many_arguments)]
-fn globals_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals: &wgpu::Buffer, light_buf: &wgpu::Buffer, cells_buf: &wgpu::Buffer, idx_buf: &wgpu::Buffer, dyn_light_buf: &wgpu::Buffer, sampler: &wgpu::Sampler, clamp_sampler: &wgpu::Sampler) -> wgpu::BindGroup {
+fn globals_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals: &wgpu::Buffer, light_buf: &wgpu::Buffer, cells_buf: &wgpu::Buffer, idx_buf: &wgpu::Buffer, dyn_light_buf: &wgpu::Buffer, sampler: &wgpu::Sampler, clamp_sampler: &wgpu::Sampler, interaction_visibility: &wgpu::Buffer) -> wgpu::BindGroup {
     device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
         label: None,
         layout,
@@ -3530,6 +3553,7 @@ fn globals_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals: 
             wgpu::BindGroupEntry { binding: 4, resource: dyn_light_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(sampler) },
             wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(clamp_sampler) },
+            wgpu::BindGroupEntry { binding: 8, resource: interaction_visibility.as_entire_binding() },
         ],
     })
 }

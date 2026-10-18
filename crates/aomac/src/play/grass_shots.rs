@@ -742,6 +742,11 @@ fn grass_ground_camera(
     use ao_render::Vec3;
     let cells = grass_fixture_cells(scene);
     let mut best: Option<(usize, f32, ao_render::Camera, u16, [i32; 2], Vec3)> = None;
+    // Counts survive failure so native CPU diagnostics identify the rejecting stage.
+    let mut rejected = [0usize; 9];
+    let floor = |point| grass_path_floor(point, |p| surface.terrain_height(p), |p| surface.ground(p));
+    let vertical_tan = (camera::lens(scene.lens.unwrap_or_default(), false)
+        .vertical_fov(1920.0 / 1200.0) * 0.5).tan();
     for (&grid, cell) in &cells {
         let distance = cell.root.distance_squared(reference);
         let neighbors = (-1..=1).flat_map(|z| (-1..=1).map(move |x| [grid[0]+x, grid[1]+z]))
@@ -749,9 +754,9 @@ fn grass_ground_camera(
         if best.as_ref().is_some_and(|old| neighbors < old.0 || (neighbors == old.0 && distance >= old.1)) { continue; }
         let path = matches!(mode, "path-day" | "path-dusk");
         if !cell.samples.iter().all(|point| (exposure.query)(point.to_array())
-            && (path || matches!(surface.ground_material(point.to_array()), 6 | 15))) { continue; }
-        if path && !matches!(surface.ground_material(cell.root.to_array()), 6 | 15) { continue; }
-        if !mode.is_empty() && !cell.green_center { continue; }
+            && (path || matches!(surface.ground_material(point.to_array()), 6 | 15))) { rejected[0] += 1; continue; }
+        if path && !matches!(surface.ground_material(cell.root.to_array()), 6 | 15) { rejected[1] += 1; continue; }
+        if !mode.is_empty() && !cell.green_center { rejected[2] += 1; continue; }
         if mode == "backlit-dusk" {
             let sun = Vec3::from(scene.environment.context("backlit grass has no native environment")?.sun_dir);
             if let Some(camera) = grass_backlit_camera(cell.root, sun,
@@ -761,48 +766,66 @@ fn grass_ground_camera(
             continue;
         }
         if matches!(mode, "path-day" | "path-dusk") {
-            for direction in [Vec3::X, -Vec3::X, Vec3::Z, -Vec3::Z] {
-                let boundary = cell.root + direction * (cell.size * 0.5);
+            'directions: for direction in [Vec3::X, -Vec3::X, Vec3::Z, -Vec3::Z] {
+                // Painted path edges need not coincide with a native fine-cell edge.
+                // Search nearby edges without changing any grass/bare/LOS evidence.
+                for edge in [cell.size * 0.5, 0.5, 1.0, 1.5, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0] {
+                let boundary = cell.root + direction * edge;
                 let tangent = direction.cross(Vec3::Y);
+                let mut valid = |camera: &ao_render::Camera| {
+                    if camera.forward().dot(direction) >= -0.5 { rejected[4] += 1; return false; }
+                    // Grass remains exposed native green terrain. The bare side may
+                    // instead be a raised native KD pavement, never buried terrain.
+                    for index in 0..12 {
+                        let across = [-0.75, 0.0, 0.75][index % 3];
+                        let mut point = if index < 3 { cell.root + tangent * across }
+                            else { boundary + direction * [0.4, 1.2, 2.4][(index - 3) / 3] + tangent * across };
+                        let Some(height) = (if index < 3 { surface.terrain_height(point.to_array()) }
+                            else { floor(point.to_array()) }) else { rejected[5] += 1; return false; };
+                        point.y = height;
+                        if index < 3 && (!(exposure.query)(point.to_array())
+                            || floor(point.to_array()).is_none_or(|ground| (ground - height).abs() > 0.02)) {
+                            rejected[5] += 1; return false;
+                        }
+                        let material = surface.ground_material(point.to_array());
+                        let terrain = surface.terrain_height(point.to_array());
+                        let raised = terrain.is_some_and(|height| point.y > height + 0.1);
+                        let green = if raised { Some(false) } else { grass_path_green(scene, point) };
+                        if (index < 3 && (!matches!(material, 6 | 15) || green != Some(true)))
+                            || (index >= 3 && (green != Some(false) || matches!(material, 8..=11))) {
+                            rejected[6] += 1; return false;
+                        }
+                        let low = point + Vec3::Y * 0.08;
+                        if index >= 3 && !grass_path_bare_in_frame(camera, boundary, direction, point, vertical_tan) {
+                            rejected[4] += 1; return false;
+                        }
+                        if !super::super::player::segment_clear(surface, low.to_array(), (point + Vec3::Y * 12.0).to_array())
+                            || !super::super::player::segment_clear(surface, camera.pos.to_array(), low.to_array()) {
+                            rejected[7] += 1; return false;
+                        }
+                    }
+                    let Some(eye_ground) = floor(camera.pos.to_array()) else { rejected[8] += 1; return false; };
+                    let eye_root = Vec3::new(camera.pos.x, eye_ground, camera.pos.z);
+                    if !(0.7..=1.8).contains(&(camera.pos.y - eye_ground))
+                        || matches!(surface.ground_material(eye_root.to_array()), 8..=11)
+                        || !super::super::player::segment_clear(surface, (eye_root + Vec3::Y * 0.08).to_array(),
+                            (eye_root + Vec3::Y * 12.0).to_array()) { rejected[8] += 1; return false; }
+                    true
+                };
                 let camera = if mode == "path-dusk" {
                     let sun = Vec3::from(scene.environment.context("path dusk has no native environment")?.sun_dir).normalize_or_zero();
                     if direction.dot(-sun) < 0.5 { continue; }
-                    grass_backlit_camera(cell.root, sun,
-                        |point| surface.ground(point), |a, b| super::super::player::segment_clear(surface, a, b))
+                    grass_backlit_camera(cell.root, sun, floor, |a, b| {
+                        super::super::player::segment_clear(surface, a, b)
+                            && valid(&ao_render::Camera::look_at(Vec3::from(a), Vec3::from(b)))
+                    })
                 } else {
-                    grass_path_crossing_camera(cell.root, cell.size, direction, |point| surface.terrain_height(point))
+                    grass_path_crossing_camera(cell.root, edge * 2.0, direction, floor).filter(|camera| valid(camera))
                 };
-                let Some(camera) = camera else { continue; };
-                if camera.forward().dot(direction) >= -0.5 { continue; }
-                // A single bare-material query can hit ground underneath a building.
-                // Require an actual open, visible ground patch on BOTH sides of the edge.
-                let mut probes = [Vec3::ZERO; 12];
-                for (index, probe) in probes.iter_mut().enumerate() {
-                    let across = [-0.75, 0.0, 0.75][index % 3];
-                    *probe = if index < 3 { cell.root + tangent * across }
-                        else { boundary + direction * [0.4, 1.2, 2.4][(index - 3) / 3] + tangent * across };
-                }
-                let open_and_visible = probes.iter_mut().enumerate().all(|(index, point)| {
-                    let Some(height) = surface.terrain_height(point.to_array()) else { return false; };
-                    point.y = height;
-                    let Some(ground) = surface.ground((*point + Vec3::Y * 0.5).to_array()) else { return false; };
-                    if (ground - height).abs() > 0.02 || !(exposure.query)(point.to_array()) { return false; }
-                    let material = surface.ground_material(point.to_array());
-                    let green = matches!(material, 6 | 15);
-                    if (index < 3 && !green) || (index >= 3 && (green || matches!(material, 0 | 8..=11))) { return false; }
-                    let low = *point + Vec3::Y * 0.08;
-                    super::super::player::segment_clear(surface, low.to_array(), (*point + Vec3::Y * 12.0).to_array())
-                        && super::super::player::segment_clear(surface, camera.pos.to_array(), low.to_array())
-                });
-                if !open_and_visible { continue; }
-                let Some(eye_ground) = surface.terrain_height(camera.pos.to_array()) else { continue; };
-                let eye_root = Vec3::new(camera.pos.x, eye_ground, camera.pos.z);
-                if !(0.7..=1.8).contains(&(camera.pos.y - eye_ground))
-                    || !(exposure.query)(eye_root.to_array())
-                    || !super::super::player::segment_clear(surface, (eye_root + Vec3::Y * 0.08).to_array(),
-                        (eye_root + Vec3::Y * 12.0).to_array()) { continue; }
+                let Some(camera) = camera else { rejected[3] += 1; continue; };
                 best = Some((neighbors, distance, camera, cell.tile, grid, cell.root));
-                break;
+                break 'directions;
+                }
             }
             continue;
         }
@@ -821,7 +844,8 @@ fn grass_ground_camera(
             break;
         }
     }
-    best.map(|(_, _, camera, tile, grid, root)| (camera, tile, grid, root)).context("no exposed native green grass with a clear evidence camera")
+    best.map(|(_, _, camera, tile, grid, root)| (camera, tile, grid, root)).with_context(|| format!(
+        "no exposed native green grass with a clear evidence camera: mode={mode:?} cells={} rejected_exposure_rootmaterial_texture_camera_heading_floor_material_los_eye={rejected:?}", cells.len()))
 }
 
 fn grass_fixture_cells(scene: &ao_scene::Scene) -> std::collections::BTreeMap<[i32; 2], GrassFixtureCell> {
@@ -1003,6 +1027,82 @@ fn grass_lightbar_receiver_requires_in_range_non_endpoint_world_intersection() {
     assert!(!grass_lightbar_blocked_receiver(source, receiver, 6.13, triangle.map(|p| p - Vec3::X * 2.0)));
 }
 
+// Match grass_mask.rs's 64x64 classification and grass.wgsl's oriented,
+// linearly filtered repeat sample. A transition tile's material alone cannot
+// distinguish its painted road from the green grass beside it.
+fn grass_path_green(scene: &ao_scene::Scene, point: ao_render::Vec3) -> Option<bool> {
+    for patch in &scene.ground_detail {
+        let x = point.x / patch.cell_size - patch.origin[0] as f32;
+        let z = -point.z / patch.cell_size - patch.origin[1] as f32;
+        if x < 0.0 || z < 0.0 || x >= patch.cells as f32 || z >= patch.cells as f32 { continue; }
+        let cell = patch.fine_cells.get(z.floor() as usize * patch.cells + x.floor() as usize)?;
+        let key = scene.meshes.get(patch.mesh)?.submeshes.get(cell.submesh)?.texture?;
+        let texture = scene.textures.get(&key)?;
+        return grass_path_texture_green(texture, [x.fract(), z.fract()], cell.orientation);
+    }
+    None
+}
+
+fn grass_path_texture_green(texture: &ao_scene::Texture, [u, v]: [f32; 2], orientation: u8) -> Option<bool> {
+    let (w, h) = (texture.width as usize, texture.height as usize);
+    if w == 0 || h == 0 || texture.rgba.len() < w * h * 4 { return None; }
+    let [u, v] = match orientation {
+        0 => [u, 1.0 - v], 1 => [1.0 - v, 1.0 - u],
+        2 => [1.0 - u, v], _ => [v, u],
+    };
+    let (x, y) = (u * 64.0 - 0.5, v * 64.0 - 0.5);
+    let sample = |x: i32, y: i32| {
+        let (x, y) = (x.rem_euclid(64) as usize, y.rem_euclid(64) as usize);
+        let (x0, x1) = (x * w / 64, ((x + 1) * w / 64).max(x * w / 64 + 1).min(w));
+        let (y0, y1) = (y * h / 64, ((y + 1) * h / 64).max(y * h / 64 + 1).min(h));
+        let mut sum = 0.0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = (y * w + x) * 4;
+                let [r, g, b] = [texture.rgba[i], texture.rgba[i + 1], texture.rgba[i + 2]].map(f32::from);
+                if g >= 20.0 { sum += ((g - (r * 0.95).max(b * 1.1)) / 6.0).clamp(0.0, 1.0); }
+            }
+        }
+        (sum / ((x1 - x0) * (y1 - y0)) as f32 * 255.0 + 0.5).floor() / 255.0
+    };
+    let (ix, iy) = (x.floor() as i32, y.floor() as i32);
+    let (fx, fy) = (x - x.floor(), y - y.floor());
+    let top = sample(ix, iy) * (1.0 - fx) + sample(ix + 1, iy) * fx;
+    let bottom = sample(ix, iy + 1) * (1.0 - fx) + sample(ix + 1, iy + 1) * fx;
+    Some(top * (1.0 - fy) + bottom * fy >= 0.15)
+}
+
+#[test]
+fn grass_path_texture_distinguishes_oriented_transition_from_material() {
+    let texture = ao_scene::Texture {
+        width: 64, height: 64,
+        rgba: (0..64 * 64).flat_map(|i| if i % 64 < 32 {
+            [58, 100, 38, 255]
+        } else { [190, 170, 120, 255] }).collect(),
+        source: Default::default(),
+    };
+    for (orientation, green, bare) in [
+        (0, [0.25, 0.25], [0.75, 0.25]),
+        (1, [0.25, 0.75], [0.25, 0.25]),
+        (2, [0.75, 0.25], [0.25, 0.25]),
+        (3, [0.25, 0.25], [0.25, 0.75]),
+    ] {
+        assert_eq!(grass_path_texture_green(&texture, green, orientation), Some(true));
+        assert_eq!(grass_path_texture_green(&texture, bare, orientation), Some(false));
+    }
+}
+
+// Query the native walking floor from near the heightfield, not from a roof-height
+// camera probe. Collision retains its native bounded downward ray.
+fn grass_path_floor(
+    mut point: [f32; 3],
+    terrain: impl Fn([f32; 3]) -> Option<f32>,
+    ground: impl Fn([f32; 3]) -> Option<f32>,
+) -> Option<f32> {
+    point[1] = terrain(point)? + 0.5;
+    ground(point)
+}
+
 fn grass_path_crossing_camera(
     root: ao_render::Vec3,
     size: f32,
@@ -1037,11 +1137,44 @@ fn submit_grass_lightbar(off: &mut Offscreen, avatar: &super::super::avatar::Ava
     off.host.actors.push(frame);
 }
 
+// Evidence must be in front of the eye, on the bare side of the actual painted
+// edge and visibly in the ground half of the unchanged 1920x1200 fixture lens.
+fn grass_path_bare_in_frame(
+    camera: &ao_render::Camera,
+    boundary: ao_render::Vec3,
+    direction: ao_render::Vec3,
+    point: ao_render::Vec3,
+    vertical_tan: f32,
+) -> bool {
+    use ao_render::Vec3;
+    if (camera.pos - boundary).dot(direction) <= 2.4 { return false; }
+    let delta = point - camera.pos;
+    let forward = camera.forward();
+    let right = forward.cross(Vec3::Y).normalize_or_zero();
+    let up = right.cross(forward);
+    let depth = delta.dot(forward);
+    depth > 0.2 && delta.dot(right).abs() < depth * vertical_tan * (1920.0 / 1200.0) * 0.9
+        && (-0.9..=0.05).contains(&(delta.dot(up) / (depth * vertical_tan)))
+}
+
+#[test]
+fn grass_path_bare_frame_rejects_inside_grass_and_offscreen_probes() {
+    use ao_render::{Camera, Vec3};
+    let boundary = Vec3::new(0.0, 0.0, -8.0);
+    let point = boundary - Vec3::Z;
+    let inside = Camera::look_at(Vec3::new(0.0, 0.8, -4.0), Vec3::ZERO);
+    assert!(!grass_path_bare_in_frame(&inside, boundary, -Vec3::Z, point, 0.625));
+    let bare = Camera::look_at(Vec3::new(0.0, 0.8, -16.0), Vec3::Y * 0.2);
+    assert!(grass_path_bare_in_frame(&bare, boundary, -Vec3::Z, point, 0.625));
+    assert!(!grass_path_bare_in_frame(&bare, boundary, -Vec3::Z, point + Vec3::X * 20.0, 0.625));
+    assert!(!grass_path_bare_in_frame(&bare, boundary, -Vec3::Z, bare.pos - Vec3::Z, 0.625));
+}
+
 fn grass_backlit_camera(
     root: ao_render::Vec3,
     sun: ao_render::Vec3,
     ground: impl Fn([f32; 3]) -> Option<f32>,
-    clear: impl Fn([f32; 3], [f32; 3]) -> bool,
+    mut clear: impl FnMut([f32; 3], [f32; 3]) -> bool,
 ) -> Option<ao_render::Camera> {
     use ao_render::{Camera, Vec3};
     let sun = sun.normalize_or_zero();
@@ -1049,7 +1182,7 @@ fn grass_backlit_camera(
     let horizontal = Vec3::new(sun.x, 0.0, sun.z).normalize_or_zero();
     if horizontal == Vec3::ZERO { return None; }
     let at = root + Vec3::Y * 0.2;
-    for distance in [4.0, 6.0, 8.0] {
+    for distance in [4.0, 6.0, 8.0, 12.0, 16.0] {
         let mut eye = root - horizontal * distance;
         let Some(height) = ground((eye + Vec3::Y * 15.0).to_array()) else { continue; };
         eye.y = height + 0.8;
@@ -1071,4 +1204,79 @@ fn grass_backlit_camera_requires_native_sun_ground_and_los() {
     assert!(grass_backlit_camera(Vec3::ZERO, -sun, |_| Some(0.0), |_, _| true).is_none());
     assert!(grass_backlit_camera(Vec3::ZERO, sun, |_| None, |_, _| true).is_none());
     assert!(grass_backlit_camera(Vec3::ZERO, sun, |_| Some(0.0), |_, _| false).is_none());
+}
+
+#[test]
+fn grass_path_camera_uses_raised_floor_not_roof_and_retries_dusk() {
+    use ao_render::Vec3;
+    // Synthetic native bounded ground ray: pavement is 0.4 m over terrain;
+    // a +15 m probe would instead select the 10 m roof.
+    let terrain = |_| Some(3.0);
+    let ground = |point: [f32; 3]| Some(if point[1] > 13.0 { 13.0 } else { 3.4 });
+    let floor = |point| grass_path_floor(point, terrain, ground);
+    assert_eq!(ground([0.0, 18.0, 0.0]), Some(13.0));
+    assert_eq!(floor([0.0, 18.0, 0.0]), Some(3.4));
+    assert!(grass_path_floor([0.0; 3], |_| None, ground).is_none());
+    let root = Vec3::new(0.0, 3.0, 0.0);
+    let day = grass_path_crossing_camera(root, 4.0, -Vec3::X, floor).unwrap();
+    assert!((day.pos.y - 5.1).abs() < 0.0001);
+    let mut tried = Vec::new();
+    let dusk = grass_backlit_camera(root, Vec3::new(1.0, 0.15, 0.0), floor, |eye, _| {
+        tried.push(eye);
+        // First eye has LOS but fails the path evidence, so try the next.
+        eye[0] < -5.0
+    }).unwrap();
+    assert_eq!(tried.len(), 2);
+    assert!((dusk.pos.x + 6.0).abs() < 0.0001);
+    assert!((dusk.pos.y - 4.2).abs() < 0.0001);
+}
+
+#[test]
+#[ignore = "installed Newland assets; CPU-only native day/dusk path selector acceptance"]
+fn grass_native_newland_path_cameras() -> anyhow::Result<()> {
+    use ao_render::Vec3;
+    let dir = ao_gui::client_dir();
+    let store = ao_rdb::RecordStore::open(&dir)?;
+    let surface = Rc::new(RefCell::new(ao_formats::playfield::collision::Collision::load(&store, 566)?));
+    let exposure = super::super::player::grass_exposure_surface(surface.clone());
+    let mut failures = Vec::new();
+    for (mode, time) in [("path-day", 3240.0), ("path-dusk", 4600.0)] {
+        ao_scene::crt_srand(1);
+        let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(
+            &store, &dir, 566, time, 0, Some(ao_formats::weather::State::clear()))?;
+        let cells = grass_fixture_cells(&scene);
+        let patch = scene.ground_detail.first().context("Newland has no native ground detail")?;
+        let reference = Vec3::new(
+            (patch.origin[0] as f32 + patch.cells as f32 * 0.5) * patch.cell_size,
+            0.0, -(patch.origin[1] as f32 + patch.cells as f32 * 0.5) * patch.cell_size);
+        let collision = surface.borrow();
+        let exposed = cells.values().filter(|cell| cell.samples.iter()
+            .all(|point| (exposure.query)(point.to_array()))).count();
+        let green_exposed = cells.values().filter(|cell| cell.green_center
+            && matches!(collision.ground_material(cell.root.to_array()), 6 | 15)
+            && cell.samples.iter().all(|point| (exposure.query)(point.to_array()))).count();
+        let env = scene.environment.context("Newland has no native weather environment")?;
+        println!("native_grass_path pf=566 mode={mode} time={time} crt_seed=1 weather=clear cells={} exposed={exposed} green_exposed={green_exposed} reference={reference:?} sun_dir={:?} sun_color={:?}",
+            cells.len(), env.sun_dir, env.sun_color);
+        ensure!(green_exposed > 0, "pf566 {mode} has no exposed native green cells");
+        ensure!(env.sun_dir[1] > 0.0 && env.sun_color.iter().any(|&c| c > 0.0),
+            "pf566 {mode} time={time} lacks native direct sunlight");
+        match grass_ground_camera(&scene, &collision, &exposure, reference, mode) {
+            Ok((camera, tile, grid, root)) => {
+                let eye_floor = grass_path_floor(camera.pos.to_array(),
+                    |p| collision.terrain_height(p), |p| collision.ground(p))
+                    .context("selected native path camera has no collision floor")?;
+                println!("native_grass_path_selected mode={mode} tile={tile} grid={grid:?} root={root:?} camera={camera:?} eye_floor={eye_floor} eye_terrain={:?} eye_material={} clearance={}",
+                    collision.terrain_height(camera.pos.to_array()),
+                    collision.ground_material([camera.pos.x, eye_floor, camera.pos.z]), camera.pos.y - eye_floor);
+                ensure!((0.7..=1.8).contains(&(camera.pos.y - eye_floor)), "native path eye not grounded");
+                ensure!((exposure.query)(root.to_array())
+                    && matches!(collision.ground_material(root.to_array()), 6 | 15),
+                    "selected path root lost exposed native green grass");
+            }
+            Err(error) => failures.push(format!("pf566 time={time} mode={mode}: {error:#}")),
+        }
+    }
+    ensure!(failures.is_empty(), "native Newland path selection failed:\n{}", failures.join("\n"));
+    Ok(())
 }

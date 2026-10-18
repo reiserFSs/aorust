@@ -12,7 +12,7 @@ pub(super) struct Compiled {
 }
 impl Compiled {
     pub(super) fn new(device: &wgpu::Device, globals: &wgpu::BindGroupLayout, entries: &[wgpu::BindGroupLayoutEntry], shader: &wgpu::ShaderModule) -> Self {
-        let mut entries: Vec<_> = entries.iter().filter(|entry| matches!(entry.binding, 0 | 1 | 5 | 6 | 7 | 8 | 9))
+        let mut entries: Vec<_> = entries.iter().filter(|entry| matches!(entry.binding, 0 | 1 | 5 | 6 | 7 | 8 | 9 | 10))
             .cloned().map(|mut entry| { entry.visibility = wgpu::ShaderStages::COMPUTE; entry }).collect();
         entries.push(wgpu::BindGroupLayoutEntry { binding: 15, visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -69,7 +69,7 @@ impl Cache {
     }
     #[allow(clippy::too_many_arguments)]
     pub(super) fn bind(&mut self, device: &wgpu::Device, compiled: &Compiled, cells: &wgpu::Buffer, params: &wgpu::Buffer,
-        visible: &wgpu::Buffer, noise: &wgpu::TextureView, sampler: &wgpu::Sampler, mask: &wgpu::TextureView, owner: Option<&wgpu::Buffer>) {
+        visible: &wgpu::Buffer, noise: &wgpu::TextureView, sampler: &wgpu::Sampler, mask: &wgpu::TextureView, trails: &wgpu::Buffer, owner: Option<&wgpu::Buffer>) {
         if self.bind.is_some() && self.owner.as_ref() == owner { return; }
         self.owner = owner.cloned();
         let mut entries = vec![
@@ -79,6 +79,7 @@ impl Cache {
             wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(noise) },
             wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(sampler) },
             wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(mask) },
+            wgpu::BindGroupEntry { binding: 10, resource: trails.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 15, resource: self.buffer.as_entire_binding() },
         ];
         if let Some(owner) = owner { entries.push(wgpu::BindGroupEntry { binding: 9, resource: owner.as_entire_binding() }); }
@@ -165,5 +166,12 @@ mod tests {
         let encode = include_str!("grass_blades.rs").split_once("pub(super) fn encode(").unwrap().1
             .split_once("fn allocate(").unwrap().0;
         assert!(encode.contains("pass.dispatch_workgroups(1, cells, 1);"));
+        // Geometry is regenerated after the current gate every frame, even when
+        // the resource bind group and blade allocation remain cached.
+        assert!(!encode.contains("if self.bind.is_some()"));
+        assert!(source.contains("grass_build_section(b, 0u)"));
+        let cache_bind = include_str!("grass_blades.rs").split_once("pub(super) fn bind(").unwrap().1
+            .split_once("pub(super) fn encode(").unwrap().0;
+        assert!(cache_bind.contains("binding: 10, resource: trails.as_entire_binding()"));
     }
 }

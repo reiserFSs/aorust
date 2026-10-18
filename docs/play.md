@@ -1010,10 +1010,12 @@ FXAA when both are selected. Motion blur uses strength 0.5; grading uses contras
 day/night LUT, without enabling HDR or loading an external file. Other knobs
 retain their explicit defaults.
 With DoF enabled, each view contains an actual captured own-character Avatar.
-Existing actor/light-bar views retain their authored placement; other views place
-that Avatar twelve world units along the fixed camera's forward ray. Focus is
-always taken from the submitted actor frame's actual scene transform, recorded
-in `<view>-focus.txt`. When postprocessing is enabled, eight frozen post frames
+Existing actor/light-bar views retain their authored placement; other explicit
+own-avatar views search native dry, level collision terrain and require clear
+feet/torso/head sightlines. The camera is six metres behind the grounded actor,
+level with its torso. Focus always comes from the submitted actor's actual
+scene transform; `<view>-focus.txt` records its view depth and projection planes.
+When postprocessing is enabled, eight frozen post frames
 warm history before capture only for selected `AOMAC_GFX_FEATURE` features or
 explicit post mode (`AOMAC_GFX_TIMING_PAN` or `AOMAC_GFX_OWN_AVATAR` set).
 Standard faithful/atmosphere PNGs retain their original time-zero capture path.
@@ -1028,6 +1030,17 @@ Set `AOMAC_GFX_OWN_AVATAR=1` for **both** the control and each post-feature
 capture to keep identical own-avatar geometry/placement when DoF is switched off.
 It forces the same actual Avatar/focus producer independently of post settings,
 and is recorded in the manifest. Leave it unset for legacy faithful baselines.
+
+`graphics_bloom_gpu_timing` measures the native Borealis carried-light view at
+1920×1200 with requested-and-required actual 4× MSAA, OFF/ON/ON/OFF, 120 warmups
+and 600 whole-frame GPU samples per phase. Optional `AOMAC_GFX_OUT` writes raw
+sample CSV, per-phase PNGs and a summary; use `AOMAC_GFX_SETTINGS=hdr-bloom`
+for an HDR-held-fixed pair. The default pair measures authored bloom without HDR.
+`AOMAC_GFX_VIEW` may instead select `borealis-street-sun-high`,
+`icc-platform-authored` or `newland-day` for native daylight/highlight timing;
+those static views add no fixture actor. Ordinary `AOMAC_GFX_FRAME_TIMING`
+also writes `<view>-frame-gpu.csv` in acquisition order, before sorting its
+percentiles, so independent fixtures can form exact ABBA comparisons.
 
 Temporal raster coverage uses the jittered native projection; velocity uses
 unjittered current/previous projections and exact last-displayed rigid/skinned
@@ -1044,6 +1057,16 @@ Fog-colour changes reset temporal history; fully fogged and reactive TAA pixels
 remain current-only. FXAA, depth of field and motion blur retain positive gathers
 with native-fog guards. Uniform fog does not disable antialiasing or bokeh.
 Clear pixels retain ordinary filtering rather than the superseded night ceiling.
+Depth of field retains the sign of near/far circle of confusion and approaches
+its configured pixel-radius cap continuously; it no longer saturates every
+background beyond twice the focus depth to the same blur. Exact-focus pixels
+remain unchanged. A bounded pixel-disc gather admits only the same signed
+defocus layer with source-aperture coverage, rather than requiring equal depth
+within 1%; this forms filled bokeh discs from small native highlights without
+importing focused-character colour. Native-fog rejection is unchanged.
+`spatial_shaders_validate_on_gpu` guards exact focus, progressive background
+blur, far highlights across different far depths, circular support and
+foreground isolation. Dense aperture coverage costs more than sparse taps.
 
 TAA also compares exact GPU-visible actor-pose IDs across frames, reduced from
 all native-depth-admitted MSAA identity samples. A visible-set change rejects
@@ -1776,6 +1799,21 @@ Grass geometry; `all-foliage` enables all ten switches plus Ground Grass,
 without unrelated enhancements. `all-foliage-shadows` additionally enables only
 Sun Shadows, for canopy cascade-draw evidence. Existing profiles, including `all` and `all-before`,
 retain their previous switch selections.
+The retained `borealis-foliage-ground-sun-high` view chooses retreat from the
+tree-root plateau, not the lowest expanded leaf-drift corner. Native
+`Collision::ground` probes start at canopy underside for landing floors and
+canopy top for eye floors, so raised KD structures are respected. Grounded
+radial views are preferred. If native ridges conceal a landing corner, a
+near-overhead fallback derives height from swept bounds and vertical field of
+view, rather than retreating farther below the garden.
+Crown LOS extends actual upper-leaf sight rays to the camera-facing exterior of
+the full transformed instance bounds plus 0.15 m, outside the native proxy
+collider rather than merely outside the rendered leaf. The full crown and all
+four landing corners must still fit and pass LOS, with the ground in the lower
+third. `graphics_fixture_ground_foliage` covers low drift ground, alternate
+headings and rejection of a blocked fourth corner; the ignored CPU-only
+`graphics_fixture_native_borealis_ground_foliage_camera` loads the actual view
+and records per-stage rejections and blocked-ray witnesses on failure.
 
 Static foliage admission uses the native texture creator identity and exact
 embedded FAFTexture names (`docs/formats.md`), not an alpha-only classifier.
@@ -1804,9 +1842,10 @@ slot. Stateless trajectories use a fixed-world drift heading, not stored weather
 history, and do not collide with trunks or other objects during descent.
 Actor push is excluded from detached trajectories to avoid retaining a hidden
 actor's influence. Their GPU resources allocate only while a leaf switch is on.
-Grass trails use a 32×32 world-anchored grid of 1.25 m cells, recover over six
-seconds and revoke each source's contribution before upload when it is no longer
-admitted. Backlit foliage transmission uses two-sided sun scattering and forward
+Grass trails keep a 32×32 world-anchored grid of 1.25 m cells per admitted owner
+(sixteen bounded layers), recover over six seconds and revoke each source's
+contribution before upload when it is no longer admitted. Current GPU owner
+visibility is checked before layers merge. Backlit foliage transmission uses two-sided sun scattering and forward
 glare before the unchanged native fog operation; it requires a sunward view and
 does not add sunlight at night. Beyond 48 m, the distant-plant shading switch
 replaces soft sun-shadow blocker/PCSS searches with one filtered comparison.
@@ -2038,16 +2077,19 @@ Interaction follows the approved conservative rule: own-character feet always
 bend grass, including first person. Other sources must be currently drawn opaque
 primary character bodies within 15 m whose feet + 5 cm are inside the final render
 frustum and clear the final camera's existing bidirectional collision/closed-door
-line-of-sight query. Admission uses the current prepared draw list, including body
-fade/priority, before selecting the fifteen nearest remote sources. Camera shake
-or a renderer-rejected body therefore cannot evict a visible source at the cap.
+line-of-sight query. CPU fade/frustum/fog/LOS eligibility is intersected with the
+previous frame's nonblocking completed primary-view GPU admission before selecting
+the sixteen benders and sixty-four foliage contacts. An incomplete or older
+result fails closed for remote candidates. The previous-frame result may
+retain a newly hidden candidate for one frame; current-frame GPU owner admission
+still rejects its direct bend, contact, trail and shadow contribution.
 Remote admission also rejects a body bound whose nearest view-space depth is at
 or beyond the final camera fog end, after local fog evaluation. Rigid and current
 CPU-skinned geometry use their transformed local AABB, without the animation
-margin. Native GPU CAT poses retain the conservative bind sphere plus pose margin;
-this bound can straddle fog even when every actual posed vertex is fully fogged,
-so suppression of every such animated body remains unresolved (no CPU re-skin or
-GPU readback is introduced). A partially unfogged bound remains eligible; disabled fog,
+margin. Native GPU CAT poses retain the conservative bind sphere plus pose margin
+for CPU eligibility; exact current primary GPU admission gates their emitted
+interaction, including fully fogged posed bodies. Partial body coverage remains
+eligible; disabled fog,
 native fog-disabled body materials and rendering effects 2/4/5/6 preserve their
 native exemptions (`shader.wgsl::shade`, Randy `10041876` vertex-depth fog).
 Own-character interaction is unchanged. This only filters Enhanced benders;
@@ -2057,10 +2099,16 @@ bounded by the currently submitted character frames, while the GPU stays fixed
 at sixteen sources. Missing collision admits only own-character interaction.
 Repeated renders of the same actor snapshot preserve bends for screenshots;
 the next actor batch replaces all candidates, including an empty batch.
-No recovery grid or actor history exists; concealment, disappearance or a blocked
-ray removes the bend immediately. Grass overwrites the optional AO attachment
-with its own receiving contribution rather than inheriting the terrain beneath
-it. Its emissive attachment remains zero: grass never seeds bloom.
+Grass trail layers retain actor ownership independently; current-frame GPU
+admission gates each layer before their maximum is merged, so hidden history
+cannot survive through another admitted actor. Foliage contacts carry the same
+owner slots. Slot zero is exclusively the always-admitted own control; missing
+remote IDs fail closed. Grass overwrites the optional AO attachment with its own
+receiving contribution rather than inheriting terrain, and never seeds bloom.
+Fluid-smoke walking inputs consume the same capped selection. Its GPU gates
+current stirring and emitter quads, clearing affected persistent fluid history
+on owner revocation even when simulation time is paused. No synchronous
+GPU-to-CPU readback or frame wait is added by the selection path.
 
 Occlusion limitation: high building floors above the 0.5 m blade envelope can hide
 otherwise admitted terrain. Opaque floors prevent visible leaks, but the hidden
@@ -2259,19 +2307,34 @@ Purpose-selected native grass views are available only by exact `AOMAC_GFX_VIEW`
 | View | Native time | Selection |
 | --- | --- | --- |
 | `newland-grass-ground-backlit-dusk` | 4600 | Exposed native green cell, camera grounded 0.8 m above Collision, looking toward the actual above-horizon sun; positive direct sun energy and forward/sun dot >0.6 required. |
-| `newland-grass-ground-path-day` | 3240 by default | Confirmed green tile centre adjoining an open bare-ground patch; terrain-grounded camera crosses the boundary from the bare foreground rather than looking along a wall. |
+| `newland-grass-ground-path-day` | 3240 by default | Confirmed green tile centre adjoining an open bare-ground patch; native-floor-grounded camera crosses the boundary from the bare foreground rather than looking along a wall. |
 | `newland-grass-ground-path-dusk` | 4600 | Same boundary requirement, with bare ground in the native sun's shadow direction and a grounded sun-facing camera for longer blade-shadow evidence. |
 | `newland-grass-ground-lightbar-night` | 0 | Captured actor25988, native mount5 LightBar mesh26163/field0/byte0, standing on the confirmed green root, grounded by Collision. |
 
 Path selection validates three grass-side and nine bare-side native ground probes:
-the latter span 0.4, 1.2 and 2.4 m beyond the cell edge and ±0.75 m laterally.
-Each probe must have matching terrain/collision height, grass-floor exposure,
-clear vertical LOS for 12 m, and direct camera LOS to ground + 8 cm. Bare probes
-must have known, non-grass, non-liquid material. The eye is also terrain-exposed,
-and camera forward must cross toward the green side, not run along the boundary.
+the latter span 0.4, 1.2 and 2.4 m beyond the actual painted boundary and ±0.75 m
+laterally. A bounded half-metre scan finds that boundary near the cell edge,
+rather than assuming painted paths coincide with the coarse cell grid.
+Grass-side probes retain matching terrain/collision height and native grass-floor
+exposure. Bare-side probes and the camera use the native walkable floor queried
+near terrain height, not a roof selected by a high downward probe. Every probe
+retains clear vertical LOS for 12 m and direct camera LOS to ground + 8 cm;
+bare probes must have known, non-liquid terrain with non-green texels or a
+walkable raised bare floor. Classification uses the renderer's oriented 64×64
+greenness mask, not coarse material 6/15: transition tiles contain genuine
+painted bare paths inside the same material. Green probes require positive
+texel greenness as well as native material/exposure proof. The eye must clear
+the same vertical/camera visibility requirements, and camera forward must cross
+toward green rather than run along the boundary. Dusk tries all candidate
+distances after complete path validation, not merely its first clear sight ray.
 These requirements reject ground underneath roofs/floors and wall-adjacent
 single-point false positives. Inspect the actual paired PNGs before calling the
 bare edge visible; this is candidate validation, not a substitute for image proof.
+`grass_path_camera_uses_raised_floor_not_roof_and_retries_dusk` covers raised
+paving and distance retry; ignored CPU-only `grass_native_newland_path_cameras`
+loads the actual day/dusk scenes and reports selection-stage counts on failure.
+`grass_path_texture_distinguishes_oriented_transition_from_material` covers the
+native rotated-tile/per-texel distinction that coarse materials cannot express.
 
 These views reuse native terrain cells, tile images, exposure and collision;
 there are no synthetic lights, geometry or exposure boosts. The manifest records

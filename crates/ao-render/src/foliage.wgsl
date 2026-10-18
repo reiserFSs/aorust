@@ -1,6 +1,13 @@
 // Plant push spring adapted from ao-vk (MIT, Copyright 2026 wannabuh).
 // Shared card/sprig/caster deformation, with ao-vk's centre-rooted branch motion
 // and fixed-world gust axes. All clocks use integer harmonics of the wrapped phase.
+fn foliage_owner_admitted(owner: u32) -> bool {
+    // Slot zero is explicit local own-control only, never a missing remote actor.
+    if owner == 0u { return true; }
+    if owner >= arrayLength(&interaction_visibility) { return false; }
+    return interaction_visibility[owner] != 0u;
+}
+
 fn foliage_vertex(v: VIn, vertex: VOut) -> VOut {
     return foliage_vertex_at(v, vertex, g.foliage_wind.w, true);
 }
@@ -50,6 +57,8 @@ fn foliage_vertex_at(v: VIn, vertex: VOut, clock: f32, with_push: bool) -> VOut 
     if with_push && g.foliage_flags.y > 0.0 {
         var push = vec2<f32>(0.0);
         for (var k = 0u; k < 16u; k += 1u) {
+            let owner = g.foliage_owners[k / 4u][k % 4u];
+            if !foliage_owner_admitted(owner) { continue; }
             let source = g.foliage_pushers[k];
             let delta = o.wpos.xz - source.xz;
             let distance = length(delta);

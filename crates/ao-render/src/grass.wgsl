@@ -15,7 +15,6 @@ struct GrassParams {
     bands: array<vec4<f32>, 2>, // blades instanced per cell in eight distance bands
     benders: array<vec4<f32>, 16>,
     trail_origin: vec4<f32>, // world grid minimum x/z, cell size, enabled
-    trails: array<vec4<f32>, 1024>, // lean x/z, foot height, compression
 }
 @group(3) @binding(0) var<storage, read> grass_cells: array<GrassCell>;
 @group(3) @binding(1) var<uniform> grass_params: GrassParams;
@@ -26,6 +25,9 @@ struct GrassParams {
 @group(3) @binding(7) var grass_noise_sampler: sampler;
 // Which texels of each ground tile picture are green (grass_mask.rs); the cell names its tile's layer.
 @group(3) @binding(8) var grass_mask: texture_2d_array<f32>;
+// Each selected source keeps its own layer until current GPU admission is applied.
+@group(3) @binding(10) var<storage, read> grass_trails: array<vec4<f32>>;
+@group(0) @binding(8) var<storage, read> interaction_visibility: array<u32>;
 
 const GRASS_HEIGHT: f32 = 0.4;
 const GRASS_MAX_HEIGHT: f32 = 0.5;
@@ -107,8 +109,13 @@ fn bend_keeping_length(b_in: vec3<f32>, above: f32) -> vec3<f32> {
     return vec3<f32>(b.x, -(above - sqrt(max(above * above - dot(b, b), 0.0))), b.z);
 }
 
-// World-anchored samples, not a camera-scrolling texture. CPU ownership revokes
-// every sample from a source as soon as final-camera admission is lost.
+fn grass_owner_admitted(index: u32) -> bool {
+    let slot = bitcast<u32>(grass_params.benders[index].w);
+    if slot == 0u { return true; }
+    if slot >= arrayLength(&interaction_visibility) { return false; }
+    return interaction_visibility[slot] != 0u;
+}
+// World-anchored, owner-separated samples; combine only currently visible owners.
 fn grass_trail(pos: vec3<f32>) -> vec2<f32> {
     let coordinate = pos.xz / grass_params.trail_origin.z - vec2<f32>(0.5);
     let base = vec2<i32>(floor(coordinate));
@@ -120,7 +127,12 @@ fn grass_trail(pos: vec3<f32>) -> vec2<f32> {
             let cell = base + vec2<i32>(x, z);
             if any(cell < origin) || any(cell >= origin + vec2<i32>(32)) { continue; }
             let wrapped = ((cell % vec2<i32>(32)) + vec2<i32>(32)) % vec2<i32>(32);
-            let sample = grass_params.trails[u32(wrapped.y * 32 + wrapped.x)];
+            var sample = vec4<f32>(0.0);
+            for (var owner = 0u; owner < min(u32(grass_params.limits.w), 16u); owner += 1u) {
+                if !grass_owner_admitted(owner) { continue; }
+                let candidate = grass_trails[owner * 1024u + u32(wrapped.y * 32 + wrapped.x)];
+                if candidate.w > sample.w { sample = candidate; }
+            }
             if abs(sample.z - pos.y) > 1.5 { continue; }
             let weight = select(1.0 - fraction.x, fraction.x, x == 1) * select(1.0 - fraction.y, fraction.y, z == 1);
             bend += sample.xy * sample.w * weight;
@@ -133,7 +145,7 @@ fn grass_push(pos: vec3<f32>, h: f32, plant_height: f32) -> vec3<f32> {
     var push = vec2<f32>(0.0);
     for (var index = 0u; index < min(u32(grass_params.limits.w), 16u); index += 1u) {
         let actor = grass_params.benders[index];
-        if actor.w == 0.0 || abs(actor.y - pos.y) > 1.5 { continue; }
+        if !grass_owner_admitted(index) || abs(actor.y - pos.y) > 1.5 { continue; }
         let d = pos.xz - actor.xz;
         let dist = length(d);
         if dist >= 0.8 { continue; }

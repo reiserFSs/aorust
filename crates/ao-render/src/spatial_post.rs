@@ -40,9 +40,23 @@ fn parameters(settings: SpatialSettings, projection: Projection) -> ([f32; 12], 
     let (near, far) = if valid_projection { (projection.near, projection.far) } else { (0.1, 1.0) };
     let motion = finite_clamp(settings.motion_blur, 1.0);
     let fog = projection.fog_color.map(|c| finite_clamp(c, 1.0));
-    ([near, far, focus.unwrap_or(0.0), aperture, radius, strength, motion, 0.0, fog[0], fog[1], fog[2], 0.0],
+    ([near, far, focus.unwrap_or(0.0), aperture, radius, strength, motion, near.recip(), fog[0], fog[1], fog[2], far.recip()],
         [motion > 0.0 && valid_projection, settings.depth_of_field && focus.is_some() && aperture > 0.0 && radius > 0.0,
          settings.fxaa && valid_projection, settings.cas && strength > 0.0 && valid_projection])
+}
+
+fn aperture_taps() -> Vec<[f32; 4]> {
+    let mut taps = Vec::with_capacity(33*33);
+    for y in -16i32..=16 {
+        for x in -16i32..=16 {
+            let squared = x*x+y*y;
+            if squared as f32 <= 16.5*16.5 {
+                taps.push([x as f32,y as f32,(squared as f32).sqrt(),0.0]);
+            }
+        }
+    }
+    taps.sort_unstable_by(|a,b| a[2].total_cmp(&b[2]).then(a[1].total_cmp(&b[1])).then(a[0].total_cmp(&b[0])));
+    taps
 }
 
 struct Pass {
@@ -65,6 +79,7 @@ pub(super) struct SpatialPost {
     source_layout: wgpu::BindGroupLayout,
     pipelines: [RenderPipeline; 4],
     params: wgpu::Buffer,
+    aperture: wgpu::Buffer,
     fallback_identity: wgpu::TextureView,
     frame: Option<Frame>,
 }
@@ -83,6 +98,8 @@ impl SpatialPost {
                 texture(3, wgpu::TextureSampleType::Float { filterable: false }),
                 texture(4, wgpu::TextureSampleType::Uint),
                 texture(5, wgpu::TextureSampleType::Float { filterable: false }),
+                wgpu::BindGroupLayoutEntry { binding: 6, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
             ],
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Spatial post"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
@@ -102,20 +119,27 @@ impl SpatialPost {
             })
         });
         let params = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("Spatial post parameters"), size: 48, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let taps = aperture_taps();
+        let aperture = device.create_buffer_tracked(&wgpu::BufferDescriptor {
+            label: Some("DoF sorted pixel aperture"), size: std::mem::size_of_val(taps.as_slice()) as u64,
+            usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: true,
+        });
+        aperture.slice(..).get_mapped_range_mut().copy_from_slice(bytemuck::cast_slice(&taps));
+        aperture.unmap();
         let fallback_identity = device.create_texture_tracked(&wgpu::TextureDescriptor {
             label: Some("Spatial unused identity"), size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::R32Uint,
             usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
         }).create_view_tracked(&Default::default());
-        Self { format, layout, source_layout: source_layout.clone(), pipelines, params, fallback_identity, frame: None }
+        Self { format, layout, source_layout: source_layout.clone(), pipelines, params, aperture, fallback_identity, frame: None }
     }
     pub fn is_ready(&self) -> bool { self.pipelines.iter().all(RenderPipeline::is_ready) }
     pub fn wait(&self) { for pipeline in &self.pipelines { pipeline.get(); } }
     /// Release targets immediately when controls turn off or the scene changes.
     pub fn clear(&mut self) { self.frame = None; }
-    /// Owned texture/uniform storage, excluding shared inputs and driver overhead.
+    /// Owned texture/uniform/aperture storage, excluding shared inputs and driver overhead.
     pub fn bytes(&self) -> u64 {
-        52 + self.frame.as_ref().map_or(0, |frame| {
+        52 + self.aperture.size() + self.frame.as_ref().map_or(0, |frame| {
             u64::from(frame.size.0) * u64::from(frame.size.1)
                 * u64::from(self.format.block_copy_size(None).unwrap_or(4))
                 * frame.passes.iter().filter(|pass| pass.is_some()).count() as u64
@@ -148,6 +172,7 @@ impl SpatialPost {
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(motion.map_or(source, |m| m.0)) },
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(motion.map_or(&self.fallback_identity, |m| m.1)) },
                     wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(fog) },
+                    wgpu::BindGroupEntry { binding: 6, resource: self.aperture.as_entire_binding() },
                 ] });
                 let present = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("Spatial post presentation"), layout: &self.source_layout,
                     entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&output) }] });
@@ -217,6 +242,41 @@ fn linear_sample(p: vec2<f32>, centre: vec2<i32>) -> vec3<f32> {
 mod tests {
     use super::*;
     #[test]
+    fn dof_aperture_table_preserves_every_pixel_and_reciprocal_coc() {
+        use std::collections::HashSet;
+        let taps = aperture_taps();
+        assert!(taps.windows(2).all(|pair| pair[0][2] <= pair[1][2]));
+        let unique: HashSet<_> = taps.iter().map(|tap| (tap[0] as i32,tap[1] as i32)).collect();
+        assert_eq!(unique.len(), taps.len(), "no repeated aperture pixels");
+        for radius in [0.0f32,0.25,0.5,1.25,3.93,5.25,8.0,16.0] {
+            let actual: HashSet<_> = taps.iter().take_while(|tap| tap[2] <= radius+0.5)
+                .map(|tap| (tap[0] as i32,tap[1] as i32)).collect();
+            let mut expected = HashSet::new();
+            for y in -17i32..=17 {
+                for x in -17i32..=17 {
+                    if ((x*x+y*y) as f32).sqrt() <= radius+0.5 { expected.insert((x,y)); }
+                }
+            }
+            assert_eq!(actual, expected, "sorted table must preserve the filled disc at radius {radius}");
+        }
+        let settings = SpatialSettings { dof_aperture: 2.0, dof_max_radius: 8.0, ..Default::default() };
+        for (near,far) in [(0.1,100.0),(0.2,600.0)] {
+            let (params,_) = parameters(settings, Projection { near,far,focus_depth: Some(4.0),fog_color: [0.0;3] });
+            for z in [near,2.0,4.0,8.0,64.0,far] {
+                let depth = far/(far-near)*(1.0-near/z);
+                let inverse = params[7]-depth*(params[7]-params[11]);
+                let reconstructed = near*far/(far-depth*(far-near)).max(0.00001);
+                let coc = |t: f32| {
+                    let magnitude = (t.abs()-0.025).max(0.0)/0.975*params[3];
+                    t.signum()*magnitude/(1.0+magnitude)*params[4]
+                };
+                assert!((coc(1.0-params[2]/reconstructed.max(0.001))
+                    -coc(1.0-params[2]*inverse)).abs() < 0.001,
+                    "reciprocal CoC must match depth reconstruction at {z}");
+            }
+        }
+    }
+    #[test]
     fn unavailable_exact_focus_disables_only_dof() {
         let settings = SpatialSettings { motion_blur: 0.0, fxaa: true, cas: true, cas_strength: 0.5, depth_of_field: true, dof_aperture: 2.0, dof_max_radius: 8.0 };
         let projection = Projection { near: 0.1, far: 100.0, fog_color: [0.3;3], focus_depth: None };
@@ -237,7 +297,7 @@ mod tests {
         assert!(post.is_ready());
         let error = pollster::block_on(scope.pop());
         assert!(error.is_none(), "{error:?}");
-        let size = (64, 4);
+        let size = (64, 32);
         let texture = |format, usage| renderer.device.create_texture_tracked(&wgpu::TextureDescriptor {
             label: Some("Spatial regression"), size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[],
@@ -312,12 +372,100 @@ mod tests {
                 }
             }
             assert!(actual.as_chunks::<4>().0.iter().all(|p|p[3]==255));
-            assert_eq!(post.bytes(), 52 + u64::from(size.0) * u64::from(size.1) * 4 * u64::from((bits as u32).count_ones()));
+            assert_eq!(post.bytes(), 52 + post.aperture.size() + u64::from(size.0) * u64::from(size.1) * 4 * u64::from((bits as u32).count_ones()));
         }
+        }
+        // Exercise the shader, not a CPU copy of CoC: exact focus is untouched,
+        // and far depths must not collapse to one hard-clamped blur radius.
+        let mut dof_frames = Vec::new();
+        for z in [4.0, 8.0, 64.0] {
+            let mask = vec![[0.0f32; 4]; (size.0*size.1) as usize];
+            renderer.queue.write_texture(wgpu::TexelCopyTextureInfo { texture: &fog_texture, mip_level: 0, origin: Default::default(), aspect: wgpu::TextureAspect::All },
+                bytemuck::cast_slice(&mask), wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size.0*16), rows_per_image: Some(size.1) },
+                wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 });
+            let mut encoder = renderer.device.create_command_encoder(&Default::default());
+            {
+                let d = projection.far/(projection.far-projection.near)
+                    * (1.0-projection.near/z);
+                let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("DoF focal depth regression"), color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(d), store: wgpu::StoreOp::Store }), stencil_ops: None }),
+                    timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                });
+            }
+            let settings = SpatialSettings { depth_of_field: true, dof_aperture: 2.0, dof_max_radius: 8.0, ..Default::default() };
+            let result = post.encode(&renderer.device, &renderer.queue, &mut encoder, &source, &depth, &fog, None, size, settings, projection).unwrap();
+            boundary.composite(&mut encoder, &output_view, Some(result), None);
+            renderer.queue.submit([encoder.finish()]);
+            dof_frames.push(crate::texture_to_rgba(&renderer, &output, size.0, size.1).unwrap());
+        }
+        assert_eq!(dof_frames[0], pixels, "own-character focal plane must remain sharp");
+        assert_ne!(dof_frames[1], pixels, "background must blur");
+        assert_ne!(dof_frames[1], dof_frames[2], "far blur must keep progressing past twice the focus depth");
+        // One native-sized bright texel at z=64 over a z=8 background. Its
+        // aperture must survive that real depth difference, but never touch
+        // the exact-focus foreground strip at x<30.
+        let spot = texture(renderer.format, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        let spot_pixels: Vec<u8> = (0..size.0*size.1).flat_map(|i| {
+            let (x,y) = (i%size.0, i/size.0);
+            if x < 30 { [40,80,120,255] } else if (x,y)==(32,16) { [255;4] } else { [0,0,0,255] }
+        }).collect();
+        renderer.queue.write_texture(wgpu::TexelCopyTextureInfo { texture: &spot, mip_level: 0, origin: Default::default(), aspect: wgpu::TextureAspect::All },
+            &spot_pixels, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size.0*4), rows_per_image: Some(size.1) },
+            wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 });
+        let spot = spot.create_view_tracked(&Default::default());
+        let depth_shader = renderer.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("DoF highlight depth regression"),
+            source: wgpu::ShaderSource::Wgsl(r#"
+                @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+                    return vec4<f32>(array<vec2<f32>,3>(vec2(-1.0,-1.0),vec2(3.0,-1.0),vec2(-1.0,3.0))[i],0.0,1.0);
+                }
+                @fragment fn fs(@builtin(position) p: vec4<f32>) -> @builtin(frag_depth) f32 {
+                    var z = 8.0;
+                    if p.x < 30.0 { z = 4.0; }
+                    else if all(vec2<i32>(p.xy) == vec2<i32>(32,16)) { z = 64.0; }
+                    return 100.0/99.9*(1.0-0.1/z);
+                }
+            "#.into()),
+        });
+        let depth_pipeline = renderer.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("DoF highlight depth regression"), layout: None,
+            vertex: wgpu::VertexState { module: &depth_shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState { module: &depth_shader, entry_point: Some("fs"), compilation_options: Default::default(), targets: &[] }),
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState { format: crate::DEPTH, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }),
+            multisample: Default::default(), multiview_mask: None, cache: None,
+        });
+        let mut encoder = renderer.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("DoF varying far depth"), color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
+                timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+            });
+            pass.set_pipeline(&depth_pipeline);
+            pass.draw(0..3,0..1);
+        }
+        let result = post.encode(&renderer.device, &renderer.queue, &mut encoder, &spot, &depth, &fog, None, size,
+            SpatialSettings { depth_of_field: true, dof_aperture: 2.0, dof_max_radius: 8.0, ..Default::default() }, projection).unwrap();
+        boundary.composite(&mut encoder, &output_view, Some(result), None);
+        renderer.queue.submit([encoder.finish()]);
+        let disc = crate::texture_to_rgba(&renderer, &output, size.0, size.1).unwrap();
+        let pixel = |x: usize,y: usize| &disc[(y*size.0 as usize+x)*4..(y*size.0 as usize+x+1)*4];
+        for (x,y) in [(37,16),(32,11),(32,21)] {
+            assert!(pixel(x,y)[0] > 0, "single far highlight must fill its disc across different far depths");
+        }
+        assert_eq!(pixel(37,21), &[0,0,0,255], "disc must not become a square/box blur");
+        for y in 0..size.1 as usize {
+            for x in 0..30 {
+                assert_eq!(pixel(x,y), &[40,80,120,255], "far bokeh must never bleed onto exact-focus body pixels");
+            }
         }
         let mut encoder = renderer.device.create_command_encoder(&Default::default());
         assert!(post.encode(&renderer.device, &renderer.queue, &mut encoder, &source, &depth, &fog, None, size, SpatialSettings::default(), projection).is_none());
         assert!(post.frame.is_none(), "all-off must release every target and bind group");
-        assert_eq!(post.bytes(), 52, "off retains only uniform and fallback texel");
+        assert_eq!(post.bytes(), 52 + post.aperture.size(), "off retains uniform, immutable aperture and fallback texel");
     }
 }

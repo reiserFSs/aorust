@@ -12,7 +12,7 @@ fn shader_source() -> std::borrow::Cow<'static, str> {
         crate::shader_source::load("sun_shadows.wgsl", include_str!("sun_shadows.wgsl")));
     crate::foliage::append_shader(&mut source);
     source = source.replace("    let wp = model * vec4<f32>(v.pos, 1.0);\n    var o: ShadowVertex;",
-        "    var wp = model * vec4<f32>(v.pos, 1.0);\n    if (u32(mat.native.z) & 64u) != 0u { wp = vec4<f32>(foliage_vertex(v, vtx(v)).wpos, 1.0); }\n    var o: ShadowVertex;");
+        "    var wp = model * vec4<f32>(v.pos, 1.0);\n    if (u32(mat.native.z) & 64u) != 0u { wp = vec4<f32>(foliage_vertex_at(v, vtx(v), g.foliage_wind.w, id < 0x80000000u).wpos, 1.0); }\n    var o: ShadowVertex;");
     source.into()
 }
 
@@ -352,7 +352,7 @@ impl SunShadows {
             actor_ids_buffer, actor_visibility, actor_capacity, visibility_group }
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn grass_bind(&self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, cells: &wgpu::Buffer, params: &wgpu::Buffer, visible: &wgpu::Buffer, noise: &wgpu::TextureView, noise_sampler: &wgpu::Sampler, mask: &wgpu::TextureView, roots: &wgpu::Buffer, points: Option<&crate::point_shadows::PointShadows>) -> wgpu::BindGroup {
+    pub fn grass_bind(&self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, cells: &wgpu::Buffer, params: &wgpu::Buffer, visible: &wgpu::Buffer, noise: &wgpu::TextureView, noise_sampler: &wgpu::Sampler, mask: &wgpu::TextureView, trails: &wgpu::Buffer, roots: &wgpu::Buffer, points: Option<&crate::point_shadows::PointShadows>) -> wgpu::BindGroup {
         let mut entries = vec![
                 wgpu::BindGroupEntry { binding: 0, resource: cells.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() },
@@ -363,13 +363,14 @@ impl SunShadows {
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(noise) },
                 wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(noise_sampler) },
                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(mask) },
+                wgpu::BindGroupEntry { binding: 10, resource: trails.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 14, resource: roots.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(&self.grass_depth) },
         ];
         if let Some(points) = points {
             entries.extend([
                 wgpu::BindGroupEntry { binding: 9, resource: self.actor_visibility.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&points.array) },
+                wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::TextureView(&points.array) },
                 wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::Sampler(&points.sampler) },
                 wgpu::BindGroupEntry { binding: 12, resource: points.metadata.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(&points.actor_array) },
@@ -459,7 +460,7 @@ fn admission_buffers(device: &wgpu::Device, capacity: usize) -> (wgpu::Buffer, w
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
     }), device.create_buffer_tracked(&wgpu::BufferDescriptor {
         label: Some("current-frame actor shadow visibility"), size: ((capacity + 1) * 4) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false,
     }))
 }
 

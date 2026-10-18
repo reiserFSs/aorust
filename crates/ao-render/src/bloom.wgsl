@@ -8,6 +8,7 @@ struct Params { strength: f32, hdr: f32, _pad0: f32, _pad1: f32 }
 @group(0) @binding(1) var coarse: texture_2d<f32>;
 @group(0) @binding(2) var seed: texture_2d<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(4) var linear_sampler: sampler;
 const THRESHOLD: f32 = 1.0;
 // One-sided knee: nothing at/below white, with a short smooth onset for exposed highlights.
 const KNEE: f32 = 0.03125;
@@ -38,25 +39,31 @@ fn seed_at(q: vec2<i32>) -> vec4<f32> {
     }
     return vec4<f32>(rgb, a);
 }
+// Extract once per source pixel, not nine times in overlapping first-downsample footprints.
+@fragment fn seed_extract(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    return seed_at(vec2<i32>(p.xy));
+}
+fn seed_box(c: vec2<f32>) -> vec4<f32> {
+    return glare_filtered(fine, linear_sampler, c);
+}
 fn karis(c: vec4<f32>) -> f32 { return 1.0 / (1.0 + max(c.r, max(c.g, c.b))); }
-// First downsample: 36 seeded pixels feed 13 box taps (Jimenez layout), five 2x2 groups, Karis-weighted so a
-// lone bright pixel cannot flicker. Output energy is a convex mix of box averages of the source.
+// Thirteen 2x2 boxes of already extracted seeds, then the original five Karis groups.
+// Nonlinear extraction stays BEFORE filtering; the transient seed uses the pyramid's f16 format.
 @fragment fn seed_down(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
-    let origin = vec2<i32>(p.xy) * 2;
-    var s: array<vec4<f32>, 36>;
-    for (var y = 0; y < 6; y++) {
-        for (var x = 0; x < 6; x++) { s[y * 6 + x] = seed_at(origin + vec2<i32>(x - 2, y - 2)); }
-    }
-    // Box tap at pixel offset o covers source pixels o..o+1 (offsets -2..2 -> indices 0..4 after the +2 shift).
-    var t: array<vec4<f32>, 25>;
-    for (var y = 0; y < 5; y++) {
-        for (var x = 0; x < 5; x++) {
-            t[y * 5 + x] = (s[y * 6 + x] + s[y * 6 + x + 1] + s[(y + 1) * 6 + x] + s[(y + 1) * 6 + x + 1]) * 0.25;
-        }
-    }
-    // t index (x,y) is offset (x-2, y-2). Inner diamond j,k,l,m at (+-1,+-1), outer a..i at (0|+-2).
-    let a = t[0]; let b = t[2]; let c = t[4]; let d = t[10]; let e = t[12]; let f = t[14]; let g = t[20]; let h = t[22]; let i = t[24];
-    let j = t[6]; let k = t[8]; let l = t[16]; let m = t[18];
+    let centre = vec2<f32>(vec2<i32>(p.xy) * 2) + 0.5;
+    let a = seed_box(centre + vec2<f32>(-2.0, -2.0));
+    let b = seed_box(centre + vec2<f32>(0.0, -2.0));
+    let c = seed_box(centre + vec2<f32>(2.0, -2.0));
+    let d = seed_box(centre + vec2<f32>(-2.0, 0.0));
+    let e = seed_box(centre);
+    let f = seed_box(centre + vec2<f32>(2.0, 0.0));
+    let g = seed_box(centre + vec2<f32>(-2.0, 2.0));
+    let h = seed_box(centre + vec2<f32>(0.0, 2.0));
+    let i = seed_box(centre + vec2<f32>(2.0, 2.0));
+    let j = seed_box(centre + vec2<f32>(-1.0, -1.0));
+    let k = seed_box(centre + vec2<f32>(1.0, -1.0));
+    let l = seed_box(centre + vec2<f32>(-1.0, 1.0));
+    let m = seed_box(centre + vec2<f32>(1.0, 1.0));
     let b0 = (j + k + l + m) * 0.25; let b1 = (a + b + d + e) * 0.25; let b2 = (b + c + e + f) * 0.25;
     let b3 = (d + e + g + h) * 0.25; let b4 = (e + f + h + i) * 0.25;
     let w0 = karis(b0) * 0.5; let w1 = karis(b1) * 0.125; let w2 = karis(b2) * 0.125;
@@ -64,26 +71,29 @@ fn karis(c: vec4<f32>) -> f32 { return 1.0 / (1.0 + max(c.r, max(c.g, c.b))); }
     return max((b0 * w0 + b1 * w1 + b2 * w2 + b3 * w3 + b4 * w4) / (w0 + w1 + w2 + w3 + w4), vec4<f32>(0.0));
 }
 @fragment fn down(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
-    var sum = vec4<f32>(0.0);
-    let origin = vec2<i32>(p.xy) * 2;
-    // Fused tent then 2x2 box: [1,3,3,1]/8. Sixteen unique taps, zero border.
-    for (var y = -1; y <= 2; y++) {
-        for (var x = -1; x <= 2; x++) {
-            let weight = select(3.0, 1.0, x == -1 || x == 2) * select(3.0, 1.0, y == -1 || y == 2) / 64.0;
-            sum += glare_load(fine, origin + vec2<i32>(x, y)) * weight;
-        }
-    }
-    return sum;
+    let origin = vec2<f32>(vec2<i32>(p.xy) * 2);
+    // Pair [1,3] and [3,1] with hardware bilinear: exactly [1,3,3,1]/8 per axis.
+    return (glare_filtered(fine, linear_sampler, origin + vec2<f32>(-0.25, -0.25))
+        + glare_filtered(fine, linear_sampler, origin + vec2<f32>(1.25, -0.25))
+        + glare_filtered(fine, linear_sampler, origin + vec2<f32>(-0.25, 1.25))
+        + glare_filtered(fine, linear_sampler, origin + vec2<f32>(1.25, 1.25))) * 0.25;
 }
 // 3x3 tent over bilinear-upsampled coarse light: round, wide falloff instead of nearest-neighbour blocks.
 @fragment fn up(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
     let c = p.xy * 0.5 - 0.5;
-    var tent = glare_bilinear(coarse, c) * 4.0;
-    tent += (glare_bilinear(coarse, c + vec2<f32>(-1.0, 0.0)) + glare_bilinear(coarse, c + vec2<f32>(1.0, 0.0))
-        + glare_bilinear(coarse, c + vec2<f32>(0.0, -1.0)) + glare_bilinear(coarse, c + vec2<f32>(0.0, 1.0))) * 2.0;
-    tent += glare_bilinear(coarse, c + vec2<f32>(-1.0, -1.0)) + glare_bilinear(coarse, c + vec2<f32>(1.0, -1.0))
-        + glare_bilinear(coarse, c + vec2<f32>(-1.0, 1.0)) + glare_bilinear(coarse, c + vec2<f32>(1.0, 1.0));
-    return mix(textureLoad(fine, vec2<i32>(p.xy), 0), tent / 16.0, UP_MIX);
+    let base = floor(c);
+    let f = fract(c);
+    // Tent convolved with bilinear gives [1-f, 2-f, 1+f, f]/4 per axis.
+    // Pair adjacent weights: four hardware taps instead of nine software bilinears (36 loads).
+    let lo_weight = (3.0 - 2.0 * f) * 0.25;
+    let hi_weight = (1.0 + 2.0 * f) * 0.25;
+    let lo = base - 1.0 + (2.0 - f) / (3.0 - 2.0 * f);
+    let hi = base + 1.0 + f / (1.0 + 2.0 * f);
+    let tent = glare_filtered(coarse, linear_sampler, lo) * (lo_weight.x * lo_weight.y)
+        + glare_filtered(coarse, linear_sampler, vec2<f32>(hi.x, lo.y)) * (hi_weight.x * lo_weight.y)
+        + glare_filtered(coarse, linear_sampler, vec2<f32>(lo.x, hi.y)) * (lo_weight.x * hi_weight.y)
+        + glare_filtered(coarse, linear_sampler, hi) * (hi_weight.x * hi_weight.y);
+    return mix(textureLoad(fine, vec2<i32>(p.xy), 0), tent, UP_MIX);
 }
 // Non-HDR presentation: UNORM-range glare onto the native colour. In HDR the grade `present` pass adds the same
 // glare above white instead.
@@ -92,6 +102,6 @@ fn karis(c: vec4<f32>) -> f32 { return 1.0 / (1.0 + max(c.r, max(c.g, c.b))); }
     let beauty = vec4<f32>(clamp(raw_beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), raw_beauty.a);
     // Source visibility comes ONLY from the world pass's depth-tested mask. Never classify/gate receivers:
     // doing so could silhouette a dark actor.
-    let received = glare_received(glare_reconstruct(coarse, p.xy), params.strength);
+    let received = glare_received(glare_filtered(coarse, linear_sampler, p.xy * 0.5 - 0.5), params.strength);
     return vec4<f32>(clamp(beauty.rgb + received, vec3<f32>(0.0), vec3<f32>(1.0)), beauty.a);
 }

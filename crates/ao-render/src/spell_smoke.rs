@@ -20,15 +20,16 @@ pub(super) struct Source {
     pub lifetime: f32,
     pub rise: f32,
 }
-/// Only current-frame admitted, walking characters may enter this list.
+/// Previous-frame selected walkers; the GPU rechecks each current owner before stirring.
 #[derive(Clone, Copy)]
-pub(super) struct Body { pub feet: [f32; 3], pub height: f32, pub velocity: [f32; 3], pub radius: f32 }
+pub(super) struct Body { pub feet: [f32; 3], pub height: f32, pub velocity: [f32; 3], pub radius: f32, pub owner: u32 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Params {
     source: [f32; 4], color: [f32; 4], uv: [f32; 4],
     wind_life: [f32; 4], clock: [f32; 4], right: [f32; 4], up: [f32; 4],
     corner_size: [f32; 4], bodies: [[f32; 4]; 16],
+    owners: [[u32; 4]; 4], body_owners: [[u32; 4]; 2], admission: [u32; 4],
 }
 
 pub(super) struct Programs {
@@ -38,10 +39,10 @@ pub(super) struct Programs {
 }
 impl Programs {
     pub fn new(device: &wgpu::Device, smoke: bool) -> Self {
-        let entries = std::array::from_fn::<_, 4, _>(|i| wgpu::BindGroupLayoutEntry {
+        let entries = std::array::from_fn::<_, 5, _>(|i| wgpu::BindGroupLayoutEntry {
             binding: i as u32, visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer { ty: if i == 0 { wgpu::BufferBindingType::Uniform }
-                else { wgpu::BufferBindingType::Storage { read_only: i == 1 } }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                else { wgpu::BufferBindingType::Storage { read_only: i == 1 || i == 4 } }, has_dynamic_offset: false, min_binding_size: None }, count: None,
         });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("native effect simulation"), entries: &entries });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("native effect simulation"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
@@ -49,7 +50,7 @@ impl Programs {
         let simulation = if smoke { crate::shader_source::load("fluid_smoke.wgsl", include_str!("fluid_smoke.wgsl")) }
             else { crate::shader_source::load("spell_particles.wgsl", include_str!("spell_particles.wgsl")) };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("native effect simulation"), source: wgpu::ShaderSource::Wgsl(format!("{common}\n{simulation}").into()) });
-        let names: &[&str] = if smoke { &["advect", "curl_field", "confine", "divergence", "jacobi", "project", "vertices"] } else { &["simulate", "vertices"] };
+        let names: &[&str] = if smoke { &["advect", "curl_field", "confine", "divergence", "jacobi", "project", "vertices", "sanitize"] } else { &["simulate", "vertices", "sanitize"] };
         let stages = names.iter().map(|entry| pipeline_creation::compute_deferred(device, &wgpu::ComputePipelineDescriptor {
             label: Some("native effect simulation"), layout: Some(&pipeline_layout), module: &shader, entry_point: Some(entry), compilation_options: Default::default(), cache: None,
         })).collect();
@@ -71,7 +72,7 @@ pub(super) struct Simulation {
     stepping: bool,
 }
 impl Simulation {
-    pub fn new(device: &wgpu::Device, programs: &Programs) -> Self {
+    pub fn new(device: &wgpu::Device, programs: &Programs, visibility: &wgpu::Buffer) -> Self {
         let count = if programs.smoke { SMOKE_CELLS.pow(3) } else { SPELL_PARTICLES };
         let buffer = |label, size, usage| device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false });
         let state = std::array::from_fn(|_| buffer("native effect state", count as u64 * 48, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST));
@@ -82,12 +83,13 @@ impl Simulation {
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: state[i].as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: state[1-i].as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: vertices.as_entire_binding() }] }));
+                wgpu::BindGroupEntry { binding: 3, resource: vertices.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: visibility.as_entire_binding() }] }));
         Self { state, params, vertices, groups, vertex_count, smoke: programs.smoke, corner: None, size: None, stepping: false }
     }
     /// Revoke the whole simulation immediately when source admission is lost; never draw orphan history.
     #[allow(clippy::too_many_arguments)]
-    pub fn update(&mut self, queue: &wgpu::Queue, source: Source, bodies: &[Body], dt: f32, time: f32, right: Vec3, up: Vec3) {
+    pub fn update(&mut self, queue: &wgpu::Queue, source: Source, bodies: &[Body], owners: &[u32], source_owner: u32, dt: f32, time: f32, right: Vec3, up: Vec3) {
         // Native birth/death billboards can be millimetres wide. They identify the
         // admitted material, not the Enhanced curl cloud / fluid injection footprint.
         let radius = source.radius.clamp(if self.smoke { 0.35 } else { 0.45 }, 4.0);
@@ -98,13 +100,16 @@ impl Simulation {
         let mut params = Params { source: Vec3::from_array(source.position).extend(radius).to_array(), color: source.color, uv: source.uv,
             wind_life: [source.wind[0], source.wind[1], source.wind[2], source.lifetime.clamp(0.2, 12.0)],
             clock: [if dt.is_finite() { dt.clamp(0.0, 1.0 / 30.0) } else { 0.0 }, time, source.rise.clamp(0.0, 8.0), 0.0],
-            right: right.extend(shift.x).to_array(), up: up.extend(shift.y).to_array(), corner_size: corner.extend(size).to_array(), bodies: [[0.0; 4]; 16] };
+            right: right.extend(shift.x).to_array(), up: up.extend(shift.y).to_array(), corner_size: corner.extend(size).to_array(), bodies: [[0.0; 4]; 16],
+            owners: [[0; 4]; 4], body_owners: [[u32::MAX; 4]; 2], admission: [source_owner, owners.len().min(16) as u32, 0, 0] };
         // Corner z is carried separately from camera vectors; clock.w is not a simulation clock.
         params.clock[3] = shift.z;
+        for (i, &owner) in owners.iter().take(16).enumerate() { params.owners[i / 4][i % 4] = owner; }
         for (i, body) in bodies.iter().filter(|b| Vec3::from_array(b.velocity).is_finite() && Vec3::from_array(b.velocity).length_squared() > 0.0025
             && Vec3::from_array(b.feet).is_finite() && b.radius.is_finite() && b.height.is_finite()).take(8).enumerate() {
             params.bodies[i] = [body.feet[0], body.feet[1], body.feet[2], body.height.clamp(0.1, 6.0)];
             params.bodies[i+8] = [body.velocity[0].clamp(-12.0,12.0), body.velocity[1].clamp(-12.0,12.0), body.velocity[2].clamp(-12.0,12.0), body.radius.clamp(0.1,1.0)];
+            params.body_owners[i / 4][i % 4] = body.owner;
         }
         self.stepping = params.clock[0] > 0.0;
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
@@ -115,6 +120,9 @@ impl Simulation {
         {
             let mut pass = encoder.begin_effect_compute_pass(&wgpu::ComputePassDescriptor { label: Some(if self.smoke { "Fluid smoke" } else { "Spell particles" }), timestamp_writes: None });
             let mut dispatch = |stage: usize, side: usize| { pass.set_pipeline(&programs.stages[stage]); pass.set_bind_group(0, &self.groups[side], &[]); pass.dispatch_workgroups(count.div_ceil(64), 1, 1); };
+            // State[1] is the last completed state. Revoke all affected history before
+            // advection, and also on paused frames that only regenerate vertices.
+            dispatch(if self.smoke { 7 } else { 2 }, 1);
             if !self.stepping {
                 dispatch(if self.smoke { 6 } else { 1 }, 0);
             } else if self.smoke {
@@ -123,7 +131,11 @@ impl Simulation {
                 dispatch(5, 0); dispatch(6, 1);
             } else { dispatch(0, 0); dispatch(1, 1); }
         }
-        if self.stepping { encoder.copy_buffer_to_buffer(&self.state[1], 0, &self.state[0], 0, count as u64 * 48); }
+        if self.stepping {
+            encoder.copy_buffer_to_buffer(&self.state[1], 0, &self.state[0], 0, count as u64 * 48);
+        } else {
+            encoder.copy_buffer_to_buffer(&self.state[0], 0, &self.state[1], 0, count as u64 * 48);
+        }
         true
     }
 }
@@ -131,6 +143,7 @@ impl Simulation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wgpu::util::DeviceExt;
     #[test]
     fn bounded_native_vertex_contract() {
         assert_eq!(std::mem::size_of::<ao_scene::Vertex>(), 48);
@@ -154,13 +167,17 @@ mod tests {
             let errors = renderer.device.push_error_scope(wgpu::ErrorFilter::Validation);
             let programs = Programs::new(&renderer.device, smoke);
             programs.wait();
-            let mut sim = Simulation::new(&renderer.device, &programs);
+            let visibility = renderer.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("effect test admission"), contents: bytemuck::cast_slice(&[1u32, 1]),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+            let mut sim = Simulation::new(&renderer.device, &programs, &visibility);
             // A native birth/death billboard must not collapse the Enhanced effect to a pixel.
             for frame in 0..24 {
                 sim.update(&renderer.queue, Source { position: [0.0;3], radius: 0.003,
                     color: [1.0, 1.0, 1.0, if smoke { 0.2 } else { 1.0 }], uv: [0.0,0.0,1.0,1.0],
                     wind: [0.4,0.0,0.0], lifetime: 2.0, rise: 1.0 },
-                    &[], 1.0/30.0, frame as f32 / 30.0, Vec3::X, Vec3::Y);
+                    &[], &[], 1, 1.0/30.0, frame as f32 / 30.0, Vec3::X, Vec3::Y);
                 let mut encoder = renderer.device.create_command_encoder(&Default::default());
                 assert!(sim.encode(&mut encoder, &programs));
                 renderer.queue.submit([encoder.finish()]);
@@ -186,5 +203,67 @@ mod tests {
             readback.unmap();
             assert!(pollster::block_on(errors.pop()).is_none(), "native GPU effect validation, smoke={smoke}");
         }
+    }
+    #[test]
+    fn revoked_smoke_walker_clears_history_and_cannot_stir_this_frame() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let renderer = Renderer::new(&instance, None).expect("smoke owner regression requires GPU");
+        let errors = renderer.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let programs = Programs::new(&renderer.device, true);
+        programs.wait();
+        let visibility = renderer.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("smoke owner revocation"), contents: bytemuck::cast_slice(&[1u32, 1, 0]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let source = Source { position: [0.0; 3], radius: 0.5, color: [1.0; 4], uv: [0.0, 0.0, 1.0, 1.0],
+            wind: [0.0; 3], lifetime: 2.0, rise: 1.0 };
+        let body = Body { feet: [0.0; 3], height: 1.8, velocity: [8.0, 0.0, 0.0], radius: 1.0, owner: 2 };
+        let mut revoked = Simulation::new(&renderer.device, &programs, &visibility);
+        let mut clean = Simulation::new(&renderer.device, &programs, &visibility);
+        // Seed unmistakable old pressure/density/velocity from a previously admitted walker.
+        let history = vec![[3.0f32; 12]; SMOKE_CELLS.pow(3) as usize];
+        renderer.queue.write_buffer(&revoked.state[1], 0, bytemuck::cast_slice(&history));
+        let read_state = |sim: &Simulation| {
+            let readback = renderer.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("smoke history regression"), size: sim.state[1].size(),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
+            });
+            let mut encoder = renderer.device.create_command_encoder(&Default::default());
+            encoder.copy_buffer_to_buffer(&sim.state[1], 0, &readback, 0, readback.size());
+            renderer.queue.submit([encoder.finish()]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            readback.slice(..).map_async(wgpu::MapMode::Read, move |result| tx.send(result).unwrap());
+            renderer.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            rx.recv().unwrap().unwrap();
+            let bytes = readback.slice(..).get_mapped_range().to_vec();
+            readback.unmap();
+            bytes
+        };
+        // A paused frame must revoke history too, and may not resurrect it on re-admission.
+        revoked.update(&renderer.queue, source, &[body], &[2], 1, 0.0, 1.0, Vec3::X, Vec3::Y);
+        let mut encoder = renderer.device.create_command_encoder(&Default::default());
+        assert!(revoked.encode(&mut encoder, &programs));
+        renderer.queue.submit([encoder.finish()]);
+        assert!(read_state(&revoked).iter().all(|&byte| byte == 0));
+        renderer.queue.write_buffer(&visibility, 8, bytemuck::bytes_of(&1u32));
+        let mut encoder = renderer.device.create_command_encoder(&Default::default());
+        assert!(revoked.encode(&mut encoder, &programs));
+        renderer.queue.submit([encoder.finish()]);
+        assert!(read_state(&revoked).iter().all(|&byte| byte == 0));
+        renderer.queue.write_buffer(&visibility, 8, bytemuck::bytes_of(&0u32));
+        // The hidden selected walker must produce exactly the unstirred source's state.
+        revoked.update(&renderer.queue, source, &[body], &[2], 1, 1.0 / 30.0, 2.0, Vec3::X, Vec3::Y);
+        clean.update(&renderer.queue, source, &[], &[], 1, 1.0 / 30.0, 2.0, Vec3::X, Vec3::Y);
+        let mut encoder = renderer.device.create_command_encoder(&Default::default());
+        assert!(revoked.encode(&mut encoder, &programs));
+        assert!(clean.encode(&mut encoder, &programs));
+        renderer.queue.submit([encoder.finish()]);
+        assert_eq!(read_state(&revoked), read_state(&clean), "hidden walkers cannot leave any fluid signal");
+        renderer.queue.write_buffer(&visibility, 4, bytemuck::bytes_of(&0u32));
+        let mut encoder = renderer.device.create_command_encoder(&Default::default());
+        assert!(revoked.encode(&mut encoder, &programs));
+        renderer.queue.submit([encoder.finish()]);
+        assert!(read_state(&revoked).iter().all(|&byte| byte == 0), "hidden emitters retain no source history");
+        assert!(pollster::block_on(errors.pop()).is_none(), "smoke owner GPU validation");
     }
 }

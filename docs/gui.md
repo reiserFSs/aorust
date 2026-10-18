@@ -1824,6 +1824,16 @@ blocks). Seeds are the world pass's depth-tested authored emission mask (clipped
 HDR on, above-white peak-RGB highlights with gain 3 and a one-sided 1/32 knee. Hue is preserved and the pyramid
 alpha tracks actual highlight luminance. Only exposed colours above native white seed highlight glow; native-range
 night and interior colours cannot seed it. No history is used.
+The same kernels use four paired hardware-bilinear fetches for each down/up
+pixel instead of sixteen/thirty-six software loads. Boundary pixels retain the
+original zero-border reconstruction. Nonlinear authored/HDR extraction runs once
+per full-resolution pixel into an RGBA16F seed texture, before the thirteen
+hardware-filtered box taps and unchanged Karis weighting. This avoids ninefold
+overlapping seed evaluation and dynamically indexed local arrays; the extra
+seed target costs 18,432,000 bytes at 1920×1200. Half-float seed rounding is not
+claimed byte-identical. `paired_bloom_filters_preserve_tent_halo_and_zero_border`
+guards the exact paired kernels; `extracted_f16_seed_preserves_karis_energy_and_highlight_share`
+guards seed precision, highlight attribution and halo energy.
 World name/org text, health bars and target-indicator plates (`play/tags.rs::quad_model`) and
 Font2014/12122 floating billboard text (`build_buff_geometry`, GC Font control) use full-bright
 native materials for readability, not authored light emission. `Submesh::overlay` marks only these

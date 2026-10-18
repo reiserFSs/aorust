@@ -96,6 +96,15 @@ impl TrailGrid {
             }
         }
     }
+    fn write_owner(&self, actor: Option<u32>, output: &mut [[f32; 4]]) {
+        output.fill([0.0; 4]);
+        if let Some(source) = self.sources.iter().find(|source| source.previous.actor == actor) {
+            for cell in &source.cells {
+                if cell.bend[3] > 0.0 { output[Self::index(cell.grid)] = cell.bend; }
+            }
+        }
+    }
+    #[cfg(test)]
     fn write(&self, output: &mut [[f32; 4]; TRAIL_CELLS]) {
         for source in &self.sources {
             for cell in &source.cells {
@@ -164,7 +173,6 @@ struct Params {
     bands: [[f32; 4]; 2],
     benders: [[f32; 4]; MAX_BENDERS],
     trail_origin: [f32; 4],
-    trails: [[f32; 4]; TRAIL_CELLS],
 }
 struct Batch {
     patch: usize,
@@ -205,6 +213,8 @@ pub(super) struct Grass {
     pub(super) root_cache: crate::grass_blades::Cache,
     pub(super) cells_buffer: wgpu::Buffer,
     pub(super) params_buffer: wgpu::Buffer,
+    trails_buffer: wgpu::Buffer,
+    trail_samples: Vec<[f32; 4]>,
     params: Params,
     pub(super) visible_buffer: wgpu::Buffer,
     pub(super) sun_visible_buffer: Option<wgpu::Buffer>,
@@ -229,6 +239,8 @@ pub(super) struct Grass {
     wind_phase: f64,
     filtered_wind: [f32; 3],
     benders: [[f32; 3]; MAX_BENDERS],
+    owners: [Option<u32>; MAX_BENDERS],
+    owner_slots: [u32; MAX_BENDERS],
     bender_count: usize,
     inputs: Vec<GrassBender>,
     trails: TrailGrid,
@@ -255,6 +267,7 @@ impl Compiled {
             wgpu::BindGroupLayoutEntry { binding: 7, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
             wgpu::BindGroupLayoutEntry { binding: 8, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }, count: None },
             wgpu::BindGroupLayoutEntry { binding: 14, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            wgpu::BindGroupLayoutEntry { binding: 10, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
         ];
         if shadows {
             // Root exposure comes from Cell.normals[0].w, not the world's lattice.
@@ -312,6 +325,7 @@ impl Grass {
         let cells_buffer = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("grass cell cache"), size: (MAX_CELLS * std::mem::size_of::<Cell>()) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let params_buffer = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("grass wind and benders"), size: std::mem::size_of::<Params>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let visible_buffer = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("grass visible cells"), size: (BANDS * MAX_CELLS * 4) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let trails_buffer = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("grass owner trail layers"), size: (MAX_BENDERS * TRAIL_CELLS * 16) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let (noise_view, noise_sampler) = noise::upload(device, queue);
         let mask_view = mask::upload(device, queue, green);
         let bind = None;
@@ -320,6 +334,7 @@ impl Grass {
             #[cfg(test)]
             forced_band: None,
             trails: TrailGrid::default(),
+            trails_buffer, trail_samples: vec![[0.0; 4]; MAX_BENDERS * TRAIL_CELLS], owners: [None; MAX_BENDERS], owner_slots: [u32::MAX; MAX_BENDERS],
             params: bytemuck::Zeroable::zeroed(),
             sun_visible_buffer: None,
             sun_visible: std::array::from_fn(|_| Vec::new()),
@@ -352,6 +367,7 @@ impl Grass {
             wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.noise_view) },
             wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&self.noise_sampler) },
             wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&self.mask_view) },
+            wgpu::BindGroupEntry { binding: 10, resource: self.trails_buffer.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 14, resource: self.root_cache.buffer.as_entire_binding() },
         ] }));
     }
@@ -494,16 +510,18 @@ impl Grass {
         params.bands = std::array::from_fn(|row| std::array::from_fn(|col| self.band_strides[row * 4 + col] as f32));
         params.benders.fill([0.0; 4]);
         params.trail_origin = [self.trails.origin[0] as f32, self.trails.origin[1] as f32, TRAIL_CELL_SIZE, f32::from(u8::from(settings.grass_trails))];
-        if settings.grass_trails {
-            params.trails.fill([0.0; 4]);
-            self.trails.write(&mut params.trails);
+        for index in 0..self.bender_count {
+            let position = self.benders[index];
+            params.benders[index] = [position[0], position[1], position[2], f32::from_bits(self.owner_slots[index])];
+            if settings.grass_trails {
+                self.trails.write_owner(self.owners[index], &mut self.trail_samples[index * TRAIL_CELLS..(index + 1) * TRAIL_CELLS]);
+            }
         }
-        for (slot, position) in params.benders.iter_mut().zip(&self.benders[..self.bender_count]) { *slot = [position[0], position[1], position[2], 1.0]; }
+        if settings.grass_trails && self.bender_count > 0 {
+            queue.write_buffer(&self.trails_buffer, 0, bytemuck::cast_slice(&self.trail_samples[..self.bender_count * TRAIL_CELLS]));
+        }
         self.bender_count = 0;
-        // Disabled trails neither clear nor upload the persistent 16KiB grid.
-        let bytes = bytemuck::bytes_of(params);
-        let size = if settings.grass_trails { bytes.len() } else { std::mem::offset_of!(Params, trails) };
-        queue.write_buffer(&self.params_buffer, 0, &bytes[..size]);
+        queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(params));
     }
     fn cell_exposed(&mut self, cell: &mut Cell, budget: &mut usize, liquids: &[super::native_liquid::LiquidRun], ground: &GroundRun, grid: [i32; 2]) -> bool {
         let key = [cell.origin[0].to_bits(), cell.origin[1].to_bits(), cell.origin[2].to_bits(), cell.identity[0]];
@@ -601,7 +619,7 @@ impl Grass {
         }
     }
     pub fn has_draws(&self) -> bool { !self.draws.is_empty() }
-    pub fn resource_bytes(&self) -> usize { MAX_CELLS * (std::mem::size_of::<Cell>() + 4 * BANDS) + std::mem::size_of::<Params>() + (noise::SIZE * noise::SIZE * 8) as usize + self.green_bytes + self.sun_visible_buffer.as_ref().map_or(0, |buffer| buffer.size() as usize) + self.root_cache.buffer.size() as usize }
+    pub fn resource_bytes(&self) -> usize { MAX_CELLS * (std::mem::size_of::<Cell>() + 4 * BANDS) + std::mem::size_of::<Params>() + MAX_BENDERS * TRAIL_CELLS * 16 + (noise::SIZE * noise::SIZE * 8) as usize + self.green_bytes + self.sun_visible_buffer.as_ref().map_or(0, |buffer| buffer.size() as usize) + self.root_cache.buffer.size() as usize }
 }
 /// Conservative cell/sphere overlap; the caster shader applies the exact root cutoff.
 fn sun_caster_in_reach(center: Vec3, extent: Vec3, eye: Vec3) -> bool {
@@ -726,10 +744,10 @@ fn shader_source_with_lights(channels: (bool, bool, bool, bool, bool), shadows: 
         crate::point_shadows::admitted_native_pool(&mut source, "vertex_lights");
         let mut receiver = crate::shader_source::load("point_shadows.wgsl", include_str!("point_shadows.wgsl")).into_owned();
         receiver.push_str(&crate::shader_source::load("point_sampling.wgsl", include_str!("point_sampling.wgsl")));
-        // Actor depth has its own view; reserve 14 for the shared blade cache.
+        // Keep owner trails at 10 and the shared blade cache at 14.
         receiver = receiver.replace("@binding(9)", "@binding(13)");
         for binding in 3..=6 {
-            receiver = receiver.replace(&format!("@binding({binding})"), &format!("@binding({})", binding + 6));
+            receiver = receiver.replace(&format!("@binding({binding})"), &format!("@binding({})", if binding == 4 { 17 } else { binding + 6 }));
         }
         source.push_str(&receiver);
     }
@@ -845,10 +863,9 @@ impl super::Renderer {
             return 0;
         }
         let mut hash = std::hash::DefaultHasher::new();
-        // Hash exactly the retained uniform upload; disabled trails are not read.
+        // Hash exactly the retained uniform upload; owner layers are hashed below.
         let params = bytemuck::bytes_of(&grass.params);
-        let size = if grass.params.trail_origin[3] > 0.0 { params.len() } else { std::mem::offset_of!(Params, trails) };
-        hash.write(&params[..size]);
+        hash.write(params);
         // Wind and recovery advance independently of Renderer::time, including
         // between preparation and the next primary draw.
         ((grass.wind_phase / 0.05) as f32).to_bits().hash(&mut hash);
@@ -856,6 +873,7 @@ impl super::Renderer {
         if settings.grass_trails {
             grass.trails.origin.hash(&mut hash);
             for source in &grass.trails.sources {
+                source.previous.actor.hash(&mut hash);
                 source.cells.len().hash(&mut hash);
                 for cell in &source.cells {
                     cell.grid.hash(&mut hash);
@@ -938,7 +956,7 @@ impl super::Renderer {
         }
         let owner = grass.admitted.then(|| &shadows.as_deref().expect("admitted grass requires current-frame shadow admission").actor_visibility);
         grass.root_cache.bind(&self.device, &grass.roots, &grass.cells_buffer, &grass.params_buffer,
-            &grass.visible_buffer, &grass.noise_view, &grass.noise_sampler, &grass.mask_view, owner);
+            &grass.visible_buffer, &grass.noise_view, &grass.noise_sampler, &grass.mask_view, &grass.trails_buffer, owner);
         let timestamp_writes = if self.shadow_timer.is_some() {
             self.shadow_stage_compute(crate::shadow_pass::ShadowGpuStage::GrassRoots, true, last_shadow_span)
         } else {
@@ -953,7 +971,7 @@ impl super::Renderer {
     pub(super) fn prepare_grass_shadow_receiver(&mut self) {
         if let (Some(grass), Some(shadows)) = (&self.grass, &mut self.sun_shadows) {
             if grass.shadows && shadows.grass_receiver.is_none() {
-                shadows.grass_receiver = Some(shadows.grass_bind(&self.device, &grass.layout, &grass.cells_buffer, &grass.params_buffer, &grass.visible_buffer, &grass.noise_view, &grass.noise_sampler, &grass.mask_view, &grass.root_cache.buffer, self.point_shadows.as_ref().filter(|_| grass.admitted)));
+                shadows.grass_receiver = Some(shadows.grass_bind(&self.device, &grass.layout, &grass.cells_buffer, &grass.params_buffer, &grass.visible_buffer, &grass.noise_view, &grass.noise_sampler, &grass.mask_view, &grass.trails_buffer, &grass.root_cache.buffer, self.point_shadows.as_ref().filter(|_| grass.admitted)));
             }
         }
     }
@@ -1002,10 +1020,12 @@ impl super::Renderer {
         let settings = self.enhanced_settings();
         if let (Some(grass), Some(ground)) = (&mut self.grass, &self.ground) {
             let (selected, count) = select_benders(
-                &mut grass.inputs, cam.pos, vp, self.act.enhanced_grass_actor_ids(fog_end),
+                &mut grass.inputs, cam.pos, vp, self.act.enhanced_grass_actor_ids(fog_end).filter(|id| self.interaction_admission.admitted.contains(id)),
                 grass.exposure.as_ref().map(|surface| surface.line_of_sight.as_ref()),
             );
             grass.benders = selected.map(|bender| bender.position);
+            grass.owners = selected.map(|bender| bender.actor);
+            grass.owner_slots = selected.map(|bender| self.act.interaction_slot(bender.actor));
             grass.bender_count = count;
             if settings.grass_trails {
                 grass.trails.update(&selected[..count], cam.pos);
@@ -1109,13 +1129,133 @@ impl super::Renderer {
 mod tests {
     use super::*;
     #[test]
-    fn primary_grass_uniform_hash_tracks_wind_benders_and_trail_recovery() {
+    fn grass_trail_upload_preserves_overlapping_owner_provenance() {
+        let mut grid = TrailGrid::default();
+        let mut actors = [
+            GrassBender { actor: Some(7), position: [0.0; 3] },
+            GrassBender { actor: Some(9), position: [0.0; 3] },
+        ];
+        grid.update(&actors, Vec3::ZERO);
+        for actor in &mut actors { actor.position[0] = 2.0; }
+        grid.update(&actors, Vec3::ZERO);
+        grid.recover(1.0);
+        let mut first = [[0.0; 4]; TRAIL_CELLS];
+        let mut second = first;
+        grid.write_owner(Some(7), &mut first);
+        grid.write_owner(Some(9), &mut second);
+        assert!(first.iter().any(|cell| cell[3] > 0.0));
+        assert_eq!(first, second, "overlap must retain both owners, not just the strongest");
+        grid.update(&actors[1..], Vec3::ZERO);
+        grid.write_owner(Some(7), &mut first);
+        assert!(first.iter().all(|cell| cell[3] == 0.0));
+        let retained = second;
+        grid.write_owner(Some(9), &mut second);
+        assert_eq!(retained, second, "removing one owner never erases the other's recovered trail");
+    }
+
+    #[test]
+    fn grass_current_gpu_hidden_owner_has_no_push_or_recovered_trail() {
+        use wgpu::util::DeviceExt;
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let renderer = crate::Renderer::new(&instance, None).expect("grass admission regression requires GPU");
+        let device = &renderer.device;
+        let queue = &renderer.queue;
+        let grass = include_str!("grass.wgsl");
+        // Exercise the actual draw helpers, not a CPU approximation of the gate.
+        let params_struct = grass.split("struct GrassParams {").nth(1).unwrap().split("}\n").next().unwrap();
+        let helpers = grass.split("fn grass_owner_admitted").nth(1).unwrap().split("struct GOut").next().unwrap();
+        let source = format!(r#"
+struct GrassParams {{{params_struct}}}
+@group(0) @binding(0) var<uniform> grass_params: GrassParams;
+@group(0) @binding(1) var<storage, read> grass_trails: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> interaction_visibility: array<u32>;
+@group(0) @binding(3) var<storage, read_write> result: array<vec4<f32>>;
+fn grass_owner_admitted{helpers}
+@compute @workgroup_size(1) fn main() {{
+    let pos = vec3<f32>(0.625, 0.0, 0.625);
+    result[0] = vec4<f32>(grass_push(pos, 1.0, 0.4), 0.0);
+    result[1] = vec4<f32>(grass_trail(pos), 0.0, 0.0);
+}}
+"#);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("actual grass admission helpers"), source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("grass admission regression"), layout: None, module: &shader, entry_point: Some("main"),
+            compilation_options: Default::default(), cache: None,
+        });
+        let mut params: Params = bytemuck::Zeroable::zeroed();
+        params.limits[3] = 2.0;
+        params.trail_origin = [-16.0, -16.0, TRAIL_CELL_SIZE, 1.0];
+        params.benders[0] = [0.8, 0.0, 0.625, f32::from_bits(1)];
+        params.benders[1] = [0.8, 0.0, 0.625, f32::from_bits(2)];
+        let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::bytes_of(&params), usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let mut samples = vec![[0.0f32; 4]; MAX_BENDERS * TRAIL_CELLS];
+        samples[0] = [1.0, 0.0, 0.0, 0.9];
+        samples[TRAIL_CELLS] = [0.0, 1.0, 0.0, 0.3];
+        let trails = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::cast_slice(&samples), usage: wgpu::BufferUsages::STORAGE,
+        });
+        let visibility = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 12,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let result = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 32,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 6 * 32,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let bindings = [&uniform, &trails, &visibility, &result];
+        let entries: Vec<_> = bindings.iter().enumerate().map(|(binding, buffer)|
+            wgpu::BindGroupEntry { binding: binding as u32, resource: buffer.as_entire_binding() }).collect();
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &pipeline.get_bind_group_layout(0), entries: &entries,
+        });
+        // Both hidden; first visible; hidden stronger overlapping visible second;
+        // same second without first; own avatar; invalid owner slot.
+        for (index, (slots, count, visibility_words)) in [
+            ([1, 2], 2, [0u32, 0, 0]),
+            ([1, 2], 1, [0, 1, 0]),
+            ([1, 2], 2, [0, 0, 1]),
+            ([u32::MAX, 2], 2, [0, 0, 1]),
+            ([0, 2], 1, [0, 0, 0]),
+            ([u32::MAX, 2], 1, [0, 0, 0]),
+        ].into_iter().enumerate() {
+            params.limits[3] = count as f32;
+            for (bender, slot) in params.benders.iter_mut().zip(slots) { bender[3] = f32::from_bits(slot); }
+            queue.write_buffer(&uniform, 0, bytemuck::bytes_of(&params));
+            queue.write_buffer(&visibility, 0, bytemuck::cast_slice(&visibility_words));
+            let mut encoder = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            encoder.copy_buffer_to_buffer(&result, 0, &readback, index as u64 * 32, 32);
+            queue.submit([encoder.finish()]);
+        }
+        // Blocking readback is confined to this offline regression, never rendering.
+        let (send, receive) = std::sync::mpsc::channel();
+        readback.slice(..).map_async(wgpu::MapMode::Read, move |value| send.send(value).unwrap());
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        receive.recv().unwrap().unwrap();
+        let mapped = readback.slice(..).get_mapped_range();
+        let values: &[[f32; 8]] = bytemuck::cast_slice(&mapped);
+        assert_eq!(values[0], [0.0; 8], "GPU-hidden selected owners emit neither geometry push nor history");
+        assert!(values[1].iter().any(|value| value.abs() > 0.0), "visible-owner positive control");
+        assert_eq!(values[2], values[3], "hidden stronger trail cannot suppress or leak into visible owner's trail");
+        assert_eq!(&values[2][4..6], &[0.0, 0.3]);
+        assert_eq!(values[1], values[4], "own-avatar slot zero preserves interaction");
+        assert_eq!(values[5], [0.0; 8], "missing or stale slots fail closed");
+    }
+
+    #[test]
+    fn primary_grass_uniform_hash_tracks_wind_benders_and_trail_switch() {
         use std::hash::Hasher;
         let signature = |params: &Params| {
             let bytes = bytemuck::bytes_of(params);
-            let size = if params.trail_origin[3] > 0.0 { bytes.len() } else { std::mem::offset_of!(Params, trails) };
             let mut hash = std::hash::DefaultHasher::new();
-            hash.write(&bytes[..size]);
+            hash.write(bytes);
             hash.finish()
         };
         let mut params: Params = bytemuck::Zeroable::zeroed();
@@ -1131,12 +1271,8 @@ mod tests {
         params.limits[3] = 1.0;
         assert_ne!(wind, signature(&params));
         let no_trails = signature(&params);
-        params.trails[0] = [0.3, 0.1, 0.0, 0.5];
-        assert_eq!(no_trails, signature(&params), "disabled trails are not sampled");
         params.trail_origin[3] = 1.0;
-        let before_recovery = signature(&params);
-        params.trails[0][3] *= (-0.1_f32 / 1.5).exp();
-        assert_ne!(before_recovery, signature(&params));
+        assert_ne!(no_trails, signature(&params));
     }
 
     #[test]
@@ -1156,8 +1292,16 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Params, bands), 80);
         assert_eq!(std::mem::offset_of!(Params, benders), 112);
         assert_eq!(std::mem::offset_of!(Params, trail_origin), 112 + MAX_BENDERS * 16);
-        assert_eq!(std::mem::offset_of!(Params, trails), 128 + MAX_BENDERS * 16);
-        assert_eq!(std::mem::size_of::<Params>(), 128 + (MAX_BENDERS + TRAIL_CELLS) * 16);
+        assert_eq!(std::mem::size_of::<Params>(), 128 + MAX_BENDERS * 16);
+        let source = include_str!("grass.wgsl");
+        assert!(source.contains("@group(3) @binding(10) var<storage, read> grass_trails: array<vec4<f32>>;"));
+        assert!(source.contains("@group(0) @binding(8) var<storage, read> interaction_visibility: array<u32>;"));
+        assert!(source.contains("let slot = bitcast<u32>(grass_params.benders[index].w);"));
+        assert!(source.contains("if slot == 0u { return true; }"));
+        assert!(source.contains("if slot >= arrayLength(&interaction_visibility) { return false; }"));
+        assert!(source.contains("owner * 1024u"));
+        let sections = source.split_once("fn grass_build_section(").unwrap().1.split_once("fn grass_vertex(").unwrap().0;
+        assert!(sections.contains("grass_push(pos, t, height)"));
         let shader = shader_source((false, false, false, false, false), false);
         for contract in ["grass_params.features.x", "grass_params.features.y",
             "grass_params.features.z", "grass_params.features.w", "grass_params.lighting.x",
@@ -1172,7 +1316,7 @@ mod tests {
         assert!(source.contains("let dyn_count = min(bitcast<u32>(dyn_lights[322u].x), 64u);"));
         assert!(source.contains("let li = 66u + k * 4u;"));
         assert!(source.contains("if !owner_light_admitted(dyn_lights[li + 3u].w) { continue; }"));
-        for binding in 9..=12 {
+        for binding in [9, 11, 12, 13, 17] {
             assert!(source.contains(&format!("@group(3) @binding({binding})")));
         }
         assert!(source.contains("@location(15) @interpolate(flat) point_loss: vec3<f32>"));
@@ -1211,7 +1355,7 @@ mod tests {
             "native energy accumulation must not reuse the renamed point-loss raster varying");
         let plain = shader_source((false, false, false, false, false), false);
         assert!(!plain.contains("grass_point_shadow_loss("));
-        for binding in 9..=13 {
+        for binding in [9, 11, 12, 13, 17] {
             assert!(!plain.contains(&format!("@group(3) @binding({binding})")));
         }
     }

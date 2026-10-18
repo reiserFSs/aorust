@@ -498,7 +498,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
             let fixed = grounded_camera.unwrap_or(fixed);
             let fixed = if matches!(name.as_str(), "borealis-foliage-ground-sun-high" | "newland-foliage-ground-day") {
                 graphics_fixture_ground_foliage_camera(scene, fixed,
-                    |point| collision.borrow().terrain_height(point),
+                    |point| collision.borrow().ground(point),
                     |eye, target| collision.borrow().line(eye, target).is_none(),
                     &mut manifest)?
             } else { fixed };
@@ -552,6 +552,20 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     Camera::look_at(fixed.pos, interaction_end + Vec3::Y * 0.8),
                 _ => fixed,
             };
+            let post_avatar = if (own_avatar || settings.depth_of_field) && interaction_path.is_none()
+                && sequence.is_none() && water_center.is_none() && !name.starts_with("icc-actor-")
+                && !name.contains("lightbar") {
+                let collision = collision.borrow();
+                let placement = graphics_fixture_post_avatar(fixed,
+                    |point| collision.terrain_height(point).filter(|height| {
+                        collision.liquid_at([point[0], *height, point[2]])
+                            .is_none_or(|liquid| liquid.level <= *height)
+                    }),
+                    |eye, target| collision.line(eye, target).is_none())?;
+                writeln!(manifest, "{name} post_avatar_scene={:?} post_camera={:?} placement=collision_dry_terrain body_los=feet_torso_head_clear", placement.1, placement.0)?;
+                Some(placement)
+            } else { None };
+            let fixed = post_avatar.map_or(fixed, |placement| placement.0);
             if let Some(sequence) = sequence {
                 for index in 0..sequence.count {
                     let target = sequence.start + sequence.dt * index as f32;
@@ -690,14 +704,19 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                         }
                     } else if lightbar { avatar.set_transform([679.6, 72.8, -482.7], 0.0); }
                     else if !authored_actor {
-                        avatar.set_transform((fixed.pos + fixed.forward() * 12.0).to_array(), 0.0);
+                        let position = post_avatar.map_or(fixed.pos + fixed.forward() * 12.0, |placement| placement.1);
+                        avatar.set_transform(position.to_array(), 0.0);
                     }
                     off.host.dynamic_lights.extend(avatar.lights());
                     off.host.actor_models.push((super::avatar::MODEL_KEY, std::sync::Arc::new(avatar.model().clone())));
                     let frame = avatar.frame();
                     let [x, y, z, _] = frame.transform[3];
                     let focus = [x, y, z];
-                    if measure { std::fs::write(out.join(format!("{name}-focus.txt")), format!("actor_id=25988\nscene_position={focus:?}\n"))?; }
+                    if measure {
+                        let view_depth = (Vec3::from(focus)-fixed.pos).dot(fixed.forward());
+                        std::fs::write(out.join(format!("{name}-focus.txt")),
+                            format!("actor_id=25988\nscene_position={focus:?}\nfocus_source=actual_avatar_transform\nfocus_view_depth={view_depth}\ncamera={fixed:?}\nprojection_near={}\nprojection_far={:?}\n", lens.near, lens.far))?;
+                    }
                     if grass_exposure.is_some() {
                         let [x, y, z, _] = frame.transform[3];
                         off.host.grass_benders.push(ao_render::GrassBender { actor: None, position: [x, y, z] });
@@ -780,6 +799,11 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                         image::save_buffer(out.join(format!("{name}-motion.png")),
                             &motion, size.0, size.1, image::ColorType::Rgba8)?;
                     }
+                    let mut timing_csv = String::from("sample,gpu_ms\n");
+                    for (sample, ms) in frames.iter().enumerate() {
+                        writeln!(timing_csv, "{sample},{ms:.9}")?;
+                    }
+                    std::fs::write(out.join(format!("{name}-frame-gpu.csv")), timing_csv)?;
                     frames.sort_by(f64::total_cmp);
                     let percentiles = [0.50_f64, 0.95, 0.99].map(|p| frames[(p * frames.len() as f64).ceil() as usize - 1]);
                     std::fs::write(out.join(format!("{name}-frame-gpu.txt")),
@@ -960,10 +984,71 @@ fn graphics_fixture_views(actor: &ao_net::n3::dynel::SimpleCharFullUpdate) -> Ve
     views
 }
 
+fn graphics_fixture_crown_collision_probe(point: Vec3, eye: Vec3, lo: Vec3, hi: Vec3) -> Vec3 {
+    let direction = (eye - point).normalize_or_zero();
+    let mut exit = f32::INFINITY;
+    for axis in 0..3 {
+        if direction[axis] > 0.0 {
+            exit = exit.min((hi[axis] - point[axis]) / direction[axis]);
+        } else if direction[axis] < 0.0 {
+            exit = exit.min((lo[axis] - point[axis]) / direction[axis]);
+        }
+    }
+    point + direction * (exit + 0.15)
+}
+
+#[test]
+fn graphics_fixture_crown_probe_exits_full_instance_collision_proxy() {
+    let point = Vec3::new(0.0, 9.0, 0.0);
+    let eye = Vec3::new(20.0, 5.0, 0.0);
+    let probe = graphics_fixture_crown_collision_probe(point, eye,
+        Vec3::new(-5.0, 0.0, -5.0), Vec3::new(5.0, 10.0, 5.0));
+    assert!(probe.x > 5.0 && probe.y > 7.5, "probe must be outside the full proxy at crown height");
+    assert!((probe - point).cross(eye - point).length() < 0.0001, "exterior target must remain on the leaf sight ray");
+    assert!((point + (eye - point).normalize() * 0.15).x < 5.0,
+        "the former tiny vertex offset leaves this leaf hidden inside its own collision proxy");
+}
+
+#[test]
+fn graphics_fixture_ground_foliage_uses_raised_collision_floor() {
+    use ao_scene::{Instance, Mesh, Submesh, Vertex, IDENTITY};
+    let mut foliage = Submesh::new(vec![0, 1], None);
+    foliage.vegetation = true;
+    let scene = Scene {
+        meshes: vec![
+            Mesh {
+                vertices: [[-1.0, 4.0, -1.0], [1.0, 8.0, 1.0]].map(|pos|
+                    Vertex { pos, ..Default::default() }).to_vec(),
+                submeshes: vec![foliage],
+            },
+            Mesh {
+                vertices: [0.0, 3.0].into_iter().flat_map(|y|
+                    [[-100.0, y, -100.0], [-100.0, y, 100.0], [100.0, y, 100.0], [100.0, y, -100.0]])
+                    .map(|pos| Vertex { pos, ..Default::default() }).collect(),
+                // Both sides of the raised solid floor obstruct a camera below it.
+                submeshes: vec![Submesh::new(vec![0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7, 4, 6, 5, 4, 7, 6], None)],
+            },
+        ],
+        instances: vec![Instance { mesh: 0, transform: IDENTITY }, Instance { mesh: 1, transform: IDENTITY }],
+        ..Default::default()
+    };
+    let collision = ao_formats::playfield::collision::Collision::from_scene(&scene);
+    let original = Camera::look_at(Vec3::new(0.0, 4.7, 15.0), Vec3::new(0.0, 6.0, 0.0));
+    let mut report = String::new();
+    let camera = graphics_fixture_ground_foliage_camera(&scene, original,
+        |point| collision.ground(point),
+        |eye, target| collision.line(eye, target).is_none(), &mut report).unwrap();
+    assert_eq!(camera.pos.y, 4.7, "eye must stand above the raised collision floor, not the lower plane");
+    assert!(graphics_fixture_ground_foliage_camera(&scene, original,
+        |_| Some(0.0), |eye, target| collision.line(eye, target).is_none(), &mut String::new()).is_err(),
+        "all four lower-plane targets are hidden below the raised floor");
+    assert!(report.contains("landing_scene=") && report.contains("collision_los=clear"));
+}
+
 fn graphics_fixture_ground_foliage_camera(
     scene: &Scene,
     original: Camera,
-    terrain_height: impl Fn([f32; 3]) -> Option<f32>,
+    ground_height: impl Fn([f32; 3]) -> Option<f32>,
     clear: impl Fn([f32; 3], [f32; 3]) -> bool,
     manifest: &mut String,
 ) -> anyhow::Result<Camera> {
@@ -977,11 +1062,15 @@ fn graphics_fixture_ground_foliage_camera(
         hi: Vec3,
         aim: Vec3,
         landing: [Vec3; 4],
+        crown_probe: Vec3,
+        overhead: bool,
+        retreat_scale: f32,
     }
     let heading = Vec3::new(original.forward().x, 0.0, original.forward().z).normalize_or_zero();
     anyhow::ensure!(heading.length_squared() > 0.0, "ground foliage view has no horizontal heading");
     let vertical_tan = (camera::lens(scene.lens.unwrap_or_default(), false).vertical_fov(1920.0 / 1200.0) * 0.5).tan();
     let mut best: Option<Selection> = None;
+    let mut diagnostics = String::new();
     for (index, instance) in scene.instances.iter().enumerate() {
         let mesh = &scene.meshes[instance.mesh];
         let transform = glam::Mat4::from_cols_array_2d(&instance.transform);
@@ -997,26 +1086,74 @@ fn graphics_fixture_ground_foliage_camera(
             let center = (lo + hi) * 0.5;
             let distance = center.distance_squared(original.pos);
             if distance > 80.0 * 80.0 || best.as_ref().is_some_and(|best| distance >= best.distance) { continue; }
+            // Native tree collision proxies enclose leaf vertices by metres.
+            // Probe the camera-facing exterior of the complete placed mesh,
+            // not a leaf submesh or a tiny offset still inside that proxy.
+            let (mut instance_lo, mut instance_hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+            for vertex in &mesh.vertices {
+                let point = transform.transform_point3(Vec3::from(vertex.pos));
+                instance_lo = instance_lo.min(point);
+                instance_hi = instance_hi.max(point);
+            }
             let mut landing = [
-                Vec3::new(lo.x, 0.0, lo.z), Vec3::new(hi.x + 5.0, 0.0, lo.z),
-                Vec3::new(lo.x, 0.0, hi.z + 5.0), Vec3::new(hi.x + 5.0, 0.0, hi.z + 5.0),
+                Vec3::new(lo.x, lo.y, lo.z), Vec3::new(hi.x + 5.0, lo.y, lo.z),
+                Vec3::new(lo.x, lo.y, hi.z + 5.0), Vec3::new(hi.x + 5.0, lo.y, hi.z + 5.0),
             ];
+            // Sample from the canopy underside: native KD floors may sit above
+            // the raw heightfield, but the canopy itself is not a landing floor.
             let mut grounded = true;
             for point in &mut landing {
-                if let Some(height) = terrain_height(point.to_array()).filter(|height| height.is_finite()) {
+                if let Some(height) = ground_height(point.to_array()).filter(|height| height.is_finite()) {
                     point.y = height;
                 } else { grounded = false; break; }
             }
-            if !grounded { continue; }
-            let ground_low = landing.iter().map(|point| point.y).fold(f32::INFINITY, f32::min);
-            let ground_high = landing.iter().map(|point| point.y).fold(f32::NEG_INFINITY, f32::max);
-            let crown = Vec3::new(center.x, lo.y + (hi.y - lo.y) * 0.75, center.z);
-            let aim = Vec3::new(center.x + 2.5, ground_low + (hi.y - ground_low) * 0.35, center.z + 2.5);
-            let retreat = ((hi.y - ground_low) * 1.5).max((hi.x - lo.x).max(hi.z - lo.z) + 5.0);
-            for scale in [1.0, 1.3, 1.7, 2.2] {
-                let mut eye = aim - heading * retreat * scale;
-                let Some(ground) = terrain_height(eye.to_array()).filter(|height| height.is_finite()) else { continue; };
-                eye.y = ground + 1.7;
+            if !grounded {
+                writeln!(diagnostics, "instance={index} mesh={} submesh={material} reject=landing_terrain lo={lo:?} hi={hi:?}", instance.mesh)?;
+                continue;
+            }
+            let Some(root_ground) = ground_height([center.x, lo.y, center.z]).filter(|height| height.is_finite()) else {
+                writeln!(diagnostics, "instance={index} mesh={} submesh={material} reject=root_terrain center={center:?}", instance.mesh)?;
+                continue;
+            };
+            let ground_high = landing.iter().map(|point| point.y).fold(root_ground, f32::max);
+            // A drift corner can fall off a plateau; it must not lower the camera or
+            // determine the retreat from the tree rooted on that plateau.
+            let aim_xz = Vec3::new(center.x + 2.5, 0.0, center.z + 2.5);
+            let retreat = ((hi.y - root_ground) * 1.5).max((hi.x - lo.x).max(hi.z - lo.z) + 5.0);
+            let footprint_span = (hi.x - lo.x + 5.0).max(hi.z - lo.z + 5.0);
+            let mut rejected = [0usize; 6];
+            let mut eyes = 0;
+            let mut best_landing_los: Option<(usize, Vec3, [bool; 4])> = None;
+            // Prefer any valid ground-level camera before considering aerial views.
+            'cameras: for overhead in [false, true] {
+            let scales: &[f32] = if overhead { &[0.0, 0.1, 0.2] } else { &[1.0, 1.3, 1.7, 2.2] };
+            for (angle, scale) in (0..32).flat_map(|step| {
+                scales.iter().map(move |&scale| (step as f32 * std::f32::consts::TAU / 32.0, scale))
+            }) {
+                let direction = glam::Quat::from_rotation_y(angle) * heading;
+                let horizontal_distance = (retreat * scale).max(0.1);
+                let mut base_eye = aim_xz - direction * horizontal_distance;
+                base_eye.y = hi.y;
+                let Some(ground) = ground_height(base_eye.to_array()).filter(|height| height.is_finite()) else {
+                    eyes += 3; rejected[0] += 3; continue;
+                };
+                base_eye.y = ground.max(ground_high) + 1.7;
+                for ground_margin in [0.35, 0.55, 0.75] {
+                eyes += 1;
+                let height = if overhead {
+                    // The complete swept footprint must fit below the crown with
+                    // the highest landing still at NDC -0.35. Its remaining
+                    // vertical half-frame is 0.85-0.35 = 0.5, hence span/tan(fov/2).
+                    (hi.y + footprint_span / vertical_tan + 1.7).max(base_eye.y)
+                } else {
+                    base_eye.y
+                };
+                let eye = Vec3::new(base_eye.x, height, base_eye.z);
+                // Aim the highest landing plane into the unchanged lower third.
+                // This derives pitch from the actual eye height instead of fixing
+                // an aim below a high landing corner or distant intervening hill.
+                let pitch = ((ground_high - eye.y) / horizontal_distance).atan() + (ground_margin * vertical_tan).atan();
+                let aim = Vec3::new(aim_xz.x, eye.y + horizontal_distance * pitch.tan(), aim_xz.z);
                 let camera = Camera::look_at(eye, aim);
                 let forward = camera.forward();
                 let right = forward.cross(Vec3::Y).normalize_or_zero();
@@ -1035,20 +1172,99 @@ fn graphics_fixture_ground_foliage_camera(
                 }
                 let ground_center = Vec3::new(aim.x, ground_high, aim.z) - eye;
                 let ground_ndc = ground_center.dot(up) / (ground_center.dot(forward) * vertical_tan);
-                if !fits_crown || !landing.iter().all(|point| fits(*point))
-                    || !(-0.85..=-0.25).contains(&ground_ndc)
-                    || !clear(eye.to_array(), crown.to_array())
-                    || !landing.iter().all(|point| clear(eye.to_array(), (*point + Vec3::Y * 0.15).to_array())) { continue; }
-                best = Some(Selection { distance, camera, instance: index, submesh: material, lo, hi, aim, landing });
-                break;
+                if !fits_crown { rejected[1] += 1; continue; }
+                if !landing.iter().all(|point| fits(*point)) { rejected[2] += 1; continue; }
+                if !(-0.85..=-0.25).contains(&ground_ndc) { rejected[3] += 1; continue; }
+                let crown_probe = submesh.indices.iter().find_map(|&vertex| {
+                    let point = transform.transform_point3(Vec3::from(mesh.vertices[vertex as usize].pos));
+                    if point.y < lo.y + (hi.y - lo.y) * 0.75 { return None; }
+                    let target = graphics_fixture_crown_collision_probe(point, eye, instance_lo, instance_hi);
+                    (target.is_finite() && target.y >= lo.y + (hi.y - lo.y) * 0.75
+                        && fits(target) && clear(eye.to_array(), target.to_array())).then_some(target)
+                });
+                let Some(crown_probe) = crown_probe else { rejected[4] += 1; continue; };
+                let landing_visible = landing.map(|point| clear(eye.to_array(), (point + Vec3::Y * 0.15).to_array()));
+                let visible_count = landing_visible.iter().filter(|&&visible| visible).count();
+                if best_landing_los.is_none_or(|(count, _, _)| visible_count > count) {
+                    best_landing_los = Some((visible_count, eye, landing_visible));
+                }
+                if visible_count != 4 {
+                    rejected[5] += 1; continue;
+                }
+                best = Some(Selection { distance, camera, instance: index, submesh: material, lo, hi, aim, landing, crown_probe, overhead, retreat_scale: scale });
+                break 'cameras;
             }
+            }
+            }
+            writeln!(diagnostics, "instance={index} mesh={} submesh={material} anchor={:?} lo={lo:?} hi={hi:?} root_ground={root_ground} highest_landing={ground_high} retreat={retreat} landing={landing:?} eyes={eyes} rejected_terrain_crownfit_landingfit_groundmargin_crownlos_landinglos={rejected:?} best_landing_count_eye_visible_mask={best_landing_los:?}", instance.mesh, transform.w_axis.truncate())?;
         }
     }
-    let selected = best.ok_or_else(|| anyhow::anyhow!("no nearby native tall canopy fits crown and collision-grounded fall footprint with clear LOS"))?;
-    writeln!(manifest, "ground_foliage instance={} mesh={} submesh={} world_lo={:?} world_hi={:?} eye={:?} aim={:?} landing_scene={:?} source=native_transformed_canopy_and_collision_terrain heading=existing_view drift_extent_positive_xz=5 ground_margin=lower_third collision_los=clear",
+    let selected = best.ok_or_else(|| anyhow::anyhow!("no nearby native tall canopy fits crown and collision-grounded fall footprint with clear LOS\n{diagnostics}"))?;
+    writeln!(manifest, "ground_foliage instance={} mesh={} submesh={} world_lo={:?} world_hi={:?} eye={:?} aim={:?} landing_scene={:?} crown_probe={:?} source=native_transformed_canopy_and_collision_floor landing_probe=canopy_underside eye_probe=canopy_top heading=existing_then_radial_32 eye_height=collision_floor_or_swept_bbox_overhead ground_ndc_targets=-0.35,-0.55,-0.75 crown_los=full_instance_camera_facing_exterior drift_extent_positive_xz=5 ground_margin=lower_third collision_los=clear",
         selected.instance, scene.instances[selected.instance].mesh, selected.submesh, selected.lo, selected.hi,
-        selected.camera.pos, selected.aim, selected.landing)?;
+        selected.camera.pos, selected.aim, selected.landing, selected.crown_probe)?;
+    writeln!(manifest, "ground_foliage_camera overhead={} retreat_scale={}", selected.overhead, selected.retreat_scale)?;
     Ok(selected.camera)
+}
+
+#[test]
+#[ignore = "installed native playfield CPU-only camera acceptance"]
+fn graphics_fixture_native_borealis_ground_foliage_camera() -> anyhow::Result<()> {
+    let dir = ao_gui::client_dir();
+    let store = ao_rdb::RecordStore::open(&dir)?;
+    let actor = graphics_fixture_actor()?;
+    let (_, pf, time, original) = graphics_fixture_views(&actor).into_iter()
+        .find(|(name, _, _, _)| name == "borealis-foliage-ground-sun-high").unwrap();
+    ao_scene::crt_srand(1);
+    let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(
+        &store, &dir, pf, time, 0, Some(ao_formats::weather::State::clear()))?;
+    let collision = ao_formats::playfield::collision::Collision::load(&store, pf)?;
+    let mut report = String::new();
+    let blocked = std::cell::RefCell::new(Vec::new());
+    let result = graphics_fixture_ground_foliage_camera(&scene, original,
+        |point| collision.ground(point),
+        |eye, target| {
+            let hit = collision.line(eye, target);
+            if let Some(hit) = hit {
+                let mut blocked = blocked.borrow_mut();
+                if blocked.len() < 16 { blocked.push((eye, target, hit.p, hit.n)); }
+            }
+            hit.is_none()
+        }, &mut report);
+    let camera = result.map_err(|error| anyhow::anyhow!("{error}\nfirst_blocked_eye_target_hit_normal={:?}", blocked.into_inner()))?;
+    println!("native_ground_foliage pf={pf} time={time} camera={:?}\n{report}", camera.pos);
+    Ok(())
+}
+
+#[test]
+fn graphics_fixture_ground_foliage_keeps_plateau_and_searches_visible_crown() {
+    let mut material = ao_scene::Submesh::new(vec![0, 1], None);
+    material.vegetation = true;
+    let scene = Scene {
+        meshes: vec![ao_scene::Mesh {
+            vertices: [[-12.0, 70.0, -12.0], [12.0, 100.0, 12.0]].map(|pos|
+                ao_scene::Vertex { pos, ..Default::default() }).to_vec(),
+            submeshes: vec![material],
+        }],
+        instances: vec![ao_scene::Instance { mesh: 0, transform: ao_scene::IDENTITY }],
+        ..Default::default()
+    };
+    let original = Camera::look_at(Vec3::new(0.0, 69.7, 10.0), Vec3::new(0.0, 80.0, 0.0));
+    // The low drift corners require aim-height search as well as retreat:
+    // the original fixed 35% aim cannot fit them with the root in the lower third.
+    let terrain = |p: [f32; 3]| Some(if p[0].abs() <= 12.0 && p[2].abs() <= 12.0 { 68.0 } else { 48.0 });
+    let clear = |eye: [f32; 3], target: [f32; 3]| {
+        eye[1] >= 69.7 && eye[0] > 3.0
+            && (target[1] < 69.0 || (target[1] > 99.0 && target[0] > 11.0))
+    };
+    let mut report = String::new();
+    let camera = graphics_fixture_ground_foliage_camera(&scene, original, terrain, clear, &mut report).unwrap();
+    assert_eq!(camera.pos.y, 69.7, "lower drift corners cannot pull the eye below the root plateau");
+    assert!(camera.pos.x > 3.0, "blocked original heading must try other headings");
+    assert!(report.contains("landing_scene="));
+    assert!(graphics_fixture_ground_foliage_camera(&scene, original, terrain,
+        |eye, target| clear(eye, target) && !(target[0] > 16.0 && target[1] < 69.0),
+        &mut String::new()).is_err(), "every landing corner still requires clear LOS");
 }
 
 fn graphics_fixture_shrub(
@@ -1491,6 +1707,56 @@ fn graphics_fixture_shore_camera_prefers_native_shallow_clear_water() {
     assert!(scene.liquids[0].triangles().any(|triangle| {
         graphics_fixture_water_triangle(triangle.map(|v| v.pos.into()), endpoint)
     }));
+}
+
+// Only explicit post/own-avatar captures use this framing. Legacy all-off cameras
+// stay untouched. Search real dry terrain rather than floating a body on a ray.
+fn graphics_fixture_post_avatar(
+    original: Camera,
+    dry_height: impl Fn([f32; 3]) -> Option<f32>,
+    clear: impl Fn([f32; 3], [f32; 3]) -> bool,
+) -> anyhow::Result<(Camera, Vec3)> {
+    let forward = Vec3::new(original.forward().x, 0.0, original.forward().z).normalize_or_zero();
+    anyhow::ensure!(forward.length_squared() > 0.0, "post avatar camera has no horizontal heading");
+    let right = forward.cross(Vec3::Y);
+    for distance in [6.0, 12.0, 24.0, 48.0, 72.0] {
+        for lateral in [0.0, -distance, distance] {
+            let mut root = original.pos + forward*distance + right*lateral;
+            let Some(height) = dry_height(root.to_array()).filter(|h| h.is_finite()) else { continue; };
+            root.y = height;
+            // A small footprint must be dry and nearly level, not a cliff edge.
+            if [right*0.3, -right*0.3, forward*0.3, -forward*0.3].into_iter()
+                .any(|offset| dry_height((root+offset).to_array())
+                    .is_none_or(|h| !h.is_finite() || (h-root.y).abs() > 0.2)) { continue; }
+            let eye = root-forward*6.0 + Vec3::Y*1.2;
+            let Some(ground) = dry_height(eye.to_array()).filter(|h| h.is_finite()) else { continue; };
+            if !(0.8..=2.5).contains(&(eye.y-ground)) { continue; }
+            if ![0.15, 1.0, 1.9].into_iter().all(|height|
+                [-0.3, 0.0, 0.3].into_iter().all(|width|
+                    clear(eye.to_array(), (root+Vec3::Y*height+right*width).to_array()))) { continue; }
+            // Level torso-height camera keeps the real feet focus plane through
+            // the standing body, with no focus override or actor-only sharpening.
+            return Ok((Camera::look_at(eye, root+Vec3::Y*1.2), root));
+        }
+    }
+    anyhow::bail!("no dry, level collision-grounded avatar placement with clear feet/torso/head LOS near fixture view")
+}
+
+#[test]
+fn graphics_fixture_post_avatar_requires_ground_and_visible_body() {
+    let original = Camera::look_at(Vec3::new(0.0, 4.0, 0.0), -Vec3::Z);
+    let (camera, root) = graphics_fixture_post_avatar(original, |_| Some(2.0), |_, _| true).unwrap();
+    assert_eq!(root.y, 2.0);
+    assert!((camera.pos.y-3.2).abs() < 0.0001);
+    assert!((root-camera.pos).dot(camera.forward()) > 5.9);
+    assert!(camera.forward().y.abs() < 0.0001);
+    assert!(graphics_fixture_post_avatar(original, |_| None, |_, _| true).is_err());
+    assert!(graphics_fixture_post_avatar(original, |_| Some(2.0), |_, _| false).is_err());
+    let (_, selected) = graphics_fixture_post_avatar(original, |_| Some(2.0),
+        |_, target| target[2] < -10.0).unwrap();
+    assert!(selected.z < -10.0, "occluded near candidate must not be used");
+    assert!(graphics_fixture_post_avatar(original,
+        |point| Some(point[0]*10.0), |_, _| true).is_err(), "reject cliff-like footprints");
 }
 
 fn graphics_fixture_newland_camera(terrain_height: impl Fn([f32; 3]) -> Option<f32>) -> anyhow::Result<Camera> {
@@ -2306,58 +2572,81 @@ fn graphics_enhanced_cpu_timing() -> anyhow::Result<()> {
 #[ignore = "explicit headless Bloom ABBA benchmark: 120 warmup, 600 GPU samples per phase"]
 fn graphics_bloom_gpu_timing() -> anyhow::Result<()> {
     use anyhow::{Context, ensure};
+    use std::fmt::Write;
+    let hdr = std::env::var("AOMAC_GFX_SETTINGS").is_ok_and(|s| s == "hdr-bloom");
+    let out = std::env::var_os("AOMAC_GFX_OUT").map(PathBuf::from);
+    if let Some(out) = &out { std::fs::create_dir(out)?; }
+    let mut csv = String::from("phase,profile,sample,gpu_ms\n");
     let dir = ao_gui::client_dir();
     let store = ao_rdb::RecordStore::open(&dir)?;
     let actor = graphics_fixture_actor()?;
+    let view = std::env::var("AOMAC_GFX_VIEW").unwrap_or_else(|_| "borealis-lightbar-night".into());
+    ensure!(matches!(view.as_str(), "borealis-lightbar-night" | "borealis-street-sun-high" | "icc-platform-authored" | "newland-day"),
+        "bloom timing requires a static authored camera view");
     let (_, pf, time, fixed) = graphics_fixture_views(&actor).into_iter()
-        .find(|(name, _, _, _)| name == "borealis-lightbar-night").context("Light Bar fixture view")?;
+        .find(|(name, _, _, _)| name == &view).context("Bloom fixture view")?;
     ao_scene::crt_srand(1);
     let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(
         &store, &dir, pf, time, 0, Some(ao_formats::weather::State::clear()))?;
     let mut summaries = [[0.0_f64; 3]; 4];
     let mut bytes = [0_u64; 4];
-    for (phase, profile) in ["neutral", "bloom", "bloom", "neutral"].into_iter().enumerate() {
+    let profiles = if hdr { ["hdr", "hdr-bloom", "hdr-bloom", "hdr"] } else { ["neutral", "bloom", "bloom", "neutral"] };
+    for (phase, profile) in profiles.into_iter().enumerate() {
         ao_scene::crt_srand(1);
         let mut lens = camera::lens(scene.lens.unwrap_or_default(), false);
         lens.far = Some(camera::far_plane(camera::VIEW_DISTANCE));
         let mut shot = Shot { gui: Gui::new(&dir, None)?, scene: Some(scene.clone()), camera: fixed, lens };
         let mut off = Offscreen::evidence_timing(&shot, (1920,1200))?;
         off.fixed_camera(Some(fixed));
-        off.host.msaa_samples = Some(1);
+        off.host.msaa_samples = Some(4);
         off.host.anisotropy = Some(1);
         off.host.fog_density_scale = Some(1.0);
         off.host.enhanced_settings = Some(graphics_fixture_settings(profile)?);
         off.frame(&mut shot, 0.0);
-        // Same captured appearance, native mount and placement as the PNG fixture.
-        let mut appearance = actor.clone();
-        appearance.attractors.retain(|mount| mount.place != 5);
-        appearance.attractors.push(ao_net::n3::dynel::AttractorMesh { place: 5, mesh: 26163, field: 0, byte: 0 });
-        let mut avatar = super::avatar::Avatar::new(&store, &dir, 25988, &appearance,
-            ao_formats::character::actor::ActorAssets::new(&store)?)?;
-        avatar.set_transform([679.6,72.8,-482.7], 0.0);
-        off.host.dynamic_lights.extend(avatar.lights());
-        off.host.actor_models.push((super::avatar::MODEL_KEY, std::sync::Arc::new(avatar.model().clone())));
-        off.host.actors.push(avatar.frame());
-        off.frame(&mut shot, 0.0);
+        ensure!(off.msaa_samples() == 4, "bloom evidence requires actual 4x MSAA");
+        if view == "borealis-lightbar-night" {
+            // Same captured appearance, native mount and placement as the PNG fixture.
+            let mut appearance = actor.clone();
+            appearance.attractors.retain(|mount| mount.place != 5);
+            appearance.attractors.push(ao_net::n3::dynel::AttractorMesh { place: 5, mesh: 26163, field: 0, byte: 0 });
+            let mut avatar = super::avatar::Avatar::new(&store, &dir, 25988, &appearance,
+                ao_formats::character::actor::ActorAssets::new(&store)?)?;
+            avatar.set_transform([679.6,72.8,-482.7], 0.0);
+            off.host.dynamic_lights.extend(avatar.lights());
+            off.host.actor_models.push((super::avatar::MODEL_KEY, std::sync::Arc::new(avatar.model().clone())));
+            off.host.actors.push(avatar.frame());
+            off.frame(&mut shot, 0.0);
+        }
         off.prepare_frozen_rendering();
         off.set_gpu_timing(true)?;
         let mut samples = Vec::with_capacity(600);
         for frame in 0..720 {
             off.render_frozen()?;
             let ms = off.read_frame_gpu_ms()?.context("GPU timestamp sample")?;
-            if frame >= 120 { samples.push(ms); }
+            if frame >= 120 {
+                writeln!(csv, "{phase},{profile},{},{ms:.9}", frame - 120)?;
+                samples.push(ms);
+            }
         }
         samples.sort_by(f64::total_cmp);
         summaries[phase] = [samples[299], samples[569], samples[593]];
         bytes[phase] = off.enhanced_target_bytes();
-        eprintln!("BLOOM_FIXTURE_GPU phase={phase} profile={profile} view=borealis-lightbar-night size=1920x1200 warmup=120 samples=600 p50_ms={:.6} p95_ms={:.6} p99_ms={:.6} attachment_bytes={}",
+        eprintln!("BLOOM_FIXTURE_GPU phase={phase} profile={profile} view={view} size=1920x1200 warmup=120 samples=600 p50_ms={:.6} p95_ms={:.6} p99_ms={:.6} attachment_bytes={}",
             summaries[phase][0], summaries[phase][1], summaries[phase][2], bytes[phase]);
+        if let Some(out) = &out {
+            image::save_buffer(out.join(format!("phase-{phase}-{profile}.png")), &off.frozen_rgba()?,
+                1920, 1200, image::ColorType::Rgba8)?;
+        }
     }
     ensure!(bytes[0] == bytes[3] && bytes[1] == bytes[2], "ABBA memory accounting changed");
     let delta = std::array::from_fn::<_, 3, _>(|i|
         (summaries[1][i] + summaries[2][i] - summaries[0][i] - summaries[3][i]) * 0.5);
     eprintln!("BLOOM_FIXTURE_GPU_DELTA p50_ms={:.6} p95_ms={:.6} p99_ms={:.6} attachment_bytes={} uniform_bytes=16",
         delta[0], delta[1], delta[2], bytes[1].checked_sub(bytes[0]).context("Bloom allocation delta")?);
+    if let Some(out) = &out {
+        std::fs::write(out.join("gpu.csv"), csv)?;
+        std::fs::write(out.join("summary.txt"), format!("view={view}\nsize=1920x1200\nmsaa_requested=4\nmsaa_actual=4\nhdr={hdr}\norder=ABBA\nwarmup=120\nsamples=600\nphase_p50_p95_p99={summaries:?}\ndelta_p50_p95_p99={delta:?}\n"))?;
+    }
     Ok(())
 }
 #[path = "grass_shots.rs"]

@@ -223,6 +223,17 @@ impl ActorLayer {
         self.items.iter().filter(move |item| self.enhanced_body_admitted(item, fog_end)).map(|item| item.actor)
     }
 
+    pub(super) fn interaction_slot(&self, actor: Option<u32>) -> u32 {
+        actor.map_or(0, |id| self.items.iter().position(|item| item.actor == id)
+            .map_or(u32::MAX, |index| index as u32 + 1))
+    }
+
+    pub(super) fn interaction_buffer_bytes(&self) -> u64 {
+        ((self.items.len().max(64).next_power_of_two() + 1) * 4) as u64
+    }
+
+    pub(super) fn reset_interaction_effects(&mut self) { self.enhanced_effects.clear(); }
+
     pub(super) fn enhanced_water_contacts(&self, fog_end: f32, out: &mut Vec<(u32, [f32; 3], f32, bool)>) {
         out.clear();
         out.extend(self.items.iter().filter(|item| self.enhanced_body_admitted(item, fog_end))
@@ -707,13 +718,16 @@ impl Renderer {
         layer.effect_time = Some(self.time);
         let mut bodies = Vec::new();
         let mut walkers = HashMap::new();
+        let mut owners = Vec::new();
         if smoke {
             for selected in self.foliage.selected() {
+                let owner = layer.interaction_slot(selected.actor);
+                owners.push(owner);
                 let position = Vec3::from_array(selected.position);
                 if let Some(previous) = layer.effect_walkers.get(&selected.actor).filter(|_| dt > 0.0) {
                     let velocity = (position - *previous) / dt;
                     if velocity.length_squared() > 0.0025 && velocity.length_squared() < 144.0 {
-                        bodies.push(spell_smoke::Body { feet: selected.position, height: 1.8, velocity: velocity.to_array(), radius: 0.35 });
+                        bodies.push(spell_smoke::Body { feet: selected.position, height: 1.8, velocity: velocity.to_array(), radius: 0.35, owner });
                     }
                 }
                 walkers.insert(selected.actor, position);
@@ -750,15 +764,17 @@ impl Renderer {
         for (_, id, smoke, source) in sources {
             let programs = if smoke { &self.smoke_programs } else { &self.spell_programs };
             if !programs.ready() { continue; }
-            let (simulation, ready) = layer.enhanced_effects.entry(id).or_insert_with(|| (spell_smoke::Simulation::new(&self.device, programs), false));
-            simulation.update(&self.queue, source, &bodies, dt, self.time, right, up);
+            let source_owner = layer.interaction_slot(Some(id));
+            let (simulation, ready) = layer.enhanced_effects.entry(id).or_insert_with(|| (spell_smoke::Simulation::new(&self.device, programs, &self.interaction_admission.buffer), false));
+            simulation.update(&self.queue, source, &bodies, &owners, source_owner, dt, self.time, right, up);
             *ready = simulation.encode(encoder, programs);
         }
     }
 
     /// Frustum-culls the submitted actors, fills the instance buffer; called by `render` before the pass.
     pub(crate) fn prepare_actors(&mut self, cam: Vec3, forward: Vec3, planes: &[Vec4; 6]) {
-        let body_fog_enabled = self.enhanced_settings().ground_grass || self.enhanced_settings().water_wakes || self.enhanced_settings().fluid_smoke;
+        let body_fog_enabled = self.enhanced_settings().ground_grass || self.enhanced_settings().water_wakes
+            || self.enhanced_settings().foliage_enabled() || self.enhanced_settings().fluid_smoke;
         let sun_enabled = self.enhanced_settings().sun_shadows;
         let smoothing_enabled = self.enhanced_settings().character_smoothing;
         let layer = &mut self.act;

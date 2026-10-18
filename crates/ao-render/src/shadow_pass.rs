@@ -28,6 +28,18 @@ fn shaft_only_maps_match_half_resolution_integration_without_lowering_surface_sh
     assert_eq!(cascade_resolution(EnhancedSettings { ground_grass:false, ..grass }), 1);
 }
 
+#[test]
+fn primary_admission_clears_old_interactions_before_exporting_current_visibility() {
+    let source = include_str!("shadow_pass.rs");
+    let encode = source.rsplit_once("pub(crate) fn encode_enhanced_shadows(").unwrap().1;
+    let clear = encode.find("encoder.clear_buffer(&self.interaction_admission.buffer").unwrap();
+    let primary = encode.find("self.draw_actor_shadows(&mut pass, &shadows, true)").unwrap();
+    let visibility = encode.find("shadows.encode_actor_visibility(").unwrap();
+    let export = encode.find("self.interaction_admission.encode(").unwrap();
+    let receivers = encode.find("self.encode_point_shadows(").unwrap();
+    assert!(clear < primary && primary < visibility && visibility < export && export < receivers);
+}
+
 pub(super) fn authored_sun(scene: &Scene) -> Option<[f32; 3]> {
     scene.ground_light
         .filter(|(color, direction)| scene.sun_authored
@@ -126,6 +138,7 @@ impl Renderer {
         let grass_enabled = self.enhanced_settings.ground_grass && self.enhanced_settings.grass_sun_shadows;
         if !self.enhanced_settings.sun_shadows && !self.enhanced_settings.moon_shadows && !grass_enabled
             && !self.enhanced_settings.volumetric_shafts && !self.enhanced_settings.needs_admitted_lights()
+            && !self.enhanced_settings.needs_interaction_admission()
             && self.enhanced_settings.night_mode != NightMode::Moonlit {
             self.sun_shadows = None;
             self.point_shadows = None;
@@ -133,7 +146,8 @@ impl Renderer {
             return;
         }
         let admission = self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows
-            || self.enhanced_settings.volumetric_shafts || self.enhanced_settings.needs_admitted_lights();
+            || self.enhanced_settings.volumetric_shafts || self.enhanced_settings.needs_admitted_lights()
+            || self.enhanced_settings.needs_interaction_admission();
         // Moon illumination alone needs only the openness binding, not maps or a primary prepass.
         let resource_size = if admission { size } else { (1, 1) };
         let resolution = cascade_resolution(self.enhanced_settings);
@@ -173,6 +187,11 @@ impl Renderer {
             }
         }
         if admission { self.prepare_actor_shadows(&mut shadows); } else { shadows.actor_ids.clear(); shadows.actor_groups.clear(); }
+        if self.enhanced_settings.needs_interaction_admission() {
+            // Admission cannot consume last frame's remote bends, even on foliage-tagged actors.
+            // Slot zero remains shader-admitted; current remote flags are exported below.
+            encoder.clear_buffer(&self.interaction_admission.buffer, 0, None);
+        }
         if !shadows.actor_ids.is_empty() {
             let timestamp_writes = self.shadow_stage_render(ShadowGpuStage::Admission, false, false);
             let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
@@ -194,6 +213,9 @@ impl Renderer {
             self.shadow_stage_compute(ShadowGpuStage::Admission, true, frame.is_none() && !self.enhanced_settings.needs_admitted_lights() && !self.grass.as_ref().is_some_and(crate::grass::Grass::has_draws))
         };
         shadows.encode_actor_visibility(encoder, visibility_timestamps);
+        if self.enhanced_settings.needs_interaction_admission() {
+            self.interaction_admission.encode(&self.device, encoder, &shadows.actor_visibility, &shadows.actor_groups);
+        }
         self.encode_point_shadows(encoder, cam, &mut shadows, [env.fog_start, env.fog_end, far], frame.is_none());
         let Some(mut frame) = frame else {
             shadows.update(&self.queue, &CascadeFrame { uniform: bytemuck::Zeroable::zeroed() });
