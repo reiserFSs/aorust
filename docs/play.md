@@ -659,6 +659,58 @@ Lighting / Materials & Reflections; folder naming and map conventions are
 documented in `docs/gui.md`. Existing profiles do not implicitly enable these
 features, preserving historical evidence controls.
 
+Real installed-client material evidence uses the existing Borealis street and
+ICC platform snapshots at **1920×1200 with asserted actual 4×MSAA**. Run one
+profile per exclusive GPU lease (under five minutes), with a new output path:
+
+```sh
+CARGO_TARGET_DIR=/tmp/MaterialsFx/target \
+AOMAC_GFX_OUT=/absolute/new/real-material-generated \
+AOMAC_MATERIAL_PROFILE=generated-normals \
+  cargo test --profile fast -p aomac -j 2 real_material_evidence -- \
+  --ignored --nocapture --test-threads=1
+```
+
+For supplemental normal-aware GGX interaction evidence, select
+`AOMAC_MATERIAL_PROFILE=generated-normals-ggx` in a separate lease. Both A/B
+phases keep PBR enabled while only generated normals toggle; the same Borealis
+street snapshot, 1920×1200 actual 4×MSAA, ABBA timestamps and sheets apply.
+This supplements rather than replaces the five isolated feature runs below.
+
+Repeat independently for `material-maps`, `material-pbr`, `wet-reflections`,
+and `environment-probe`. Each run writes ABBA whole-frame GPU timestamp CSVs
+(60 samples per phase after readiness/cache warmup), native-content before/after
+PNGs, a sheet, camera-rotation frame strip and manifest. Wet reflection A/B
+keeps Wet Surfaces enabled, accumulates actual native Borealis rain through the
+collision shelter map for 30 simulated seconds, then stops precipitation at
+zero simulation delta before capturing the retained wet floor. Covered-floor
+control images use the same collision map. The covered-floor oracle holds SSR
+enabled in both images and toggles only Wet Surfaces; the saved wet/dry sheet
+must be byte-identical. Generic roof SSR gloss is reported separately and is
+not mistaken for wetness leakage. Wetness and roughness are not overridden.
+Probe learning sees
+only the static geometry actually rendered during camera rotations. Side maps
+use one actual scene RDB texture ID selected by summed projected visible wall
+area, in an explicit temporary root. Small procedurally authored normal, ORM
+(AO 0.45–1, roughness 0.2–0.8, metalness 0.3), and warm emissive-groove PNGs
+are removed on exit; native albedo/alpha are unchanged. Only `material-maps`
+creates these files; no source game assets are written. Settings remain
+default-off. A zero native-content effect fails after
+writing evidence, rather than introducing fake glossy material overrides.
+The probe run additionally saves its 128² confidence/radiance texture and an
+analytic-only versus learned-static frame sheet. It asserts nonzero confident
+texels and a nonzero RGB pixel delta against analytic-only shading, so an
+analytic sky fallback alone cannot pass as observed static-scene learning.
+The wet camera keeps native facades/signage above the visible floor at pitch
+−0.25. Its separate SSR-versus-analytic sheet disables primary SSR and probe
+sampling only in the diagnostic oracle; a nonzero observed-scene RGB delta is
+required, so an analytic sky sheen alone cannot satisfy wet-reflection evidence.
+Probe and SSR diagnostic pairs are both reconstructed at the same
+**pre-weather reflection stage from the identical native primary snapshot**.
+Neither side includes later weather sheen or post effects, avoiding a false
+positive caused by comparing reflection-only output against a final wet frame.
+The ordinary user-facing before/after PNGs remain complete final frames.
+
 Headless procedural material/reflection acceptance (no client assets, server,
 window, or user-folder changes) is available with an exclusive GPU timing lock:
 

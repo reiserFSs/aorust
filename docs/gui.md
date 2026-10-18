@@ -1428,6 +1428,13 @@ source is retained per texture for exact live toggles, not a duplicate Scene.
 Normal mipmaps retain averaged-normal coherence; roughness filters as roughness⁴
 and widens with lost normal detail, reducing distant specular sparkle. Malformed
 or over-limit PNGs are rejected; map dimensions are capped at 2048.
+Generated relief uses slope strength 3 (within ao-vk's 0.25–4 strength range)
+and scales unresolved variance accordingly; painted normal maps keep strength 1.
+Texture Material GGX includes ao-vk's Karis split-sum analytic sky/ground specular
+and specular occlusion, added before native fog. Authored-only specular remains
+unchanged. Reflection receivers use ao-vk's 0.3 glossy budget, widened for metals
+and faded only near fully matte roughness; roughness primarily filters the
+reflection rather than squaring ordinary native receivers below the cutoff.
 Replace files before reloading the relevant assets; this is not a file-watching
 texture editor. Maps alone enable normal/AO/emissive and metallic diffuse
 conservation; GGX highlights still require their own switch. See `THIRD_PARTY`

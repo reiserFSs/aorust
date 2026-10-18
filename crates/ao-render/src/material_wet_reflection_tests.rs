@@ -14,11 +14,13 @@ fn wet_reflections_require_accumulated_wetness_and_exposed_floor()->anyhow::Resu
         for enabled in [false,true] {
             r.set_enhanced_settings(EnhancedSettings::default());r.upload(&scene);
             r.set_weather_input(WeatherInput {rain,outdoor:true,surface:Some(std::rc::Rc::new(move |_|Some([roof_height,0.0]))),..Default::default()});
-            r.set_enhanced_settings(EnhancedSettings {wet_surfaces:true,material_reflections:enabled,..Default::default()});
+            r.set_enhanced_settings(EnhancedSettings {wet_surfaces:enabled,material_reflections:true,..Default::default()});
             let targets=Targets::new(&r,128,128);r.time=0.0;r.render(&view,&targets,&camera);r.wait_for_pipeline_warmup();
             for frame in 0..8 {r.time=frame as f32/60.0;r.render(&view,&targets,&camera);}
-            let wet=r.rain_wet.as_ref().unwrap();
-            assert_eq!(wet.reflection_wetness()>0.0,rain>0.0,"{name}: concrete native wetness state");
+            if enabled {
+                let wet=r.rain_wet.as_ref().unwrap();
+                assert_eq!(wet.reflection_wetness()>0.0,rain>0.0,"{name}: concrete native wetness state");
+            }
             pixels.push(texture_to_rgba(&r,&output,128,128)?);
         }
         if visible {assert_ne!(pixels[0],pixels[1],"{name}: exposed native wetness must visibly contribute reflection");}

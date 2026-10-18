@@ -155,7 +155,8 @@ pub(super) fn append_materials(source: &mut String, settings: crate::EnhancedSet
         let body = source[start..end]
             .replace("    let dx = dpdx(n);\n    let dy = dpdy(n);\n    let variance = max(dot(dx, dx), dot(dy, dy));\n", "    let variance = material_variance;\n")
             .replace("max(length(fwidth(i.wpos)), 1e-6)", "material_footprint")
-            .replace("sun_visibility(i.wpos, i.n, i.clip.xy)", "material_visibility_value");
+            .replace("sun_visibility(i.wpos, i.n, i.clip.xy)", "material_visibility_value")
+            .replace("return max(local + sun", "return max(material_ambient_specular(i, n, v, f0) + local + sun");
         source.replace_range(start..end, &body);
     }
     let specular = if settings.material_pbr { "authored_specular(i, vec3<f32>(0.0))" } else { "vec3<f32>(0.0)" };
@@ -203,6 +204,53 @@ mod tests {
         let off = crate::enhanced_shader::source(crate::EnhancedSettings::default());
         assert!(!off.contains("fn material_prepare"));
         assert!(!off.contains("var generated_normal_tex"));
+    }
+
+    #[test]
+    fn generated_relief_strength_does_not_scale_painted_normals() {
+        let source = crate::enhanced_shader::source(crate::EnhancedSettings {
+            generated_normals: true, material_maps: true, ..Default::default()
+        });
+        let generated = source.split("if MATERIAL_GENERATED {").nth(1).unwrap().split("\n    }").next().unwrap();
+        let painted = source.split("if (material_mask_value & 1u) != 0u {").nth(1).unwrap().split("\n    }").next().unwrap();
+        assert!(generated.contains("t = vec3<f32>(t.xy * 3.0, t.z);"));
+        assert!(!painted.contains("* 3.0"));
+        assert!(source.contains("select(1.0, 9.0, MATERIAL_GENERATED && (material_mask_value & 1u) == 0u)"));
+    }
+
+    #[test]
+    fn generic_pbr_adds_reference_split_sum_without_changing_authored_only_ggx() {
+        let generic = crate::enhanced_shader::source(crate::EnhancedSettings {
+            material_pbr: true, ..Default::default()
+        });
+        assert!(generic.contains("return max(material_ambient_specular(i, n, v, f0) + local + sun"));
+        assert!(generic.contains("vec4<f32>(-1.0, -0.0275, -0.572, 0.022)"));
+        assert!(generic.contains("vec4<f32>(1.0, 0.0425, 1.04, -0.04)"));
+        assert!(generic.contains("mix(ambient * 0.5, sky * 1.3, smoothstep(-0.4, 0.6, reflected.y))"));
+        assert!(generic.contains("exp2(-16.0 * roughness - 1.0)"));
+        let authored = crate::enhanced_shader::source(crate::EnhancedSettings {
+            material_specular: true, ..Default::default()
+        });
+        assert!(!authored.contains("material_ambient_specular("));
+        let brdf = |roughness: f64, nv: f64| {
+            let r = [1.0 - roughness, 0.0425 - 0.0275 * roughness, 1.04 - 0.572 * roughness, -0.04 + 0.022 * roughness];
+            let a004 = (r[0] * r[0]).min((-9.28 * nv).exp2()) * r[0] + r[1];
+            0.04 * (-1.04 * a004 + r[2]) + 1.04 * a004 + r[3]
+        };
+        assert!((brdf(0.7, 1.0) - 0.02468).abs() < 0.00001);
+        assert!(brdf(0.7, 0.01) > brdf(0.7, 1.0), "grazing dielectric reflection retains split-sum Fresnel");
+        assert!(brdf(1.0, 1.0) > 0.0, "roughness broadens rather than deleting integrated specular energy");
+    }
+
+    #[test]
+    fn native_reflection_budget_survives_default_roughness_but_fades_matte() {
+        let source = crate::enhanced_shader::source(crate::EnhancedSettings {
+            environment_probe: true, ..Default::default()
+        });
+        assert!(source.contains("mix(max(0.3, authored_f0), 1.0, material_metallic(i))"));
+        assert!(source.contains("1.0 - smoothstep(0.6, 1.0, material_roughness(i))"));
+        let t = (0.7_f64 - 0.6) / (1.0 - 0.6);
+        assert!((0.3 * (1.0 - t * t * (3.0 - 2.0 * t)) - 0.253125).abs() < 1e-9);
     }
 
     #[test]

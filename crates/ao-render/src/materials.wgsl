@@ -60,6 +60,8 @@ fn material_prepare(i: VOut) {
     var coherence = 1.0;
     if MATERIAL_GENERATED {
         t = (generated.xyz * 255.0 - vec3<f32>(128.0)) / 127.0;
+        // Enhanced generated relief uses ao-vk-style strength 3; painted normals retain their authored slope.
+        t = vec3<f32>(t.xy * 3.0, t.z);
         coherence = generated.a;
     }
     if (material_mask_value & 1u) != 0u {
@@ -75,7 +77,7 @@ fn material_prepare(i: VOut) {
     // Normal mips preserve vector length before renormalization; unresolved
     // slopes widen GGX alpha squared rather than producing distant sparkles.
     let len = clamp(coherence, 0.001, 1.0);
-    let normal_variance = 2.0 * (1.0 - len * len) / max(len * (3.0 - len * len), 0.001);
+    let normal_variance = 2.0 * (1.0 - len * len) / max(len * (3.0 - len * len), 0.001) * select(1.0, 9.0, MATERIAL_GENERATED && (material_mask_value & 1u) == 0u);
     material_variance = min(1.0, normal_variance + max(dot(dx, dx), dot(dy, dy)));
 }
 fn material_shading_normal(i: VOut) -> vec3<f32> { return material_normal_value; }
@@ -101,6 +103,29 @@ fn material_diffuse(i: VOut, native_light: vec3<f32>) -> vec3<f32> {
 }
 fn material_reflectivity(i: VOut) -> f32 {
     let authored_f0 = clamp(max(i.light.w, max(i.dlight.w, i.spec.w)), 0.04, 1.0);
-    let f0 = mix(authored_f0, 1.0, material_metallic(i));
-    return f0 * pow(1.0 - material_roughness(i), 2.0);
+    // ao-vk's 0.3 glossy receiver budget; roughness filters the lobe, fading only near-matte surfaces.
+    let budget = mix(max(0.3, authored_f0), 1.0, material_metallic(i));
+    return budget * (1.0 - smoothstep(0.6, 1.0, material_roughness(i)));
+}
+
+// ao-vk lighting.glsl EnvBrdfApprox (Karis), without a lookup texture.
+fn material_env_brdf(f0: vec3<f32>, roughness: f32, nv: f32) -> vec3<f32> {
+    let c0 = vec4<f32>(-1.0, -0.0275, -0.572, 0.022);
+    let c1 = vec4<f32>(1.0, 0.0425, 1.04, -0.04);
+    let r = roughness * c0 + c1;
+    let a004 = min(r.x * r.x, exp2(-9.28 * nv)) * r.x + r.y;
+    let ab = vec2<f32>(-1.04, 1.04) * a004 + r.zw;
+    return max(f0 * ab.x + vec3<f32>(ab.y), vec3<f32>(0.0));
+}
+fn material_ambient_specular(i: VOut, n: vec3<f32>, v: vec3<f32>, f0: vec3<f32>) -> vec3<f32> {
+    let roughness = material_roughness(i);
+    let nv = max(dot(n, v), 1e-4);
+    let reflected = reflect(-v, n);
+    let ambient = g.ambient_g.rgb;
+    let fog_enabled = (u32(mat.native.z) & 2u) == 0u;
+    let sky = select(ambient, mix(ambient, g.fog_g.rgb, 0.5), fog_enabled) + g.sun_g.rgb * 0.25;
+    let environment = mix(ambient * 0.5, sky * 1.3, smoothstep(-0.4, 0.6, reflected.y));
+    let ao = material_orm_value.x;
+    let specular_occlusion = clamp(pow(nv + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao, 0.0, 1.0);
+    return material_env_brdf(f0, roughness, nv) * environment * specular_occlusion;
 }

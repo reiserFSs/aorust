@@ -2261,3 +2261,5 @@ mod grass_shots;
 mod bloom_seeds;
 #[path = "weather_shots.rs"]
 mod weather_shots;
+#[path = "material_shots.rs"]
+mod material_shots;

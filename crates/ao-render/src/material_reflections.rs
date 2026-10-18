@@ -46,16 +46,14 @@ impl Reflections {
     }
     pub(super) fn ready(&self)->bool {self.accumulate.is_ready() && self.reflection.is_ready()}
     pub(super) fn wait(&self) {self.accumulate.get();self.reflection.get();}
-    #[cfg(test)]
     pub(super) fn history_view(&self)->&wgpu::TextureView {&self.probe[self.head]}
     #[cfg(test)]
     pub(super) fn forget_history(&mut self) {self.previous=None;self.previous_direction=None;}
-    #[cfg(test)]
     pub(super) fn analytic_comparison(&self, r:&crate::Renderer, encoder:&mut wgpu::CommandEncoder) {
         let frame=r.enhanced_frame.as_ref().unwrap();
         let bg=r.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {label:Some("analytic-only oracle"),layout:r.enhanced_pipelines.source_layout(),entries:&[wgpu::BindGroupEntry {binding:0,resource:wgpu::BindingResource::TextureView(&self.snapshot)}]});
         frame.composite(encoder,&frame.colour,Some(&bg),None);
-        r.queue.write_buffer(&self.params,(std::mem::offset_of!(Params,control)+4) as u64,bytemuck::bytes_of(&0.0f32));
+        r.queue.write_buffer(&self.params,std::mem::offset_of!(Params,control) as u64,bytemuck::cast_slice(&[0.0f32,0.0f32]));
         draw(encoder,&self.reflection,&self.bindings.as_ref().unwrap().groups[self.head],&frame.colour,true);
     }
     pub(super) fn bytes(&self)->u64 {u64::from(self.size.0)*u64::from(self.size.1)*4+u64::from(PROBE*PROBE)*16}
@@ -71,6 +69,53 @@ impl Reflections {
     }
 }
 impl crate::Renderer {
+    /// Explicit offline evidence: probe RGB/confidence, observed reflections, and
+    /// analytic-only fallback. Both frame images reconstruct the same native snapshot
+    /// before weather/post effects. Allocates only when called; never mutates history.
+    #[allow(clippy::type_complexity)]
+    pub fn material_probe_evidence(&self)->anyhow::Result<Option<(Vec<u8>,Vec<u8>,Vec<u8>)>> {
+        let Some(frame)=self.enhanced_frame.as_ref() else {return Ok(None);};
+        let Some(state)=self.material_reflections.as_ref().filter(|state|(self.enhanced_settings.environment_probe || self.enhanced_settings.material_reflections) && state.ready() && state.bindings.is_some()) else {return Ok(None);};
+        let image=|size:(u32,u32),label|self.device.create_texture_tracked(&wgpu::TextureDescriptor {
+            label:Some(label),size:wgpu::Extent3d {width:size.0,height:size.1,depth_or_array_layers:1},
+            mip_level_count:1,sample_count:1,dimension:wgpu::TextureDimension::D2,format:self.format,
+            usage:wgpu::TextureUsages::RENDER_ATTACHMENT|wgpu::TextureUsages::COPY_SRC,view_formats:&[],
+        });
+        let probe=image((PROBE,PROBE),"observed static probe evidence");
+        let observed=image(frame.size,"observed reflection stage evidence");
+        let analytic=image(frame.size,"analytic fallback evidence");
+        let bind=self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
+            label:Some("observed static probe evidence"),layout:self.enhanced_pipelines.source_layout(),
+            entries:&[wgpu::BindGroupEntry {binding:0,resource:wgpu::BindingResource::TextureView(state.history_view())}],
+        });
+        let snapshot=self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
+            label:Some("reflection stage snapshot evidence"),layout:self.enhanced_pipelines.source_layout(),
+            entries:&[wgpu::BindGroupEntry {binding:0,resource:wgpu::BindingResource::TextureView(&state.snapshot)}],
+        });
+        let mut encoder=self.device.create_command_encoder(&Default::default());
+        frame.composite(&mut encoder,&probe.create_view(&Default::default()),Some(&bind),None);
+        let observed_view=observed.create_view(&Default::default());
+        frame.composite(&mut encoder,&observed_view,Some(&snapshot),None);
+        let controls=[f32::from(u8::from(self.enhanced_settings.material_reflections)),f32::from(u8::from(self.enhanced_settings.environment_probe))];
+        self.queue.write_buffer(&state.params,std::mem::offset_of!(Params,control) as u64,bytemuck::cast_slice(&controls));
+        draw(&mut encoder,&state.reflection,&state.bindings.as_ref().unwrap().groups[state.head],&observed_view,true);
+        self.queue.submit([encoder.finish()]);
+        // Complete observed GPU work before analytic_comparison overwrites the uniform.
+        // Queue writes are not scoped to an encoded pass, so one submission would confound both.
+        let mut probe=crate::texture_to_rgba(self,&probe,PROBE,PROBE)?;
+        let mut observed=crate::texture_to_rgba(self,&observed,frame.size.0,frame.size.1)?;
+        let mut encoder=self.device.create_command_encoder(&Default::default());
+        state.analytic_comparison(self,&mut encoder);
+        frame.composite(&mut encoder,&analytic.create_view(&Default::default()),None,None);
+        self.queue.submit([encoder.finish()]);
+        let mut analytic=crate::texture_to_rgba(self,&analytic,frame.size.0,frame.size.1)?;
+        if self.format==wgpu::TextureFormat::Bgra8Unorm {
+            for pixel in probe.as_chunks_mut::<4>().0 {pixel.swap(0,2);}
+            for pixel in observed.as_chunks_mut::<4>().0 {pixel.swap(0,2);}
+            for pixel in analytic.as_chunks_mut::<4>().0 {pixel.swap(0,2);}
+        }
+        Ok(Some((probe,observed,analytic)))
+    }
     pub(super) fn encode_material_reflections(&mut self, encoder:&mut wgpu::CommandEncoder, vp:Mat4, eye:Vec3, env:ao_scene::Environment) {
         let settings=self.enhanced_settings;
         if !settings.material_reflections && !settings.environment_probe {self.material_reflections=None;return;}

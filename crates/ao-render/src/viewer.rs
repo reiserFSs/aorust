@@ -1301,6 +1301,16 @@ impl Offscreen {
     }
     pub fn world_variant_cache_len(&self) -> usize { self.r.world_variant_cache_len() }
     pub fn emissive_seed_rgba(&self) -> Result<Option<Vec<u8>>> { self.r.emissive_seed_rgba() }
+    /// Explicit probe confidence and same-stage observed/analytic reflection readbacks.
+    #[allow(clippy::type_complexity)]
+    pub fn material_probe_evidence(&self) -> Result<Option<(Vec<u8>, Vec<u8>, Vec<u8>)>> {
+        self.r.material_probe_evidence()
+    }
+
+    /// Explicit side-map root for offline evidence; set before the first scene upload.
+    pub fn set_materials_root(&mut self, root: Option<std::path::PathBuf>) {
+        self.r.set_materials_root(root);
+    }
 
     /// Changes rendering resources while retaining the frozen actors and scene.
     pub fn set_enhanced_settings(&mut self, settings: crate::EnhancedSettings) {
