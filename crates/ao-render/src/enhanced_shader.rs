@@ -6,6 +6,7 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
     let ao = settings.ambient_occlusion || settings.indirect_light;
     let bloom = settings.emissive_bloom;
     let hdr = settings.needs_sun_mask();
+    let fog_only = settings.fog_only_mask();
     let compact_indirect = crate::enhanced::compact_indirect(&settings);
     let materials = settings.generated_normals || settings.material_maps || settings.material_pbr
         || settings.material_reflections || settings.environment_probe;
@@ -15,7 +16,7 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
     let local_light_shadows = settings.local_light_shadows;
     let night = settings.night_mode != crate::NightMode::AsGame;
     // HDR and night receivers need the native directional shares independently.
-    let sun_shares = shadows || hdr || night;
+    let sun_shares = shadows || settings.needs_full_sun_mask() || night;
     let mut source = crate::shader_source::load("shader.wgsl", include_str!("shader.wgsl")).into_owned();
     source = source.replace("    @location(12) env_uv: vec2<f32>,", "    @location(12) env_uv: vec2<f32>,\n    @location(13) ao_info: vec3<f32>,\n    @location(14) sun_share: vec3<f32>,\n    @location(15) sun_spec_share: vec3<f32>,");
     source = source.replace("    var o: VOut;", "    var o: VOut;\n    o.ao_info = vec3<f32>(0.0);\n    o.sun_share = vec3<f32>(0.0);\n    o.sun_spec_share = vec3<f32>(0.0);");
@@ -60,6 +61,13 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
     source = source.replace("@fragment\nfn fs_", "fn enhanced_original_fs_");
     source = source.replace(" -> @location(0) vec4<f32>", " -> vec4<f32>");
     source.push_str(&crate::shader_source::load("enhanced_output.wgsl", OUTPUT));
+    if fog_only {
+        // Specialize the existing helper, retaining its native material gates and
+        // ground_fog selection without evaluating directional or roof metadata.
+        let start = source.find("    let share = dot(i.sun_share.xyz,").expect("sun share");
+        let end = start + source[start..].find("\n}").expect("sun helper end");
+        source.replace_range(start..end, "    return vec4<f32>(fog, 0.0, 0.0, beauty.a);");
+    }
     if settings.cloud_shadows || reflections || (settings.indirect_light && !compact_indirect) {
         source = source.replace("    @location(3) sun: vec4<f32>,", "    @location(3) sun: vec4<f32>,\n    @location(4) water_cloud: vec4<f32>,");
     }
@@ -108,9 +116,11 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
             _ if !hdr => "vec4<f32>(0.0)",
             name if name.starts_with("fs_sky_") => "vec4<f32>(0.0)",
             "fs_opaque" | "fs_fade_opaque" | "fs_fade_test" | "fs_test" | "fs_blend" => "enhanced_sun(i, beauty, false, 0.0)",
+            "fs_ground_fused" | "fs_ground_base" | "fs_ground_simple" if fog_only => "enhanced_sun(i, beauty, true, 0.0)",
             "fs_ground_fused" | "fs_ground_base" | "fs_ground_simple" => "enhanced_sun(i, beauty, true, terrain_sky_open(i.wpos))",
             // ZERO/SRCCOLOR must extinguish only direct exposure under a roof;
             // sky eligibility, native fog and coverage belong to the base pass.
+            "fs_ground_shadow" if fog_only => "vec4<f32>(1.0)",
             "fs_ground_shadow" if shadows => "vec4<f32>(enhanced_sun_visibility, 1.0, 1.0, 1.0)",
             "fs_ground_shadow" => "vec4<f32>(1.0)",
             _ => "vec4<f32>(0.0, 0.0, 0.0, beauty.a)",
@@ -149,7 +159,7 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
     source = source.replace("sun_visibility(i.wpos)", "sun_visibility(i.wpos, i.n, i.clip.xy)");
     if shadows {
         append_shadow_receiver(&mut source, 0);
-        if hdr || material_specular {
+        if settings.needs_full_sun_mask() || material_specular {
             // HDR eligibility uses actual light visibility, not the artistic shade floor.
             // Capture before the final mix: beauty retains its native Enhanced shadow strength.
             source = source.replace(
@@ -187,6 +197,7 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
         }
     }
     if !sun_shares {
+        source = source.replace("    let excess = max(native_raw - vec3<f32>(1.0), vec3<f32>(0.0));\n", "");
         source = source.replace("i.sun_share.xyz", "vec3<f32>(0.0)");
         source = source.replace("i.sun_spec_share.xyz", "vec3<f32>(0.0)");
     }
@@ -357,6 +368,54 @@ mod tests {
         ] {
             assert!(!crate::enhanced::compact_indirect(&settings));
             assert_eq!(crate::enhanced::target_count(&settings), 8);
+        }
+    }
+
+    #[test]
+    fn post_only_mask_preserves_native_fog_without_directional_work() {
+        use crate::EnhancedSettings;
+        let defaults = EnhancedSettings::default();
+        assert!(!defaults.fog_only_mask() && !defaults.needs_full_sun_mask());
+        for settings in [
+            EnhancedSettings { depth_of_field: true, ..defaults },
+            EnhancedSettings { taa: true, ..defaults },
+            EnhancedSettings { fxaa: true, ..defaults },
+            EnhancedSettings { cas: true, ..defaults },
+            EnhancedSettings { motion_blur: 1.0, ..defaults },
+        ] {
+            assert!(settings.fog_only_mask() && settings.needs_sun_mask() && !settings.needs_full_sun_mask());
+            assert_eq!(crate::enhanced::sun_format(&settings), wgpu::TextureFormat::R16Float);
+            assert_eq!(crate::enhanced::target_count(&settings), 4);
+            let full = EnhancedSettings { hdr: true, ..settings };
+            assert!(!full.fog_only_mask() && full.needs_full_sun_mask());
+            assert_eq!(crate::enhanced::sun_format(&full), crate::enhanced::AUX);
+            assert_ne!(crate::variant::Key::of(settings, 4), crate::variant::Key::of(full, 4));
+            let source = super::source(settings);
+            let helper = source.split("fn enhanced_sun(").nth(1).unwrap().split("\n}").next().unwrap();
+            let full_source = super::source(full);
+            let full_helper = full_source.split("fn enhanced_sun(").nth(1).unwrap().split("\n}").next().unwrap();
+            assert_eq!(helper.split("    return vec4<f32>(fog,").next().unwrap(),
+                full_helper.split("    let share =").next().unwrap());
+            assert!(helper.contains("select(native_fog(i.fog), ground_fog(i), ground)"));
+            assert!(helper.contains("return vec4<f32>(fog, 0.0, 0.0, beauty.a);"));
+            assert!(!source.contains("sun_share:") && !source.contains("sun_spec_share:"));
+            assert!(!source.contains("terrain_sky_open(i.wpos)"));
+            let multiplier = source.split("@fragment fn fs_ground_shadow(").nth(1).unwrap().split("\n}").next().unwrap();
+            assert!(multiplier.contains(", vec4<f32>(1.0));"));
+            assert!(full_helper.contains("sky_open, fog, beauty.a"));
+            let indirect = EnhancedSettings { indirect_light: true, ..settings };
+            assert!(indirect.fog_only_mask());
+            assert_eq!(crate::enhanced::target_count(&indirect), 8);
+            let indirect_source = super::source(indirect);
+            assert!(indirect_source.contains("@location(7) albedo:"));
+            assert!(indirect_source.contains("enhanced_diffuse *= 1.0 - f;"));
+        }
+        for settings in [
+            EnhancedSettings { depth_of_field: true, sun_shadows: true, ..defaults },
+            EnhancedSettings { depth_of_field: true, night_mode: crate::NightMode::Moonlit, ..defaults },
+        ] {
+            assert!(settings.fog_only_mask());
+            assert!(super::source(settings).contains("sun_share:"));
         }
     }
 

@@ -1023,7 +1023,7 @@ fn compile_pipeline(
     let vert_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
         let target = wgpu::ColorTargetState { format, blend: state, write_mask: wgpu::ColorWrites::ALL };
         let auxiliary = wgpu::ColorTargetState { format: enhanced::AUX, blend: state, write_mask: wgpu::ColorWrites::ALL };
-        let sun_mask = settings.needs_sun_mask().then(|| auxiliary.clone());
+        let sun_mask = settings.needs_sun_mask().then(|| wgpu::ColorTargetState { format: enhanced::sun_format(&settings), ..auxiliary.clone() });
         let water_cloud = settings.cloud_shadows.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R16Float, blend: state, write_mask: wgpu::ColorWrites::RED });
         // The native ground lightmap multiplies existing coverage; retain its base material metadata.
         let reflection = (settings.material_reflections || settings.environment_probe).then_some(wgpu::ColorTargetState { format: enhanced::AUX, blend: None, write_mask: if fs == "fs_ground_shadow" { wgpu::ColorWrites::empty() } else { wgpu::ColorWrites::ALL } });
@@ -1720,7 +1720,7 @@ impl Renderer {
         if auxiliary {
             self.msaa_supported.iter().copied().filter(|&count| count <= requested
                 && self.auxiliary_msaa.sample_count_supported(count)
-                && (!settings.cloud_shadows || self.water_cloud_msaa.sample_count_supported(count))).max().unwrap_or(1)
+                && (!(settings.cloud_shadows || settings.fog_only_mask()) || self.water_cloud_msaa.sample_count_supported(count))).max().unwrap_or(1)
         } else {
             clamp_msaa_samples(requested.max(1), &self.msaa_supported)
         }
@@ -1887,6 +1887,7 @@ impl Renderer {
             || previous.emissive_bloom != settings.emissive_bloom
             || previous.indirect_light != settings.indirect_light
             || previous.needs_sun_mask() != settings.needs_sun_mask()
+            || previous.fog_only_mask() != settings.fog_only_mask()
             || (previous.material_reflections || previous.environment_probe) != (settings.material_reflections || settings.environment_probe);
         self.enhanced_settings = settings;
         if previous.needs_interaction_admission() != settings.needs_interaction_admission() {
@@ -1994,7 +1995,8 @@ impl Renderer {
         self.enhanced_frame.as_ref().map_or(0, |frame| {
             let pixels = u64::from(frame.size.0) * u64::from(frame.size.1);
             let ambient_bytes = if enhanced::ambient_format(&self.enhanced_settings) == enhanced::ALBEDO { 4 } else { 8 };
-            let colour = 4 + ambient_bytes * u64::from(frame.ambient.is_some()) + 8 * (u64::from(frame.emissive.is_some()) + u64::from(frame.sun.is_some()) + u64::from(frame.reflection_surface.is_some()) + u64::from(frame.reflection_mask.is_some())) + 2 * u64::from(frame.water_cloud.is_some()) + 4 * u64::from(frame.albedo.is_some());
+            let sun_bytes = if enhanced::sun_format(&self.enhanced_settings) == wgpu::TextureFormat::R16Float { 2 } else { 8 };
+            let colour = 4 + ambient_bytes * u64::from(frame.ambient.is_some()) + sun_bytes * u64::from(frame.sun.is_some()) + 8 * (u64::from(frame.emissive.is_some()) + u64::from(frame.reflection_surface.is_some()) + u64::from(frame.reflection_mask.is_some())) + 2 * u64::from(frame.water_cloud.is_some()) + 4 * u64::from(frame.albedo.is_some());
             let samples = u64::from(frame.sample_count);
             pixels * (colour + 4 * samples + if samples > 1 { colour * samples + 4 } else { 0 })
         }) + self.ambient_occlusion.as_ref().map_or(0, ambient_occlusion::AmbientOcclusion::target_bytes)

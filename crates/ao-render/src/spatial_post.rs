@@ -22,6 +22,8 @@ pub(super) struct Projection {
     pub far: f32,
     /// Native gamma-space fog colour, matching the current frame's fog fraction.
     pub fog_color: [f32; 3],
+    /// Compact native fog is in R; the full sun mask keeps it in B.
+    pub fog_red: bool,
     /// Positive view-space depth of the exact own-character world position.
     /// Missing/behind-camera focus disables DoF; never substitute screen-centre depth.
     pub focus_depth: Option<f32>,
@@ -30,7 +32,7 @@ pub(super) struct Projection {
 fn finite_clamp(value: f32, max: f32) -> f32 {
     if value.is_finite() { value.clamp(0.0, max) } else { 0.0 }
 }
-fn parameters(settings: SpatialSettings, projection: Projection) -> ([f32; 12], [bool; 4]) {
+fn parameters(settings: SpatialSettings, projection: Projection) -> ([f32; 16], [bool; 4]) {
     let valid_projection = projection.near.is_finite() && projection.far.is_finite()
         && projection.near > 0.0 && projection.far > projection.near;
     let focus = projection.focus_depth.filter(|z| valid_projection && z.is_finite() && *z >= projection.near && *z <= projection.far);
@@ -40,7 +42,8 @@ fn parameters(settings: SpatialSettings, projection: Projection) -> ([f32; 12], 
     let (near, far) = if valid_projection { (projection.near, projection.far) } else { (0.1, 1.0) };
     let motion = finite_clamp(settings.motion_blur, 1.0);
     let fog = projection.fog_color.map(|c| finite_clamp(c, 1.0));
-    ([near, far, focus.unwrap_or(0.0), aperture, radius, strength, motion, near.recip(), fog[0], fog[1], fog[2], far.recip()],
+    ([near, far, focus.unwrap_or(0.0), aperture, radius, strength, motion, near.recip(), fog[0], fog[1], fog[2], far.recip(),
+        f32::from(u8::from(projection.fog_red)), 0.0, 0.0, 0.0],
         [motion > 0.0 && valid_projection, settings.depth_of_field && focus.is_some() && aperture > 0.0 && radius > 0.0,
          settings.fxaa && valid_projection, settings.cas && strength > 0.0 && valid_projection])
 }
@@ -172,7 +175,7 @@ impl SpatialPost {
             mag_filter: wgpu::FilterMode::Nearest, min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
-        let params = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("Spatial post parameters"), size: 48, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let params = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("Spatial post parameters"), size: 64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         // Immutable uniform indexing avoids materializing a shader-local aperture array per fragment.
         let taps: [[f32; 4]; 48] = std::array::from_fn(|i| {
             let radius = ((i as f64 + 0.5) / 48.0).sqrt();
@@ -199,7 +202,7 @@ impl SpatialPost {
     pub fn clear(&mut self) { self.frame = None; }
     /// Owned texture/uniform storage, excluding shared inputs and driver overhead.
     pub fn bytes(&self) -> u64 {
-        60 + self.dof_aperture.size() + self.frame.as_ref().map_or(0, |frame| {
+        self.params.size() + 12 + self.dof_aperture.size() + self.frame.as_ref().map_or(0, |frame| {
             let full = u64::from(frame.size.0) * u64::from(frame.size.1)
                 * u64::from(self.format.block_copy_size(None).unwrap_or(4))
                 * frame.passes.iter().flatten().filter(|pass| pass.output.is_some()).count() as u64;
@@ -325,7 +328,7 @@ impl SpatialPost {
 
 // Shared WGSL is prepended to each standalone feature kernel, including override sources.
 const COMMON: &str = r#"
-struct Params { projection: vec4<f32>, effect: vec4<f32>, fog_color: vec4<f32> }
+struct Params { projection: vec4<f32>, effect: vec4<f32>, fog_color: vec4<f32>, mask: vec4<f32> }
 @group(0) @binding(0) var image: texture_2d<f32>;
 @group(0) @binding(1) var depth: texture_depth_2d;
 @group(0) @binding(2) var<uniform> params: Params;
@@ -343,7 +346,10 @@ fn view_z(p: vec2<i32>) -> f32 {
 fn luma(c: vec3<f32>) -> f32 { return dot(c,vec3(0.299,0.587,0.114)); }
 // Normalized positive gathers only admit taps at least as fogged as the centre.
 // CAS sharpens bounded recovered surface colour, then restores native extinction.
-fn fog_fraction(p: vec2<i32>) -> f32 { return clamp(textureLoad(fog_mask,coord(p),0).b,0.0,1.0); }
+fn fog_fraction(p: vec2<i32>) -> f32 {
+    let mask = textureLoad(fog_mask,coord(p),0);
+    return clamp(select(mask.b,mask.r,params.mask.x>0.5),0.0,1.0);
+}
 fn safe_output(c: vec3<f32>, _original: vec3<f32>, alpha: f32, _p: vec2<i32>) -> vec4<f32> {
     return vec4<f32>(clamp(c,vec3(0.0),vec3(1.0)),alpha);
 }
@@ -375,7 +381,7 @@ mod tests {
     fn reciprocal_coc_matches_depth_reconstruction() {
         let settings = SpatialSettings { dof_aperture: 2.0, dof_max_radius: 8.0, ..Default::default() };
         for (near,far) in [(0.1,100.0),(0.2,600.0)] {
-            let (params,_) = parameters(settings, Projection { near,far,focus_depth: Some(4.0),fog_color: [0.0;3] });
+            let (params,_) = parameters(settings, Projection { near,far,focus_depth: Some(4.0),fog_color: [0.0;3],fog_red: false });
             for z in [near,2.0,4.0,8.0,64.0,far] {
                 let depth = far/(far-near)*(1.0-near/z);
                 let inverse = params[7]-depth*(params[7]-params[11]);
@@ -393,13 +399,19 @@ mod tests {
     #[test]
     fn unavailable_exact_focus_disables_only_dof() {
         let settings = SpatialSettings { motion_blur: 0.0, fxaa: true, cas: true, cas_strength: 0.5, depth_of_field: true, dof_aperture: 2.0, dof_max_radius: 8.0 };
-        let projection = Projection { near: 0.1, far: 100.0, fog_color: [0.3;3], focus_depth: None };
+        let projection = Projection { near: 0.1, far: 100.0, fog_color: [0.3;3], fog_red: false, focus_depth: None };
         assert_eq!(parameters(settings, projection).1, [false,false,true,true]);
         for focus in [f32::NAN, f32::INFINITY, -1.0, 0.0, 101.0] {
             assert!(!parameters(settings, Projection { focus_depth: Some(focus), ..projection }).1[1]);
         }
         assert_eq!(parameters(settings, Projection { focus_depth: Some(4.0), ..projection }).1, [false,true,true,true]);
         assert_eq!(parameters(SpatialSettings::default(), projection).1, [false;4]);
+        let blue = parameters(settings, projection).0;
+        let red = parameters(settings, Projection { fog_red: true, ..projection }).0;
+        assert_eq!(&blue[..12], &red[..12], "mask channel must not overwrite projection/effect/fog fields");
+        assert_eq!(blue[12], 0.0);
+        assert_eq!(red[12], 1.0);
+        assert_eq!(std::mem::size_of_val(&red), 64);
     }
     #[test]
     fn spatial_shaders_validate_on_gpu() {
@@ -429,7 +441,7 @@ mod tests {
         let output = texture(renderer.format, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
         let output_view = output.create_view_tracked(&Default::default());
         let mut post = post;
-        let projection = Projection { near: 0.1, far: 100.0, fog_color: [0.3;3], focus_depth: Some(4.0) };
+        let projection = Projection { near: 0.1, far: 100.0, fog_color: [0.3;3], fog_red: false, focus_depth: Some(4.0) };
         let motion = texture(wgpu::TextureFormat::Rgba32Float, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
         let ids = texture(wgpu::TextureFormat::R32Uint, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
         let vectors: Vec<[f32;4]> = vec![[0.1,0.0,0.5,0.0]; (size.0*size.1) as usize];
@@ -443,13 +455,27 @@ mod tests {
         let ids = ids.create_view_tracked(&Default::default());
         let fog_texture = texture(wgpu::TextureFormat::Rgba32Float, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
         let fog = fog_texture.create_view_tracked(&Default::default());
+        let red_texture = texture(wgpu::TextureFormat::R16Float, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        let red_fog = red_texture.create_view_tracked(&Default::default());
         for fog_case in 0..4 {
+            let mut blue_outputs = Vec::new();
+            for fog_red in [false, true] {
+            let projection = Projection { fog_red, ..projection };
+            let fog_view = if fog_red { &red_fog } else { &fog };
             let mask: Vec<[f32;4]> = (0..size.0*size.1).map(|i| {
-                let fraction = match fog_case { 0 => 0.0, 1 => 0.5, 3 => 1.0, _ => if i%size.0 < size.0/2 {0.2} else {0.8} };
+                let fraction = match fog_case { 0 => 0.0, 1 => 0.5, 3 => 1.0, _ => if i%size.0 < size.0/2 {0.25} else {0.75} };
                 [0.0,0.0,fraction,0.0]
             }).collect();
             renderer.queue.write_texture(wgpu::TexelCopyTextureInfo { texture: &fog_texture, mip_level: 0, origin: Default::default(), aspect: wgpu::TextureAspect::All },
                 bytemuck::cast_slice(&mask), wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size.0*16), rows_per_image: Some(size.1) },
+                wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 });
+            // Exact binary16 fractions match the full mask without introducing quantization differences.
+            let red: Vec<u16> = mask.iter().map(|p| match p[2] {
+                0.0 => 0x0000, 0.25 => 0x3400, 0.5 => 0x3800, 0.75 => 0x3a00, 1.0 => 0x3c00,
+                _ => unreachable!(),
+            }).collect();
+            renderer.queue.write_texture(wgpu::TexelCopyTextureInfo { texture: &red_texture, mip_level: 0, origin: Default::default(), aspect: wgpu::TextureAspect::All },
+                bytemuck::cast_slice(&red), wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size.0*2), rows_per_image: Some(size.1) },
                 wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 });
         for bits in 1..16 {
             let settings = SpatialSettings {
@@ -466,9 +492,14 @@ mod tests {
                     timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
                 });
             }
-            assert!(post.encode(&renderer.device, &renderer.queue, &mut encoder, &source, &depth, &fog, Some((&motion,&ids)), size, settings, projection, &output_view, None));
+            assert!(post.encode(&renderer.device, &renderer.queue, &mut encoder, &source, &depth, fog_view, Some((&motion,&ids)), size, settings, projection, &output_view, None));
             renderer.queue.submit([encoder.finish()]);
             let actual = crate::texture_to_rgba(&renderer, &output, size.0, size.1).unwrap();
+            if fog_red {
+                assert_eq!(actual,blue_outputs[bits as usize-1], "R16F and full B fog must guard identically (case {fog_case}, effects {bits})");
+            } else {
+                blue_outputs.push(actual.clone());
+            }
             if fog_case < 2 && (bits == 1 || bits == 4) {
                 assert_ne!(actual,pixels,"uniform-fog bokeh/sharpening must remain functional");
                 assert!(actual.as_chunks::<4>().0.iter().zip(pixels.as_chunks::<4>().0)
@@ -486,8 +517,9 @@ mod tests {
             assert!(actual.as_chunks::<4>().0.iter().all(|p|p[3]==255));
             let [half, tiles] = dof_sizes(size);
             let dof_bytes = if bits&1 != 0 { u64::from(half.0)*u64::from(half.1)*26 + u64::from(tiles.0)*u64::from(tiles.1)*8 } else { 0 };
-            assert_eq!(post.bytes(), 828 + dof_bytes + u64::from(size.0) * u64::from(size.1) * 4 * u64::from((bits as u32).count_ones()-1));
+            assert_eq!(post.bytes(), 844 + dof_bytes + u64::from(size.0) * u64::from(size.1) * 4 * u64::from((bits as u32).count_ones()-1));
         }
+            }
         }
         // Exercise the shader, not a CPU copy of CoC: exact focus is untouched,
         // and far depths must not collapse to one hard-clamped blur radius.
@@ -643,6 +675,6 @@ mod tests {
         let mut encoder = renderer.device.create_command_encoder(&Default::default());
         assert!(!post.encode(&renderer.device, &renderer.queue, &mut encoder, &source, &depth, &fog, None, size, SpatialSettings::default(), projection, &output_view, None));
         assert!(post.frame.is_none(), "all-off must release every target and bind group");
-        assert_eq!(post.bytes(), 828, "off retains uniforms, immutable aperture and fallback texels only");
+        assert_eq!(post.bytes(), 844, "off retains uniforms, immutable aperture and fallback texels only");
     }
 }

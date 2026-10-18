@@ -25,7 +25,7 @@ pub(super) struct Leaves {
     enabled: bool,
 }
 struct Compiled {
-    key: (u32, bool, bool, bool, NightMode, bool, bool, bool, bool),
+    key: (u32, bool, bool, bool, NightMode, bool, bool, bool, bool, bool),
     beauty: [pipeline_creation::RenderPipeline; 2],
     shadow: pipeline_creation::RenderPipeline,
     uniform: wgpu::Buffer,
@@ -196,7 +196,7 @@ impl Leaves {
     }
 }
 impl Compiled {
-    fn new(renderer: &Renderer, key: (u32, bool, bool, bool, NightMode, bool, bool, bool, bool)) -> Self {
+    fn new(renderer: &Renderer, key: (u32, bool, bool, bool, NightMode, bool, bool, bool, bool, bool)) -> Self {
         let device = &renderer.device;
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("canopy wind"), entries: &[wgpu::BindGroupLayoutEntry {
@@ -213,7 +213,7 @@ impl Compiled {
             cloud_shadows: water, material_reflections: key.7, indirect_light: key.8, ..Default::default()
         });
         let shaders = [false, true].map(|water| {
-            let mut source = shader_source((key.1 || key.8, key.2, key.3, water, key.8), key.4, key.5, key.6);
+            let mut source = shader_source_with_fog((key.1 || key.8, key.2, key.3, water, key.8), key.4, key.5, key.6, key.9);
             if compact(water) {
                 source = source.replace("@location(7) albedo:", "@location(2) albedo:");
             }
@@ -250,7 +250,7 @@ impl Compiled {
             let albedo = key.8.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: None, write_mask: wgpu::ColorWrites::ALL });
             let targets = [Some(wgpu::ColorTargetState { format: renderer.format, blend: None, write_mask: wgpu::ColorWrites::ALL }),
                 (key.1 || key.8).then_some(wgpu::ColorTargetState { format: ambient_format, blend: None, write_mask: wgpu::ColorWrites::ALL }),
-                if compact { albedo.clone() } else { key.2.then(auxiliary).flatten() }, key.3.then(auxiliary).flatten(),
+                if compact { albedo.clone() } else { key.2.then(auxiliary).flatten() }, key.3.then(|| wgpu::ColorTargetState { format: crate::enhanced::sun_format(&renderer.enhanced_settings), blend: None, write_mask: wgpu::ColorWrites::ALL }),
                 water.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R16Float, blend: None, write_mask: wgpu::ColorWrites::RED }),
                 key.7.then(auxiliary).flatten(), key.7.then(auxiliary).flatten(),
                 if compact { None } else { albedo }];
@@ -275,7 +275,11 @@ impl Compiled {
         Self { key, beauty: [make(false, false), make(false, true)], shadow: make(true, false), uniform, bind }
     }
 }
+#[cfg(test)]
 fn shader_source(channels: (bool, bool, bool, bool, bool), night: NightMode, moon_shadows: bool, sun_shadows: bool) -> String {
+    shader_source_with_fog(channels, night, moon_shadows, sun_shadows, false)
+}
+fn shader_source_with_fog(channels: (bool, bool, bool, bool, bool), night: NightMode, moon_shadows: bool, sun_shadows: bool, fog_red: bool) -> String {
     let leaf = crate::shader_source::load("foliage_leaves.wgsl", include_str!("foliage_leaves.wgsl"))
         .replace("struct CanopyOutput {", if channels.4 { "struct CanopyOutput {\n @location(7) albedo: vec4<f32>," } else { "struct CanopyOutput {" })
         .replace("var output: CanopyOutput;", if channels.4 { "var output: CanopyOutput;\n output.albedo = vec4<f32>(0.0);" } else { "var output: CanopyOutput;" })
@@ -293,7 +297,7 @@ fn shader_source(channels: (bool, bool, bool, bool, bool), night: NightMode, moo
     // Reuse native directional budgets and the exact world sun receiver rather
     // than estimating a second sun contribution for sprigs.
     let mut native = crate::enhanced_shader::source(EnhancedSettings {
-        hdr: channels.2, sun_shadows: sun_shadows || (night == NightMode::Moonlit && moon_shadows), night_mode: night, ..Default::default()
+        hdr: channels.2 && !fog_red, taa: fog_red, sun_shadows: sun_shadows || (night == NightMode::Moonlit && moon_shadows), night_mode: night, ..Default::default()
     });
     native = native.replace("    @location(12) env_uv: vec2<f32>,",
         "    @location(12) env_uv: vec2<f32>,\n    @location(13) canopy_corner: vec2<f32>,");
@@ -329,7 +333,7 @@ impl Renderer {
                 label: Some("native canopy sprigs"), contents: bytemuck::cast_slice(&self.canopy_leaves.baked), usage: wgpu::BufferUsages::VERTEX,
             }));
         }
-        let key = (self.world.msaa, s.ambient_occlusion, s.emissive_bloom, s.needs_sun_mask(), s.night_mode, s.moon_shadows, s.sun_shadows, s.material_reflections || s.environment_probe, s.indirect_light);
+        let key = (self.world.msaa, s.ambient_occlusion, s.emissive_bloom, s.needs_sun_mask(), s.night_mode, s.moon_shadows, s.sun_shadows, s.material_reflections || s.environment_probe, s.indirect_light, s.fog_only_mask());
         if self.canopy_leaves.compiled.as_ref().is_none_or(|compiled| compiled.key != key) {
             self.canopy_leaves.compiled = Some(Compiled::new(self, key));
         }
@@ -377,6 +381,13 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compact_canopy_exports_native_fog_without_sun_shares() {
+        let source = shader_source_with_fog((false, false, true, false, false), NightMode::AsGame, false, false, true);
+        assert!(source.contains("output.sun = enhanced_sun(receiver, output.beauty, false, 0.0);"));
+        assert!(source.contains("return vec4<f32>(fog, 0.0, 0.0, beauty.a);"));
+        assert!(!source.contains("sun_share:"));
+    }
     #[test]
     fn generated_canopy_is_excluded_from_indirect_light() {
         for indirect in [false, true] {

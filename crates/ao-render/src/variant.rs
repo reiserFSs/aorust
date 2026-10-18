@@ -13,6 +13,7 @@ pub(super) struct Key {
     indirect_light: bool,
     bloom: bool,
     sun_mask: bool,
+    fog_only: bool,
     foliage: [bool; 6],
     material_specular: bool,
     materials: [bool; 5],
@@ -33,6 +34,7 @@ impl Key {
             grass_shadows: settings.ground_grass && settings.grass_sun_shadows,
             grass_point_shadows: settings.ground_grass && settings.grass_point_shadows,
             bloom: settings.emissive_bloom, sun_mask: settings.needs_sun_mask(), water_cloud: false, msaa,
+            fog_only: settings.fog_only_mask(),
             foliage: [settings.foliage_edges, settings.foliage_sway, settings.foliage_push, settings.foliage_subdivision, settings.foliage_translucency, settings.foliage_lod] }
     }
     pub(super) fn with_water_cloud(mut self, visible: bool) -> Self {
@@ -184,7 +186,7 @@ impl Request {
     pub(super) fn prepare(&self) -> Pipes {
         // Cloud receivers still need the native sun mask without visible water.
         let mut settings = self.settings;
-        settings.hdr |= settings.needs_sun_mask();
+        settings.hdr |= settings.needs_full_sun_mask();
         settings.cloud_shadows = self.key.water_cloud;
         let shader = self.key.enhanced().then(|| {
             let source = super::enhanced_shader::source(settings);
@@ -248,7 +250,7 @@ impl Request {
         let grass = super::grass::Compiled::new(
             &self.device, &self.g_layout, &self.tex_layout, &self.holo_layout, self.key.msaa,
             (settings.ambient_occlusion, settings.emissive_bloom, settings.needs_sun_mask(), self.key.water_cloud, settings.material_reflections || settings.environment_probe, settings.indirect_light),
-            self.settings.sun_shadows || self.settings.moon_shadows || self.key.grass_shadows, self.settings.needs_admitted_lights(), self.format);
+            self.settings.sun_shadows || self.settings.moon_shadows || self.key.grass_shadows, self.settings.needs_admitted_lights(), self.format, super::enhanced::sun_format(&settings));
         Pipes { #[cfg(test)] shader, msaa: self.key.msaa, native_sky_pipes,
             pipes, actor_pipes, ground_pipes, depth_clear_pipe, grass }
     }

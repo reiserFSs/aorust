@@ -200,6 +200,7 @@ pub(super) struct Compiled {
     roots: crate::grass_blades::Compiled,
     samples: u32,
     channels: (bool, bool, bool, bool, bool, bool),
+    fog_red: bool,
     shadows: bool,
     admitted: bool,
 }
@@ -236,6 +237,7 @@ pub(super) struct Grass {
     surface_parities: Vec<u32>,
     samples: u32,
     channels: (bool, bool, bool, bool, bool, bool),
+    fog_red: bool,
     wind_phase: f64,
     filtered_wind: [f32; 3],
     benders: [[f32; 3]; MAX_BENDERS],
@@ -257,7 +259,7 @@ pub(super) struct Grass {
 }
 impl Compiled {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(device: &wgpu::Device, globals: &wgpu::BindGroupLayout, material: &wgpu::BindGroupLayout, palette: &wgpu::BindGroupLayout, samples: u32, channels: (bool, bool, bool, bool, bool, bool), shadows: bool, admitted: bool, format: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device, globals: &wgpu::BindGroupLayout, material: &wgpu::BindGroupLayout, palette: &wgpu::BindGroupLayout, samples: u32, channels: (bool, bool, bool, bool, bool, bool), shadows: bool, admitted: bool, format: wgpu::TextureFormat, sun_format: wgpu::TextureFormat) -> Self {
         let shadows = shadows || admitted;
         let mut entries = vec![
             wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
@@ -283,7 +285,13 @@ impl Compiled {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("grass cells, benders and shared sun receiver"), entries: &entries,
         });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("native material grass"), source: wgpu::ShaderSource::Wgsl(shader_source_with_lights(channels, shadows, admitted).into()) });
+        let fog_red = sun_format == wgpu::TextureFormat::R16Float;
+        let mut source = shader_source_with_lights(channels, shadows, admitted);
+        if fog_red {
+            source = source.replace("output.sun = vec4<f32>(sun_luma * grass_direct_visibility * (1.0 - fog), i.normal.w * (1.0 - fog), fog, 1.0);", "output.sun = vec4<f32>(fog, 0.0, 0.0, 1.0);");
+            source = source.replace("let sun_luma = dot(sun_share, vec3<f32>(0.2126, 0.7152, 0.0722));", "");
+        }
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("native material grass"), source: wgpu::ShaderSource::Wgsl(source.into()) });
         let roots = crate::grass_blades::Compiled::new(device, globals, &entries, &shader);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("grass"), bind_group_layouts: &[Some(globals), Some(material), Some(palette), Some(&layout)], immediate_size: 0 });
         let compact_indirect = channels.5 && !channels.1 && !channels.2 && !channels.3 && !channels.4;
@@ -292,7 +300,7 @@ impl Compiled {
             (channels.0 || channels.5).then_some(wgpu::ColorTargetState { format: crate::enhanced::ambient_format(&crate::EnhancedSettings { ambient_occlusion: channels.0, indirect_light: channels.5, ..Default::default() }), blend: None, write_mask: wgpu::ColorWrites::ALL }),
             channels.1.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL }),
             // HDR sun mask: blades write the same surviving sun share as the ground.
-            channels.2.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+            channels.2.then_some(wgpu::ColorTargetState { format: sun_format, blend: None, write_mask: wgpu::ColorWrites::ALL }),
             channels.3.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R16Float, blend: None, write_mask: wgpu::ColorWrites::RED }),
             channels.4.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL }),
             channels.4.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL }),
@@ -308,7 +316,7 @@ impl Compiled {
             depth_stencil: Some(wgpu::DepthStencilState { format: super::DEPTH, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::LessEqual), stencil: Default::default(), bias: Default::default() }),
             multisample: wgpu::MultisampleState { count: samples, alpha_to_coverage_enabled: samples > 1, ..Default::default() }, multiview_mask: None, cache: None,
         });
-        Self { pipeline, layout, roots, samples, channels, shadows, admitted }
+        Self { pipeline, layout, roots, samples, channels, shadows, admitted, fog_red }
     }
     pub fn is_ready(&self) -> bool {
         self.pipeline.is_ready() && self.roots.is_ready()
@@ -324,7 +332,7 @@ impl Compiled {
 }
 impl Grass {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, green: &GreenMasks, compiled: &Compiled) -> Self {
-        let Compiled { pipeline, layout, roots, samples, channels, shadows, admitted } = compiled.clone();
+        let Compiled { pipeline, layout, roots, samples, channels, shadows, admitted, fog_red } = compiled.clone();
         let cells_buffer = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("grass cell cache"), size: (MAX_CELLS * std::mem::size_of::<Cell>()) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let params_buffer = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("grass wind and benders"), size: std::mem::size_of::<Params>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let visible_buffer = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("grass visible cells"), size: (BANDS * MAX_CELLS * 4) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -344,6 +352,7 @@ impl Grass {
             admitted,
             roots,
             root_cache: crate::grass_blades::Cache::new(device),
+            fog_red,
             pipeline, bind, layout, shadows, cells_buffer, params_buffer, visible_buffer, noise_view, noise_sampler, mask_view, green_bytes: green.layers.len(), cells: Vec::with_capacity(MAX_CELLS), batches: Vec::with_capacity(MAX_CELLS), visible: std::array::from_fn(|_| Vec::with_capacity(MAX_CELLS)), draws: Vec::new(), stride: 0, band_strides: [0; BANDS], surface_heights: Vec::new(), surface_parities: Vec::new(), samples, channels, wind_phase: 0.0, filtered_wind, benders: [[0.0; 3]; MAX_BENDERS], bender_count: 0, inputs: Vec::with_capacity(MAX_BENDERS), prepare_cpu_ns: 0, exposure: None, exposure_cache: std::collections::HashMap::with_capacity(MAX_EXPOSURE_CELLS * 2), exposure_order: std::collections::VecDeque::with_capacity(MAX_EXPOSURE_CELLS), candidates: Vec::with_capacity(MAX_CELLS), order: Vec::with_capacity(MAX_CELLS), last_selection: None, last_radius: 0, last_path: super::GroundPath::Simple, pending: false };
         grass.refresh_plain_bind(device);
         grass
@@ -351,7 +360,7 @@ impl Grass {
     /// A render variant owns programs, not terrain/exposure or admitted motion.
     /// Retain those resources when shadow/AO/MSAA switches change the layout.
     fn reconfigure(&mut self, device: &wgpu::Device, compiled: &Compiled) {
-        let Compiled { pipeline, layout, roots, samples, channels, shadows, admitted } = compiled.clone();
+        let Compiled { pipeline, layout, roots, samples, channels, shadows, admitted, fog_red } = compiled.clone();
         self.pipeline = pipeline;
         self.layout = layout;
         self.roots = roots;
@@ -359,6 +368,7 @@ impl Grass {
         self.samples = samples;
         self.channels = channels;
         self.shadows = shadows;
+        self.fog_red = fog_red;
         self.admitted = admitted;
         self.refresh_plain_bind(device);
     }
@@ -942,6 +952,10 @@ impl super::Renderer {
         let shadows = settings.sun_shadows || settings.moon_shadows || (settings.ground_grass && settings.grass_sun_shadows) || admitted;
         if let Some(grass) = &mut self.grass {
             if grass.samples == samples && (grass.channels.0, grass.channels.1, grass.channels.2, grass.channels.4, grass.channels.5) == (channels.0, channels.1, channels.2, channels.4, channels.5) && grass.shadows == shadows && grass.admitted == admitted {
+                if grass.fog_red != self.world.grass.fog_red {
+                    grass.pipeline = self.world.grass.pipeline.clone();
+                    grass.fog_red = self.world.grass.fog_red;
+                }
                 if grass.channels.3 != channels.3 {
                     // Paired water-output programs share the same resource layout.
                     // Keep buffers, receiver bindings and interaction history intact.
@@ -2083,13 +2097,13 @@ mod blade_appearance_tests {
             assert_eq!(source.contains("grass_direct_visibility = visible;"), shadows,
                 "the HDR sun mask excludes beauty's retained shadow floor");
             // Creating the pipeline validates the shader against the real bind-group layouts.
-            let grass = super::Compiled::new(&renderer.device, &renderer.g_layout, &renderer.tex_layout, &renderer.holo_layout, 1, (ao, bloom, hdr, water, false, false), shadows, false, renderer.format);
+            let grass = super::Compiled::new(&renderer.device, &renderer.g_layout, &renderer.tex_layout, &renderer.holo_layout, 1, (ao, bloom, hdr, water, false, false), shadows, false, renderer.format, crate::enhanced::AUX);
             grass.wait();
             assert!(grass.is_ready());
         }
         for shadows in [false, true] {
             let grass = super::Compiled::new(&renderer.device, &renderer.g_layout, &renderer.tex_layout, &renderer.holo_layout,
-                1, (false, false, false, false, false, false), shadows, true, renderer.format);
+                1, (false, false, false, false, false, false), shadows, true, renderer.format, crate::enhanced::AUX);
             grass.wait();
             assert!(grass.is_ready(), "admitted grass receiver must validate against its actual bindings");
         }

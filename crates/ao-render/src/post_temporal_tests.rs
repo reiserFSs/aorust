@@ -421,15 +421,21 @@ fn post_temporal_native_fog_accumulates_and_color_density_change_rejects_history
     let settings = EnhancedSettings { taa: true, ..Default::default() };
     let mut accumulated = renderer();
     let mut current_only = renderer();
-    for r in [&mut accumulated, &mut current_only] {
+    let mut full_mask = renderer();
+    for r in [&mut accumulated, &mut current_only, &mut full_mask] {
         r.upload(&scene);
         r.env.fog_start = 0.1;
         r.env.fog_end = 10.0;
         r.env.fog_color = [0.18, 0.25, 0.32];
         r.set_enhanced_settings(settings);
     }
+    // Sky discs require the full sun mask, but cannot affect this checker interior.
+    full_mask.set_enhanced_settings(EnhancedSettings { sky_discs: true, ..settings });
+    assert!(settings.fog_only_mask());
+    assert!(!full_mask.enhanced_settings.fog_only_mask());
     let capture = Capture::new(&accumulated, size);
     let control = Capture::new(&current_only, size);
+    let full_capture = Capture::new(&full_mask, size);
     let interior: Vec<_> = (40..88).flat_map(|y| (64..128).map(move |x| ((y * size.0 + x) * 4) as usize)).collect();
     let mut history_changes = 0;
     for frame in 0..16 {
@@ -439,6 +445,11 @@ fn post_temporal_native_fog_accumulates_and_color_density_change_rejects_history
         current_only.reset_motion_vectors();
         let actual = capture.pixels(&mut accumulated, &camera);
         let cold = control.pixels(&mut current_only, &camera);
+        let blue = full_capture.pixels(&mut full_mask, &camera);
+        for &i in &interior {
+            assert_eq!(actual[i..i + 4],blue[i..i + 4],
+                "TAA must preserve identical native fog through compact R and full B masks at frame {frame}, pixel {}", i/4);
+        }
         if frame > 1 {
             history_changes += interior.iter().filter(|&&i|
                 actual[i..i + 3] != cold[i..i + 3]).count();
@@ -447,13 +458,19 @@ fn post_temporal_native_fog_accumulates_and_color_density_change_rejects_history
     assert!(history_changes > 0, "native-fogged checker interiors must accumulate TAA, not silently bypass it");
     // Both the stronger extinction and new fog colour apply immediately. The
     // old weaker/differently coloured atmosphere must not survive this reset.
-    for r in [&mut accumulated, &mut current_only] {
+    for r in [&mut accumulated, &mut current_only, &mut full_mask] {
         r.env.fog_end = 4.0;
         r.env.fog_color = [0.45, 0.12, 0.28];
     }
     current_only.reset_motion_vectors();
-    assert_eq!(capture.pixels(&mut accumulated, &camera), control.pixels(&mut current_only, &camera),
+    let actual = capture.pixels(&mut accumulated, &camera);
+    assert_eq!(actual, control.pixels(&mut current_only, &camera),
         "stronger native fog with a new colour must equal the current-only rendered control byte-for-byte");
+    let blue = full_capture.pixels(&mut full_mask, &camera);
+    for &i in &interior {
+        assert_eq!(actual[i..i + 4],blue[i..i + 4],
+            "fog colour/density history reset must match for compact R and full B masks");
+    }
 }
 
 #[test]

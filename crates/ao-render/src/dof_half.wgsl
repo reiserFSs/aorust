@@ -1,6 +1,6 @@
 // Golden-spiral aperture adapted from ao-vk (MIT, Copyright 2026 wannabuh).
 // See THIRD_PARTY. All inputs are resolved, current-visible-frame textures.
-struct Params { projection: vec4<f32>, effect: vec4<f32>, fog_color: vec4<f32> }
+struct Params { projection: vec4<f32>, effect: vec4<f32>, fog_color: vec4<f32>, mask: vec4<f32> }
 @group(0) @binding(0) var image: texture_2d<f32>;
 @group(0) @binding(1) var depth: texture_depth_2d;
 @group(0) @binding(2) var<uniform> params: Params;
@@ -27,7 +27,8 @@ fn full_data(p: vec2<i32>) -> vec3<f32> {
     let q = full_coord(p);
     let d = textureLoad(depth,q,0);
     let iz = params.effect.w-d*(params.effect.w-params.fog_color.w);
-    return vec3(coc(iz),clamp(textureLoad(fog_mask,q,0).b,0.0,1.0),iz);
+    let mask = textureLoad(fog_mask,q,0);
+    return vec3(coc(iz),clamp(select(mask.b,mask.r,params.mask.x>0.5),0.0,1.0),iz);
 }
 struct Prepared { @location(0) colour: vec4<f32>, @location(1) data: vec4<f32> }
 fn prefer(candidate: vec3<f32>, current: vec3<f32>) -> bool {

@@ -79,7 +79,7 @@ impl Temporal {
         let jitter=halton_jitter(self.frame); self.frame=self.frame.wrapping_add(1); jitter
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn encode(&mut self,device:&wgpu::Device,queue:&wgpu::Queue,encoder:&mut wgpu::CommandEncoder,current:&wgpu::TextureView,motion:&wgpu::TextureView,identity:&wgpu::TextureView,depth:&wgpu::TextureView,fog:&wgpu::TextureView,fog_color:[f32;3],actor_visibility_changed:&wgpu::Buffer){
+    pub fn encode(&mut self,device:&wgpu::Device,queue:&wgpu::Queue,encoder:&mut wgpu::CommandEncoder,current:&wgpu::TextureView,motion:&wgpu::TextureView,identity:&wgpu::TextureView,depth:&wgpu::TextureView,fog:&wgpu::TextureView,fog_color:[f32;3],fog_red:bool,actor_visibility_changed:&wgpu::Buffer){
         let old=&self.history[1-self.index]; let out=&self.history[self.index];
         if self.bindings[self.index].is_none() {
             let views=[current,&old.colour,motion,identity,&old.identity,depth,&old.depth,fog];
@@ -87,7 +87,7 @@ impl Temporal {
             self.bindings[self.index]=Some(device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {label:Some("Temporal current frame"),layout:&self.layout,entries:&entries}));
         }
         let bg=self.bindings[self.index].as_ref().expect("temporal inputs initialized");
-        queue.write_buffer(&self.params,0,bytemuck::cast_slice(&[self.size.0 as f32,self.size.1 as f32,0.0,0.0,if self.valid {1.0}else{0.0},fog_color[0],fog_color[1],fog_color[2]]));
+        queue.write_buffer(&self.params,0,bytemuck::cast_slice(&[self.size.0 as f32,self.size.1 as f32,f32::from(u8::from(fog_red)),0.0,if self.valid {1.0}else{0.0},fog_color[0],fog_color[1],fog_color[2]]));
         let attachments=[&out.colour,&out.identity,&out.depth].map(|view|Some(wgpu::RenderPassColorAttachment {view,resolve_target:None,depth_slice:None,ops:wgpu::Operations {load:wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),store:wgpu::StoreOp::Store}}));
         let mut pass=encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {label:Some("Enhanced TAA"),color_attachments:&attachments,depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None,multiview_mask:None});
         pass.set_pipeline(&self.pipeline);pass.set_bind_group(0,bg,&[]);pass.draw(0..3,0..1);drop(pass);
@@ -147,7 +147,7 @@ impl crate::Renderer {
         let (input, input_source) = self.post_target.as_ref().map_or(
             (&frame.colour, &frame.composite_bg), |target| (&target.view, &target.source));
         if let (Some(temporal), Some(motion)) = (&mut self.temporal, &self.motion_vectors) {
-            temporal.encode(&self.device,&self.queue,encoder,input,motion.motion_view(),motion.identity_view(),&frame.resolved_depth,frame.sun.as_ref().expect("postprocessing owns native fog mask"),self.post_fog_color.unwrap_or_default().map(crate::gamma),motion.visibility_changed());
+            temporal.encode(&self.device,&self.queue,encoder,input,motion.motion_view(),motion.identity_view(),&frame.resolved_depth,frame.sun.as_ref().expect("postprocessing owns native fog mask"),self.post_fog_color.unwrap_or_default().map(crate::gamma),self.enhanced_settings.fog_only_mask(),motion.visibility_changed());
         }
         let (view, source) = self.temporal.as_ref().map_or((input,input_source),|temporal|(temporal.output(),temporal.source()));
         let settings = self.enhanced_settings;
@@ -160,6 +160,7 @@ impl crate::Renderer {
             near: self.lens.near, far,
             focus_depth: self.post_focus.map(|p|(Vec3::from_array(p)-camera.pos).dot(camera.forward())).filter(|z|*z>self.lens.near),
             fog_color: self.post_fog_color.unwrap_or_default().map(crate::gamma),
+            fog_red: settings.fog_only_mask(),
         };
         let motion = self.motion_vectors.as_ref().map(|motion|(motion.motion_view(),motion.identity_view()));
         let output = self.heat_haze.source().unwrap_or(output);

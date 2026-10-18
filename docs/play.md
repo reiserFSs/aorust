@@ -1231,6 +1231,10 @@ writes directly to presentation; ungraded/unbloomed input reuses resolved native
 colour without another full-resolution copy. No gather tap
 reads MSAA samples. Native-fog rejection is retained at reduction, gather and
 upsample; small native highlights retain circular apertures rather than a box blur.
+When post effects are the only native-mask consumers, the world exports exact
+native fog to R16F rather than computing/storing unused sun shares, openness and
+coverage. Other mask consumers retain their RGBA16F layout; post uniforms select
+the appropriate channel without quantizing fog or changing native extinction.
 `spatial_shaders_validate_on_gpu` guards exact focus, progressive background
 blur, far highlights across different far depths, circular support and
 foreground isolation. `dof_targets_round_up_without_losing_edge_pixels` covers odd and 1px targets.
@@ -2840,8 +2844,8 @@ policy as the main timing pass; post camera-yaw sweeps remain a separate report.
 Neither timing pass changes capture/repeat poses or their effect time of zero.
 Both reports give full-frame nearest-rank p50/p95/p99 in milliseconds, not isolated
 pass cost. Acquire the shared GPU timing lock; no concurrent captures or GPU tests.
-`AOMAC_GFX_EFFECT_TIMING=1` separately collects 180 frozen frames with the existing
-per-effect profiler and writes `<view>-effects.txt` (label, rolling mean, samples).
+`AOMAC_GFX_INDIRECT_TIMING=1` separately collects 120 frozen frames with the existing
+per-effect profiler and writes `<view>-effect-gpu.txt` (label, rolling mean, samples).
 These overlapping/dependency-inclusive intervals are not additive exclusive pass
 costs; use the full-frame ABBA reports for feature-cost claims.
 

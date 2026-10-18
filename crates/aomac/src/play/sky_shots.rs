@@ -410,7 +410,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         ensure!(!interaction, "sequence mode replaces AOMAC_GFX_FOLIAGE_INTERACTION");
         ensure!(std::env::var_os("AOMAC_GFX_FRAME_TIMING").is_none()
             && std::env::var_os("AOMAC_GFX_SHADOW_TIMING").is_none()
-            && std::env::var_os("AOMAC_GFX_EFFECT_TIMING").is_none()
+            && std::env::var_os("AOMAC_GFX_INDIRECT_TIMING").is_none()
             && std::env::var_os("AOMAC_GFX_TIMING_PAN").is_none(),
             "sequence evidence and frozen timing must be separate runs");
     }

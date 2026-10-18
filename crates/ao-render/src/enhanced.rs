@@ -11,6 +11,11 @@ pub(super) fn ambient_format(settings: &crate::EnhancedSettings) -> wgpu::Textur
     if settings.indirect_light && !settings.ambient_occlusion { ALBEDO } else { AUX }
 }
 
+/// Post-only consumers need the exact native fog component, not directional metadata.
+pub(super) fn sun_format(settings: &crate::EnhancedSettings) -> wgpu::TextureFormat {
+    if settings.fog_only_mask() { wgpu::TextureFormat::R16Float } else { AUX }
+}
+
 /// Reuse the otherwise disabled emission slot for albedo, avoiding sparse MRT exports.
 pub(super) fn compact_indirect(settings: &crate::EnhancedSettings) -> bool {
     settings.indirect_light && !settings.emissive_bloom && !settings.needs_sun_mask()
@@ -29,7 +34,7 @@ pub(super) struct EnhancedFrame {
     pub colour: wgpu::TextureView,
     pub ambient: Option<wgpu::TextureView>,
     pub emissive: Option<wgpu::TextureView>,
-    /// Directional share (r), terrain sky openness (g), native fog (b), admitted coverage (a).
+    /// Full mask: directional (r), openness (g), native fog (b), coverage (a); post-only: fog (r).
     pub sun: Option<wgpu::TextureView>,
     pub water_cloud: Option<wgpu::TextureView>,
     pub reflection_surface: Option<wgpu::TextureView>,
@@ -58,7 +63,7 @@ impl EnhancedFrame {
         let compact_indirect = compact_indirect(&settings);
         let ambient = (settings.ambient_occlusion || settings.indirect_light).then(|| make(ambient_format, 1, "Enhanced ambient share"));
         let emissive = settings.emissive_bloom.then(|| make(AUX, 1, "Enhanced authored emission"));
-        let sun = settings.needs_sun_mask().then(|| make(AUX, 1, "Enhanced sun mask"));
+        let sun = settings.needs_sun_mask().then(|| make(sun_format(&settings), 1, "Enhanced sun mask"));
         let water_cloud = water_cloud.then(|| Self::water_cloud_view(device, size, 1));
         let reflections = settings.material_reflections || settings.environment_probe;
         let reflection_surface = reflections.then(|| make(AUX, 1, "Reflection normal roughness"));
@@ -66,7 +71,7 @@ impl EnhancedFrame {
         let albedo = settings.indirect_light.then(|| make(ALBEDO, 1, "Indirect diffuse albedo"));
         let depth = make(DEPTH, samples, "Enhanced sampleable depth");
         let resolved_depth = if samples == 1 { depth.clone() } else { make(DEPTH, 1, "Enhanced resolved depth") };
-        let msaa = (samples > 1).then(|| [Some(make(format, samples, "Enhanced MSAA native colour")), (settings.ambient_occlusion || settings.indirect_light).then(|| make(ambient_format, samples, "Enhanced MSAA ambient")), if compact_indirect { Some(make(ALBEDO, samples, "MSAA indirect albedo")) } else { settings.emissive_bloom.then(|| make(AUX, samples, "Enhanced MSAA emission")) }, settings.needs_sun_mask().then(|| make(AUX, samples, "Enhanced MSAA sun mask")), water_cloud.as_ref().map(|_| Self::water_cloud_view(device, size, samples)), reflections.then(|| make(AUX, samples, "MSAA reflection surface")), reflections.then(|| make(AUX, samples, "MSAA reflection admission")), (settings.indirect_light && !compact_indirect).then(|| make(ALBEDO, samples, "MSAA indirect albedo"))]);
+        let msaa = (samples > 1).then(|| [Some(make(format, samples, "Enhanced MSAA native colour")), (settings.ambient_occlusion || settings.indirect_light).then(|| make(ambient_format, samples, "Enhanced MSAA ambient")), if compact_indirect { Some(make(ALBEDO, samples, "MSAA indirect albedo")) } else { settings.emissive_bloom.then(|| make(AUX, samples, "Enhanced MSAA emission")) }, settings.needs_sun_mask().then(|| make(sun_format(&settings), samples, "Enhanced MSAA sun mask")), water_cloud.as_ref().map(|_| Self::water_cloud_view(device, size, samples)), reflections.then(|| make(AUX, samples, "MSAA reflection surface")), reflections.then(|| make(AUX, samples, "MSAA reflection admission")), (settings.indirect_light && !compact_indirect).then(|| make(ALBEDO, samples, "MSAA indirect albedo"))]);
         let composite = compiled.colour.clone();
         let composite_bg = bind(device, &compiled.colour_layout, &colour);
         let depth_resolve = (samples > 1).then(|| (compiled.depth.clone(), bind(device, &compiled.depth_layout, &depth)));

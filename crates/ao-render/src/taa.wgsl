@@ -14,6 +14,11 @@ struct Params { size: vec4<f32>, control: vec4<f32> }
     return vec4<f32>(vec2<f32>(f32((i<<1u)&2u),f32(i&2u))*2.0-1.0,0.0,1.0);
 }
 fn bounded(p:vec2<i32>)->vec2<i32>{return clamp(p,vec2<i32>(0),vec2<i32>(params.size.xy)-1);}
+// size.z uses an otherwise unused lane; control retains history validity and fog colour.
+fn fog_fraction(p:vec2<i32>)->f32{
+    let mask=textureLoad(native_fog,p,0);
+    return select(mask.b,mask.r,params.size.z>0.5);
+}
 fn yc(c:vec3<f32>)->vec3<f32>{return vec3<f32>(dot(c,vec3<f32>(0.25,0.5,0.25)),0.5*(c.r-c.b),dot(c,vec3<f32>(-0.25,0.5,-0.25)));}
 fn rgb(c:vec3<f32>)->vec3<f32>{return vec3<f32>(c.x+c.y-c.z,c.x+c.z,c.x-c.y-c.z);}
 fn luma(c:vec3<f32>)->f32{return dot(c,vec3<f32>(0.2126,0.7152,0.0722));}
@@ -43,7 +48,7 @@ struct Result { @location(0) colour:vec4<f32>, @location(1) id:u32, @location(2)
 @fragment fn resolve(@builtin(position) p:vec4<f32>)->Result {
     let q=vec2<i32>(p.xy); let cur=textureLoad(current,q,0); let id=textureLoad(identity,q,0).r;
     let m=textureLoad(motion,q,0); let prev=p.xy-m.xy*params.size.xy;
-    let fog=textureLoad(native_fog,q,0).b;
+    let fog=fog_fraction(q);
     var c=cur.rgb;
     if actor_visibility_changed==0u && fog<1.0 && params.control.x>0.5 && m.w<1.0 && all(prev>=vec2<f32>(0.5)) && all(prev<params.size.xy-0.5) {
         let hq=bounded(vec2<i32>(prev));
@@ -52,7 +57,7 @@ struct Result { @location(0) colour:vec4<f32>, @location(1) id:u32, @location(2)
             var mean=vec3<f32>(0.0); var square=vec3<f32>(0.0);
             for(var y=-1;y<=1;y++){for(var x=-1;x<=1;x++){
                 let n=bounded(q+vec2<i32>(x,y));
-                let f=textureLoad(native_fog,n,0).b;
+                let f=fog_fraction(n);
                 let valid=textureLoad(identity,n,0).r==id && f<1.0;
                 let sample=select(current_surface,surface(textureLoad(current,n,0).rgb,f),valid);
                 let v=yc(sample); mean+=v; square+=v*v;

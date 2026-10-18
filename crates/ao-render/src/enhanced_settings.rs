@@ -214,14 +214,22 @@ impl EnhancedSettings {
         self.taa || self.fxaa || self.cas || self.motion_blur > 0.0 || self.depth_of_field
     }
 
-    /// Directional share, native fog fraction and authoritative admitted-world coverage (alpha); native sky/cloud depth is not world geometry.
-    pub fn needs_sun_mask(self) -> bool {
-        self.needs_grade() || self.contact_shadows || self.post_enabled()
+    /// Full directional, openness, fog and admitted-world coverage mask.
+    pub(super) fn needs_full_sun_mask(self) -> bool {
+        self.needs_grade() || self.contact_shadows
             || self.cloud_shadows || self.volumetric_shafts || self.cloud_gap_shafts
             || self.height_haze || self.land_haze || self.valley_mist || self.sky_discs
             || self.enhanced_rain || self.wet_surfaces || self.weather_particles
             || self.gpu_spell_particles || self.fluid_smoke
             || self.material_pbr || self.material_reflections || self.environment_probe
+    }
+
+    pub fn needs_sun_mask(self) -> bool {
+        self.needs_full_sun_mask() || self.post_enabled()
+    }
+
+    pub(super) fn fog_only_mask(self) -> bool {
+        self.post_enabled() && !self.needs_full_sun_mask()
     }
 
     /// Bound external preferences, replacing non-finite floats with their defaults.
