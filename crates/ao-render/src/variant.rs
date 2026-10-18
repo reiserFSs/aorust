@@ -6,6 +6,8 @@ use super::{EnhancedSettings, Pipelines, PipelineSpec, build_pipelines, compile_
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct Key {
     shadows: bool,
+    moon_shadows: bool,
+    night_mode: super::NightMode,
     ao: bool,
     bloom: bool,
     sun_mask: bool,
@@ -14,10 +16,11 @@ pub(super) struct Key {
 
 impl Key {
     pub(super) fn of(settings: EnhancedSettings, msaa: u32) -> Self {
-        Self { shadows: settings.sun_shadows, ao: settings.ambient_occlusion,
+        Self { shadows: settings.sun_shadows || settings.moon_shadows, ao: settings.ambient_occlusion,
+            moon_shadows: settings.moon_shadows, night_mode: settings.night_mode,
             bloom: settings.emissive_bloom, sun_mask: settings.needs_sun_mask(), msaa }
     }
-    fn enhanced(self) -> bool { self.shadows || self.ao || self.bloom || self.sun_mask }
+    fn enhanced(self) -> bool { self.shadows || self.ao || self.bloom || self.sun_mask || self.night_mode != super::NightMode::AsGame }
 }
 
 pub(super) struct Pipes {
@@ -133,14 +136,16 @@ impl Request {
 
     pub(super) fn prepare(&self) -> Pipes {
         let shader = self.key.enhanced().then(|| {
-            let source = super::enhanced_shader::source(
-                self.settings.sun_shadows, self.settings.ambient_occlusion,
-                self.settings.emissive_bloom, self.settings.needs_sun_mask());
+            let source = super::enhanced_shader::source(self.settings);
+            let source = if self.settings.night_mode != super::NightMode::AsGame {
+                super::moon_shadows::shader(source, self.settings.moon_shadows, self.settings.night_mode == super::NightMode::Moonlit)
+            } else { source };
             self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("Enhanced world"), source: wgpu::ShaderSource::Wgsl(source.into()),
             })
         });
-        let shadow_layout = self.key.shadows.then(|| super::sun_shadows::receiver_layout(&self.device));
+        let shadow_layout = (self.key.shadows || self.settings.night_mode == super::NightMode::Moonlit)
+            .then(|| super::sun_shadows::receiver_layout(&self.device));
         let mut ordinary = vec![Some(&self.g_layout), Some(&self.tex_layout)];
         let mut holo = vec![Some(&self.g_layout), Some(&self.tex_layout), Some(&self.holo_layout)];
         if let Some(shadow_layout) = shadow_layout.as_ref() {

@@ -651,6 +651,43 @@ knobs; the manifest records
 the full settings value. Selecting a profile does not change the captured world,
 camera, clock, actor equipment or lights.
 
+### Enhanced moon and night lighting
+
+The Lighting page exposes **As Game** (default), **Moonlit**, and **Dark**,
+plus independent **Moon Shadows**, Moon Intensity (0–4), and Dark Night Strength
+(0–1). All switches default off; the shared registry persists and resets these
+controls through the normal root preferences. Fixture profiles are `moonlit`,
+`moon-shadows`, and `dark-night`.
+
+Moonlit uses the actual authored `Scene::moons` poses, phase relative to the
+authored sun, horizon fade, native night-sky colour, and authored daylight.
+The gamma-space energy constants in `moon_shadows.rs` are Enhanced art tuning,
+not a claim that retail moon discs lit world geometry. No new artwork is used.
+Material and native ground receivers apply authored-normal illumination before
+the unchanged native material/fog equations. The native collision-baked ground
+lattice closes roofs and unknown locations; no actor contributes exposure.
+Dark attenuates native ambient/daylight without suppressing retained local light.
+
+`Renderer::enhanced_moonlight()` returns the intensity-scaled authored source
+only in Moonlit mode with valid above-horizon, nonzero-phase nighttime input.
+`Renderer::enhanced_shadow_moonlight()` returns only actual encoded Moon-map
+metadata after shadow encoding, never the unshadowed source or dummy bindings.
+Moonlit without maps reuses a 1×1 SunShadows receiver for the exposure binding;
+Moon Shadows or Volumetric Shafts can independently request native cascades.
+Surface Moon-shadow sampling remains controlled by Moon Shadows. All-off uses
+the native shader unchanged apart from the shared Globals tail declarations.
+
+Focused headless regressions: `cargo test --release -p ao-render moon -j2 --
+--nocapture --test-threads=1` exercises authored phase/daylight, native lattice
+interpolation, independent night shader combinations, actual material and ground
+RGB increases, roof closure, native fully-fogged identity, exact all-off
+roundtrip, independent shaft-map metadata, unknown-clock Dark neutrality, and
+hidden/non-admitted actor image identity with a visible positive control.
+The shared settings persistence/reset regression is
+`enhanced_graphics_default_persistence_independence_and_reset` in `aomac`.
+At 1× MSAA, `icc-landmark-authored` retained zero differing RGBA bytes and zero
+maximum channel error against the PNG-only original `base-icc` fixture.
+
 Atmosphere controls are independent checkboxes under **F10 → Enhanced → Sky & Weather**
 and default off. They persist in the normal account-independent root `Prefs.xml`.
 The registry's page reset restores that page; its global reset restores all Enhanced controls.

@@ -522,3 +522,138 @@ fn soft_shadow_penumbra_grows_with_caster_distance_and_is_stable() {
     let at = (y * width as usize + x) * 4 + 1;
     assert!(half[at] > soft[at] && half[at] <= original[at], "shadow strength must keep part of the sun: {} {} {}", soft[at], half[at], original[at]);
 }
+
+#[test]
+fn moon_receivers_positive_roof_fog_and_all_off_roundtrip() {
+    use ao_scene::ground_detail::{GroundCell, GroundPatch};
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let mut renderer = Renderer::new(&instance, None).expect("headless moon receiver GPU");
+    let mut ground = quad([[0.0, 0.0, 0.0], [8.0, 0.0, 0.0], [0.0, 0.0, -8.0], [8.0, 0.0, -8.0]], [0.0, 1.0, 0.0]);
+    ground.submeshes[0].indices = vec![0, 1, 2, 1, 3, 2];
+    for vertex in &mut ground.vertices { vertex.color[3] = 0.0; }
+    let mut scene = Scene {
+        environment: Some(Environment {
+            sky_color: [0.01; 3], fog_color: [0.02; 3], fog_start: 100.0, fog_end: 120.0,
+            ambient: [0.01; 3], sun_color: [0.0; 3], sun_dir: [0.0, -1.0, 0.0], sun_specular: 0.0,
+        }),
+        daylight: Some(0.0),
+        meshes: vec![ground, quad([[1.0, 0.1, -1.0], [3.0, 0.1, -1.0], [1.0, 0.1, -3.0], [3.0, 0.1, -3.0]], [0.0, 1.0, 0.0])],
+        instances: (0..2).map(|mesh| ao_scene::Instance {mesh, transform: ao_scene::IDENTITY}).collect(),
+        ground_detail: vec![GroundPatch {
+            mesh: 0, cells: 1, cell_size: 8.0, heights: vec![0; 4], coarse_submesh: 0,
+            fine_cells: vec![GroundCell {submesh: 0, vertices: [0, 1, 2, 3], ..Default::default()}],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    scene.meshes[1].submeshes[0].indices = vec![0, 1, 2, 1, 3, 2];
+    scene.moons[0] = Some(ao_scene::MoonSource {toward_light: [0.0, 1.0, 0.0], ..Default::default()});
+    renderer.upload(&scene);
+    let camera = Camera::look_at(Vec3::new(4.0, 9.0, 3.0), Vec3::new(4.0, 0.0, -4.0));
+    let (width, height) = (128, 128);
+    let output = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("moon numeric receiver"), size: wgpu::Extent3d {width, height, depth_or_array_layers: 1},
+        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: renderer.format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+    });
+    let capture = |renderer: &mut Renderer, settings| {
+        renderer.set_enhanced_settings(settings);
+        renderer.render(&output.create_view(&Default::default()), &Targets::new(renderer, width, height), &camera);
+        texture_to_rgba(renderer, &output, width, height).unwrap()
+    };
+    let moonlit = EnhancedSettings {night_mode: NightMode::Moonlit, ..Default::default()};
+    let faithful = capture(&mut renderer, EnhancedSettings::default());
+    let lit = capture(&mut renderer, moonlit);
+    let brighter = lit.as_chunks::<4>().0.iter().zip(faithful.as_chunks::<4>().0)
+        .filter(|(a, b)| a[..3].iter().zip(&b[..3]).any(|(x, y)| i16::from(*x) - i16::from(*y) > 4)).count();
+    assert!(brighter > 100, "authored moon must add measurable native receiver energy: {brighter}");
+    let vp = Mat4::perspective_rh(renderer.lens.vertical_fov(1.0), 1.0, renderer.lens.near,
+        renderer.lens.far.unwrap_or(180.0)) * Mat4::look_to_rh(camera.pos, camera.forward(), camera.up());
+    for (name, point) in [("material", Vec3::new(2.0, 0.1, -2.0)), ("ground", Vec3::new(6.0, 0.0, -5.0))] {
+        let clip = vp * point.extend(1.0);
+        let ndc = clip.truncate() / clip.w;
+        let x = ((ndc.x * 0.5 + 0.5) * width as f32) as usize;
+        let y = ((0.5 - ndc.y * 0.5) * height as f32) as usize;
+        let offset = (y * width as usize + x) * 4;
+        assert!(lit[offset..offset + 3].iter().zip(&faithful[offset..offset + 3])
+            .all(|(a, b)| i16::from(*a) - i16::from(*b) > 4), "{name} must receive positive Moon RGB");
+    }
+    assert_eq!(renderer.sun_shadows.as_ref().unwrap().resolution, 1, "unshadowed Moonlit must not allocate cascades");
+    assert!(renderer.enhanced_moonlight().is_some());
+    assert!(renderer.enhanced_shadow_moonlight().is_none(), "dummy bindings are not encoded Moon maps");
+    let mapped = EnhancedSettings {moon_shadows: true, shadow_map_size: 256, ..moonlit};
+    capture(&mut renderer, mapped);
+    assert!(renderer.enhanced_shadow_moonlight().is_some(), "encoded Moon metadata must be public");
+    capture(&mut renderer, EnhancedSettings {volumetric_shafts: true, shadow_map_size: 256, ..moonlit});
+    assert!(renderer.enhanced_shadow_moonlight().is_some(), "shafts request Moon maps independently of surface shadows");
+    assert_eq!(faithful, capture(&mut renderer, EnhancedSettings::default()), "all-off must roundtrip exactly");
+    for vertex in &mut scene.meshes[0].vertices { vertex.color[3] = 1.0; }
+    renderer.upload(&scene);
+    let roofed = capture(&mut renderer, EnhancedSettings::default());
+    assert_eq!(roofed, capture(&mut renderer, moonlit), "native roof exposure must close material and ground receivers");
+    for vertex in &mut scene.meshes[0].vertices { vertex.color[3] = 0.0; }
+    renderer.upload(&scene);
+    renderer.env.fog_start = 0.0;
+    renderer.env.fog_end = 1.0;
+    let fogged = capture(&mut renderer, EnhancedSettings::default());
+    assert_eq!(fogged, capture(&mut renderer, moonlit), "fully native-fogged geometry must retain identity");
+    scene.daylight = None;
+    renderer.upload(&scene);
+    let unknown = capture(&mut renderer, EnhancedSettings::default());
+    assert_eq!(unknown, capture(&mut renderer, EnhancedSettings {night_mode: NightMode::Dark, ..Default::default()}),
+        "unknown authored clock must not darken login, preview or interior geometry");
+}
+
+#[test]
+fn moonlit_hidden_and_nonadmitted_actors_leave_no_shadow_signal() {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let mut renderer = Renderer::new(&instance, None).expect("headless moon shadow GPU");
+    let environment = Environment {
+        sky_color: [0.01; 3], fog_color: [0.0; 3], fog_start: 100.0, fog_end: 120.0,
+        ambient: [0.03; 3], sun_color: [0.0; 3], sun_dir: [0.0, -1.0, 0.0], sun_specular: 0.0,
+    };
+    let mut scene = Scene {
+        meshes: vec![
+            quad([[-8.0, 0.0, -8.0], [8.0, 0.0, -8.0], [8.0, 0.0, 8.0], [-8.0, 0.0, 8.0]], [0.0, 1.0, 0.0]),
+            quad([[-2.0, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, 4.0, 0.0], [-2.0, 4.0, 0.0]], [0.0, 0.0, 1.0]),
+        ],
+        environment: Some(environment), daylight: Some(0.0), ..Default::default()
+    };
+    scene.instances = (0..2).map(|mesh| ao_scene::Instance {mesh, transform: ao_scene::IDENTITY}).collect();
+    scene.moons[0] = Some(ao_scene::MoonSource {toward_light: [-0.8, 0.5, -0.3], ..Default::default()});
+    renderer.upload(&scene);
+    renderer.add_actor_model(1, &Scene {meshes: vec![
+        quad([[-0.4, 0.0, -1.0], [0.4, 0.0, -1.0], [0.4, 1.8, -1.0], [-0.4, 1.8, -1.0]], [0.0, 0.0, 1.0]),
+    ], ..Default::default()});
+    renderer.set_enhanced_settings(EnhancedSettings {
+        night_mode: NightMode::Moonlit, moon_shadows: true, shadow_map_size: 256, ..Default::default()
+    });
+    let (width, height) = (384, 256);
+    let targets = Targets::new(&renderer, width, height);
+    let output = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("moon hidden actor regression"), size: wgpu::Extent3d {width, height, depth_or_array_layers: 1},
+        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: renderer.format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+    });
+    let view = output.create_view(&Default::default());
+    let camera = Camera::look_at(Vec3::new(0.0, 3.0, 8.0), Vec3::new(0.0, 1.0, 0.0));
+    let capture = |renderer: &mut Renderer| {
+        renderer.render(&view, &targets, &camera);
+        texture_to_rgba(renderer, &output, width, height).unwrap()
+    };
+    let absent = capture(&mut renderer);
+    assert!(renderer.enhanced_shadow_moonlight().is_some(), "fixture needs active Moon maps");
+    let body = ao_scene::ActorFrame {id: 1, model: 1, ..Default::default()};
+    for actor in [
+        body.clone(),
+        ao_scene::ActorFrame {priority: Some(8), transform: Mat4::from_translation(Vec3::new(-5.0, 0.0, 0.0)).to_cols_array_2d(), ..body.clone()},
+        ao_scene::ActorFrame {alpha: 0.0, transform: Mat4::from_translation(Vec3::new(3.0, 0.0, 0.0)).to_cols_array_2d(), ..body.clone()},
+    ] {
+        renderer.set_actors(vec![actor]);
+        assert_eq!(absent, capture(&mut renderer), "hidden/nonadmitted actor disclosed itself in moonlight");
+    }
+    renderer.set_actors(vec![ao_scene::ActorFrame {
+        transform: Mat4::from_translation(Vec3::new(-5.0, 0.0, 0.0)).to_cols_array_2d(), ..body
+    }]);
+    assert_ne!(absent, capture(&mut renderer), "positive-control moonlit actor was not visible");
+}

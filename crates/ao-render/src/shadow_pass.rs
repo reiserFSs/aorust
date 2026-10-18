@@ -32,6 +32,7 @@ impl Renderer {
 
     pub(super) fn update_shadow_sun(&mut self, scene: &Scene) {
         self.shadow_sun = authored_sun(scene);
+        self.shadow_moon = crate::moon_shadows::source(scene);
     }
 
     /// Developer/offscreen only. Read each submitted sample before the next frame.
@@ -67,17 +68,26 @@ impl Renderer {
 
     pub(crate) fn encode_enhanced_shadows(&mut self, encoder: &mut wgpu::CommandEncoder, cam: &Camera, size: (u32, u32), env: Environment, far: f32) {
         self.shadow_timer_pending = false;
-        if !self.enhanced_settings.sun_shadows && !self.enhanced_settings.volumetric_shafts {
+        if !self.enhanced_settings.sun_shadows && !self.enhanced_settings.moon_shadows
+            && !self.enhanced_settings.volumetric_shafts && self.enhanced_settings.night_mode != NightMode::Moonlit {
             self.sun_shadows = None;
             return;
         }
-        let resolution = self.enhanced_settings.shadow_map_size.clamp(256, 4096);
-        let mut shadows = self.sun_shadows.take().filter(|s| s.size == size && s.resolution == resolution)
-            .unwrap_or_else(|| SunShadows::new(self, size, resolution));
-        let sun = self.shadow_sun.map(Vec3::from);
+        let directional = self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows || self.enhanced_settings.volumetric_shafts;
+        let resource_size = if directional { size } else { (1, 1) };
+        let resolution = if directional { self.enhanced_settings.shadow_map_size.clamp(256, 4096) } else { 1 };
+        let mut shadows = self.sun_shadows.take().filter(|s| s.size == resource_size && s.resolution == resolution)
+            .unwrap_or_else(|| SunShadows::new(self, resource_size, resolution));
+        let sun = (self.enhanced_settings.sun_shadows || self.enhanced_settings.volumetric_shafts)
+            .then_some(self.shadow_sun).flatten().map(Vec3::from);
         let mut strength = sun.map_or(0.0, |direction| crate::sun_shadows::horizon_fade(direction.normalize().y))
             .min(Vec3::from(env.sun_dir).try_normalize().map_or(0.0, |direction| crate::sun_shadows::horizon_fade(direction.y)));
         if !env.sun_color.iter().any(|&channel| channel > 0.0) { strength = 0.0; }
+        let moon = (self.enhanced_settings.moon_shadows || self.enhanced_settings.volumetric_shafts)
+            .then(|| self.enhanced_moonlight()).flatten().filter(|_| strength <= 0.0);
+        let direction = moon.map(|(direction, _)| Vec3::from(direction)).or(sun);
+        if let Some((direction, _)) = moon { strength = crate::sun_shadows::horizon_fade(Vec3::from(direction).normalize().y); }
+        if !directional { strength = 0.0; }
         if strength <= 0.0 {
             shadows.update(&self.queue, &CascadeFrame { uniform: bytemuck::Zeroable::zeroed() });
             self.sun_shadows = Some(shadows);
@@ -89,7 +99,7 @@ impl Renderer {
         let shadow_far = self.lens.far.unwrap_or(180.0).min(180.0).max(self.lens.near + 0.01);
         let receiver_far = far.min(env.fog_end).min(shadow_far);
         let Some(mut frame) = CascadeFrame::new(cam.pos, cam.forward(), cam.up(), self.lens.vertical_fov(aspect),
-            aspect, self.lens.near, shadow_far, sun.expect("positive authored sun strength"), resolution) else {
+            aspect, self.lens.near, shadow_far, direction.expect("positive authored directional strength"), resolution) else {
             shadows.update(&self.queue, &CascadeFrame { uniform: bytemuck::Zeroable::zeroed() });
             self.sun_shadows = Some(shadows);
             return;
@@ -97,6 +107,10 @@ impl Renderer {
         frame.uniform.forward[3] = strength * self.enhanced_settings.shadow_strength.clamp(0.0, 1.0);
         frame.uniform.eye[3] = receiver_far;
         frame.uniform.control[1] = self.enhanced_settings.shadow_softness.clamp(0.0, 4.0).to_bits();
+        if let Some((direction, budget)) = moon {
+            frame.uniform.moon_direction = Vec3::from(direction).normalize().extend(1.0).to_array();
+            frame.uniform.moon_budget = [budget[0], budget[1], budget[2], 0.0];
+        }
         shadows.update(&self.queue, &frame);
         // The primary pass uses only the native visible list. Cascades also
         // admit loaded static geometry in their bounded light volumes.

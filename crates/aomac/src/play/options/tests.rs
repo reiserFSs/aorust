@@ -941,7 +941,7 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
     let mut d = DValues::new(&tmp);
     let names = ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows",
         "AomacHeightHaze", "AomacLandHaze", "AomacValleyMist", "AomacVolumetricShafts",
-        "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs"];
+        "AomacCloudGapShafts", "AomacVolumetricClouds", "AomacCloudShadows", "AomacSkyDiscs", "AomacMoonShadows"];
     assert_eq!(d.enhanced_settings(), EnhancedSettings::default());
     d.open_user(&tmp, "account", 7);
     // Retain the original combinations, then cover each atmosphere switch and all-on.
@@ -955,13 +955,27 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
             emissive_bloom: mask & 4 != 0, ground_grass: mask & 8 != 0, hdr: mask & 16 != 0, contact_shadows: mask & 32 != 0,
             height_haze: mask & 64 != 0, land_haze: mask & 128 != 0, valley_mist: mask & 256 != 0,
             volumetric_shafts: mask & 512 != 0, cloud_gap_shafts: mask & 1024 != 0,
-            volumetric_clouds: mask & 2048 != 0, cloud_shadows: mask & 4096 != 0, sky_discs: mask & 8192 != 0, ..Default::default()
+            volumetric_clouds: mask & 2048 != 0, cloud_shadows: mask & 4096 != 0, sky_discs: mask & 8192 != 0,
+            moon_shadows: mask & 16384 != 0, ..Default::default()
         };
         assert_eq!(d.enhanced_settings(), expected);
         d.save_user();
         let mut again = DValues::new(&tmp);
         again.open_user(&tmp, "other-account", 99);
         assert_eq!(again.enhanced_settings(), expected);
+    }
+    for mode in 0..=2 {
+        d.set("AomacNightMode", Variant::Int(mode));
+        d.set("AomacMoonIntensity", Variant::Float(2.5));
+        d.set("AomacDarkNightStrength", Variant::Float(0.75));
+        d.save_user();
+        let mut again = DValues::new(&tmp);
+        again.open_user(&tmp, "account", 7);
+        assert_eq!(again.enhanced_settings(), d.enhanced_settings());
+        assert_eq!(d.enhanced_settings().night_mode,
+            [ao_render::NightMode::AsGame, ao_render::NightMode::Moonlit, ao_render::NightMode::Dark][mode as usize]);
+        assert_eq!(again.enhanced_settings().moon_intensity, 2.5);
+        assert_eq!(again.enhanced_settings().dark_night_strength, 0.75);
     }
     d.set("AomacShadowMapSize", Variant::Int(2048));
     for (name, value) in [

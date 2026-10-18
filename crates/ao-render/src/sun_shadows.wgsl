@@ -5,6 +5,8 @@ struct ShadowFrame {
     eye: vec4<f32>,
     forward: vec4<f32>,
     control: vec4<u32>,
+    moon_direction: vec4<f32>,
+    moon_budget: vec4<f32>,
 }
 @group(3) @binding(0) var<uniform> shadow_frame: ShadowFrame;
 @group(3) @binding(1) var shadow_maps: texture_depth_2d_array;

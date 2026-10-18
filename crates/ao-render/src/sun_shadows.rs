@@ -20,7 +20,7 @@ pub(crate) fn receiver_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
-pub(crate) fn receiver_entries() -> [wgpu::BindGroupLayoutEntry; 3] {
+pub(crate) fn receiver_entries() -> [wgpu::BindGroupLayoutEntry; 4] {
     [
             wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform,
@@ -30,6 +30,9 @@ pub(crate) fn receiver_entries() -> [wgpu::BindGroupLayoutEntry; 3] {
                     view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }, count: None },
             wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison), count: None },
+            wgpu::BindGroupLayoutEntry { binding: 7, visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false, min_binding_size: None }, count: None },
     ]
 }
 
@@ -48,6 +51,8 @@ pub(crate) struct ShadowUniform {
     pub eye: [f32; 4],
     pub forward: [f32; 4],
     pub control: [u32; 4],
+    pub moon_direction: [f32; 4],
+    pub moon_budget: [f32; 4],
 }
 
 
@@ -105,11 +110,13 @@ impl CascadeFrame {
         });
         Some(Self { uniform: ShadowUniform { matrices,
             splits: [splits[0], splits[1], splits[2], near], eye: eye.extend(useful_far).to_array(),
-            forward: forward.extend(horizon_fade(authored_sun.y)).to_array(), control: [0; 4] } })
+            forward: forward.extend(horizon_fade(authored_sun.y)).to_array(), control: [0; 4],
+            moon_direction: [0.0; 4], moon_budget: [0.0; 4] } })
     }
 }
 
 pub(crate) struct SunShadows {
+    pub coverage_uniform: ShadowUniform,
     pub receiver: wgpu::BindGroup,
     pub grass_receiver: Option<wgpu::BindGroup>,
     array: wgpu::TextureView,
@@ -253,9 +260,14 @@ impl SunShadows {
         let sampler = device.create_sampler_tracked(&wgpu::SamplerDescriptor { label: Some("sun shadow PCF"),
             compare: Some(wgpu::CompareFunction::LessEqual), mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest, ..Default::default() });
+        let exposure = renderer.moon_exposure.buffer().cloned().unwrap_or_else(|| device.create_buffer_tracked(&wgpu::BufferDescriptor {
+            label: Some("disabled moon exposure header"), size: 32,
+            usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false,
+        }));
         let receiver_entries = [wgpu::BindGroupEntry { binding: 0, resource: uniforms[0].as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&array) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) }];
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+            wgpu::BindGroupEntry { binding: 7, resource: exposure.as_entire_binding() }];
         let receiver = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("sun shadow receiver"),
             layout: &receiver_layout, entries: &receiver_entries });
         let actor_capacity = 64;
@@ -263,6 +275,7 @@ impl SunShadows {
         let cascade_groups = caster_groups(device, caster_layout, &uniforms, &actor_visibility);
         let visibility_group = visibility_group(device, visibility_layout, &primary_ids, &actor_visibility);
         Self { receiver, grass_receiver: None, array, sampler, cascade_groups, layers, _maps: maps,
+            coverage_uniform: ShadowUniform::zeroed(),
             primary_depth, primary_ids, size, resolution, uniforms, compiled,
             static_commands: Vec::new(), static_transforms: Vec::new(),
             static_instances: None, static_capacity: 0, actor_ids: Vec::new(), actor_groups: Default::default(),
@@ -305,7 +318,8 @@ impl SunShadows {
         pass.set_bind_group(0, &self.visibility_group, &[]);
         pass.dispatch_workgroups(self.size.0.div_ceil(8), self.size.1.div_ceil(8), 1);
     }
-    pub fn update(&self, queue: &wgpu::Queue, frame: &CascadeFrame) {
+    pub fn update(&mut self, queue: &wgpu::Queue, frame: &CascadeFrame) {
+        self.coverage_uniform = frame.uniform;
         for (i, buffer) in self.uniforms.iter().enumerate() {
             let mut uniform = frame.uniform;
             uniform.control[0] = i as u32;

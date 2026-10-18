@@ -1,8 +1,12 @@
 //! Enhanced-only shader generation; the faithful WGSL is never modified.
 
-pub(super) fn source(shadows: bool, ao: bool, bloom: bool, hdr: bool) -> String {
-    // The HDR sun mask needs the per-vertex sun shares even when shadows are off.
-    let sun_shares = shadows || hdr;
+pub(super) fn source(settings: crate::EnhancedSettings) -> String {
+    let shadows = settings.sun_shadows || settings.moon_shadows;
+    let ao = settings.ambient_occlusion;
+    let bloom = settings.emissive_bloom;
+    let hdr = settings.needs_sun_mask();
+    // Night receivers also need native directional shares for Dark mode.
+    let sun_shares = shadows || hdr || settings.night_mode != crate::NightMode::AsGame;
     let mut source = crate::shader_source::load("shader.wgsl", include_str!("shader.wgsl")).into_owned();
     source = source.replace("    @location(12) env_uv: vec2<f32>,", "    @location(12) env_uv: vec2<f32>,\n    @location(13) ao_info: vec3<f32>,\n    @location(14) sun_share: vec3<f32>,\n    @location(15) sun_spec_share: vec3<f32>,");
     source = source.replace("    var o: VOut;", "    var o: VOut;\n    o.ao_info = vec3<f32>(0.0);\n    o.sun_share = vec3<f32>(0.0);\n    o.sun_spec_share = vec3<f32>(0.0);");
@@ -18,12 +22,12 @@ pub(super) fn source(shadows: bool, ao: bool, bloom: bool, hdr: bool) -> String 
     source = source.replace("    o.light = min(to_g(emissive) + g.ambient_g.rgb + sun_diffuse * max(sn, 0.0) + dl[0], vec3<f32>(1.0));", "    let native_raw = to_g(emissive) + g.ambient_g.rgb + sun_diffuse * max(sn, 0.0) + dl[0];\n    o.light = min(native_raw, vec3<f32>(1.0));");
     source = source.replace("    o.spec = min(to_g(specular) * (dl[1] + sun_spec), vec3<f32>(1.0));", "    let native_spec = to_g(specular) * (dl[1] + sun_spec);\n    o.spec = min(native_spec, vec3<f32>(1.0));");
     source = source.replace("    return o;\n}\n\n// mode:", "    let excess = max(native_raw - vec3<f32>(1.0), vec3<f32>(0.0));\n    o.ao_info = vec3<f32>(select(0.0, 1.0, all(emissive <= vec3<f32>(0.0))), 0.0, 0.0);\n    o.sun_share = max(sun_diffuse * max(sn, 0.0) - excess, vec3<f32>(0.0));\n    o.sun_spec_share = max(to_g(specular) * sun_spec - max(native_spec - vec3<f32>(1.0), vec3<f32>(0.0)), vec3<f32>(0.0));\n    return o;\n}\n\n// mode:");
-    if shadows {
+    if settings.sun_shadows {
         source = source.replace("    var light = i.light;\n    var spec = i.spec;", "    var shadow = 0.0;\n    if any(i.sun_share > vec3<f32>(0.0)) || any(i.sun_spec_share > vec3<f32>(0.0)) { shadow = 1.0 - sun_visibility(i.wpos); }\n    var light = max(i.light - i.sun_share * shadow, vec3<f32>(0.0));\n    var spec = max(i.spec - i.sun_spec_share * shadow, vec3<f32>(0.0));");
     }
     source = source.replace("    o.light = clamp(g.sun_g.rgb * max(dot(n, g.sun_dir.xyz), 0.0) + vertex_lights(o.wpos, n, 0.0)[0],", "    let ground_local = vertex_lights(o.wpos, n, 0.0)[0];\n    o.light = clamp(g.sun_g.rgb * max(dot(n, g.sun_dir.xyz), 0.0) + ground_local,");
     source = source.replace("    o.dlight = clamp(o.light + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0));", "    o.dlight = clamp(o.light + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0));\n    o.sun_share = vec4<f32>(max(o.light - clamp(ground_local, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(0.0)), 0.0);\n    o.sun_spec_share = vec4<f32>(max(o.dlight - clamp(ground_local + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(0.0)), 0.0);");
-    if shadows {
+    if settings.sun_shadows {
         source = source.replace("clamp(i.light + ground_palette(i),", "clamp(i.light - i.sun_share * (1.0 - sun_visibility(i.wpos)) + ground_palette(i),");
         source = source.replace("ground_tile(i) * i.dlight", "ground_tile(i) * max(i.dlight - i.sun_spec_share * (1.0 - sun_visibility(i.wpos)), vec3<f32>(0.0))");
     }
@@ -190,7 +194,7 @@ mod tests {
 
     #[test]
     fn enhanced_preserves_native_entrypoints_and_separates_baked_light() {
-        let source = super::source(false, true, true, false);
+        let source = super::source(crate::EnhancedSettings { ambient_occlusion: true, emissive_bloom: true, ..Default::default() });
         assert!(source.contains("@fragment fn fs_ground_shadow"));
         assert!(source.contains("@fragment fn fs_lava_crust"));
         assert!(!source.contains("@group(3)"));
@@ -202,18 +206,18 @@ mod tests {
         assert_eq!(boost(super::OUTPUT, "const AO_SKY_BOOST"), boost(include_str!("ambient_occlusion.wgsl"), "const SKY_BOOST"));
         assert_eq!(boost(super::OUTPUT, "const AO_SKY_BOOST").as_deref(), Some("1.25"));
         assert!(super::OUTPUT.contains("const AO_SUN_CAP = 0.6;"), "sunlit creases retain a bounded 60% direct-diffuse budget");
-        let hdr = super::source(false, false, false, true);
+        let hdr = super::source(crate::EnhancedSettings { hdr: true, ..Default::default() });
         let multiplier = hdr.split("@fragment fn fs_ground_shadow(").nth(1).unwrap().split("\n}").next().unwrap();
         assert!(multiplier.contains(", vec4<f32>(1.0));"),
             "without shadows, terrain multiplication preserves the base-pass daylight mask");
-        assert!(super::source(true, false, false, true).contains(
+        assert!(super::source(crate::EnhancedSettings { sun_shadows: true, hdr: true, ..Default::default() }).contains(
             "enhanced_sun_visibility = visible;\n    return mix(1.0, visible, clamp(shadow_frame.forward.w, 0.0, 1.0));"),
             "HDR uses raw visibility before beauty's artistic shadow floor");
-        let ao_only = super::source(false, true, false, false);
+        let ao_only = super::source(crate::EnhancedSettings { ambient_occlusion: true, ..Default::default() });
         assert!(!ao_only.contains("sun_share:"));
         assert!(!ao_only.contains("sun_spec_share:"));
         assert!(!ao_only.contains("fn enhanced_emission"));
-        let shadows_only = super::source(true, false, false, false);
+        let shadows_only = super::source(crate::EnhancedSettings { sun_shadows: true, ..Default::default() });
         assert!(!shadows_only.contains("ao_info:"));
         assert!(!shadows_only.contains("fn enhanced_ao_receiver"));
     }
@@ -322,7 +326,7 @@ fn ground_fog(i: VOut) -> f32 {{ return i.fog; }}
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let r = crate::Renderer::new(&instance, None).expect("ground two-pass regression requires offscreen GPU");
         for shadows in [true, false] {
-            let generated = super::source(shadows, false, false, true);
+            let generated = super::source(crate::EnhancedSettings { sun_shadows: shadows, hdr: true, ..Default::default() });
             let wrapper = generated[generated.find("@fragment fn fs_ground_shadow(").unwrap()..]
                 .split("\n}").next().unwrap().replacen("@fragment ", "", 1);
             // Exercise the generated wrapper with a fake roof receiver: beauty
@@ -399,7 +403,9 @@ fn enhanced_original_fs_ground_shadow(i: VOut) -> vec4<f32> {{
             let (shadows, ao, bloom, hdr) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0, flags & 8 != 0);
             let _shader = renderer.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("Enhanced ambient/emissive/shadow syntax regression"),
-                source: wgpu::ShaderSource::Wgsl(super::source(shadows, ao, bloom, hdr).into()),
+                source: wgpu::ShaderSource::Wgsl(super::source(crate::EnhancedSettings {
+                    sun_shadows: shadows, ambient_occlusion: ao, emissive_bloom: bloom, hdr, ..Default::default()
+                }).into()),
             });
         }
     }

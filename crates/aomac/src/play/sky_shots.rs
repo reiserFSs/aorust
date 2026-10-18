@@ -779,6 +779,9 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
         "faithful" => {}
         "neutral" => { settings.ground_grass = true; settings.grass_density = 0.0; }
         "shadows" => settings.sun_shadows = true,
+        "moonlit" => settings.night_mode = ao_render::NightMode::Moonlit,
+        "moon-shadows" => { settings.night_mode = ao_render::NightMode::Moonlit; settings.moon_shadows = true; }
+        "dark-night" => settings.night_mode = ao_render::NightMode::Dark,
         // Pre-soft-shadow look: 1024 maps, hard 3x3 PCF, full-strength shadow.
         "shadows-hard" => {
             settings.sun_shadows = true;

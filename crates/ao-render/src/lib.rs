@@ -33,9 +33,11 @@ mod heat_haze;
 mod gpu_stats;
 pub use gpu_stats::FrameGpuTimer;
 mod enhanced_settings;
-pub use enhanced_settings::EnhancedSettings;
+pub use enhanced_settings::{EnhancedSettings, NightMode};
 mod enhanced;
 mod enhanced_shader;
+mod moon_shadows;
+mod moon_exposure;
 mod variant;
 mod shader_source;
 mod ambient_occlusion;
@@ -200,6 +202,8 @@ struct Globals {
     sky_counter: [f32; 4],
     /// Pairs of toward-light direction / gamma diffuse+specular colour.
     directional: [[f32; 4]; 16],
+    moon_direction: [f32; 4],
+    moon_g: [f32; 4],
 }
 
 /// One submesh draw. Scene pipes use `material_pipe`; sky draws use `sky_material_pipe`.
@@ -685,6 +689,8 @@ pub struct Renderer {
     pub stats: FrameStats,
     sun_shadows: Option<sun_shadows::SunShadows>,
     shadow_sun: Option<[f32; 3]>,
+    shadow_moon: Option<ao_scene::MoonSource>,
+    moon_exposure: moon_exposure::MoonExposure,
     shadow_timer: Option<FrameGpuTimer>,
     shadow_timer_pending: bool,
     /// Seconds driving `Submesh::uv_scroll` (the viewer advances it; screenshots leave it at 0).
@@ -1172,6 +1178,8 @@ impl Renderer {
             heat_haze: Default::default(),
             sun_shadows: None,
             shadow_sun: None,
+            shadow_moon: None,
+            moon_exposure: Default::default(),
             shadow_timer: None,
             shadow_timer_pending: false,
             realistic_water: true,
@@ -1420,6 +1428,8 @@ impl Renderer {
             || previous.emissive_bloom != settings.emissive_bloom
             || previous.needs_sun_mask() != settings.needs_sun_mask();
         self.enhanced_settings = settings;
+        self.moon_exposure.sync(&self.device, settings.night_mode == NightMode::Moonlit);
+        if previous.night_mode != settings.night_mode { self.sun_shadows = None; }
         if !settings.ground_grass || settings.grass_density <= 0.0 { self.grass = None; }
         if !settings.ambient_occlusion {
             self.ambient_occlusion.as_mut().expect("startup AO pipelines").release_targets();
@@ -1427,7 +1437,7 @@ impl Renderer {
         if !settings.contact_shadows {
             self.contact_shadows.as_mut().expect("startup contact pipelines").release_targets();
         }
-        if !settings.sun_shadows && !settings.volumetric_shafts { self.sun_shadows = None; }
+        if !settings.sun_shadows && !settings.moon_shadows && !settings.volumetric_shafts && settings.night_mode != NightMode::Moonlit { self.sun_shadows = None; }
         self.release_disabled_atmosphere(settings);
         if changed_frame {
             self.release_effect_targets();
@@ -1514,6 +1524,8 @@ impl Renderer {
         self.sky_dot_counter = 0.0;
         self.sky.directional_epoch = self.time;
         self.water_light = scene.water_light;
+        self.moon_exposure = moon_exposure::MoonExposure::from_scene(scene);
+        self.moon_exposure.sync(&self.device, self.enhanced_settings.night_mode == NightMode::Moonlit);
         self.sun_shadows = None;
         self.sky.clouds.clear();
         self.release_atmosphere_targets();
@@ -1912,6 +1924,7 @@ impl Renderer {
             ground_light: scene.ground_light,
             sun_authored: scene.sun_authored,
             daylight: scene.daylight,
+            moons: scene.moons,
             directional_lights: scene.directional_lights.clone(),
             meshes: scene.meshes.iter().map(|mesh| ao_scene::Mesh {
                 vertices: if mesh.submeshes.iter().any(|sub| sub.sun_flicker) { mesh.vertices.clone() } else { vec![] },
@@ -1952,6 +1965,7 @@ impl Renderer {
         }
         if let Some(env) = self.sky.pose.environment { self.env.sun_dir = env.sun_dir; }
         self.shadow_sun = shadow_pass::authored_sun(&self.sky.pose);
+        self.shadow_moon = moon_shadows::source(&self.sky.pose);
     }
 
     /// `set_sky` calls since the renderer started that fell through to a full rebuild, for leak regressions: in
@@ -2227,6 +2241,7 @@ impl Renderer {
         let w = ao_scene::wave_curves(self.time);
         let (water_color, water_dir) = self.water_light.unwrap_or_default();
         self.sky_dot_counter = (self.sky_dot_counter + 0.01) % 1.0;
+        let moon = self.enhanced_moonlight();
         let g = Globals {
             view_proj: vp.to_cols_array_2d(),
             eye: cam.pos.extend(far).to_array(),
@@ -2255,6 +2270,12 @@ impl Renderer {
                     }
                 })
             }),
+            moon_direction: moon.map_or([0.0; 4], |(direction, _)| v4(direction, 1.0)),
+            moon_g: v4(moon.map_or([0.0; 3], |(_, energy)| energy),
+                if self.enhanced_settings.night_mode == NightMode::Dark {
+                    self.sky.pose.daylight.filter(|day| day.is_finite()).map_or(0.0, |day|
+                        self.enhanced_settings.dark_night_strength * (1.0 - day.clamp(0.0, 1.0)))
+                } else { 0.0 }),
         };
         self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
 
@@ -2430,7 +2451,7 @@ impl Renderer {
             });
             pass.set_bind_group(0, &self.globals_bg, &[]);
             // Sky, ground and actors retain this receiver across pipeline changes.
-            if self.enhanced_settings.sun_shadows {
+            if self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows || self.enhanced_settings.night_mode == NightMode::Moonlit {
                 pass.set_bind_group(3, &self.sun_shadows.as_ref().expect("shadow maps prepared before world").receiver, &[]);
             }
             let (pipe, mesh, mat) = (std::cell::Cell::new(usize::MAX), std::cell::Cell::new((false, usize::MAX)), std::cell::Cell::new((false, usize::MAX)));
@@ -2464,7 +2485,7 @@ impl Renderer {
             let world_phase = |pass: &mut wgpu::RenderPass, priority: i32| {
                 pass.set_bind_group(0, &self.globals_bg, &[]);
                 // Grass replaces group 3; restore the shared receiver at phase entry.
-                if self.enhanced_settings.sun_shadows {
+                if self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows || self.enhanced_settings.night_mode == NightMode::Moonlit {
                     pass.set_bind_group(3, &self.sun_shadows.as_ref().expect("shadow maps prepared before world").receiver, &[]);
                 }
                 pipe.set(usize::MAX); mesh.set((false, usize::MAX)); mat.set((false, usize::MAX));
