@@ -1351,11 +1351,12 @@ fn graphics_fixture_msaa_selector_is_explicit_and_bounded() {
     for invalid in ["", "0", "3", "16", "-1", "invalid"] { assert!(graphics_fixture_msaa(invalid).is_err()); }
 }
 
-/// Independent post selectors layer on any existing immutable scene/profile.
+/// Independent effect selectors layer on any existing immutable scene/profile.
 fn graphics_fixture_post_features(mut settings: ao_render::EnhancedSettings, features: &str) -> anyhow::Result<ao_render::EnhancedSettings> {
     if features.is_empty() { return Ok(settings); }
     for feature in features.split([',', '+']) {
         match feature {
+            "sun_shadows" => settings.sun_shadows = true,
             "taa" => settings.taa = true,
             "fxaa" => settings.fxaa = true,
             "cas" => settings.cas = true,
@@ -1370,7 +1371,7 @@ fn graphics_fixture_post_features(mut settings: ao_render::EnhancedSettings, fea
                 settings.warmth = 0.55;
                 settings.night_cool = 0.2;
             }
-            _ => anyhow::bail!("unknown AOMAC_GFX_FEATURE {feature:?}; use comma-separated taa,fxaa,cas,motion_blur,dof,grading"),
+            _ => anyhow::bail!("unknown AOMAC_GFX_FEATURE {feature:?}; use comma-separated taa,fxaa,cas,motion_blur,dof,grading,sun_shadows"),
         }
     }
     Ok(settings)
@@ -1397,6 +1398,8 @@ fn graphics_fixture_post_selectors_are_independent_and_composable() {
         vignette: 0.15, contrast: 1.1, saturation: 1.1, warmth: 0.55, night_cool: 0.2,
         ..foliage
     });
+    assert_eq!(graphics_fixture_post_features(foliage, "sun_shadows").unwrap(),
+        ao_render::EnhancedSettings { sun_shadows: true, ..foliage });
 }
 
 #[test]
@@ -1494,7 +1497,7 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
     let actor = graphics_fixture_actor().unwrap();
     assert_eq!(actor.name, "Testy");
     let views = graphics_fixture_views(&actor);
-    assert_eq!(views.iter().map(|view| &view.0).collect::<std::collections::HashSet<_>>().len(), 18);
+    assert_eq!(views.iter().map(|view| &view.0).collect::<std::collections::HashSet<_>>().len(), 19);
     for (light, expected_time) in [("day", 3240.0), ("dusk", 4860.0), ("night", 0.0)] {
         let newland = views.iter().find(|view| view.0 == format!("newland-{light}")).unwrap();
         assert_eq!((newland.1, newland.2), (566, expected_time));
