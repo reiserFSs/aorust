@@ -11,6 +11,7 @@ struct ShadowFrame {
 @group(3) @binding(0) var<uniform> shadow_frame: ShadowFrame;
 @group(3) @binding(1) var shadow_maps: texture_depth_2d_array;
 @group(3) @binding(2) var shadow_sampler: sampler_comparison;
+@group(3) @binding(8) var grass_depth: texture_depth_2d;
 @group(3) @binding(3) var<storage, read> shadow_actor_visibility: array<u32>;
 struct ShadowVertex {
     @builtin(position) @invariant clip: vec4<f32>,
@@ -186,23 +187,21 @@ fn cascade_visibility(world: vec3<f32>, normal: vec3<f32>, layer: u32, pixel: ve
 // from solid casters, so a carpet never extinguishes the native ambient budget.
 fn grass_blade_visibility(world: vec3<f32>) -> f32 {
     if shadow_frame.control.z == 0u { return 1.0; }
+    let reach = 1.0 - smoothstep(12.0, 15.0, distance(world, shadow_frame.eye.xyz));
+    if reach <= 0.0 { return 1.0; }
     let clip = shadow_frame.matrices[0] * vec4<f32>(world, 1.0);
     let p = clip.xyz / clip.w;
     let uv = p.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
-    let dimensions = vec2<f32>(textureDimensions(shadow_maps));
+    let dimensions = vec2<f32>(textureDimensions(grass_depth));
     let guard = vec2<f32>(2.0) / dimensions;
     if any(uv <= guard) || any(uv >= vec2<f32>(1.0) - guard) || p.z <= 0.0 || p.z >= 1.0 { return 1.0; }
-    var visible = 0.0;
-    // A four-tap footprint softens the narrow real silhouettes without an
-    // expensive blocker search per blade. Fade at the nearest map's boundary.
-    for (var y = 0u; y < 2u; y += 1u) {
-        for (var x = 0u; x < 2u; x += 1u) {
-            let offset = (vec2<f32>(f32(x), f32(y)) - 0.5) / dimensions;
-            visible += textureSampleCompareLevel(shadow_maps, shadow_sampler, uv + offset, 3, p.z - 0.00002);
-        }
-    }
+    // Two-tap grass-only soft filter using the shared nearest comparison sampler.
+    let texel = vec2<f32>(0.5) / dimensions;
+    let depth = p.z - 0.00002;
+    let visible = (textureSampleCompareLevel(grass_depth, shadow_sampler, uv + texel, depth)
+        + textureSampleCompareLevel(grass_depth, shadow_sampler, uv - texel, depth)) * 0.5;
     let edge = smoothstep(0.75, 0.95, max(abs(p.x), abs(p.y)));
-    return mix(1.0, visible * 0.25, 0.45 * (1.0 - edge));
+    return mix(1.0, visible, 0.3 * (1.0 - edge) * reach);
 }
 fn sun_visibility(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>) -> f32 {
     if shadow_frame.forward.w <= 0.0 { return 1.0; }

@@ -12,7 +12,6 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
     let reflections = settings.material_reflections || settings.environment_probe;
     let clustered_lighting = settings.clustered_lighting;
     let local_light_shadows = settings.local_light_shadows;
-    let grass_point_shadows = settings.ground_grass && settings.grass_point_shadows;
     let night = settings.night_mode != crate::NightMode::AsGame;
     // HDR and night receivers need the native directional shares independently.
     let sun_shares = shadows || hdr || night;
@@ -172,51 +171,13 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
             source = source.replace(&format!(", o.{field}.w)"), ", 0.0)");
         }
     }
-    // The existing local receiver already samples the same cubes (including
-    // blades); applying the grass-only receiver too would shadow twice.
-    if grass_point_shadows && !local_light_shadows { append_grass_point_receiver(&mut source); }
     if clustered_lighting || local_light_shadows { crate::clustered_lighting::apply(&mut source); }
     if material_specular { crate::authored_specular::append(&mut source, settings.night_mode == crate::NightMode::Moonlit); }
     if materials { crate::authored_specular::append_materials(&mut source, settings); }
-    if settings.needs_admitted_lights() { crate::point_shadows::apply_shader(&mut source, local_light_shadows, clustered_lighting); }
+    if (crate::EnhancedSettings { grass_point_shadows: false, ..settings }).needs_admitted_lights() {
+        crate::point_shadows::apply_shader(&mut source, local_light_shadows, clustered_lighting);
+    }
     source
-}
-
-/// Terrain has no native specular/tint use: keep both exact saturated local
-/// marginals in those existing Gouraud fields, including +a0c's ambient stage.
-fn append_grass_point_receiver(source: &mut String) {
-    let start = source.find("fn vs_ground(").expect("native ground vertex");
-    let end = start + source[start..].find("\n}").expect("ground vertex end");
-    let body = source[start..end].replace("    return o;", "    let ground_without_local = clamp(g.sun_g.rgb * max(dot(n, g.sun_dir.xyz), 0.0) + grass_ground_directional(n), vec3<f32>(0.0), vec3<f32>(1.0));\n    o.spec = max(o.light - ground_without_local, vec3<f32>(0.0));\n    o.tint = max(o.dlight - clamp(ground_without_local + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(0.0));\n    return o;");
-    source.replace_range(start..end, &body);
-    // Directional depth bias receives a derivative facet normal via `surface`.
-    // Point diffuse must retain the authored interpolated lighting normal.
-    source.push_str("\nvar<private> grass_point_normal: vec3<f32>;\n");
-    *source = source.replace("    let beauty = enhanced_original_", "    grass_point_normal = i.n;\n    let beauty = enhanced_original_");
-    // Preserve the native directional loop's order and gamma arithmetic. Only
-    // the admitted point/spot terms are absent from this no-local baseline.
-    source.push_str(r#"
-fn grass_ground_directional(n: vec3<f32>) -> vec3<f32> {
-    var diff = vec3<f32>(0.0);
-    let directional_count = u32(g.dyn_info.y);
-    for (var k = 0u; k < directional_count; k = k + 1u) {
-        let l = g.directional[k * 2u].xyz;
-        let col = g.directional[k * 2u + 1u].rgb;
-        let nl = dot(n, l);
-        if nl > 0.0 { diff += col * nl; }
-    }
-    return diff;
-}
-"#);
-    for name in ["fs_ground_fused", "fs_ground_shadow", "fs_ground_simple"] {
-        let start = source.find(&format!("fn enhanced_original_{name}(")).expect("native ground fragment");
-        let end = start + source[start..].find("\n}").expect("ground fragment end");
-        let (channel, share) = if name == "fs_ground_simple" { ("dlight", "tint") } else { ("light", "spec") };
-        // This is before the palette clamp, texture modulation and native fog;
-        // the two-pass base remains untouched and its multiplier receives once.
-        let body = source[start..end].replace(&format!("i.{channel}"), &format!("(i.{channel} - min(i.{share}, grass_point_shadow_loss(i.wpos, grass_point_normal)))"));
-        source.replace_range(start..end, &body);
-    }
 }
 
 /// Reuse the world receiver verbatim; grass packs it beside its cell buffers.
@@ -225,10 +186,11 @@ pub(super) fn append_shadow_receiver(source: &mut String, binding_offset: u32) {
     let declarations = shader.split("@group(3) @binding(3)").next().expect("shadow receiver declarations");
     for line in declarations.lines() {
         let mut line = line.to_owned();
-        for binding in 0..3 {
+        for binding in [0, 1, 2, 8] {
             let old = format!("@group(3) @binding({binding})");
             if line.contains(&old) {
-                line = line.replace(&old, &format!("@group(3) @binding({})", binding + binding_offset));
+                let mapped = if binding == 8 { if binding_offset == 2 { 16 } else { 8 } } else { binding + binding_offset };
+                line = line.replace(&old, &format!("@group(3) @binding({mapped})"));
                 break;
             }
         }

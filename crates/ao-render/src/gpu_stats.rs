@@ -214,6 +214,18 @@ impl FrameGpuTimer {
             end_of_pass_write_index: None,
         }
     }
+    /// Offline stage boundaries may end a span at a compute pass.
+    pub(crate) fn compute_span(&mut self, last: bool) -> wgpu::ComputePassTimestampWrites<'_> {
+        let first = self.state == TimerState::Idle;
+        let expected = if first { TimerState::Idle } else { TimerState::Recording };
+        let next = if last { TimerState::Ready } else { TimerState::Recording };
+        advance_timer(&mut self.state, expected, next).expect("GPU compute span requires previous readback");
+        wgpu::ComputePassTimestampWrites {
+            query_set: &self.queries,
+            beginning_of_pass_write_index: first.then_some(0),
+            end_of_pass_write_index: last.then_some(1),
+        }
+    }
 
     /// Beginning-of-pass writes avoid encoder timestamp reordering. `last_pass` also writes the end
     /// timestamp when the world pass is the final output pass, without adding a dummy render pass.

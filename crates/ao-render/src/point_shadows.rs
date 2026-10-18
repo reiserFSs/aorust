@@ -39,6 +39,7 @@ fn local_receiver_entries() -> [wgpu::BindGroupLayoutEntry; 5] {
 pub(crate) fn grass_receiver_entries() -> [wgpu::BindGroupLayoutEntry; 5] {
     local_receiver_entries().map(|mut entry| {
         entry.binding = if entry.binding == 9 { 13 } else { entry.binding + 6 };
+        entry.visibility = wgpu::ShaderStages::VERTEX;
         entry
     })
 }
@@ -146,8 +147,6 @@ pub(crate) struct PointShadows {
     static_face_mask: u32,
     actor_face_mask: u32,
     had_dynamic_casters: bool,
-    had_grass_casters: bool,
-    grass: Option<crate::grass_point_shadows::GrassPointShadows>,
 }
 impl PointShadows {
     fn new(device: &wgpu::Device, size: (u32, u32), local_resources: bool, count: usize) -> Self {
@@ -180,7 +179,7 @@ impl PointShadows {
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
         let state = buffer("persistent cube cache state", CUBES as u64 * STATE_BYTES,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
-        let params = buffer("point shadow simulation clock and encoded schedule", 80, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+        let params = buffer("point shadow simulation clock and encoded schedule", 64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         let caster_buffer = buffer("point caster descriptors", 64, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
         let indirect = buffer("point cache indirect commands", (face_count * 2).max(1) as u64 * 40,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST);
@@ -192,12 +191,9 @@ impl PointShadows {
             static_input_signature: 0,
             caster_buffer, caster_capacity: 1, indirect, indirect_stride: 40,
             dispatch: point_cache::Dispatch::default(), static_face_mask: 0,
-            actor_face_mask: 0, had_dynamic_casters: false, had_grass_casters: false, grass: None,
+            actor_face_mask: 0, had_dynamic_casters: false,
             sampler, metadata, _maps: maps, faces, face_data, face_stride, state, params,
             groups: Vec::new(), selection: None, input_buffer: None, admission: None, size, count, local_resources, clock: None }
-    }
-    pub(crate) fn grass_resource_bytes(&self) -> usize {
-        self.grass.as_ref().map_or(0, crate::grass_point_shadows::GrassPointShadows::resource_bytes)
     }
 }
 
@@ -243,8 +239,12 @@ impl Renderer {
             points.static_face_mask, points.actor_face_mask, points.static_input_signature,
         ))
     }
-    pub(crate) fn encode_point_shadows(&mut self, encoder: &mut wgpu::CommandEncoder, cam: &Camera, shadows: &mut SunShadows, admission_planes: [f32; 3]) {
-        if !self.enhanced_settings.needs_admitted_lights() { self.point_shadows = None; return; }
+    pub(crate) fn encode_point_shadows(&mut self, encoder: &mut wgpu::CommandEncoder, cam: &Camera, shadows: &mut SunShadows, admission_planes: [f32; 3], last_shadow_span: bool) {
+        if !self.enhanced_settings.needs_admitted_lights() {
+            self.point_shadows = None;
+            self.encode_grass_roots(encoder, Some(shadows), last_shadow_span);
+            return;
+        }
         let local = self.enhanced_settings.local_light_shadows
             || (self.enhanced_settings.ground_grass && self.enhanced_settings.grass_point_shadows);
         let count = self.enhanced_settings.point_shadow_count.clamp(1, CUBES as u32) as usize;
@@ -275,16 +275,16 @@ impl Renderer {
             light[3][3] = encode_owner(self.dynamic_owners.get(index).copied().flatten(), &shadows.actor_groups);
         }
         // Owner proof is reduced on GPU before either the 64-light or cube caps.
-        self.encode_clustered_lights(encoder, cam.pos, &shadows.actor_visibility);
+        let roots = self.grass.as_ref().is_some_and(crate::grass::Grass::has_draws);
+        self.encode_clustered_lights(encoder, cam.pos, &shadows.actor_visibility, last_shadow_span && !local && !roots);
+        self.encode_grass_roots(encoder, Some(shadows), last_shadow_span && !local);
         if local {
+            // Negative-only proof over every raw candidate: admission and both caps remain GPU-only.
+            let can_cast = self.cluster_frame.data[2..].as_chunks::<5>().0.iter().any(|source| potential_point_shadow_source(source));
+            self.prepare_point_static(shadows);
             points.casters.clear();
             let selection_inputs = self.point_dispatch_inputs(cam, &mut points, admission_planes);
-            if self.enhanced_settings.local_light_shadows {
-                self.prepare_point_static(shadows);
-                self.point_static_casters(shadows, &mut points.casters, &points.dispatch.possible_lights);
-            } else {
-                shadows.static_commands.clear();
-            }
+            self.point_static_casters(shadows, &mut points.casters, &points.dispatch.possible_lights);
             points.dynamic_world.clear();
             if self.enhanced_settings.foliage_push {
                 let dynamic_world = &mut points.dynamic_world;
@@ -300,7 +300,7 @@ impl Renderer {
             let fingerprint = point_cache::world_fingerprint(selection_inputs, points.static_input_signature, self.time);
             points.static_face_mask = points.dispatch.mask(fingerprint, self.time);
             points.static_caster_count = points.casters.len();
-            if self.enhanced_settings.local_light_shadows { self.point_actor_casters(shadows, &mut points.casters); }
+            self.point_actor_casters(shadows, &mut points.casters);
             let static_count = points.static_caster_count;
             let mut index = 0;
             points.casters.retain(|caster| {
@@ -311,11 +311,7 @@ impl Renderer {
                 keep
             });
             points.casters.append(&mut points.dynamic_world);
-            let grass_enabled = self.enhanced_settings.ground_grass && self.enhanced_settings.grass_point_shadows;
-            let potential_grass = grass_enabled && self.grass.as_ref().is_some_and(crate::grass::Grass::has_draws);
-            let previous_grass = points.had_grass_casters;
-            points.had_grass_casters = potential_grass;
-            let potential_dynamic = points.casters.len() > points.static_caster_count || potential_grass;
+            let potential_dynamic = points.casters.len() > points.static_caster_count;
             points.actor_face_mask = if potential_dynamic || points.had_dynamic_casters { 63 } else { 0 };
             points.had_dynamic_casters = potential_dynamic;
             if points.casters.len() > points.caster_capacity {
@@ -343,9 +339,6 @@ impl Renderer {
                     u8::from(points.dispatch.allocation_cold) as f32, points.actor_face_mask as f32],
             };
             self.queue.write_buffer(&points.params, 0, bytemuck::bytes_of(&params));
-            self.queue.write_buffer(&points.params, 64, bytemuck::bytes_of(&[
-                u8::from(potential_grass) as f32, u8::from(previous_grass) as f32, 0.0, 0.0,
-            ]));
             if points.selection.is_none() || points.input_buffer.as_ref() != Some(&self.dyn_light_buf) {
                 points.input_buffer = Some(self.dyn_light_buf.clone());
                 points.selection = Some(self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
@@ -363,39 +356,38 @@ impl Renderer {
                 }));
             }
             encoder.clear_buffer(&points.indirect, 0, None);
+            let last_layer = can_cast.then(|| (0..points.faces.len() * 2).rfind(|&layer| {
+                let mask = if layer >= points.faces.len() { points.actor_face_mask } else { points.static_face_mask };
+                mask & (1 << (layer % 6)) != 0
+            })).flatten();
             {
-                let mut pass = encoder.begin_effect_compute_pass(&wgpu::ComputePassDescriptor { label: Some("GPU admitted cube ranking"), timestamp_writes: None });
+                let timestamp_writes = self.shadow_stage_compute(crate::shadow_pass::ShadowGpuStage::PointMaps, last_layer.is_none(), last_shadow_span && last_layer.is_none());
+                let mut pass = encoder.begin_effect_compute_pass(&wgpu::ComputePassDescriptor { label: Some("GPU admitted cube ranking"), timestamp_writes });
                 pass.set_pipeline(&self.point_program.pipeline);
                 pass.set_bind_group(0, points.selection.as_ref().expect("cube selection bindings"), &[]);
                 pass.dispatch_workgroups(1, 1, 1);
-                if points.static_face_mask != 0 {
+                if can_cast && points.static_face_mask != 0 {
                     pass.set_pipeline(&self.point_program.cull);
                     pass.dispatch_workgroups((points.static_caster_count as u32 + 1).div_ceil(64), (count * 6) as u32, 1);
                 }
-                if points.actor_face_mask != 0 {
+                if can_cast && points.actor_face_mask != 0 {
                     pass.set_pipeline(&self.point_program.cull_actors);
                     pass.dispatch_workgroups(((points.casters.len() - points.static_caster_count) as u32 + 1).div_ceil(64), (count * 6) as u32, 1);
                 }
             }
-            if potential_grass {
-                if let Some(grass) = &self.grass {
-                    if points.grass.as_ref().is_none_or(|casters| !casters.matches(grass, count)) {
-                        points.grass = Some(crate::grass_point_shadows::GrassPointShadows::new(self, grass, &points.face_data, points.face_stride, count));
-                    }
-                    points.grass.as_ref().expect("point grass prepared").encode(&self.queue, encoder, grass, points.face_stride);
-                }
-            } else { points.grass = None; }
-            // Static history is retained; current grass belongs only to the dynamic layer.
-            for layer in 0..points.faces.len() * 2 {
+            // Loaded-world broadphase is conservative; GPU proof and per-face culling own actual draws.
+            for layer in 0..last_layer.map_or(0, |last| last + 1) {
                 let actor = layer >= points.faces.len();
                 let face_mask = if actor { points.actor_face_mask } else { points.static_face_mask };
                 if (face_mask & (1 << (layer % 6))) == 0 { continue; }
                 let view = if actor { &points.actor_faces[layer - points.faces.len()] } else { &points.faces[layer] };
+                let last = Some(layer) == last_layer;
+                let timestamp_writes = self.shadow_stage_render(crate::shadow_pass::ShadowGpuStage::PointMaps, last, last_shadow_span && last);
                 let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("cached admitted local shadow face"), color_attachments: &[],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view,
                         depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }), stencil_ops: None }),
-                    timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                    timestamp_writes, occlusion_query_set: None, multiview_mask: None,
                 });
                 let base = layer as u64 * points.indirect_stride;
                 pass.set_pipeline(&self.point_program.clear);
@@ -406,9 +398,6 @@ impl Renderer {
                     self.draw_point_actors(&mut pass, shadows, &points.indirect, base + 20, &points.casters);
                     self.draw_point_static(&mut pass, shadows, &points.indirect, base + 20, &points.casters,
                         point_cache::FaceDraw { kind: 2, face: layer % 6, lights: &points.dispatch.possible_lights });
-                    if let Some(grass) = &points.grass {
-                        grass.draw(&mut pass, &self.globals_bg, layer - points.faces.len());
-                    }
                 } else {
                     self.draw_point_static(&mut pass, shadows, &points.indirect, base + 20, &points.casters,
                         point_cache::FaceDraw { kind: 0, face: layer % 6, lights: &points.dispatch.possible_lights });
@@ -444,6 +433,10 @@ impl Renderer {
         }
         if changed { if let Some(buffer) = &shadows.static_instances { self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&shadows.static_transforms)); } }
     }
+}
+
+fn potential_point_shadow_source(source: &[[f32; 4]]) -> bool {
+    source[0][3] > 0.1 && source[1][..3].iter().any(|&channel| channel > 0.0)
 }
 
 fn shadow_elapsed(previous: Option<f32>, now: f32) -> f32 {
@@ -526,6 +519,23 @@ mod tests {
     use super::*;
     use ao_scene::{Instance, Mesh, Submesh, Vertex};
     #[test]
+    fn zero_radiance_cube_skip_is_only_a_negative_potential_proof() {
+        let mut source = [[0.0; 4]; 5];
+        source[0][3] = 20.0;
+        assert!(!potential_point_shadow_source(&source));
+        source[1][1] = 0.01;
+        assert!(potential_point_shadow_source(&source));
+        source[0][0] = 1_000_000.0;
+        source[4] = [f32::from_bits(u32::MAX); 4];
+        assert!(potential_point_shadow_source(&source), "owner metadata and position cannot CPU-admit or reject a source");
+        source[0][3] = 0.1;
+        assert!(!potential_point_shadow_source(&source));
+        source[0][3] = f32::from_bits(0.1_f32.to_bits() + 1);
+        assert!(potential_point_shadow_source(&source));
+        assert!(include_str!("point_shadow_select.wgsl").contains("light.w <= 0.1 || !any(pool[66u + index * 4u + 1u].xyz > vec3<f32>(0.0))"),
+            "negative CPU proof must match the existing GPU cube eligibility, not the native eight-light pool");
+    }
+    #[test]
     fn point_face_clip_flags_do_not_alias_directional_grass_or_solid_receivers() {
         let clipped = |control: [u32; 4], character: bool| (control[1] & 0x80000000) != 0
             && (control[2] != 0 || (control[3] != 0 && character));
@@ -542,8 +552,61 @@ mod tests {
         assert!(clipped([0, 0x80000000, 0, 1], true));
         assert!(!clipped([0, 0x80000000, 0, 1], false));
         assert!(include_str!("sun_shadows.wgsl").contains("(shadow_frame.control.y & 0x80000000u) != 0u"));
-        assert!(include_str!("point_shadow_select.wgsl").contains("vec4<u32>(0u, 0x80000000u,"));
-        assert!(include_str!("point_shadow_select.wgsl").contains("face_data[base + 13u] = light;"));
+        assert!(include_str!("point_shadow_select.wgsl").contains("vec4<u32>(0u,0x80000000u,"));
+    }
+
+    #[test]
+    fn native_and_grass_light_queries_use_ordered_spatial_candidates() {
+        let mut source = crate::shader_source::load("shader.wgsl", include_str!("shader.wgsl")).into_owned();
+        crate::authored_specular::append(&mut source, false);
+        for name in ["vertex_lights", "authored_local_spec"] {
+            admitted_native_pool(&mut source, name);
+            let start = source.find(&format!("fn {name}(")).unwrap();
+            let end = start + source[start..].find("\n}\n").unwrap() + 3;
+            let body = &source[start..end];
+            assert!(body.contains("let local_list = admitted_light_list(p);"));
+            assert!(body.contains("candidate < min(dyn_count, local_list.y) && used < 8u"));
+            assert!(body.contains("let k = bitcast<u32>(dyn_lights[local_list.x + candidate].x);"));
+            assert!(body.contains("if !owner_light_admitted(dyn_lights[li + 3u].w) { continue; }"));
+        }
+        let point = include_str!("point_shadows.wgsl");
+        assert!(point.contains("let list = admitted_light_list(world);"));
+        assert!(point.contains("if count == 0u || used >= 8u { return loss; }"));
+        let consumed = point.find("used += 1u;").unwrap();
+        let skip = point.find("if (u32(abs(packed)) % 32u) == 0u { continue; }").unwrap();
+        assert!(consumed < skip, "non-shadowed native lights must still consume their slots");
+        let grass = include_str!("grass.wgsl");
+        let vertex_start = grass.find("fn grass_vertex(").unwrap();
+        let vertex_end = vertex_start + grass[vertex_start..].find("\n}").unwrap();
+        let vertex = &grass[vertex_start..vertex_end];
+        assert!(!vertex.contains("vertex_lights("), "root lighting must run only once in the shared compute cache");
+        assert!(!vertex.contains("grass_build_blade("), "all beauty/caster views reuse the same prepared root");
+        assert!(!vertex.contains("grass_build_section("), "geometry must be computed once per section, not per view/edge");
+        assert!(vertex.contains("grass_blade_cache.blades[index].base"));
+        assert!(vertex.contains("grass_blade_cache.blades[index].sections[vertex >> 1u]"));
+        assert!(grass.contains("grass_blade_output.blades[index].base = grass_blade_shade(b);"));
+        assert!(grass.contains("grass_blade_output.blades[index].sections[0] = grass_build_section(b, 0u);"));
+        let caster = include_str!("grass_caster.wgsl");
+        assert!(caster.contains("grass_blade_cache.blades[index]"));
+        assert!(!caster.contains("grass_vertex("), "near sun casters read only cached geometry");
+        assert!(vertex.contains("o.coverage = vec2<f32>(b.root_coverage.w, b.spec.w);"));
+        assert!(!grass.contains("vs_grass_depth"), "beauty alone owns grass coverage and depth");
+    }
+    #[test]
+    fn grass_receiver_reuses_static_and_actor_cube_binding_contract() {
+        let local = local_receiver_entries();
+        let grass = grass_receiver_entries();
+        assert_eq!(grass.map(|entry| entry.binding), [9, 10, 11, 12, 13]);
+        for (world, blade) in local.into_iter().zip(grass) {
+            assert_eq!(world.visibility, if world.binding == 3 { wgpu::ShaderStages::VERTEX_FRAGMENT } else { wgpu::ShaderStages::FRAGMENT });
+            assert_eq!(blade.visibility, wgpu::ShaderStages::VERTEX);
+            assert_eq!(world.ty, blade.ty);
+            assert_eq!(world.count, blade.count);
+        }
+        let selector = include_str!("point_shadow_select.wgsl");
+        assert!(selector.contains("struct PointParams { eye: vec4<f32>, timing: vec4<f32>, cache: vec4<u32>, schedule: vec4<f32>, }"));
+        assert!(selector.contains("var dynamic_world = false;"));
+        assert!(selector.contains("var has_actor_depth = false;"));
     }
     fn quad(corners: [[f32; 3]; 4]) -> Mesh {
         Mesh {

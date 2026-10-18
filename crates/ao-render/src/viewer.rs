@@ -1436,6 +1436,7 @@ impl Offscreen {
     pub fn fixed_camera(&mut self, camera: Option<Camera>) { self.fixed_camera = camera; }
 
     pub fn set_shadow_gpu_timing(&mut self, enabled: bool) -> Result<()> { self.r.set_shadow_gpu_timing(enabled) }
+    pub fn set_shadow_gpu_timing_stage(&mut self, stage: &str) -> Result<()> { self.r.set_shadow_gpu_timing_stage(stage) }
     pub fn read_shadow_gpu_ms(&mut self) -> Result<Option<f64>> { self.r.read_shadow_gpu_ms() }
     pub fn shadow_resident_bytes(&self) -> u64 { self.r.shadow_resident_bytes() }
     pub fn shadow_static_command_counts(&self) -> (usize, usize) { self.r.shadow_static_command_counts() }

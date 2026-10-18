@@ -325,6 +325,10 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
     let compare_features = compare_grass_features(&feature)?;
     let png_only = std::env::var("AOMAC_GFX_PNG_ONLY").is_ok_and(|value| value == "1");
     let capture_only = std::env::var("AOMAC_GFX_CAPTURE_ONLY").is_ok_and(|value| value == "1");
+    let shadow_timing = !capture_only && std::env::var("AOMAC_GFX_GRASS_SHADOW_TIMING").is_ok_and(|value| value == "1");
+    let shadow_stage = std::env::var("AOMAC_GFX_GRASS_SHADOW_STAGE").unwrap_or_else(|_| "all".into());
+    ensure!(matches!(shadow_stage.as_str(), "all" | "admission" | "light_pool" | "grass_roots" | "point_maps" | "sun_maps" | "grass_sun"),
+        "AOMAC_GFX_GRASS_SHADOW_STAGE must be all, admission, light_pool, grass_roots, point_maps, sun_maps or grass_sun");
     let assert_specks = !compare_features && !std::env::var("AOMAC_GFX_ASSERT_SPECKS").is_ok_and(|value| value == "0");
     // AOMAC_GFX_DENSITY: grass density (default 1); AOMAC_GFX_EFFECTS=1: sun/contact shadows, AO and bloom in both variants.
     // AOMAC_GFX_HDR=1: the HDR present; AOMAC_GFX_MSAA: requested samples (default 1).
@@ -352,6 +356,8 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
     let mut report = format!("fixture=graphics_offline_fixture\nsize=1920x1200\nrenderer_time=0\ndt=0\ncrt_seed=1\nweather=clear\nmsaa_requested={msaa}\nanisotropy=1\nwarmup_frames=320\nmeasured_frames={measured_frames}\ntiming={timing}\nvisual_acceptance=unexercised\n");
     writeln!(report, "selected_view={selected:?}\npng_only={png_only}\ncapture_only={capture_only}\nassert_specks={assert_specks}\nao={ao}\nsun_shadows={shadows}\ncontact_shadows={contact}")?;
     writeln!(report, "grass_feature={feature}\ncompare_features={compare_features}\ncomparison={}\nvariant_order=off_on_on_off", if compare_features { "plain_grass_vs_selected_grass_features" } else { "density_zero_vs_selected_grass" })?;
+    writeln!(report, "shadow_gpu_timing={shadow_timing}\nshadow_samples_per_variant={}\nshadow_timing_phase=after_whole_frame_samples_same_warmed_renderer_dt0\nshadow_span=shared_native_and_grass_shadow_passes_not_isolated_grass\ncsv_sample_index=independent_whole_frame_and_shadow_phase_samples_not_simultaneous\nmissing_shadow_timestamp=blank_csv_and_None_summary_not_measured_zero", if shadow_timing { measured_frames } else { 0 })?;
+    writeln!(report, "shadow_gpu_stage={shadow_stage}\nshadow_all_stage_scope=admission_light_pool_grass_roots_point_maps_sun_maps_grass_sun")?;
     for (key, program, args) in [
         ("revision", "git", vec!["rev-parse".into(), "HEAD".into()]),
         ("resource_sha256", "shasum", vec!["-a".into(), "256".into(), dir.join("cd_image/rdb.db").into_os_string()]),
@@ -394,13 +400,24 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                 ensure!(env.sun_dir[1] > 0.0 && env.sun_color.iter().any(|&channel| channel > 0.0),
                     "low-sun grass evidence requires an above-horizon native sun with positive direct energy");
             }
-            let (fixed, tile, grid, mut root) = grass_ground_camera(&lit_scene, &surface.borrow(), &exposure, reference, mode)?;
-            if mode == "lightbar-night" {
-                root.y = surface.borrow().ground((root + ao_render::Vec3::Y * 0.5).to_array())
-                    .context("LightBar green root has no collision ground")?;
-                ensure!(super::super::player::segment_clear(&surface.borrow(), fixed.pos.to_array(),
-                    (root + ao_render::Vec3::Y * 0.05).to_array()), "LightBar feet fail final-camera native LOS");
-            }
+            let (fixed, tile, grid, root) = if mode == "lightbar-night" {
+                let appearance = super::graphics_fixture_lightbar_appearance(&actor);
+                let mut avatar = super::super::avatar::Avatar::new(&store, &dir, 25988, &appearance,
+                    ao_formats::character::actor::ActorAssets::new(&store)?)?;
+                avatar.set_transform([0.0; 3], 0.0);
+                let light = avatar.lights().next().context("native LightBar fixture has no mounted light")?;
+                let (camera, tile, grid, proof) = grass_lightbar_camera(&lit_scene, &surface.borrow(), &exposure, reference, light)?;
+                avatar.set_transform(proof.owner.to_array(), 0.0);
+                let transformed = avatar.lights().next().context("transformed LightBar lost its source")?;
+                ensure!(ao_render::Vec3::from(transformed.pos).distance(proof.source) < 0.001,
+                    "LightBar proof disagrees with actual native bone transform");
+                writeln!(report, "lightbar_owner={:?} yaw=0 native_source={:?} native_rgb={:?} native_range={} shadow_receiver={:?} lit_receiver={:?} caster_instance={} caster_mesh={} caster_submesh={} caster_triangle={} collision_segment={:?}->{:?} collision_blocked=true opaque_scene_triangle_intersection=true final_camera_owner_body_feet_receiver_los=true",
+                    proof.owner, transformed.pos, transformed.color, transformed.range, proof.receiver, proof.lit_receiver,
+                    proof.caster[0], proof.caster[1], proof.caster[2], proof.caster[3], proof.source, proof.receiver)?;
+                (camera, tile, grid, proof.owner)
+            } else {
+                grass_ground_camera(&lit_scene, &surface.borrow(), &exposure, reference, mode)?
+            };
             let view_name = format!("{name}-{mode}");
             writeln!(report, "grass_evidence_view={view_name} pf={pf} time={light_time} native_tile={tile} grid={grid:?} root={root:?} camera={fixed:?} sun_dir={:?} sun_alignment={:?}",
                 lit_scene.environment.map(|env| env.sun_dir), lit_scene.environment.map(|env| fixed.forward().dot(ao_render::Vec3::from(env.sun_dir).normalize_or_zero())))?;
@@ -469,6 +486,7 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
             Some(avatar)
         } else { None };
         let mut medians = [0.0; 2];
+        let mut shadow_medians = [None; 2];
         let mut baseline_raw = None;
         let mut allocated = [None; 2];
         // Repeat opposite ordering to expose simple thermal/order drift.
@@ -497,6 +515,15 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                 off.frame(&mut shot, 0.0);
                 if let Some(avatar) = &lightbar {
                     off.host.actor_models.push((super::super::avatar::MODEL_KEY, std::sync::Arc::new(avatar.model().clone())));
+                    // Mounted sources arrive after the scene snapshot; dt=0 cannot age their
+                    // native 0.25-second admission/slot fades. Prime BOTH variants identically.
+                    let mut prime_time = 0.0_f32;
+                    for _ in 0..60 {
+                        submit_grass_lightbar(&mut off, avatar);
+                        off.frame(&mut shot, 1.0 / 60.0);
+                        prime_time += 1.0 / 60.0;
+                    }
+                    writeln!(report, "view={name} round={round} variant={variant} lightbar_prime_frames=60 lightbar_prime_dt={} renderer_frozen_time_after_prime={prime_time} avatar_pose_time=0", 1.0_f32 / 60.0)?;
                 }
                 let warm_started = std::time::Instant::now();
                 off.warm_grass_tiles();
@@ -508,10 +535,7 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                 let mut list = Default::default();
                 for frame in 0..320 + measured_frames {
                     if let Some(avatar) = &lightbar {
-                        off.host.dynamic_lights.extend(avatar.lights());
-                        let mut frame = avatar.frame();
-                        frame.always = false;
-                        off.host.actors.push(frame);
+                        submit_grass_lightbar(&mut off, avatar);
                     }
                     list = off.frame(&mut shot, 0.0);
                     let ms = if capture_only { None } else { Some(off.read_frame_gpu_ms()?.context("GPU timestamps unavailable")?) };
@@ -527,6 +551,34 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                     writeln!(report, "view={name} round={round} variant={variant} lightbar_body_admitted=true")?;
                 }
                 if !capture_only { off.set_gpu_timing(false)?; }
+                let mut shadow_gpu = Vec::with_capacity(if shadow_timing { measured_frames } else { 0 });
+                if shadow_timing { off.set_shadow_gpu_timing_stage(&shadow_stage)?; }
+                if !capture_only {
+                    let mut csv = String::with_capacity(measured_frames * 80 + 100);
+                    writeln!(csv, "sample_index,whole_frame_gpu_ms,prepare_wall_ms,shadow_span_gpu_ms")?;
+                    for sample in 0..measured_frames {
+                        let shadow_ms = if shadow_timing {
+                            if let Some(avatar) = &lightbar {
+                                submit_grass_lightbar(&mut off, avatar);
+                            }
+                            list = off.frame(&mut shot, 0.0);
+                            off.read_shadow_gpu_ms()?
+                        } else { None };
+                        write!(csv, "{sample},{},{},", gpu[sample], prepare[sample])?;
+                        if let Some(ms) = shadow_ms {
+                            write!(csv, "{ms}")?;
+                            shadow_gpu.push(ms);
+                        }
+                        writeln!(csv)?;
+                    }
+                    std::fs::write(out.join(format!("{name}-round{round}-variant{variant}-timing.csv")), csv)?;
+                }
+                if shadow_timing { off.set_shadow_gpu_timing(false)?; }
+                let shadow_stats = (!shadow_gpu.is_empty()).then(|| percentiles(&mut shadow_gpu));
+                shadow_medians[variant] = shadow_stats.map(|stats| stats.0);
+                if shadow_timing {
+                    writeln!(report, "view={name} round={round} variant={variant} shadow_stage={shadow_stage} shadow_gpu_samples={} shadow_gpu_ms_p50_p95_p99={shadow_stats:?}", shadow_gpu.len())?;
+                }
                 let (bytes, _, cells) = off.evidence_grass_metrics();
                 let generation_mean = generation.iter().sum::<f64>() / generation.len() as f64;
                 let generation_max = generation.iter().copied().fold(0.0, f64::max);
@@ -586,6 +638,10 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
             }
             if !capture_only {
                 writeln!(report, "view={name} round={round} incremental_grass_gpu_frame_p50_ms={}", medians[1] - medians[0])?;
+                if shadow_timing {
+                    let delta = shadow_medians[1].zip(shadow_medians[0]).map(|(on, off)| on - off);
+                    writeln!(report, "view={name} round={round} shadow_stage={shadow_stage} incremental_grass_gpu_shadow_p50_ms={delta:?}")?;
+                }
             }
             if let [Some(before), Some(after)] = allocated {
                 writeln!(report, "view={name} round={round} native_metal_allocated_delta_bytes={}", after as i128 - before as i128)?;
@@ -684,6 +740,92 @@ fn grass_ground_camera(
     mode: &str,
 ) -> anyhow::Result<(ao_render::Camera, u16, [i32; 2], ao_render::Vec3)> {
     use ao_render::Vec3;
+    let cells = grass_fixture_cells(scene);
+    let mut best: Option<(usize, f32, ao_render::Camera, u16, [i32; 2], Vec3)> = None;
+    for (&grid, cell) in &cells {
+        let distance = cell.root.distance_squared(reference);
+        let neighbors = (-1..=1).flat_map(|z| (-1..=1).map(move |x| [grid[0]+x, grid[1]+z]))
+            .filter(|neighbor| cells.contains_key(neighbor)).count();
+        if best.as_ref().is_some_and(|old| neighbors < old.0 || (neighbors == old.0 && distance >= old.1)) { continue; }
+        let path = matches!(mode, "path-day" | "path-dusk");
+        if !cell.samples.iter().all(|point| (exposure.query)(point.to_array())
+            && (path || matches!(surface.ground_material(point.to_array()), 6 | 15))) { continue; }
+        if path && !matches!(surface.ground_material(cell.root.to_array()), 6 | 15) { continue; }
+        if !mode.is_empty() && !cell.green_center { continue; }
+        if mode == "backlit-dusk" {
+            let sun = Vec3::from(scene.environment.context("backlit grass has no native environment")?.sun_dir);
+            if let Some(camera) = grass_backlit_camera(cell.root, sun,
+                |point| surface.ground(point), |a, b| super::super::player::segment_clear(surface, a, b)) {
+                best = Some((neighbors, distance, camera, cell.tile, grid, cell.root));
+            }
+            continue;
+        }
+        if matches!(mode, "path-day" | "path-dusk") {
+            for direction in [Vec3::X, -Vec3::X, Vec3::Z, -Vec3::Z] {
+                let boundary = cell.root + direction * (cell.size * 0.5);
+                let tangent = direction.cross(Vec3::Y);
+                let camera = if mode == "path-dusk" {
+                    let sun = Vec3::from(scene.environment.context("path dusk has no native environment")?.sun_dir).normalize_or_zero();
+                    if direction.dot(-sun) < 0.5 { continue; }
+                    grass_backlit_camera(cell.root, sun,
+                        |point| surface.ground(point), |a, b| super::super::player::segment_clear(surface, a, b))
+                } else {
+                    grass_path_crossing_camera(cell.root, cell.size, direction, |point| surface.terrain_height(point))
+                };
+                let Some(camera) = camera else { continue; };
+                if camera.forward().dot(direction) >= -0.5 { continue; }
+                // A single bare-material query can hit ground underneath a building.
+                // Require an actual open, visible ground patch on BOTH sides of the edge.
+                let mut probes = [Vec3::ZERO; 12];
+                for (index, probe) in probes.iter_mut().enumerate() {
+                    let across = [-0.75, 0.0, 0.75][index % 3];
+                    *probe = if index < 3 { cell.root + tangent * across }
+                        else { boundary + direction * [0.4, 1.2, 2.4][(index - 3) / 3] + tangent * across };
+                }
+                let open_and_visible = probes.iter_mut().enumerate().all(|(index, point)| {
+                    let Some(height) = surface.terrain_height(point.to_array()) else { return false; };
+                    point.y = height;
+                    let Some(ground) = surface.ground((*point + Vec3::Y * 0.5).to_array()) else { return false; };
+                    if (ground - height).abs() > 0.02 || !(exposure.query)(point.to_array()) { return false; }
+                    let material = surface.ground_material(point.to_array());
+                    let green = matches!(material, 6 | 15);
+                    if (index < 3 && !green) || (index >= 3 && (green || matches!(material, 0 | 8..=11))) { return false; }
+                    let low = *point + Vec3::Y * 0.08;
+                    super::super::player::segment_clear(surface, low.to_array(), (*point + Vec3::Y * 12.0).to_array())
+                        && super::super::player::segment_clear(surface, camera.pos.to_array(), low.to_array())
+                });
+                if !open_and_visible { continue; }
+                let Some(eye_ground) = surface.terrain_height(camera.pos.to_array()) else { continue; };
+                let eye_root = Vec3::new(camera.pos.x, eye_ground, camera.pos.z);
+                if !(0.7..=1.8).contains(&(camera.pos.y - eye_ground))
+                    || !(exposure.query)(eye_root.to_array())
+                    || !super::super::player::segment_clear(surface, (eye_root + Vec3::Y * 0.08).to_array(),
+                        (eye_root + Vec3::Y * 12.0).to_array()) { continue; }
+                best = Some((neighbors, distance, camera, cell.tile, grid, cell.root));
+                break;
+            }
+            continue;
+        }
+        let full_radius = 0.72 * 50.0f32.min((44.0 / 3.0 - 3.0) * cell.size).min(12.5 * cell.size);
+        let offset = 8.0f32.min(full_radius * 0.6);
+        for direction in [Vec3::Z, Vec3::X, -Vec3::Z, -Vec3::X] {
+            let mut eye = cell.root + direction * offset;
+            let ground = [-2.0, 0.0, 2.0].into_iter().flat_map(|x| [-2.0, 0.0, 2.0].into_iter().map(move |z| [eye.x + x, eye.y + 15.0, eye.z + z]))
+                .filter_map(|point| surface.ground(point)).max_by(f32::total_cmp);
+            let Some(ground) = ground else { continue; };
+            eye.y = ground + 1.7;
+            if eye.distance(cell.root) >= full_radius { continue; }
+            let at = cell.root + Vec3::Y * 0.2;
+            if !super::super::player::segment_clear(surface, eye.to_array(), at.to_array()) { continue; }
+            best = Some((neighbors, distance, ao_render::Camera::look_at(eye, at), cell.tile, grid, cell.root));
+            break;
+        }
+    }
+    best.map(|(_, _, camera, tile, grid, root)| (camera, tile, grid, root)).context("no exposed native green grass with a clear evidence camera")
+}
+
+fn grass_fixture_cells(scene: &ao_scene::Scene) -> std::collections::BTreeMap<[i32; 2], GrassFixtureCell> {
+    use ao_render::Vec3;
     let mut cells = std::collections::BTreeMap::new();
     for patch in &scene.ground_detail {
         for (index, cell) in patch.fine_cells.iter().enumerate() {
@@ -711,68 +853,188 @@ fn grass_ground_camera(
             cells.insert(grid, GrassFixtureCell { root, samples, tile: cell.native_tile, size: patch.cell_size, green_center });
         }
     }
-    let mut best: Option<(usize, f32, ao_render::Camera, u16, [i32; 2], Vec3)> = None;
-    for (&grid, cell) in &cells {
-        let distance = cell.root.distance_squared(reference);
-        let neighbors = (-1..=1).flat_map(|z| (-1..=1).map(move |x| [grid[0]+x, grid[1]+z]))
-            .filter(|neighbor| cells.contains_key(neighbor)).count();
-        if best.as_ref().is_some_and(|old| neighbors < old.0 || (neighbors == old.0 && distance >= old.1)) { continue; }
-        let path = matches!(mode, "path-day" | "path-dusk");
-        if !cell.samples.iter().all(|point| (exposure.query)(point.to_array())
-            && (path || matches!(surface.ground_material(point.to_array()), 6 | 15))) { continue; }
-        if path && !matches!(surface.ground_material(cell.root.to_array()), 6 | 15) { continue; }
-        if !mode.is_empty() && !cell.green_center { continue; }
-        if mode == "backlit-dusk" {
-            let sun = Vec3::from(scene.environment.context("backlit grass has no native environment")?.sun_dir);
-            if let Some(camera) = grass_backlit_camera(cell.root, sun,
-                |point| surface.ground(point), |a, b| super::super::player::segment_clear(surface, a, b)) {
-                best = Some((neighbors, distance, camera, cell.tile, grid, cell.root));
+    cells
+}
+
+struct GrassLightbarProof {
+    owner: ao_render::Vec3,
+    source: ao_render::Vec3,
+    receiver: ao_render::Vec3,
+    lit_receiver: ao_render::Vec3,
+    caster: [usize; 4],
+}
+
+// This is an evidence selector, not scene construction: both the collision hit and
+// an opaque, non-ground triangle from the loaded scene must cross the native ray.
+fn grass_lightbar_camera(
+    scene: &ao_scene::Scene,
+    surface: &ao_formats::playfield::collision::Collision,
+    exposure: &ao_render::GrassExposure,
+    reference: ao_render::Vec3,
+    light: ao_scene::Light,
+) -> anyhow::Result<(ao_render::Camera, u16, [i32; 2], GrassLightbarProof)> {
+    use ao_render::Vec3;
+    ensure!(light.range.is_finite() && light.range > 0.0, "native LightBar has no positive range");
+    let ground_meshes: std::collections::HashSet<_> = scene.ground_detail.iter().map(|patch| patch.mesh).collect();
+    let mut triangles = Vec::new();
+    for (instance_index, instance) in scene.instances.iter().enumerate() {
+        if ground_meshes.contains(&instance.mesh) { continue; }
+        let mesh = &scene.meshes[instance.mesh];
+        let transform = |point: [f32; 3]| {
+            let m = instance.transform;
+            let xyz = |axis: [f32; 4]| Vec3::new(axis[0], axis[1], axis[2]);
+            xyz(m[0]) * point[0] + xyz(m[1]) * point[1] + xyz(m[2]) * point[2] + xyz(m[3])
+        };
+        for (submesh_index, submesh) in mesh.submeshes.iter().enumerate() {
+            if submesh.blend != ao_scene::Blend::Opaque || submesh.overlay || submesh.base_color[3] < 1.0 { continue; }
+            for (triangle_index, indices) in submesh.indices.as_chunks::<3>().0.iter().enumerate() {
+                let points = [indices[0], indices[1], indices[2]].map(|index| transform(mesh.vertices[index as usize].pos));
+                let normal = (points[1] - points[0]).cross(points[2] - points[0]).normalize_or_zero();
+                if normal == Vec3::ZERO || normal.y.abs() > 0.7 { continue; }
+                let lo = points[0].min(points[1]).min(points[2]);
+                let hi = points[0].max(points[1]).max(points[2]);
+                triangles.push((points, lo, hi, [instance_index, instance.mesh, submesh_index, triangle_index]));
             }
-            continue;
-        }
-        if matches!(mode, "path-day" | "path-dusk") {
-            for direction in [Vec3::X, -Vec3::X, Vec3::Z, -Vec3::Z] {
-                let mut bare = cell.root + direction * (cell.size * 0.5 + 0.25);
-                let Some(height) = surface.ground((bare + Vec3::Y * 1.0).to_array()) else { continue; };
-                bare.y = height;
-                let material = surface.ground_material(bare.to_array());
-                if material == 0 || matches!(material, 6 | 15) { continue; }
-                if mode == "path-dusk" {
-                    let sun = Vec3::from(scene.environment.context("path dusk has no native environment")?.sun_dir).normalize_or_zero();
-                    if direction.dot(-sun) < 0.5 { continue; }
-                    let Some(camera) = grass_backlit_camera(cell.root, sun,
-                        |point| surface.ground(point), |a, b| super::super::player::segment_clear(surface, a, b)) else { continue; };
-                    if !super::super::player::segment_clear(surface, camera.pos.to_array(), (bare + Vec3::Y * 0.2).to_array()) { continue; }
-                    best = Some((neighbors, distance, camera, cell.tile, grid, cell.root));
-                    break;
-                }
-                let mut eye = cell.root + direction.cross(Vec3::Y) * 4.0 - direction;
-                let Some(height) = surface.ground((eye + Vec3::Y * 15.0).to_array()) else { continue; };
-                eye.y = height + 1.2;
-                let at = cell.root.lerp(bare, 0.5) + Vec3::Y * 0.2;
-                if !super::super::player::segment_clear(surface, eye.to_array(), (cell.root + Vec3::Y * 0.2).to_array())
-                    || !super::super::player::segment_clear(surface, eye.to_array(), (bare + Vec3::Y * 0.2).to_array()) { continue; }
-                best = Some((neighbors, distance, ao_render::Camera::look_at(eye, at), cell.tile, grid, cell.root));
-                break;
-            }
-            continue;
-        }
-        let full_radius = 0.72 * 50.0f32.min((44.0 / 3.0 - 3.0) * cell.size).min(12.5 * cell.size);
-        let offset = if mode == "lightbar-night" { 4.0 } else { 8.0f32.min(full_radius * 0.6) };
-        for direction in [Vec3::Z, Vec3::X, -Vec3::Z, -Vec3::X] {
-            let mut eye = cell.root + direction * offset;
-            let ground = [-2.0, 0.0, 2.0].into_iter().flat_map(|x| [-2.0, 0.0, 2.0].into_iter().map(move |z| [eye.x + x, eye.y + 15.0, eye.z + z]))
-                .filter_map(|point| surface.ground(point)).max_by(f32::total_cmp);
-            let Some(ground) = ground else { continue; };
-            eye.y = ground + 1.7;
-            if eye.distance(cell.root) >= full_radius { continue; }
-            let at = cell.root + Vec3::Y * 0.2;
-            if !super::super::player::segment_clear(surface, eye.to_array(), at.to_array()) { continue; }
-            best = Some((neighbors, distance, ao_render::Camera::look_at(eye, at), cell.tile, grid, cell.root));
-            break;
         }
     }
-    best.map(|(_, _, camera, tile, grid, root)| (camera, tile, grid, root)).context("no exposed native green grass with a clear evidence camera")
+    // Index the authored triangles once; a whole-playfield cell × triangle scan
+    // would dominate this opt-in fixture before it ever reaches the renderer.
+    let bucket = |value: f32| (value / 8.0).floor() as i32;
+    let mut nearby = std::collections::HashMap::<[i32; 2], Vec<usize>>::new();
+    for (index, &(_, lo, hi, _)) in triangles.iter().enumerate() {
+        for x in bucket(lo.x - light.range)..=bucket(hi.x + light.range) {
+            for z in bucket(lo.z - light.range)..=bucket(hi.z + light.range) {
+                nearby.entry([x, z]).or_default().push(index);
+            }
+        }
+    }
+    let cells = grass_fixture_cells(scene);
+    let mut ordered: Vec<_> = cells.iter().filter(|(_, cell)| cell.green_center).collect();
+    ordered.sort_by(|(a_grid, a), (b_grid, b)| a.root.distance_squared(reference)
+        .total_cmp(&b.root.distance_squared(reference)).then_with(|| a_grid.cmp(b_grid)));
+    let clear = |a: Vec3, b: Vec3| super::super::player::segment_clear(surface, a.to_array(), b.to_array());
+    let ground = |point: Vec3| -> Option<Vec3> {
+        let height = surface.terrain_height(point.to_array())?;
+        let point = Vec3::new(point.x, height, point.z);
+        let support = surface.ground((point + Vec3::Y * 0.5).to_array())?;
+        ((support - height).abs() < 0.02).then_some(point)
+    };
+    for (&grid, cell) in ordered {
+        for sample in cell.samples {
+            let Some(root) = ground(sample) else { continue; };
+            if !(exposure.query)(root.to_array()) || !matches!(surface.ground_material(root.to_array()), 6 | 15) { continue; }
+            let receiver = root + Vec3::Y * 0.15;
+            let Some(candidates) = nearby.get(&[bucket(receiver.x), bucket(receiver.z)]) else { continue; };
+            for &index in candidates {
+                let (points, lo, hi, caster) = triangles[index];
+                if receiver.clamp(lo, hi).distance(receiver) >= light.range { continue; }
+                let normal = (points[1] - points[0]).cross(points[2] - points[0]);
+                let normal = Vec3::new(normal.x, 0.0, normal.z).normalize_or_zero();
+                for direction in [normal, -normal] {
+                    let tangent = direction.cross(Vec3::Y);
+                    for distance in [2.5, 3.5, 4.5, 5.0] {
+                        let Some(owner) = ground(root + direction * distance) else { continue; };
+                        let source = owner + Vec3::from(light.pos);
+                        if !grass_lightbar_blocked_receiver(source, receiver, light.range, points)
+                            || clear(source, receiver) { continue; }
+                        if !clear(owner + Vec3::Y * 0.05, source)
+                            || surface.sphere_hit((owner + Vec3::Y).to_array(), 0.4).is_some() { continue; }
+                        for side in [-1.0, 1.0] {
+                            for across in [0.8, 1.6, 2.4] {
+                                let Some(lit_root) = ground(root + tangent * side * across) else { continue; };
+                                let lit_receiver = lit_root + Vec3::Y * 0.15;
+                                if source.distance(lit_receiver) >= light.range * 0.9
+                                    || !(exposure.query)(lit_root.to_array())
+                                    || !matches!(surface.ground_material(lit_root.to_array()), 6 | 15)
+                                    || !clear(source, lit_receiver) { continue; }
+                                let center = (root + owner) * 0.5;
+                                let Some(eye_root) = ground(center + tangent * side * 6.0) else { continue; };
+                                let eye = eye_root + Vec3::Y * 3.4;
+                                let camera = ao_render::Camera::look_at(eye, center + Vec3::Y * 0.7);
+                                let visible = [owner + Vec3::Y * 0.05, owner + Vec3::Y, source, receiver, lit_receiver]
+                                    .into_iter().all(|point| clear(eye, point)
+                                        && camera.forward().dot((point - eye).normalize_or_zero()) > 0.88);
+                                if visible {
+                                    return Ok((camera, cell.tile, grid,
+                                        GrassLightbarProof { owner, source, receiver, lit_receiver, caster }));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    anyhow::bail!("no native opaque world caster with blocked green receiver, adjacent lit receiver, native LightBar range and visible owner/camera LOS")
+}
+
+fn grass_lightbar_blocked_receiver(
+    source: ao_render::Vec3,
+    receiver: ao_render::Vec3,
+    range: f32,
+    triangle: [ao_render::Vec3; 3],
+) -> bool {
+    let ray = receiver - source;
+    if !range.is_finite() || range <= 0.0 || !ray.is_finite() || ray.length() >= range * 0.9 { return false; }
+    let [a, b, c] = triangle;
+    let edge = b - a;
+    let other = c - a;
+    let cross = ray.cross(other);
+    let determinant = edge.dot(cross);
+    if determinant.abs() < 1e-6 { return false; }
+    let offset = source - a;
+    let u = offset.dot(cross) / determinant;
+    let q = offset.cross(edge);
+    let v = ray.dot(q) / determinant;
+    let t = other.dot(q) / determinant;
+    (0.0..=1.0).contains(&u) && v >= 0.0 && u + v <= 1.0 && (0.02..0.98).contains(&t)
+}
+
+#[test]
+fn grass_lightbar_receiver_requires_in_range_non_endpoint_world_intersection() {
+    use ao_render::Vec3;
+    let triangle = [Vec3::new(0.0, 0.0, -1.0), Vec3::new(0.0, 3.0, -1.0), Vec3::new(0.0, 0.0, 1.0)];
+    let source = Vec3::new(-2.0, 2.1, 0.0);
+    let receiver = Vec3::new(2.0, 0.15, 0.0);
+    assert!(grass_lightbar_blocked_receiver(source, receiver, 6.13, triangle));
+    assert!(grass_lightbar_blocked_receiver(source, receiver, 6.13, [triangle[2], triangle[1], triangle[0]]));
+    assert!(!grass_lightbar_blocked_receiver(source, receiver, 4.0, triangle));
+    assert!(!grass_lightbar_blocked_receiver(source, receiver + Vec3::Z * 4.0, 10.0, triangle));
+    assert!(!grass_lightbar_blocked_receiver(source, receiver, 6.13, triangle.map(|p| p - Vec3::X * 2.0)));
+}
+
+fn grass_path_crossing_camera(
+    root: ao_render::Vec3,
+    size: f32,
+    direction: ao_render::Vec3,
+    terrain: impl Fn([f32; 3]) -> Option<f32>,
+) -> Option<ao_render::Camera> {
+    use ao_render::{Camera, Vec3};
+    let boundary = root + direction * (size * 0.5);
+    let mut eye = boundary + direction * 3.5 + direction.cross(Vec3::Y) * 1.5;
+    let mut at = boundary - direction * 0.75;
+    eye.y = terrain(eye.to_array())? + 1.7;
+    at.y = terrain(at.to_array())? + 0.15;
+    (eye.is_finite() && at.is_finite()).then(|| Camera::look_at(eye, at))
+}
+
+#[test]
+fn grass_path_camera_crosses_the_edge_from_bare_foreground() {
+    use ao_render::Vec3;
+    for direction in [Vec3::X, -Vec3::X, Vec3::Z, -Vec3::Z] {
+        let camera = grass_path_crossing_camera(Vec3::ZERO, 4.0, direction, |_| Some(3.0)).unwrap();
+        assert!(camera.pos.dot(direction) > 2.0);
+        assert!(camera.forward().dot(direction) < -0.8);
+        assert_eq!(camera.pos.y, 4.7);
+    }
+    assert!(grass_path_crossing_camera(Vec3::ZERO, 4.0, Vec3::X, |_| None).is_none());
+}
+
+fn submit_grass_lightbar(off: &mut Offscreen, avatar: &super::super::avatar::Avatar) {
+    off.host.dynamic_lights.extend(avatar.lights());
+    let mut frame = avatar.frame();
+    frame.always = false;
+    off.host.actors.push(frame);
 }
 
 fn grass_backlit_camera(

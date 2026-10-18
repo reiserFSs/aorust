@@ -4,6 +4,7 @@ use glam::{Mat4, Vec3};
 use super::{GpuStatsExt, TextureViewStatsExt};
 
 pub(crate) const CASCADES: usize = 3;
+pub(crate) const GRASS_RESOLUTION: u32 = 512;
 #[cfg(test)]
 pub(crate) const RESOLUTION: u32 = 1024;
 fn shader_source() -> std::borrow::Cow<'static, str> {
@@ -24,7 +25,7 @@ pub(crate) fn receiver_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
-pub(crate) fn receiver_entries() -> [wgpu::BindGroupLayoutEntry; 3] {
+pub(crate) fn receiver_entries() -> [wgpu::BindGroupLayoutEntry; 4] {
     [
             wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform,
@@ -34,6 +35,9 @@ pub(crate) fn receiver_entries() -> [wgpu::BindGroupLayoutEntry; 3] {
                     view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }, count: None },
             wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison), count: None },
+            wgpu::BindGroupLayoutEntry { binding: 8, visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
     ]
 }
 
@@ -133,6 +137,7 @@ pub(crate) struct SunShadows {
     pub grass_layer: Option<wgpu::TextureView>,
     pub grass_caster: Option<GrassCaster>,
     array: wgpu::TextureView,
+    grass_depth: wgpu::TextureView,
     sampler: wgpu::Sampler,
     pub cascade_groups: [wgpu::BindGroup; CASCADES],
     pub layers: [wgpu::TextureView; CASCADES],
@@ -187,7 +192,7 @@ impl GrassCaster {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("grass shadow geometry"), entries: &[buffer(0, true), buffer(1, false), buffer(2, false),
                 buffer(5, true), texture(6), wgpu::BindGroupLayoutEntry { binding: 7, visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None }, texture(8)],
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None }, texture(8), buffer(14, true)],
         });
         let mut source = crate::grass::shader_source((false, false, false, false, false), false);
         source.push_str(&crate::shader_source::load("grass_caster.wgsl", include_str!("grass_caster.wgsl")));
@@ -196,9 +201,9 @@ impl GrassCaster {
             label: Some("grass caster"), bind_group_layouts: &[Some(&renderer.g_layout), None, None, Some(&layout)], immediate_size: 0,
         });
         let pipeline = crate::pipeline_creation::render_deferred(device, &wgpu::RenderPipelineDescriptor {
-            label: Some("real grass blade shadows"), layout: Some(&pipeline_layout),
+            label: Some("near triangular grass blade shadows"), layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_grass_shadow"), compilation_options: Default::default(), buffers: &[] },
-            fragment: None, primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, cull_mode: None, ..Default::default() },
+            fragment: None, primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
             depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::LessEqual), stencil: Default::default(), bias: wgpu::DepthBiasState { constant: 1, slope_scale: 1.0, clamp: 0.0 } }),
             multisample: Default::default(), multiview_mask: None, cache: None,
@@ -306,13 +311,16 @@ impl SunShadows {
         }).create_view_tracked(&Default::default());
         let primary_ids = texture("sun caster admission identities", size.0, size.1, 1, wgpu::TextureFormat::R32Uint).create_view_tracked(&Default::default());
         let grass_enabled = renderer.enhanced_settings.ground_grass && renderer.enhanced_settings.grass_sun_shadows;
-        let maps = texture("current-frame sun cascades and optional grass", resolution, resolution, 3 + u32::from(grass_enabled), wgpu::TextureFormat::Depth32Float);
+        // Grass keeps the nearest native projection, but never its allocation size.
+        let maps = texture("current-frame sun cascades", resolution, resolution, CASCADES as u32, wgpu::TextureFormat::Depth32Float);
         let array = maps.create_view_tracked(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
         let layers = std::array::from_fn(|i| maps.create_view_tracked(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2), base_array_layer: i as u32,
             array_layer_count: Some(1), ..Default::default() }));
-        let grass_layer = grass_enabled.then(|| maps.create_view_tracked(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D2), base_array_layer: 3, array_layer_count: Some(1), ..Default::default() }));
+        let grass_resolution = if grass_enabled { GRASS_RESOLUTION } else { 1 };
+        let grass_depth = texture("near grass sun depth", grass_resolution, grass_resolution, 1, wgpu::TextureFormat::Depth32Float)
+            .create_view_tracked(&Default::default());
+        let grass_layer = grass_enabled.then(|| grass_depth.clone());
         let grass_caster = grass_enabled.then(|| GrassCaster::new(renderer));
         let uniforms: [wgpu::Buffer; CASCADES] = std::array::from_fn(|_| device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
             label: Some("current cascade matrices"), contents: bytemuck::bytes_of(&ShadowUniform::zeroed()),
@@ -327,14 +335,15 @@ impl SunShadows {
         let receiver_entries = [wgpu::BindGroupEntry { binding: 0, resource: uniforms[0].as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&array) },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
-            wgpu::BindGroupEntry { binding: 7, resource: exposure.as_entire_binding() }];
+            wgpu::BindGroupEntry { binding: 7, resource: exposure.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&grass_depth) }];
         let receiver = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("sun shadow receiver"),
             layout: &receiver_layout, entries: &receiver_entries });
         let actor_capacity = 64;
         let (actor_ids_buffer, actor_visibility) = admission_buffers(device, actor_capacity);
         let cascade_groups = caster_groups(device, caster_layout, &uniforms, &actor_visibility);
         let visibility_group = visibility_group(device, visibility_layout, &primary_ids, &actor_visibility);
-        Self { receiver, grass_receiver: None, grass_layer, grass_caster, array, sampler, cascade_groups, layers, _maps: maps,
+        Self { receiver, grass_receiver: None, grass_layer, grass_caster, array, grass_depth, sampler, cascade_groups, layers, _maps: maps,
             primary_depth, primary_ids, size, resolution, uniforms, compiled, exposure,
             sun_replacement_active: false, coverage_uniform: ShadowUniform::zeroed(),
             native_fog_end: f32::INFINITY,
@@ -343,7 +352,7 @@ impl SunShadows {
             actor_ids_buffer, actor_visibility, actor_capacity, visibility_group }
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn grass_bind(&self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, cells: &wgpu::Buffer, params: &wgpu::Buffer, visible: &wgpu::Buffer, noise: &wgpu::TextureView, noise_sampler: &wgpu::Sampler, mask: &wgpu::TextureView, points: Option<&crate::point_shadows::PointShadows>) -> wgpu::BindGroup {
+    pub fn grass_bind(&self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, cells: &wgpu::Buffer, params: &wgpu::Buffer, visible: &wgpu::Buffer, noise: &wgpu::TextureView, noise_sampler: &wgpu::Sampler, mask: &wgpu::TextureView, roots: &wgpu::Buffer, points: Option<&crate::point_shadows::PointShadows>) -> wgpu::BindGroup {
         let mut entries = vec![
                 wgpu::BindGroupEntry { binding: 0, resource: cells.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() },
@@ -354,6 +363,8 @@ impl SunShadows {
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(noise) },
                 wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(noise_sampler) },
                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(mask) },
+                wgpu::BindGroupEntry { binding: 14, resource: roots.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(&self.grass_depth) },
         ];
         if let Some(points) = points {
             entries.extend([
@@ -370,15 +381,17 @@ impl SunShadows {
     }
     pub fn grass_caster_bind(&self, device: &wgpu::Device, grass: &crate::grass::Grass) -> Option<wgpu::BindGroup> {
         let caster = self.grass_caster.as_ref()?;
+        let visible = grass.sun_visible_buffer.as_ref()?;
         Some(device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
             label: Some("current grass blade caster"), layout: &caster.layout, entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: grass.cells_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: grass.params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.uniforms[0].as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: grass.visible_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: visible.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&grass.noise_view) },
                 wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&grass.noise_sampler) },
                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&grass.mask_view) },
+                wgpu::BindGroupEntry { binding: 14, resource: grass.root_cache.buffer.as_entire_binding() },
             ],
         }))
     }
@@ -394,11 +407,11 @@ impl SunShadows {
         self.actor_groups.clear();
     }
 
-    pub fn encode_actor_visibility(&self, encoder: &mut wgpu::CommandEncoder) {
+    pub fn encode_actor_visibility(&self, encoder: &mut wgpu::CommandEncoder, timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>) {
         if self.actor_ids.is_empty() { return; }
         encoder.clear_buffer(&self.actor_visibility, 0, None);
         let mut pass = encoder.begin_effect_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("current-frame actor visibility reduction"), timestamp_writes: None,
+            label: Some("current-frame actor visibility reduction"), timestamp_writes,
         });
         pass.set_pipeline(&self.compiled.visibility_pipeline);
         pass.set_bind_group(0, &self.visibility_group, &[]);
@@ -413,7 +426,8 @@ impl SunShadows {
         }
     }
     pub fn resident_bytes(&self) -> u64 {
-        u64::from(self.resolution).pow(2) * 4 * (CASCADES + usize::from(self.grass_layer.is_some())) as u64
+        u64::from(self.resolution).pow(2) * 4 * CASCADES as u64
+            + u64::from(if self.grass_layer.is_some() { GRASS_RESOLUTION } else { 1 }).pow(2) * 4
             + u64::from(self.size.0) * u64::from(self.size.1) * 4
             + (std::mem::size_of::<ShadowUniform>() * CASCADES) as u64
             + (self.static_capacity * 64) as u64
@@ -432,6 +446,7 @@ impl SunShadows {
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&points.sampler) },
                 wgpu::BindGroupEntry { binding: 6, resource: points.metadata.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: self.exposure.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&self.grass_depth) },
                 wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&points.actor_array) },
             ],
         })

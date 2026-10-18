@@ -5,7 +5,7 @@ struct CubeState {
     cache: vec4<u32>, progress: vec4<u32>, clock: vec4<f32>,
     cached_input: vec4<u32>,
 }
-struct PointParams { eye: vec4<f32>, timing: vec4<f32>, cache: vec4<u32>, schedule: vec4<f32>, grass: vec4<f32>, }
+struct PointParams { eye: vec4<f32>, timing: vec4<f32>, cache: vec4<u32>, schedule: vec4<f32>, }
 struct PointFaceMetadata { static_matrix: mat4x4<f32>, dynamic_matrix: mat4x4<f32>, params: vec4<f32>, }
 struct PointMetadata { slots: array<vec4<f32>,16>, lights: array<vec4<f32>,16>, faces: array<PointFaceMetadata,96>, }
 @group(0) @binding(0) var<storage, read_write> pool: array<vec4<f32>>;
@@ -127,9 +127,8 @@ fn select_cubes() {
         var actor_pose = 0u;
         var membership = 0u;
         var membership_second = 0u;
-        // Grass is admitted camera-visible geometry, conservatively present in each selected cube.
-        var dynamic_world = params.grass.x > 0.0 || params.grass.y > 0.0;
-        var has_actor_depth = params.grass.x > 0.0;
+        var dynamic_world = false;
+        var has_actor_depth = false;
         for (var i=u32(params.timing.w); i<params.cache.x; i++) {
             let c = casters[i];
             // Hidden owners must not affect even a radius test or cache schedule.
@@ -250,9 +249,8 @@ fn select_cubes() {
                         face_data[base+col]=raster[col];
                     }
                     face_data[base+14u]=vec4<f32>(0.0,0.0,0.0,ratio*256.0);
-                    face_data[base + 13u] = light;
                 }
-                face_data[base+15u]=bitcast<vec4<f32>>(vec4<u32>(0u, 0x80000000u, select(1u,0u,update),select(0u,1u,owned)));
+                face_data[base+15u]=bitcast<vec4<f32>>(vec4<u32>(0u,0x80000000u,select(1u,0u,update),select(0u,1u,owned)));
             }
         }
     }

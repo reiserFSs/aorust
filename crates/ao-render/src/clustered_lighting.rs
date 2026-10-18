@@ -81,13 +81,21 @@ impl Frame {
         self.data[..prefix.len()].copy_from_slice(prefix);
         self.pairs.clear();
         if selected.is_empty() { return; }
+        let radius = |p: Vec3, range: f32, grid_scale: f32| {
+            range + p.abs().max_element().max(range).max(grid_scale).max(1.0) * (16.0 * f32::EPSILON)
+        };
         let mut lo = Vec3::splat(f32::MAX);
         let mut hi = Vec3::splat(f32::MIN);
         for light in selected {
             let p = Vec3::from_slice(&light[0][..3]);
-            lo = lo.min(p - light[0][3]);
-            hi = hi.max(p + light[0][3]);
+            let range = radius(p, light[0][3], 0.0);
+            lo = lo.min(p - range);
+            hi = hi.max(p + range);
         }
+        let bounds_scale = lo.abs().max_element().max(hi.abs().max_element()).max((hi - lo).max_element());
+        let bounds_padding = bounds_scale.max(1.0) * (16.0 * f32::EPSILON);
+        lo -= Vec3::splat(bounds_padding);
+        hi += Vec3::splat(bounds_padding);
         let mut cell = crate::MIN_CELL;
         let dims = loop {
             let d = ((hi - lo) / cell).ceil().max(Vec3::ONE);
@@ -99,10 +107,11 @@ impl Frame {
         self.data[PREFIX + 1] = [f32::from_bits(dims.x), f32::from_bits(dims.y), f32::from_bits(dims.z), f32::from_bits(cells_start as u32)];
         self.data.extend(selected.iter().flat_map(|light| *light));
         let count = (dims.x * dims.y * dims.z) as usize;
+        let grid_scale = lo.abs().max_element().max(hi.abs().max_element()).max(cell * dims.max_element() as f32);
         self.data.resize(cells_start + count, [0.0; 4]);
         for (index, light) in selected.iter().enumerate() {
             let p = Vec3::from_slice(&light[0][..3]);
-            let range = light[0][3];
+            let range = radius(p, light[0][3], grid_scale);
             let a = ((p - range - lo) / cell).floor().max(Vec3::ZERO).as_uvec3();
             let b = ((p + range - lo) / cell).floor().as_uvec3().min(dims - 1);
             for z in a.z..=b.z { for y in a.y..=b.y { for x in a.x..=b.x {
@@ -123,7 +132,7 @@ impl Frame {
 }
 
 impl crate::Renderer {
-    pub(super) fn encode_clustered_lights(&mut self, encoder: &mut wgpu::CommandEncoder, eye: Vec3, owners: &wgpu::Buffer) {
+    pub(super) fn encode_clustered_lights(&mut self, encoder: &mut wgpu::CommandEncoder, eye: Vec3, owners: &wgpu::Buffer, last_shadow_span: bool) {
         if !self.enhanced_settings.needs_admitted_lights() { return; }
         let data = &mut self.cluster_frame.data;
         data.clear();
@@ -193,10 +202,14 @@ impl crate::Renderer {
             });
             self.cluster_frame.gpu = Some(Gpu { input, output: self.dyn_light_buf.clone(), owners: owners.clone(), bind });
         }
-        let gpu = self.cluster_frame.gpu.as_ref().expect("admitted light resources");
-        self.queue.write_buffer(&gpu.input, 0, bytes);
-        let timestamp_writes = self.gpu_timer.as_mut().filter(|timer| !timer.is_recording()).map(crate::FrameGpuTimer::begin_compute_pass);
+        self.queue.write_buffer(&self.cluster_frame.gpu.as_ref().expect("admitted light resources").input, 0, bytes);
+        let timestamp_writes = if self.shadow_timer.is_some() {
+            self.shadow_stage_compute(crate::shadow_pass::ShadowGpuStage::LightPool, true, last_shadow_span)
+        } else {
+            self.gpu_timer.as_mut().filter(|timer| !timer.is_recording()).map(crate::FrameGpuTimer::begin_compute_pass)
+        };
         let mut pass = encoder.begin_effect_compute_pass(&wgpu::ComputePassDescriptor { label: Some("admitted local light selection and spatial clusters"), timestamp_writes });
+        let gpu = self.cluster_frame.gpu.as_ref().expect("admitted light resources");
         pass.set_pipeline(&self.cluster_programs.pipeline);
         pass.set_bind_group(0, &gpu.bind, &[]);
         pass.dispatch_workgroups(1, 1, 1);
@@ -323,6 +336,72 @@ mod tests {
         let count = row[1].to_bits() as usize;
         assert!(count > 0);
         assert!(frame.data[first..first + count].iter().all(|id| id[0].to_bits() == 0));
+    }
+
+    #[test]
+    fn ordered_spatial_native_query_matches_full_scan_bytes_at_edges_and_over_eight_lights() {
+        let shade = |selected: &[[[f32; 4]; 4]], candidates: &[usize], point: Vec3, normal: Vec3, directionals: u32| {
+            let mut used = directionals + u32::from(directionals > 0);
+            let mut diffuse = Vec3::ZERO;
+            for &index in candidates {
+                if used >= 8 { break; }
+                let light = selected[index];
+                let delta = Vec3::from_slice(&light[0][..3]) - point;
+                let distance = delta.length();
+                if light[0][3] <= 0.0 || distance > light[0][3] { continue; }
+                used += 1;
+                let toward = delta / distance.max(0.001);
+                diffuse += Vec3::from_slice(&light[1][..3]) * normal.dot(toward).max(0.0);
+            }
+            diffuse.to_array().map(f32::to_bits)
+        };
+        let all: Vec<_> = (0..SOURCES).collect();
+        for scenario in 0..4 {
+            let scattered = scenario == 1;
+            let rounded_boundary = scenario == 2;
+            let cancellation_boundary = scenario == 3;
+            let selected: [[[f32; 4]; 4]; SOURCES] = std::array::from_fn(|index| crate::pack_light(&ao_scene::Light {
+                pos: [if cancellation_boundary && index == 0 { -134_217_472.0 } else if rounded_boundary { -128.0 } else if scattered && index >= 16 { index as f32 * 20.0 } else { 0.0 }, 0.0, 0.0],
+                color: [0.02 * (index + 1) as f32, 0.3, 0.2],
+                range: if cancellation_boundary { 1.0 } else if rounded_boundary { 128.0 } else { 8.0 },
+                atten: [1.0, 0.0, 0.0], ..Default::default()
+            }));
+            let mut frame = Frame::default();
+            frame.build(&selected, &[]);
+            let grid = frame.data[PREFIX];
+            let metadata = frame.data[PREFIX + 1].map(f32::to_bits);
+            let dims = glam::UVec3::new(metadata[0], metadata[1], metadata[2]);
+            let origin = Vec3::from_slice(&grid[..3]);
+            let upper = origin + dims.as_vec3() * grid[3];
+            let points = [Vec3::new(0.0, -1.0, 0.0), Vec3::X * 8.0, -Vec3::X * 8.0,
+                Vec3::X * f32::from_bits(8.0_f32.to_bits() + 1), Vec3::X * 50.0,
+                origin - Vec3::ONE, upper, upper + Vec3::ONE,
+                Vec3::X * f32::from_bits(0.000001_f32.to_bits() - 1),
+                Vec3::X * 0.000001_f32,
+                Vec3::X * f32::from_bits(0.000001_f32.to_bits() + 1),
+                Vec3::X * f32::from_bits(0.5_f32.to_bits() - 1), Vec3::X * 0.5,
+                Vec3::X * f32::from_bits(0.5_f32.to_bits() + 1),
+                Vec3::X * f32::from_bits(1), -Vec3::X * f32::from_bits(1)];
+            for point in points {
+                let candidates: Vec<_> = if point.cmplt(origin).any() || point.cmpgt(upper).any() {
+                    Vec::new()
+                } else {
+                    let c = ((point - origin) / grid[3]).floor().as_uvec3().min(dims - 1);
+                    let cell = ((c.z * dims.y + c.y) * dims.x + c.x) as usize;
+                    let list = frame.data[metadata[3] as usize + cell].map(f32::to_bits);
+                    frame.data[list[0] as usize..(list[0] + list[1]) as usize]
+                        .iter().map(|row| row[0].to_bits() as usize).collect()
+                };
+                assert!(candidates.windows(2).all(|indices| indices[0] < indices[1]));
+                for directionals in [0, 2, 7] {
+                    for normal in [Vec3::Y, Vec3::X, -Vec3::X] {
+                        assert_eq!(shade(&selected, &all, point, normal, directionals),
+                            shade(&selected, &candidates, point, normal, directionals),
+                            "spatial native energy changed at {point:?}, directional budget {directionals}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

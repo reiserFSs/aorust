@@ -45,18 +45,27 @@ fn grass_point_shadow_loss(world: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
     var loss = vec3<f32>(0.0);
     let directional_count = u32(g.dyn_info.y);
     var used = directional_count + select(0u, 1u, directional_count > 0u);
-    let count = min(bitcast<u32>(dyn_lights[322u].x), 64u);
+    let list = admitted_light_list(world);
+    let count = min(list.y, 64u);
+    if count == 0u || used >= 8u { return loss; }
     let n = normalize(normal);
     for (var k = 0u; k < count && used < 8u; k = k + 1u) {
-        let li = 66u + k * 4u;
+        let index = bitcast<u32>(dyn_lights[list.x + k].x);
+        let li = 66u + index * 4u;
         let a = dyn_lights[li];
         let packed = dyn_lights[li + 3u].w;
         if !owner_light_admitted(packed) { continue; }
         if a.w <= 0.0 { continue; }
         let d = a.xyz - world;
+        // Conservative coarse rejection; retain the exact native range test
+        // below around float-rounded sphere boundaries.
+        if dot(d, d) > a.w * a.w * 1.000001 { continue; }
         let dist = length(d);
         if dist > a.w { continue; }
         used += 1u;
+        // Unshadowed lights still consume their native slot, but need no BRDF
+        // evaluation or texture comparison in a shadow-loss-only query.
+        if (u32(abs(packed)) % 32u) == 0u { continue; }
         let col = dyn_lights[li + 1u];
         let att = dyn_lights[li + 2u];
         let l = d / max(dist, 1e-3);

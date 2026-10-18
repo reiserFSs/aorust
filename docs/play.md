@@ -2123,13 +2123,64 @@ a selection other than `none`, and skips the far-speck regression because that
 regression requires a grass-free terrain control. It still requires visible change
 in a positive view. Variant 0/1 PNGs are baseline/selected respectively.
 
+The renderer shares one current-frame GPU blade cache between beauty and the
+near sun-shadow view. It computes root/hash/mask/tuft/species and native lighting
+once per visible LOD-prefix blade, then evaluates wind, admitted character push,
+billboard, sunlight and fog once per blade section. The cache has one per-cell
+span header and a persistent capacity-sized record buffer, not a dense
+allocation for every possible blade in the field.
+One 64-lane workgroup walks each cell's bounded prefix, rather than launching the
+nearest cell's maximum blade count for every distant cell. Each 288-byte blade
+record retains full-f32 positions/fog; the three 48-byte sections pack only their
+eight appearance coefficients with `pack2x16float`. Invalid blades clear only
+the validity word before consumers reject them, avoiding unused shade writes.
+Sun casters compact camera-visible cells against the nearest sun-map volume and
+the actual camera's 15 m reach. A single base-to-tip triangle casts each near
+blade; blades never enter the far cascades. Grass shadow attenuation is capped
+at 30%, softened with two symmetric taps and faded from 12 to 15 m. This caster-only
+approximation does not reduce beauty grass density or distance.
+The grass depth image is a separate fixed 512×512 texture using the nearest
+cascade's projection, not an extra full-resolution array layer. The three native
+solid cascades keep their configured resolution and filtering unchanged.
+Blades evaluate sun/moon visibility at their actual cached vertices and
+interpolate it through spare components of the existing sunlight varying.
+Fragments keep the original direct/ambient separation and fog equations without
+repeating shadow-map comparisons. This Gouraud approximation smooths boundaries
+within one blade; per-fragment sampling is reserved for a visible quality need.
+
+Beauty writes depth and hardware alpha-to-coverage in one material-batched pass.
+There is no second whole-field grass depth prepass.
+
+Grass Point Shadows only receives the shared cached static/actor point cubes;
+there is no grass-specific cube caster pass, cell compaction or cube allocation.
+It requests the same admitted lights and current-source ownership checks without
+enabling the world Clustered Lighting or Local Light Shadows preferences.
+Only blades receive this grass-only point modifier: terrain keeps its existing
+world Local Light Shadows permission, rather than executing the obsolete
+terrain receiver for grass cube casters. Vertex shading samples the cached cubes
+at each blade root and transports the capped blocked-light loss in the existing
+flat varying; fragments do not rescan lights or sample point maps. This preserves
+the exact surviving native local-light cap, palette saturation and fog order.
+Root sampling approximates shadow boundaries smaller than one blade; use
+per-fragment sampling only if a visible quality requirement warrants that cost.
+
+
 Build and run the CPU-only selector check before acquiring the GPU lock:
 
 ```sh
 CARGO_TARGET_DIR=/tmp/GrassPlus/target cargo test --profile fast -j 2 -p aomac grass_feature_selection_is_explicit
 CARGO_TARGET_DIR=/tmp/GrassPlus/target cargo test --profile fast -j 2 -p aomac grass_backlit_camera_requires_native_sun_ground_and_los
+CARGO_TARGET_DIR=/tmp/GrassPlus/target cargo test --profile fast -j 2 -p aomac grass_path_camera_crosses_the_edge_from_bare_foreground
+CARGO_TARGET_DIR=/tmp/GrassPlus/target cargo test --profile fast -j 2 -p ao-render shared_blade_cache_matches_explicit_wgsl_storage_layout
+CARGO_TARGET_DIR=/tmp/GrassPlus/target cargo test --profile fast -j 2 -p ao-render grass_receiver_reuses_static_and_actor_cube_binding_contract
+CARGO_TARGET_DIR=/tmp/GrassPlus/target cargo test --profile fast -j 2 -p ao-render ordered_spatial_native_query_matches_full_scan_bytes_at_edges_and_over_eight_lights
 CARGO_TARGET_DIR=/tmp/GrassPlus/target cargo test --profile fast -j 2 -p aomac grass_offline --no-run
 ```
+
+The ordered spatial-query check includes the observed rounded native-range
+counterexample at x=1e-6 and a distant-origin grid cancellation case, with adjacent
+f32 values. Candidate bounds and cell spheres receive floating-point margins;
+the actual native range/attenuation test and eight-light slot budget do not.
 
 Run each following chunk separately under the GPU timing lock described above;
 hold it for less than five minutes and release before the next chunk. Use a new
@@ -2141,6 +2192,49 @@ variant, density-zero/selected/selected/density-zero order):
 AOMAC_GFX_OUT=/tmp/GrassPlus/evidence-all-cost \
 AOMAC_GFX_VIEW=newland-grass-ground-day AOMAC_GFX_GRASS_FEATURE=all \
 AOMAC_GFX_GRASS_COMPARE=density AOMAC_GFX_MSAA=4 AOMAC_GFX_EFFECTS=1 \
+AOMAC_GFX_HDR=1 AOMAC_GFX_PNG_ONLY=1 CARGO_TARGET_DIR=/tmp/GrassPlus/target \
+  cargo test --profile fast -j 2 -p aomac grass_offline_capture_and_timing -- \
+  --ignored --nocapture --test-threads=1
+```
+
+For actual shadow-stage diagnosis, add `AOMAC_GFX_GRASS_SHADOW_TIMING=1`
+to that command and use a new output such as
+`AOMAC_GFX_OUT=/tmp/GrassPlus/evidence-all-shadow-stage`. Whole-frame and shadow
+timers are mutually exclusive: after each variant's existing 600 whole-frame
+samples, the same warmed renderer renders 600 additional fixed-time frames
+with only the shadow timer enabled. ABBA order, scene, camera and settings
+remain unchanged. This flag has no effect in capture-only mode.
+`{view}-round{round}-variant{variant}-timing.csv` records `sample_index`,
+`whole_frame_gpu_ms`, `prepare_wall_ms`, and `shadow_span_gpu_ms`; its columns
+describe **separate sampling phases**, not simultaneous spans of one frame.
+The manifest reports shadow p50/p95/p99, sample counts, and
+`incremental_grass_gpu_shadow_p50_ms` for each ordering. The shadow span includes
+shared native and grass shadow passes; its paired delta is not an isolated grass
+draw timestamp. An unavailable stage timestamp remains blank in the CSV and
+`None` in the summary, never a measured zero. Without the flag, timing CSVs
+still record whole-frame/preparation samples with an empty shadow column.
+
+`AOMAC_GFX_GRASS_SHADOW_STAGE` selects one timestamp span for that additional
+phase (requires `AOMAC_GFX_GRASS_SHADOW_TIMING=1`). Its default is `all`.
+Run each selected stage in a separate GPU-lock chunk and fresh output directory:
+
+| Stage | GPU work inside the timestamp span |
+| --- | --- |
+| `all` | Admission prepass, admitted light pool, shared grass-root computation, point maps, native sun cascades and grass sun-depth layer. |
+| `admission` | Primary visible-actor depth/ID prepass and visibility reduction. |
+| `light_pool` | Admitted light selection and spatial-grid construction compute dispatch. |
+| `grass_roots` | Current-frame blade roots, native lighting and complete section geometry shared by beauty and all grass casters; included in `all` before point/sun maps. |
+| `point_maps` | Shared cached static/actor cube selection and updates; no blade casting or grass-cell compaction. |
+| `sun_maps` | Three native solid sun cascades; excludes the separate grass-depth layer. |
+| `grass_sun` | The separate real-blade sun-depth layer. |
+
+For example, isolate point-map work without changing the whole-frame baseline:
+
+```sh
+AOMAC_GFX_OUT=/tmp/GrassPlus/evidence-all-point-stage \
+AOMAC_GFX_VIEW=newland-grass-ground-day AOMAC_GFX_GRASS_FEATURE=all \
+AOMAC_GFX_GRASS_COMPARE=density AOMAC_GFX_MSAA=4 AOMAC_GFX_EFFECTS=1 \
+AOMAC_GFX_GRASS_SHADOW_TIMING=1 AOMAC_GFX_GRASS_SHADOW_STAGE=point_maps \
 AOMAC_GFX_HDR=1 AOMAC_GFX_PNG_ONLY=1 CARGO_TARGET_DIR=/tmp/GrassPlus/target \
   cargo test --profile fast -j 2 -p aomac grass_offline_capture_and_timing -- \
   --ignored --nocapture --test-threads=1
@@ -2165,9 +2259,19 @@ Purpose-selected native grass views are available only by exact `AOMAC_GFX_VIEW`
 | View | Native time | Selection |
 | --- | --- | --- |
 | `newland-grass-ground-backlit-dusk` | 4600 | Exposed native green cell, camera grounded 0.8 m above Collision, looking toward the actual above-horizon sun; positive direct sun energy and forward/sun dot >0.6 required. |
-| `newland-grass-ground-path-day` | 3240 by default | Confirmed green tile centre next to a nonzero, non-grass Collision material; grounded oblique camera with LOS to both sides. |
+| `newland-grass-ground-path-day` | 3240 by default | Confirmed green tile centre adjoining an open bare-ground patch; terrain-grounded camera crosses the boundary from the bare foreground rather than looking along a wall. |
 | `newland-grass-ground-path-dusk` | 4600 | Same boundary requirement, with bare ground in the native sun's shadow direction and a grounded sun-facing camera for longer blade-shadow evidence. |
 | `newland-grass-ground-lightbar-night` | 0 | Captured actor25988, native mount5 LightBar mesh26163/field0/byte0, standing on the confirmed green root, grounded by Collision. |
+
+Path selection validates three grass-side and nine bare-side native ground probes:
+the latter span 0.4, 1.2 and 2.4 m beyond the cell edge and ±0.75 m laterally.
+Each probe must have matching terrain/collision height, grass-floor exposure,
+clear vertical LOS for 12 m, and direct camera LOS to ground + 8 cm. Bare probes
+must have known, non-grass, non-liquid material. The eye is also terrain-exposed,
+and camera forward must cross toward the green side, not run along the boundary.
+These requirements reject ground underneath roofs/floors and wall-adjacent
+single-point false positives. Inspect the actual paired PNGs before calling the
+bare edge visible; this is candidate validation, not a substitute for image proof.
 
 These views reuse native terrain cells, tile images, exposure and collision;
 there are no synthetic lights, geometry or exposure boosts. The manifest records
@@ -2175,6 +2279,19 @@ the exact camera, root, grid, tile, sun and time. LightBar appearance, transform
 native mounted lights and opacity are identical in both variants. The actor is
 submitted each frame with ordinary body admission (not `always`), requires
 camera-to-feet LOS, and the fixture fails unless its body is actually admitted.
+Before frozen warmup/capture, **both** LightBar variants submit the same native
+source for 60 deterministic 1/60-second frames (nominally one second). This ages
+the real source-admission and cube-slot fades after the mounted light is born;
+320 frames at `dt=0` alone cannot do so. Actor pose stays idle at time zero,
+and both variants advance identical renderer/wind clocks, then freeze together.
+The manifest records the priming count, dt and accumulated frozen renderer time.
+There is no light boost or acceptance-threshold adjustment.
+The LightBar proof view searches actual opaque, non-ground world triangles for
+a native blocker between the mounted source and a green receiver, with an
+adjacent unblocked green receiver inside the authored light range. It records
+the caster/poses and collision checks. A character standing alone in an open
+meadow is not a point-shadow proof: carried lights intentionally exclude
+character silhouettes, and procedural blades do not populate their cubes.
 The canonical `newland-grass-ground-day` budget camera is unchanged.
 The generic `newland-day`, `newland-dusk`, and `newland-night` views now also use
 the same native terrain-height camera resolver as `graphics_offline_fixture`;

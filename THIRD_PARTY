@@ -22,16 +22,19 @@ darkening the whole field: ao-vk's grass.vert uses 0.4, and its
 ffp_main.glsl GrassShadowVisibility uses the 0.45 weight used by this renderer.
 This renderer reuses the visible blade geometry, including its wind and
 admitted-character deformation, rather than maintaining a second blade generator.
-The independently optional grass point-light shadows in
-crates/ao-render/src/grass_caster.wgsl, grass_point_select.wgsl and the shared
-point_shadows.wgsl receiver adapt the cube-face casting, sparse cell/range
-selection and receiver algorithms in rvk/pointshadow.cpp, grass.cpp
-(DrawGrassPointShadow) and shaders/grass_shadow.vert and grass.vert.
-The shared admitted-light pool, current source ownership checks, GPU cell
-compaction and native per-corner surviving lamp-energy cap are specific to this
+The independently optional grass point-light receiver in point_shadows.wgsl
+reuses the renderer's cached static/actor cube sampling; blades do not cast into
+point cubes. Receiver algorithms follow rvk/pointshadow.cpp and
+shaders/grass.vert. The shared admitted-light pool, current source ownership
+checks and native per-corner surviving lamp-energy cap are specific to this
 renderer: shadows remove only local light surviving the native
 saturation/Gouraud/ambient pipeline, before palette and fog. The MIT notice below
 applies to these adaptations as well.
+The per-frame GPU blade/section cache in grass.wgsl is specific to this renderer.
+It evaluates the same procedural root, placement, species and native lighting
+expressions once per visible blade prefix, then computes each blade section's
+shared wind/push axis, both edge positions, sunlight and native fog once.
+Beauty and every depth caster reuse those exact current-frame positions.
 
 ao-vk is distributed under the MIT License:
 

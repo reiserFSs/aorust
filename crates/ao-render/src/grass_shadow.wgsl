@@ -1,7 +1,7 @@
 // Appended after the shared sun-shadow receiver when Enhanced sun shadows are on.
-// A blade is a few pixels wide and takes the shadow at its root, so the world's 3x3 (or soft-shadow) PCF per
-// fragment would be spent on the same answer thousands of times: one hardware-filtered comparison per fragment
-// instead, with the receiver plane's slope as the bias. Same cascades, splits and blends as `sun_visibility`.
+// Narrow blades use one solid-map comparison instead of the world's broader PCF.
+// Sun callers pass the raised blade position for real self-shadowing; the separate
+// near blade layer uses the shared softened receiver and its exact disable gate.
 fn grass_cascade_visibility(world: vec3<f32>, normal: vec3<f32>, layer: u32) -> f32 {
     let matrix = shadow_frame.matrices[layer];
     let clip = matrix * vec4<f32>(world, 1.0);
@@ -33,8 +33,10 @@ fn grass_sun_visibility(world: vec3<f32>, normal: vec3<f32>) -> f32 {
         let start = select(shadow_frame.splits.w, shadow_frame.splits[layer - min(layer, 1u)], layer > 0u);
         let end = shadow_frame.splits[layer];
         let blend = smoothstep(end - (end - start) * 0.1, end, depth);
-        if layer < 2u { visible = mix(visible, grass_cascade_visibility(world, normal, layer + 1u), blend); }
-        else { visible = mix(visible, 1.0, blend); }
+        if blend > 0.0 {
+            if layer < 2u { visible = mix(visible, grass_cascade_visibility(world, normal, layer + 1u), blend); }
+            else { visible = mix(visible, 1.0, blend); }
+        }
     }
     visible *= grass_blade_visibility(world);
     return mix(1.0, visible, clamp(shadow_frame.forward.w, 0.0, 1.0));

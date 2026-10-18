@@ -78,7 +78,7 @@ mod ambient_occlusion;
 mod sky_probe;
 mod sun_shadows;
 mod point_shadows;
-mod grass_point_shadows;
+mod grass_blades;
 mod shadow_pass;
 mod shadow_coverage;
 #[cfg(test)]
@@ -793,6 +793,7 @@ pub struct Renderer {
     moon_exposure: moon_exposure::MoonExposure,
     shadow_timer: Option<FrameGpuTimer>,
     shadow_timer_pending: bool,
+    shadow_timer_stage: shadow_pass::ShadowGpuStage,
     /// Seconds driving `Submesh::uv_scroll` (the viewer advances it; screenshots leave it at 0).
     pub time: f32,
     globals: wgpu::Buffer,
@@ -1193,14 +1194,14 @@ impl Renderer {
         };
         let storage_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
             count: None,
         };
         let g_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
-                uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE),
                 storage_entry(1),
                 storage_entry(2),
                 storage_entry(3),
@@ -1340,6 +1341,7 @@ impl Renderer {
             moon_exposure: Default::default(),
             shadow_timer: None,
             shadow_timer_pending: false,
+            shadow_timer_stage: shadow_pass::ShadowGpuStage::All,
             realistic_water: true,
             liquid_edge: [0.0; 3],
             water_light: None,

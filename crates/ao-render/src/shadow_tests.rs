@@ -16,16 +16,126 @@ fn static_shadow_ranges_preserve_draw_order_and_instance_holes() {
 fn grass_shadow_receiver_preserves_ambient_and_disables_without_caster_layer() {
     let source = include_str!("sun_shadows.wgsl");
     assert!(source.contains("if shadow_frame.control.z == 0u { return 1.0; }"));
-    assert!(source.contains("0.45 * (1.0 - edge)"));
+    assert!(source.contains("0.3 * (1.0 - edge) * reach"));
+    assert!(source.contains("smoothstep(12.0, 15.0, distance(world, shadow_frame.eye.xyz))"));
     assert!(source.contains("visible *= grass_blade_visibility(world);"));
     assert!(include_str!("grass_shadow.wgsl").contains("visible *= grass_blade_visibility(world);"));
     assert!(source.contains("if shadow_frame.control.w != 0u {"));
     assert!(include_str!("grass_shadow.wgsl").contains("if shadow_frame.control.w != 0u {"));
+    let grass = include_str!("grass_shadow.wgsl");
+    assert!(grass.contains("if blend > 0.0 {\n            if layer < 2u"),
+        "the adjacent cascade must not be sampled outside its crossfade");
     assert!(!include_str!("volumetric_shafts.wgsl").contains("shadow_frame.control.w"),
         "shaft ray marching must retain raw solid depths independently of surface receiver permission");
     // Only the directional share is attenuated; the receiver's existing artistic
     // strength remains the final operation, never the ambient or fog budget.
     assert!(source.contains("return mix(1.0, visible, clamp(shadow_frame.forward.w, 0.0, 1.0));"));
+}
+
+#[test]
+fn grass_sun_visibility_is_gouraud_without_fragment_shadow_reads() {
+    for shadows in [false, true] {
+        let source = crate::grass::shader_source((false, false, true, false, false), shadows);
+        let vertex = source.split_once("fn grass_vertex(").unwrap().1.split_once("\n}").unwrap().0;
+        let fragment = source.split_once("fn fs_grass(").unwrap().1.split_once("\n}").unwrap().0;
+        assert!(source.contains("@location(13) sunlight: vec4<f32>"));
+        assert!(source.contains("var<private> grass_direct_visibility: f32 = 1.0;"));
+        assert!(vertex.contains("o.world = edge.xyz;"));
+        assert!(vertex.contains("o.sunlight = vec4<f32>(sunlight.x * side, sunlight.y, 1.0, 1.0);"));
+        assert_eq!(vertex.contains("o.sunlight.z = grass_sun_visibility(o.world + o.normal.xyz * 0.005, o.normal.xyz);"), shadows);
+        assert_eq!(vertex.contains("o.sunlight.z = grass_sun_visibility(o.root + o.normal.xyz * 0.05, o.normal.xyz);"), shadows);
+        assert_eq!(vertex.contains("o.sunlight.w = grass_direct_visibility;"), shadows);
+        assert_eq!(fragment.contains("visibility = i.sunlight.z;"), shadows);
+        assert_eq!(fragment.contains("moon_visibility = i.sunlight.z;"), shadows);
+        assert_eq!(fragment.contains("grass_direct_visibility = i.sunlight.w;"), shadows);
+        let moon_gate = "g.moon_direction.w > 0.0 && dot(shadow_frame.moon_direction.xyz, g.moon_direction.xyz) > 0.9999";
+        assert_eq!(vertex.contains(moon_gate), shadows);
+        assert_eq!(fragment.contains(moon_gate), shadows);
+        assert!(!fragment.contains("grass_sun_visibility("));
+        assert!(!fragment.contains("sun_visibility("));
+        assert!(!fragment.contains("textureSampleCompare"));
+        assert!(!fragment.contains("grass_blade_visibility("));
+        assert!(!fragment.contains("grass_cascade_visibility("));
+        assert!(fragment.contains("sun_luma * grass_direct_visibility * (1.0 - fog)"));
+    }
+    // The world layout retains fragment receivers; only grass remaps its stages.
+    let entries = sun_shadows::receiver_entries();
+    assert_eq!(entries[0].visibility, wgpu::ShaderStages::VERTEX_FRAGMENT);
+    for entry in &entries[1..] {
+        assert_eq!(entry.visibility, wgpu::ShaderStages::FRAGMENT);
+    }
+    let grass = include_str!("grass.rs");
+    assert!(grass.contains("entry.binding = if entry.binding == 8 { 16 } else { entry.binding + 2 };"));
+    assert!(grass.contains("entry.visibility = if entry.binding == 2 { wgpu::ShaderStages::VERTEX_FRAGMENT } else { wgpu::ShaderStages::VERTEX };"));
+    assert!(!include_str!("point_sampling.wgsl").contains("grass_direct_visibility"));
+    assert!(!include_str!("point_shadows.wgsl").contains("grass_direct_visibility"));
+}
+
+#[test]
+fn grass_shadow_two_tap_filter_preserves_solid_filter() {
+    let source = include_str!("sun_shadows.wgsl");
+    let (solid, grass) = source.split_once("fn grass_blade_visibility(").unwrap();
+    let grass = grass.split_once("fn sun_visibility(").unwrap().0;
+    assert_eq!(grass.matches("textureSampleCompareLevel(").count(), 2);
+    assert!(grass.contains("textureDimensions(grass_depth)"));
+    assert!(grass.contains("textureSampleCompareLevel(grass_depth, shadow_sampler, uv + texel, depth)"));
+    assert!(grass.contains("textureSampleCompareLevel(grass_depth, shadow_sampler, uv - texel, depth)) * 0.5;"));
+    assert!(grass.contains("let texel = vec2<f32>(0.5) / dimensions;"));
+    assert!(grass.contains("let guard = vec2<f32>(2.0) / dimensions;"));
+    assert!(grass.contains("let depth = p.z - 0.00002;"));
+    assert_eq!(solid.matches("textureSampleCompareLevel(").count(), 3);
+    assert!(solid.contains("return visibility / 9.0;"));
+    assert!(solid.contains("for (var i = 0u; i < 4u; i++)"));
+    assert!(solid.contains("return visibility * 0.25;"));
+    assert!(solid.contains("for (var i = 0u; i < 12u; i++)"));
+    assert!(solid.contains("return visibility / 12.0;"));
+}
+
+#[test]
+fn grass_sun_depth_is_separate_and_avoids_mask_and_point_bindings() {
+    assert_eq!(sun_shadows::CASCADES, 3);
+    assert_eq!(sun_shadows::GRASS_RESOLUTION, 512);
+    let resources = include_str!("sun_shadows.rs");
+    assert!(resources.contains("texture(\"current-frame sun cascades\", resolution, resolution, CASCADES as u32,"));
+    assert!(resources.contains("if grass_enabled { GRASS_RESOLUTION } else { 1 }"));
+    assert!(resources.contains("texture(\"near grass sun depth\", grass_resolution, grass_resolution, 1,"));
+    let entries = sun_shadows::receiver_entries();
+    assert_eq!(entries.map(|entry| entry.binding), [0, 1, 2, 8]);
+    assert!(matches!(entries[3].ty, wgpu::BindingType::Texture {
+        sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false
+    }));
+    let mut world = String::new();
+    enhanced_shader::append_shadow_receiver(&mut world, 0);
+    assert!(world.contains("@group(3) @binding(8) var grass_depth: texture_depth_2d;"));
+    let mut grass = String::new();
+    enhanced_shader::append_shadow_receiver(&mut grass, 2);
+    for declaration in [
+        "@group(3) @binding(2) var<uniform> shadow_frame",
+        "@group(3) @binding(3) var shadow_maps",
+        "@group(3) @binding(4) var shadow_sampler",
+        "@group(3) @binding(16) var grass_depth",
+    ] {
+        assert!(grass.contains(declaration), "{declaration}");
+    }
+    for reserved in [8, 9, 10, 11, 12, 13, 14, 15] {
+        assert!(!grass.contains(&format!("@group(3) @binding({reserved})")));
+    }
+    let combined = crate::grass::shader_source((false, false, false, false, false), true);
+    assert_eq!(combined.matches("@group(3) @binding(8)").count(), 1, "terrain mask must remain binding 8");
+    assert_eq!(combined.matches("@group(3) @binding(16)").count(), 1);
+}
+
+#[test]
+fn sun_blade_casters_are_near_triangles_from_cached_beauty_sections() {
+    let source = include_str!("grass_caster.wgsl");
+    assert!(!source.contains("point"));
+    assert!(source.contains("if dot(delta, delta) > 15.0 * 15.0 { return clipped; }"));
+    assert!(source.contains("blade.base.root_coverage.xyz - grass_caster_frame.eye.xyz"));
+    assert!(source.contains("blade.sections[0].left.xyz"));
+    assert!(source.contains("blade.sections[0].right.xyz"));
+    assert!(source.contains("blade.sections[2].left.xyz + blade.sections[2].right.xyz"));
+    assert!(source.contains("return grass_caster_frame.matrices[0]"));
+    assert!(!source.contains("grass_vertex("), "casters must not expand full beauty vertices");
 }
 
 #[test]
@@ -45,76 +155,39 @@ fn standalone_grass_sun_shadows_compile_receivers_without_world_shadow_preferenc
 }
 
 #[test]
-fn standalone_grass_point_receiver_preserves_native_caps_palette_and_fog() {
-    let settings = EnhancedSettings { ground_grass: true, grass_point_shadows: true, ..Default::default() };
-    assert!(!settings.clustered_lighting && !settings.local_light_shadows);
-    let off = enhanced_shader::source(EnhancedSettings { grass_point_shadows: false, ..settings });
-    assert!(!off.contains("fn grass_point_shadow_loss("));
-    assert_eq!(off, enhanced_shader::source(EnhancedSettings { ground_grass: false, ..settings }));
-    assert_ne!(variant::Key::of(settings, 1), variant::Key::of(EnhancedSettings { grass_point_shadows: false, ..settings }, 1));
+fn grass_point_toggle_preserves_world_source() {
+    let settings = EnhancedSettings { ground_grass: true, ..Default::default() };
+    assert!(!settings.needs_admitted_lights());
+    let grass = EnhancedSettings { grass_point_shadows: true, ..settings };
+    assert!(grass.needs_admitted_lights(), "grass still needs the admitted light producer and cached cubes");
+    assert_ne!(variant::Key::of(settings, 1), variant::Key::of(grass, 1));
+    let off = enhanced_shader::source(settings);
+    assert_eq!(off, enhanced_shader::source(grass));
+    assert_eq!(off, enhanced_shader::source(EnhancedSettings { ground_grass: false, ..grass }));
+    assert!(!off.contains("fn point_shadow_visibility("));
     for clustered in [false, true] {
         for packed in [false, true] {
-            for directional in 0..8 {
-                let source = enhanced_shader::source(EnhancedSettings {
-                    clustered_lighting: clustered, material_specular: packed,
-                    sun_shadows: directional & 1 != 0, moon_shadows: directional & 2 != 0,
-                    grass_sun_shadows: directional & 4 != 0,
-                    ambient_occlusion: true, emissive_bloom: true, hdr: true,
-                    ..settings
-                });
-                assert_eq!(source.contains("fn clustered_ground("), clustered,
-                    "grass alone must not turn on world per-pixel relighting");
-                assert!(source.contains("o.light - ground_without_local") || source.contains("o.light.xyz - ground_without_local"));
-                assert!(source.contains("ground_without_local + g.ambient_g.rgb"),
-                    "simple terrain's local cap must include its second native ambient saturation");
-                for name in ["fs_ground_fused", "fs_ground_shadow", "fs_ground_simple"] {
-                    let body = source.split(&format!("fn enhanced_original_{name}(")).nth(1).unwrap().split("\n}").next().unwrap();
-                    assert_eq!(body.matches("grass_point_shadow_loss(i.wpos, grass_point_normal)").count(), 1);
-                    assert!(!body.contains("grass_point_shadow_loss(i.wpos, i.n)"),
-                        "directional depth-bias facet normal is not a diffuse lighting normal");
-                    let wrapper = source.split(&format!("@fragment fn {name}(")).nth(1).unwrap().split("\n}").next().unwrap();
-                    assert!(wrapper.find("grass_point_normal = i.n;").unwrap() < wrapper.find("let beauty =").unwrap(),
-                        "preserve the authored normal before calling the body with the directional surface normal");
-                    let share = if name == "fs_ground_simple" { "tint" } else { "spec" };
-                    // Clustered lighting packs material fields too, even when
-                    // the authored-specular setting itself is disabled.
-                    let swizzle = if packed || clustered { ".xyz" } else { "" };
-                    assert!(body.contains(&format!("min(i.{share}{swizzle}, grass_point_shadow_loss(")),
-                        "{name} must cap the blocked loss to its own exact native local share");
-                    let loss = body.find("grass_point_shadow_loss").unwrap();
-                    let fog = body.rfind("ground_fog(i)").unwrap();
-                    assert!(loss < fog, "native fog must follow the local subtraction");
-                    if name != "fs_ground_simple" {
-                        assert!(loss < body.find("ground_palette(i)").unwrap(),
-                            "native palette saturation must follow the local subtraction");
-                    }
+            for local in [false, true] {
+                for directional in 0..8 {
+                    let world = EnhancedSettings {
+                        clustered_lighting: clustered, material_specular: packed,
+                        local_light_shadows: local,
+                        sun_shadows: directional & 1 != 0, moon_shadows: directional & 2 != 0,
+                        grass_sun_shadows: directional & 4 != 0,
+                        ambient_occlusion: true, emissive_bloom: true, hdr: true,
+                        ..settings
+                    };
+                    let source = enhanced_shader::source(world);
+                    assert_eq!(source, enhanced_shader::source(EnhancedSettings { grass_point_shadows: true, ..world }),
+                        "grass point receiving must not alter world lighting: clustered={clustered}, packed={packed}, local={local}, directional={directional}");
+                    assert_eq!(source.contains("fn clustered_ground("), clustered || local,
+                        "only world lighting settings may enable per-pixel relighting");
+                    assert_eq!(source.contains("fn point_shadow_visibility("), world.needs_admitted_lights(),
+                        "existing world consumers must retain the admitted light pool");
                 }
-                let base = source.split("fn enhanced_original_fs_ground_base(").nth(1).unwrap().split("\n}").next().unwrap();
-                assert!(!base.contains("grass_point_shadow_loss"), "two-pass base must not shadow twice");
-                let helper = source.split("fn grass_point_shadow_loss(").nth(1).unwrap().split("\n}").next().unwrap();
-                assert!(helper.contains("dyn_lights[322u]") && helper.contains("66u + k * 4u"));
-                assert!(helper.find("!owner_light_admitted(packed)").unwrap() < helper.find("used += 1u").unwrap());
-                assert!(helper.contains("used < 8u"));
-                assert!(helper.contains("1.0 - point_shadow_visibility(-d, a.w, packed, false)"));
-                assert!(!source.contains("@location(16)") && !source.contains("@group(4)"));
             }
         }
     }
-    let shared = enhanced_shader::source(EnhancedSettings { local_light_shadows: true, ..settings });
-    assert!(!shared.contains("fn grass_ground_directional("), "existing local shadow receiver samples blade cubes already");
-    // Scalar channel model of the native two saturation stages: local light
-    // hidden by sun/ambient saturation cannot be removed later at the fragment.
-    let cap = |sun: f32, local: f32, ambient: f32| {
-        let full = (sun + local).clamp(0.0, 1.0);
-        let base = sun.clamp(0.0, 1.0);
-        (full - base, (full + ambient).clamp(0.0, 1.0) - (base + ambient).clamp(0.0, 1.0))
-    };
-    assert_eq!(cap(1.0, 0.5, 0.2), (0.0, 0.0));
-    assert_eq!(cap(0.5, 0.75, 0.5), (0.5, 0.0));
-    let corners = [cap(0.0, 0.5, 0.0).0, cap(1.0, 0.5, 0.0).0];
-    let gouraud_cap = 0.5 * (corners[0] + corners[1]);
-    assert_eq!(gouraud_cap, 0.25);
-    assert_eq!(gouraud_cap.min(0.5), 0.25, "cap after Gouraud interpolation, not from interpolated inputs");
 }
 
 #[test]
@@ -129,7 +202,10 @@ fn real_grass_shadow_pipeline_is_opt_in_and_reuses_visible_geometry() {
     let blades = sun_shadows::SunShadows::new(&renderer, (32, 32), 256);
     blades.grass_caster.as_ref().expect("enabled blade caster").pipeline.get();
     assert!(blades.grass_layer.is_some());
-    assert_eq!(blades.resident_bytes() - baseline.resident_bytes(), 256 * 256 * 4);
+    assert_eq!(baseline.layers.len(), 3);
+    assert_eq!(blades.layers.len(), 3);
+    assert_eq!(baseline.resolution, blades.resolution);
+    assert_eq!(blades.resident_bytes() - baseline.resident_bytes(), 512 * 512 * 4 - 4);
 }
 
 #[test]

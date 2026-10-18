@@ -1532,8 +1532,8 @@ remain independent. Missing keys in older preferences retain false. The CPU uplo
 every prepared frame, without per-blade allocations.
 Grass Sun Shadows adds blade casters independently of world Sun Shadows;
 the modifier neither requires nor enables that preference.
-Grass Point Shadows requests admitted point-light shadow resources for the grass
-receiver/caster without enabling world Clustered Lighting or Local Light Shadows.
+Grass Point Shadows requests the shared cached static/actor point-light shadows
+for receiving only, without enabling world Clustered Lighting or Local Light Shadows.
 The artistic reference is ao-vk `rvk/grass.cpp` and
 `rvk/shaders/grass_common.glsl`, `grass.vert`, `grass.frag` (MIT; see `THIRD_PARTY`);
 these controls are not reconstructed retail settings. Native fog extinction and

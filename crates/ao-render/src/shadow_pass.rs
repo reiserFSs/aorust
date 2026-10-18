@@ -2,6 +2,9 @@
 use super::*;
 use crate::sun_shadows::{CascadeFrame, SunShadows, CASCADES};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShadowGpuStage { All, Admission, LightPool, GrassRoots, PointMaps, SunMaps, GrassSun }
+
 fn cascade_resolution(settings: EnhancedSettings) -> u32 {
     let grass = settings.ground_grass && settings.grass_sun_shadows;
     if !settings.sun_shadows && !settings.moon_shadows && !settings.volumetric_shafts && !grass { return 1; }
@@ -63,7 +66,21 @@ impl Renderer {
         anyhow::ensure!(!enabled || self.effect_profiler.is_none(), "offline shadow timing and live per-effect profiling must be sampled separately");
         if enabled && self.gpu_timer.is_some() { return Err(anyhow!("frame and shadow GPU timing must be sampled separately")); }
         self.shadow_timer_pending = false;
+        self.shadow_timer_stage = ShadowGpuStage::All;
         self.shadow_timer = if enabled { Some(FrameGpuTimer::new(&self.device, &self.queue)?) } else { None };
+        Ok(())
+    }
+    /// Offline only; each selected stage is measured on separate frozen frames.
+    pub fn set_shadow_gpu_timing_stage(&mut self, stage: &str) -> Result<()> {
+        let stage = match stage {
+            "all" => ShadowGpuStage::All, "admission" => ShadowGpuStage::Admission,
+            "light_pool" => ShadowGpuStage::LightPool, "point_maps" => ShadowGpuStage::PointMaps,
+            "grass_roots" => ShadowGpuStage::GrassRoots,
+            "sun_maps" => ShadowGpuStage::SunMaps, "grass_sun" => ShadowGpuStage::GrassSun,
+            _ => return Err(anyhow!("unknown shadow GPU timing stage {stage:?}")),
+        };
+        self.set_shadow_gpu_timing(true)?;
+        self.shadow_timer_stage = stage;
         Ok(())
     }
 
@@ -81,13 +98,27 @@ impl Renderer {
         if let Some(timer) = &mut self.shadow_timer {
             if last {
                 self.shadow_timer_pending = true;
-                Some(timer.end_pass())
+                Some(if timer.is_recording() { timer.end_pass() } else { timer.begin_pass(true) })
             } else if !timer.is_recording() {
                 Some(timer.begin_pass(false))
             } else { None }
         } else {
             self.gpu_timer.as_mut().filter(|timer| !timer.is_recording()).map(|timer| timer.begin_pass(false))
         }
+    }
+    pub(crate) fn shadow_stage_render(&mut self, stage: ShadowGpuStage, last: bool, last_all: bool) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        if self.shadow_timer.is_none() { return self.shadow_timestamp(false); }
+        let finish = if self.shadow_timer_stage == ShadowGpuStage::All { last_all }
+            else if self.shadow_timer_stage == stage { last } else { return None; };
+        self.shadow_timestamp(finish)
+    }
+    pub(crate) fn shadow_stage_compute(&mut self, stage: ShadowGpuStage, last: bool, last_all: bool) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        let finish = if self.shadow_timer_stage == ShadowGpuStage::All { last_all }
+            else if self.shadow_timer_stage == stage { last } else { return None; };
+        let timer = self.shadow_timer.as_mut()?;
+        if !finish && timer.is_recording() { return None; }
+        if finish { self.shadow_timer_pending = true; }
+        Some(timer.compute_span(finish))
     }
 
     pub(crate) fn encode_enhanced_shadows(&mut self, encoder: &mut wgpu::CommandEncoder, cam: &Camera, size: (u32, u32), env: Environment, far: f32) {
@@ -98,6 +129,7 @@ impl Renderer {
             && self.enhanced_settings.night_mode != NightMode::Moonlit {
             self.sun_shadows = None;
             self.point_shadows = None;
+            self.encode_grass_roots(encoder, None, true);
             return;
         }
         let admission = self.enhanced_settings.sun_shadows || self.enhanced_settings.moon_shadows
@@ -142,7 +174,7 @@ impl Renderer {
         }
         if admission { self.prepare_actor_shadows(&mut shadows); } else { shadows.actor_ids.clear(); shadows.actor_groups.clear(); }
         if !shadows.actor_ids.is_empty() {
-            let timestamp_writes = self.shadow_timestamp(false);
+            let timestamp_writes = self.shadow_stage_render(ShadowGpuStage::Admission, false, false);
             let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("sun current-frame visible surface admission"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -158,8 +190,11 @@ impl Renderer {
             self.draw_static_shadows(&mut pass, &shadows, true);
             self.draw_actor_shadows(&mut pass, &shadows, true);
         }
-        shadows.encode_actor_visibility(encoder);
-        self.encode_point_shadows(encoder, cam, &mut shadows, [env.fog_start, env.fog_end, far]);
+        let visibility_timestamps = if shadows.actor_ids.is_empty() { None } else {
+            self.shadow_stage_compute(ShadowGpuStage::Admission, true, frame.is_none() && !self.enhanced_settings.needs_admitted_lights() && !self.grass.as_ref().is_some_and(crate::grass::Grass::has_draws))
+        };
+        shadows.encode_actor_visibility(encoder, visibility_timestamps);
+        self.encode_point_shadows(encoder, cam, &mut shadows, [env.fog_start, env.fog_end, far], frame.is_none());
         let Some(mut frame) = frame else {
             shadows.update(&self.queue, &CascadeFrame { uniform: bytemuck::Zeroable::zeroed() });
             self.sun_shadows = Some(shadows);
@@ -173,7 +208,8 @@ impl Renderer {
             shadows.static_commands.clear();
         }
         for layer in 0..CASCADES {
-            let timestamp_writes = self.shadow_timestamp(layer == CASCADES - 1 && shadows.grass_layer.is_none());
+            let timestamp_writes = self.shadow_stage_render(ShadowGpuStage::SunMaps, layer == CASCADES - 1,
+                layer == CASCADES - 1 && shadows.grass_layer.is_none());
             let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("current-frame sun cascade"), color_attachments: &[],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -191,8 +227,13 @@ impl Renderer {
                 self.draw_canopy_leaf_shadows(&mut pass, &shadows);
             }
         }
+        if shadows.grass_layer.is_some() {
+            if let Some(grass) = &mut self.grass {
+                grass.prepare_sun_casters(&self.device, &self.queue, &frame.uniform.matrices[0], cam.pos);
+            }
+        }
         let grass_bind = self.grass.as_ref().and_then(|grass| shadows.grass_caster_bind(&self.device, grass));
-        let grass_timestamp = if shadows.grass_layer.is_some() { self.shadow_timestamp(true) } else { None };
+        let grass_timestamp = if shadows.grass_layer.is_some() { self.shadow_stage_render(ShadowGpuStage::GrassSun, true, true) } else { None };
         if let Some(layer) = &shadows.grass_layer {
             let mut pass = encoder.begin_effect_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("nearest real grass blade shadows"), color_attachments: &[],

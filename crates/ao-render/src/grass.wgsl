@@ -150,12 +150,12 @@ fn grass_push(pos: vec3<f32>, h: f32, plant_height: f32) -> vec3<f32> {
 }
 
 struct GOut {
-    @builtin(position) clip: vec4<f32>,
+    @builtin(position) @invariant clip: vec4<f32>,
     @location(0) @interpolate(flat) root: vec3<f32>,
     @location(1) @interpolate(flat) uv: vec2<f32>,
-    @location(2) light: vec3<f32>,
-    @location(3) dlight: vec3<f32>,
-    @location(4) spec: vec3<f32>,
+    @location(2) @interpolate(flat) light: vec3<f32>,
+    @location(3) @interpolate(flat) dlight: vec3<f32>,
+    @location(4) @interpolate(flat) spec: vec3<f32>,
     @location(5) shape: vec4<f32>,    // x: up the blade; y: across it (-1..1); z: gradient x canopy; w: gust light
     @location(6) @interpolate(flat) hue: vec4<f32>,    // rgb: per-blade colour jitter; w: dry-patch share
     @location(7) @interpolate(flat) head: vec4<f32>,   // rgb: seed head / flower colour; w: 1 on a head
@@ -164,9 +164,9 @@ struct GOut {
     @location(10) @interpolate(flat) path: u32,
     @location(11) @interpolate(flat) normal: vec4<f32>, // xyz: normal; w: same baked sky openness as terrain
     @location(12) @interpolate(flat) coverage: vec2<f32>, // field coverage, then geometry-LOD AO share
-    @location(13) sunlight: vec2<f32>, // rounded-edge delta, physical blade sheen (before sun visibility)
+    @location(13) sunlight: vec4<f32>, // rounded-edge delta, sheen, artistic visibility, raw direct visibility
     @location(14) world: vec3<f32>, // shared visible/caster geometry, including wind and admitted pushes
-    @location(15) local_share: vec3<f32>, // native surviving lamp energy after per-corner saturation and ambient
+    @location(15) @interpolate(flat) point_loss: vec3<f32>, // root-sampled blocked light, capped to native surviving lamp energy
 }
 
 // Raw light visibility, before the artistic shadow-strength floor used by beauty.
@@ -183,15 +183,66 @@ fn grass_directional_light(n: vec3<f32>) -> vec3<f32> {
 }
 
 
-fn grass_vertex(vertex: u32, instance: u32) -> GOut {
+// Per-frame, per-blade invariants. Packed vec4 fields keep storage layout explicit.
+struct TransientGrassBladeData {
+    root_radius: vec4<f32>,
+    ground_distance: vec4<f32>,
+    dimensions: vec4<f32>, // height, half width, droop, root fog
+    density: vec4<f32>, // fade, widen, range coverage, wind lean level
+    field1: vec4<f32>, // view-adjusted growth direction xyz, gust
+    tuft: vec4<f32>, // blade droop direction xz, geometry morph, steep-view share
+    random: vec4<f32>, // v0, pixel width scale, wind sway, canopy
+    identity: vec4<u32>, // kind, valid, reserved
+    texuv: vec4<f32>, // uv, sky openness, ground path
+    light: vec4<f32>,
+    dlight: vec4<f32>,
+    spec: vec4<f32>,
+    local_share: vec4<f32>,
+    hue: vec4<f32>,
+    head: vec4<f32>,
+}
+// Only beauty inputs survive section construction; geometry-only inputs stay transient.
+struct GrassBladeShade {
+    root_coverage: vec4<f32>,
+    normal_sky: vec4<f32>,
+    uv_path: vec4<f32>,
+    light: vec4<f32>,
+    dlight: vec4<f32>,
+    spec: vec4<f32>,
+    local_share: vec4<f32>,
+    hue: vec4<f32>,
+    head: vec4<f32>, // rgb: head colour; w: valid
+}
+fn grass_blade_shade(b: TransientGrassBladeData) -> GrassBladeShade {
+    return GrassBladeShade(
+        vec4<f32>(b.root_radius.xyz, b.density.z),
+        vec4<f32>(b.ground_distance.xyz, b.texuv.z),
+        vec4<f32>(b.texuv.xy, b.texuv.w, 0.0),
+        b.light, b.dlight, vec4<f32>(b.spec.xyz, 1.0 - b.tuft.z),
+        b.local_share, b.hue, vec4<f32>(b.head.rgb, f32(b.identity.y)));
+}
+struct GrassBladeSection {
+    left: vec4<f32>, // world xyz, native fog with root extinction floor
+    right: vec4<f32>,
+    appearance: vec4<u32>, // half pairs: height/gradient-AO, gust/head, edge/sheen, transmission/ground
+}
+struct GrassBladeRecord {
+    base: GrassBladeShade,
+    sections: array<GrassBladeSection, 3>,
+}
+struct GrassBladeSpan { offset: u32, count: u32, active_cell: u32, _pad1: u32 }
+struct GrassBladeCache {
+    spans: array<GrassBladeSpan, 16384>,
+    blades: array<GrassBladeRecord>,
+}
+@group(3) @binding(14) var<storage, read> grass_blade_cache: GrassBladeCache;
+@group(3) @binding(15) var<storage, read_write> grass_blade_output: GrassBladeCache;
+
+fn grass_build_blade(cell_id: u32, k: u32) -> TransientGrassBladeData {
+    var b: TransientGrassBladeData;
     var o: GOut;
-    o.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
-    // The instance index carries its distance band in the top bits, then runs over the band's visible cells' blades.
-    let band = instance >> 28u;
-    let within = instance & 0x0fffffffu;
-    let band_stride = u32(grass_params.bands[band / 4u][band % 4u]);
-    let c = grass_cells[grass_visible[band * GRASS_MAX_CELLS + within / band_stride]];
-    let k = within % band_stride;
+    var local_share = vec3<f32>(0.0);
+    let c = grass_cells[cell_id];
     let stride = u32(grass_params.limits.x);
     let size = c.origin.z;
     let seed = c.identity.x;
@@ -204,7 +255,7 @@ fn grass_vertex(vertex: u32, instance: u32) -> GOut {
     // below removes blades without clumps or bare gaps.
     let uv = fract(vec2<f32>(grass_unit(seed), grass_unit(grass_hash(seed ^ 0xabcdu))) + f32(k + 1u) * vec2<f32>(0.7548776662, 0.5698402910));
     let triangle = select(select(2u, 1u, uv.x >= uv.y), select(2u, 1u, uv.x + uv.y <= 1.0), c.identity.z == 0u);
-    if (c.identity.w & triangle) == 0u { return o; }
+    if (c.identity.w & triangle) == 0u { return b; }
     var root = vec3<f32>(c.origin.x + uv.x * size, grass_height(c, uv) - 0.02, c.origin.y - uv.y * size);
     let eye = g.eye.xyz;
     let dist = distance(root.xz, eye.xz);
@@ -215,8 +266,7 @@ fn grass_vertex(vertex: u32, instance: u32) -> GOut {
     let by_rank = smoothstep(0.0, min(0.08, keep * 0.25), max(keep - rank, 0.0));
     let by_range = 1.0 - smoothstep(0.7 * radius, radius, dist);
     let fade = by_rank * by_range;
-    if fade <= 0.002 { return o; }
-    o.coverage = vec2<f32>(by_range, 1.0);
+    if fade <= 0.002 { return b; }
     let widen = min(inverseSqrt(keep), 6.0);
 
     // The terrain under the root: slope, and distance from neighbouring path, soil or rock.
@@ -225,13 +275,13 @@ fn grass_vertex(vertex: u32, instance: u32) -> GOut {
     for (var j = 0u; j < 4u; j += 1u) { ground_n += w4[j] * c.normals[j].xyz; }
     ground_n = normalize(ground_n);
     // Green hills remain grassy; only near-vertical cliff faces thin out (60 to 75 degrees).
-    if hb(hw, 0u) > (ground_n.y - 0.2588) / 0.2412 { return o; }
+    if hb(hw, 0u) > (ground_n.y - 0.2588) / 0.2412 { return b; }
     // Grass grows where the ground's own picture is green, texel by texel: a transition tile's soil stays bare.
     let tile_uv = grass_uv(c.identity.y & 255u, uv);
     let layer = i32(c.identity.y >> 8u);
     // The root texel mask is always authoritative, independently of optional path thinning.
     let m0 = textureSampleLevel(grass_mask, grass_noise_sampler, tile_uv, layer, 0.0).r;
-    if m0 < 0.15 { return o; }
+    if m0 < 0.15 { return b; }
     var edge = 1.0;
     if grass_params.features.z > 0.5 {
         let reach = 0.5 / size;
@@ -249,7 +299,7 @@ fn grass_vertex(vertex: u32, instance: u32) -> GOut {
             }
         }
         edge = min(clamp(edge_distance / 1.2, 0.0, 1.0), smoothstep(0.1, 0.6, around));
-        if hb(hw, 1u) > smoothstep(0.15, 0.45, m0) * (0.3 + 0.7 * edge) { return o; }
+        if hb(hw, 1u) > smoothstep(0.15, 0.45, m0) * (0.3 + 0.7 * edge) { return b; }
     }
 
     // The slow fields at the root (grass_noise.rs): two fetches.
@@ -262,7 +312,7 @@ fn grass_vertex(vertex: u32, instance: u32) -> GOut {
     var vigour = 0.5;
     var rim = 1.0;
     if tufts > 0.5 {
-        if hb(hv, 0u) > 0.72 + 0.28 * clump { return o; }
+        if hb(hv, 0u) > 0.72 + 0.28 * clump { return b; }
         // The nearest of four jittered lattice centres: thinning between tufts and fan-out within them.
         let tuft_cell = 0.5;
         let base = vec2<i32>(floor(root.xz / tuft_cell - 0.5));
@@ -280,7 +330,7 @@ fn grass_vertex(vertex: u32, instance: u32) -> GOut {
         let tuft_d = sqrt(nearest);
         rim = min(tuft_d / (0.75 * tuft_cell), 1.0);
         out_dir = select(vec2<f32>(0.0), out_dir / tuft_d, tuft_d > 1e-4);
-        if hb(hv, 1u) > 1.0 - 0.45 * rim * rim { return o; }
+        if hb(hv, 1u) > 1.0 - 0.45 * rim * rim { return b; }
     }
 
     // What it is: mostly blades; a few broad blades, seed stalks and flowers (in patches of one colour).
@@ -308,69 +358,6 @@ fn grass_vertex(vertex: u32, instance: u32) -> GOut {
     height = select(height, 0.4 + (height - 0.4) * 0.3, height > 0.4);
     height = min(height, GRASS_MAX_HEIGHT);
 
-    // Use the same first triangle in every band; collapse the shoulder onto its tip before dropping the rest.
-    let step = vertex >> 1u;
-    let section = select(0u, step + 1u, step > 0u);
-    let t0 = SECTION_T[kind][section];
-    // Finish collapsing the shoulder before band 2 (~29 m nearest cell edge).
-    // Evaluating all geometry and shading at the tip also makes the remaining triangles degenerate.
-    let simple_tuft = smoothstep(22.0, 27.0, dist);
-    let t = select(t0, mix(t0, 1.0, simple_tuft), section == 2u);
-    // Half-resolution AO cannot resolve root/tip tufts: fade their receiving share with the geometry.
-    o.coverage.y = 1.0 - simple_tuft;
-    let profile = mix(SECTION_W[kind][section], 1.0 - t, simple_tuft);
-    let side = select(-1.0, 1.0, (vertex & 1u) != 0u);
-    let is_head = kind >= 2u && section >= 2u;
-
-    // Lean: along the ground's slope, a low-frequency field (a patch leans together), scatter, out from the tuft.
-    let rr = vec3<f32>(cos(yaw), 0.0, sin(yaw));
-    let lean_field = field1.xy - 0.5;
-    let lean_dir = lean_field / (length(lean_field) + 1e-6) * (0.05 + 0.22 * field1.z);
-    let scatter = (v2 - 0.5) * 0.18;
-    let fan = 0.3 * min(rim * 1.5, 1.0) * tufts;
-    // Growth tends upwards on steep hills, rather than turning a green cliff into horizontal fur.
-    let growth_n = normalize(mix(ground_n, vec3<f32>(0.0, 1.0, 0.0), 1.0 - smoothstep(0.5, 0.85, ground_n.y)));
-    var up = normalize(vec3<f32>(growth_n.x + lean_dir.x + rr.x * scatter + out_dir.x * fan, growth_n.y,
-        growth_n.z + lean_dir.y + rr.z * scatter + out_dir.y * fan));
-    // Seen from above an upright field is mostly the ground between blades: the steeper the view, the further they
-    // lean (each its own way) and the wider they are drawn.
-    let to_eye = eye - root;
-    let steep = smoothstep(0.4, 0.95, to_eye.y / max(length(to_eye), 1e-3));
-    let tilt = 0.45 * steep * edge * edge;
-    let up_view = normalize(up * cos(tilt) + rr * sin(tilt));
-    let axis0 = root + up_view * (height * t) + rr * (droop * height * mix(t * t, t, simple_tuft));
-    let pos = root + (axis0 - root) * fade;
-
-    // Wind: waves running through the field (the upper blade bending most) with gusts on top.
-    let wd = grass_params.wind_time.xy;
-    let time = grass_params.wind_time.z;
-    // Never rotate world position with weather: even a tiny direction change
-    // becomes a large phase jump at distant world coordinates (e.g. ICC).
-    let aa = vec2<f32>(dot(root.xz, vec2<f32>(0.8, 0.6)), dot(root.xz, vec2<f32>(-0.6, 0.8)));
-    let gust = grass_gust(aa, time) * grass_params.wind.y;
-    let strength = grass_params.wind.x;
-    let lean_level = select(1.0 + 1.3 * (1.0 - exp(-(strength - 1.0) / 1.2)), strength, strength <= 1.0);
-    let phase = root.x * 0.3 + root.z * 0.25 + yaw;
-    let hh = height * fade * lean_level * mix(t * t, t, simple_tuft);
-    let above = height * t * fade;
-    let wind_dir3 = vec3<f32>(wd.x, 0.0, wd.y);
-    let wind_bend = bend_keeping_length(wind_dir3 * (0.16 * hh * grass_sway(aa, time, phase, gust) + 0.7 * hh * gust), above);
-    let axis = pos + wind_bend + grass_push(pos, t, height);
-
-    // Billboard about the blade's own axis: never edge-on.
-    let vh = eye.xz - axis.xz;
-    let vl = length(vh);
-    let horiz = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(-vh.y, 0.0, vh.x) / vl, vl > 1e-3);
-    let view_dir = normalize(axis - eye);
-    let right = normalize(cross(normalize(up_view + rr * droop), view_dir) + 0.1 * horiz);
-    // A blade thinner than a pixel flickers: draw it at least `limits.z` pixels wide, its colour going towards the
-    // ground's by as much as it was widened.
-    let root_width = 2.0 * half_width * widen * max(fade, 0.05);
-    let pixels = root_width * grass_params.limits.y / max((g.vp * vec4<f32>(root, 1.0)).w, 1e-3);
-    let widen_px = max(grass_params.limits.z / max(pixels, 1e-4), 1.0);
-    let p = axis + right * (side * half_width * profile * fade * widen * (1.0 + 0.3 * steep) * widen_px);
-    o.clip = g.vp * vec4<f32>(p, 1.0);
-    o.world = p;
 
     // Colour inputs; the terrain sample itself is taken per fragment at the root.
     let dry = clamp((field0.y - 0.56) / 0.16, 0.0, 1.0) * 0.55 * (0.6 + 0.4 * hb(hv, 3u)) * tufts;
@@ -383,39 +370,11 @@ fn grass_vertex(vertex: u32, instance: u32) -> GOut {
         if hb(hj, 3u) < 0.15 { colour = hj % 6u; }
         head = FLOWERS[colour] * (0.85 + 0.15 * v2);
     }
-    // Fade the flat head-colour flag with the geometric morph.
-    o.head = vec4<f32>(head, select(0.0, 1.0 - simple_tuft, is_head));
+    o.head = vec4<f32>(head, 0.0);
     let canopy = clamp(0.55 * (1.0 - rim) * (0.5 + vigour) + 0.6 * clump - 0.05, 0.0, 1.0);
-    let grad = mix(0.9, 1.2, t);
-    let ao = (1.0 - 0.55 * canopy * (1.0 - t) * (1.0 - t)) / (1.0 - 0.275 * canopy);
-    // Sun on the blade itself: the lit and shaded edges of a rounded blade (zero-mean), light through its thin upper
-    // part when the sun is behind it, a denser canopy keeping a low sun off the lower blades.
-    let sun = normalize(g.sun_dir.xyz + vec3<f32>(0.0, 1e-6, 0.0));
-    let sun_on = clamp(dot(g.sun_g.rgb, LUMA) * 2.5, 0.0, 1.0) * smoothstep(0.0, 0.1, sun.y);
-    let canopy_shade = mix(1.0, smoothstep(0.0, 0.75, t), canopy * 0.7 * (1.0 - sun.y));
-    let sunlit = sun_on * canopy_shade * grass_params.lighting.x;
-    let face = vec3<f32>(vh.x, 0.0, vh.y) / max(vl, 1e-3);
-    let behind = max(-dot(face, sun), 0.0);
-    let towards = max(dot(view_dir, sun), 0.0);
-    let through = (0.5 * behind + 0.5 * towards * towards * towards) * pow(t, 1.3);
-    let tangent = normalize(up_view + rr * (2.0 * droop * t));
-    let half_vector = sun - view_dir;
-    let half_dir = half_vector / max(length(half_vector), 1e-6);
-    let th = dot(tangent, half_dir);
-    let sheen = pow(max(1.0 - th * th, 0.0), 20.0) * t;
-    o.sunlight = vec2<f32>(sunlit * 0.3 * side * dot(right, sun), 0.07 * sheen * sunlit);
-    o.shape = vec4<f32>(t, side, grad * ao,
-        1.0 + grass_params.features.w * 0.45 * (gust - GUST_MEAN * grass_params.wind.y) * t);
-    o.mixes = vec4<f32>(0.55 * (1.0 - smoothstep(0.0, 0.4, t)),
-        max(0.95 * smoothstep(24.0, 80.0, dist), min(0.7 * smoothstep(0.55 * radius, radius, dist) + 0.5 * (1.0 - 1.0 / widen_px), 0.85)),
-        0.4 * through * sunlit, 0.94 + 0.12 * v0);
 
     // Preserve the daylight appearance; night lamps use the native per-corner
     // saturation and Gouraud order rather than relighting the root independently.
-    o.root = root;
-    o.uv = tile_uv;
-    o.normal = vec4<f32>(ground_n, c.normals[0].w);
-    o.path = u32(c.origin.w + 0.5);
     let simple = c.origin.w < 0.5;
     if darkness < 1.0 {
         let local = vertex_lights(root, ground_n, 0.0)[0];
@@ -440,7 +399,7 @@ fn grass_vertex(vertex: u32, instance: u32) -> GOut {
                 if g.moon_g.w > 0.0 {
                     no_lamps = mix(no_lamps, clamp(directional, vec3<f32>(0.0), vec3<f32>(1.0)), g.moon_g.w);
                 }
-                o.local_share += w4[j] * max(corner_light - no_lamps, vec3<f32>(0.0));
+                local_share += w4[j] * max(corner_light - no_lamps, vec3<f32>(0.0));
             }
         }
     }
@@ -484,19 +443,213 @@ fn grass_vertex(vertex: u32, instance: u32) -> GOut {
         o.light = mix(o.light, native_light, darkness);
         o.dlight = mix(o.dlight, native_dlight, darkness);
         o.spec = mix(o.spec, native_spec, darkness);
-        o.local_share = mix(o.local_share, native_local_share, darkness);
+        local_share = mix(local_share, native_local_share, darkness);
     }
-    // Ground-root fog: raised tips cannot reduce native extinction. (Fog is linear in view depth, so the root's
-    // equals the ground's own interpolation.)
+    // Lean: along the ground's slope, a low-frequency field (a patch leans together), scatter, out from the tuft.
+    let rr = vec3<f32>(cos(yaw), 0.0, sin(yaw));
+    let lean_field = field1.xy - 0.5;
+    let lean_dir = lean_field / (length(lean_field) + 1e-6) * (0.05 + 0.22 * field1.z);
+    let scatter = (v2 - 0.5) * 0.18;
+    let fan = 0.3 * min(rim * 1.5, 1.0) * tufts;
+    // Growth tends upwards on steep hills, rather than turning a green cliff into horizontal fur.
+    let growth_n = normalize(mix(ground_n, vec3<f32>(0.0, 1.0, 0.0), 1.0 - smoothstep(0.5, 0.85, ground_n.y)));
+    var up = normalize(vec3<f32>(growth_n.x + lean_dir.x + rr.x * scatter + out_dir.x * fan, growth_n.y,
+        growth_n.z + lean_dir.y + rr.z * scatter + out_dir.y * fan));
+    // Seen from above an upright field is mostly the ground between blades: the steeper the view, the further they
+    // lean (each its own way) and the wider they are drawn.
+    let to_eye = eye - root;
+    let steep = smoothstep(0.4, 0.95, to_eye.y / max(length(to_eye), 1e-3));
+    let tilt = 0.45 * steep * edge * edge;
+    let up_view = normalize(up * cos(tilt) + rr * sin(tilt));
+    // Wind: waves running through the field (the upper blade bending most) with gusts on top.
+    let wd = grass_params.wind_time.xy;
+    let time = grass_params.wind_time.z;
+    // Never rotate world position with weather: even a tiny direction change
+    // becomes a large phase jump at distant world coordinates (e.g. ICC).
+    let aa = vec2<f32>(dot(root.xz, vec2<f32>(0.8, 0.6)), dot(root.xz, vec2<f32>(-0.6, 0.8)));
+    let gust = grass_gust(aa, time) * grass_params.wind.y;
+    let strength = grass_params.wind.x;
+    let lean_level = select(1.0 + 1.3 * (1.0 - exp(-(strength - 1.0) / 1.2)), strength, strength <= 1.0);
+    let phase = root.x * 0.3 + root.z * 0.25 + yaw;
+    let root_width = 2.0 * half_width * widen * max(fade, 0.05);
+    let pixels = root_width * grass_params.limits.y / max((g.vp * vec4<f32>(root, 1.0)).w, 1e-3);
+    let widen_px = max(grass_params.limits.z / max(pixels, 1e-4), 1.0);
     let root_fog = vertex_fog(-(g.view * vec4<f32>(root, 1.0)).z);
-    o.fog = max(vertex_fog(-(g.view * vec4<f32>(p, 1.0)).z), root_fog);
+    let simple_tuft = smoothstep(22.0, 27.0, dist);
+    let sway = grass_sway(aa, time, phase, gust);
+    b.root_radius = vec4<f32>(root, radius);
+    b.ground_distance = vec4<f32>(ground_n, dist);
+    b.dimensions = vec4<f32>(height, half_width, droop, root_fog);
+    b.density = vec4<f32>(fade, widen, by_range, lean_level);
+    b.field1 = vec4<f32>(up_view, gust);
+    b.tuft = vec4<f32>(rr.xz, simple_tuft, steep);
+    b.random = vec4<f32>(v0, widen_px, sway, canopy);
+    b.identity = vec4<u32>(kind, 1u, 0u, 0u);
+    b.texuv = vec4<f32>(tile_uv, c.normals[0].w, c.origin.w);
+    b.light = vec4<f32>(o.light,
+        max(0.95 * smoothstep(24.0, 80.0, dist), min(0.7 * smoothstep(0.55 * radius, radius, dist) + 0.5 * (1.0 - 1.0 / widen_px), 0.85)));
+    b.dlight = vec4<f32>(o.dlight, 0.94 + 0.12 * v0);
+    b.spec = vec4<f32>(o.spec, 0.0);
+    b.local_share = vec4<f32>(local_share, 0.0);
+    b.hue = o.hue;
+    b.head = o.head;
+    return b;
+}
+
+fn grass_build_section(b: TransientGrassBladeData, vertex: u32) -> GrassBladeSection {
+    let root = b.root_radius.xyz;
+    let height = b.dimensions.x;
+    let half_width = b.dimensions.y;
+    let droop = b.dimensions.z;
+    let root_fog = b.dimensions.w;
+    let fade = b.density.x;
+    let widen = b.density.y;
+    let lean_level = b.density.w;
+    let up_view = b.field1.xyz;
+    let gust = b.field1.w;
+    let rr = vec3<f32>(b.tuft.x, 0.0, b.tuft.y);
+    let simple_tuft = b.tuft.z;
+    let steep = b.tuft.w;
+    let widen_px = b.random.y;
+    let sway = b.random.z;
+    let canopy = b.random.w;
+    let kind = b.identity.x;
+    let eye = g.eye.xyz;
+    // One axis evaluation supplies both edges and every beauty/shadow view.
+    // Use the same first triangle in every band; collapse the shoulder onto its tip before dropping the rest.
+    let step = vertex >> 1u;
+    let section = select(0u, step + 1u, step > 0u);
+    let t0 = SECTION_T[kind][section];
+    let t = select(t0, mix(t0, 1.0, simple_tuft), section == 2u);
+    let profile = mix(SECTION_W[kind][section], 1.0 - t, simple_tuft);
+    let is_head = kind >= 2u && section >= 2u;
+
+    let axis0 = root + up_view * (height * t) + rr * (droop * height * mix(t * t, t, simple_tuft));
+    let pos = root + (axis0 - root) * fade;
+
+    let wd = grass_params.wind_time.xy;
+    let hh = height * fade * lean_level * mix(t * t, t, simple_tuft);
+    let above = height * t * fade;
+    let wind_dir3 = vec3<f32>(wd.x, 0.0, wd.y);
+    let wind_bend = bend_keeping_length(wind_dir3 * (0.16 * hh * sway + 0.7 * hh * gust), above);
+    let axis = pos + wind_bend + grass_push(pos, t, height);
+
+    // Billboard about the blade's own axis: never edge-on.
+    let vh = eye.xz - axis.xz;
+    let vl = length(vh);
+    let horiz = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(-vh.y, 0.0, vh.x) / vl, vl > 1e-3);
+    let view_dir = normalize(axis - eye);
+    let right = normalize(cross(normalize(up_view + rr * droop), view_dir) + 0.1 * horiz);
+    // A blade thinner than a pixel flickers: draw it at least `limits.z` pixels wide, its colour going towards the
+    // ground's by as much as it was widened.
+    let left = axis + right * (-1.0 * half_width * profile * fade * widen * (1.0 + 0.3 * steep) * widen_px);
+    let right_edge = axis + right * (1.0 * half_width * profile * fade * widen * (1.0 + 0.3 * steep) * widen_px);
+    let grad = mix(0.9, 1.2, t);
+    let ao = (1.0 - 0.55 * canopy * (1.0 - t) * (1.0 - t)) / (1.0 - 0.275 * canopy);
+    // Sun on the blade itself: the lit and shaded edges of a rounded blade (zero-mean), light through its thin upper
+    // part when the sun is behind it, a denser canopy keeping a low sun off the lower blades.
+    let sun = normalize(g.sun_dir.xyz + vec3<f32>(0.0, 1e-6, 0.0));
+    let sun_on = clamp(dot(g.sun_g.rgb, LUMA) * 2.5, 0.0, 1.0) * smoothstep(0.0, 0.1, sun.y);
+    let canopy_shade = mix(1.0, smoothstep(0.0, 0.75, t), canopy * 0.7 * (1.0 - sun.y));
+    let sunlit = sun_on * canopy_shade * grass_params.lighting.x;
+    let face = vec3<f32>(vh.x, 0.0, vh.y) / max(vl, 1e-3);
+    let behind = max(-dot(face, sun), 0.0);
+    let towards = max(dot(view_dir, sun), 0.0);
+    let through = (0.5 * behind + 0.5 * towards * towards * towards) * pow(t, 1.3);
+    let tangent = normalize(up_view + rr * (2.0 * droop * t));
+    let half_vector = sun - view_dir;
+    let half_dir = half_vector / max(length(half_vector), 1e-6);
+    let th = dot(tangent, half_dir);
+    let sheen = pow(max(1.0 - th * th, 0.0), 20.0) * t;
+    let shape = vec4<f32>(t, grad * ao,
+        1.0 + grass_params.features.w * 0.45 * (gust - GUST_MEAN * grass_params.wind.y) * t,
+        select(0.0, 1.0 - simple_tuft, is_head));
+    let sunlight = vec4<f32>(sunlit * 0.3 * dot(right, sun), 0.07 * sheen * sunlit,
+        0.4 * through * sunlit, 0.55 * (1.0 - smoothstep(0.0, 0.4, t)));
+    // Only bounded appearance is half-packed; world positions and fog stay full f32.
+    return GrassBladeSection(
+        vec4<f32>(left, max(vertex_fog(-(g.view * vec4<f32>(left, 1.0)).z), root_fog)),
+        vec4<f32>(right_edge, max(vertex_fog(-(g.view * vec4<f32>(right_edge, 1.0)).z), root_fog)),
+        vec4<u32>(pack2x16float(shape.xy), pack2x16float(shape.zw),
+            pack2x16float(sunlight.xy), pack2x16float(sunlight.zw)));
+}
+
+fn grass_vertex(vertex: u32, instance: u32) -> GOut {
+    var o: GOut;
+    o.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+    let band = instance >> 28u;
+    let within = instance & 0x0fffffffu;
+    let band_stride = u32(grass_params.bands[band / 4u][band % 4u]);
+    let cell_id = grass_visible[band * GRASS_MAX_CELLS + within / band_stride] & (GRASS_MAX_CELLS - 1u);
+    let k = within % band_stride;
+    let span = grass_blade_cache.spans[cell_id];
+    if k >= span.count { return o; }
+    let index = span.offset + k;
+    if grass_blade_cache.blades[index].base.head.w == 0.0 { return o; }
+    let b = grass_blade_cache.blades[index].base;
+    let section = grass_blade_cache.blades[index].sections[vertex >> 1u];
+    let shape = vec4<f32>(unpack2x16float(section.appearance.x), unpack2x16float(section.appearance.y));
+    let sunlight = vec4<f32>(unpack2x16float(section.appearance.z), unpack2x16float(section.appearance.w));
+    let edge = select(section.left, section.right, (vertex & 1u) != 0u);
+    o.world = edge.xyz;
+    o.clip = g.vp * vec4<f32>(o.world, 1.0);
+    o.coverage = vec2<f32>(b.root_coverage.w, b.spec.w);
+    let side = select(-1.0, 1.0, (vertex & 1u) != 0u);
+    o.root = b.root_coverage.xyz;
+    o.uv = b.uv_path.xy;
+    o.normal = b.normal_sky;
+    o.path = u32(b.uv_path.z + 0.5);
+    o.light = b.light.xyz;
+    o.dlight = b.dlight.xyz;
+    o.spec = b.spec.xyz;
+    o.point_loss = vec3<f32>(0.0);
+    // ponytail: root-sampled point shadows approximate sub-blade shadow edges; use per-fragment only if quality needs it.
+    //__VERTEX_POINT_SHADOW_LOSS__
+    o.hue = b.hue;
+    o.head = vec4<f32>(b.head.rgb, shape.w);
+    o.shape = vec4<f32>(shape.x, side, shape.y, shape.z);
+    o.sunlight = vec4<f32>(sunlight.x * side, sunlight.y, 1.0, 1.0);
+    // ponytail: Gouraud visibility approximates within-blade shadow edges; use per-fragment only if quality needs it.
+    //__VERTEX_SHADOW_VISIBILITY__
+    o.mixes = vec4<f32>(sunlight.w, b.light.w, sunlight.z, b.dlight.w);
+    o.fog = edge.w;
     return o;
+}
+
+// One workgroup per active cell; each lane walks its bounded visible prefix.
+// The CPU supplies only one span per cell, with no maximum-stride dispatch.
+@compute @workgroup_size(64)
+fn cs_grass_blades(@builtin(global_invocation_id) id: vec3<u32>) {
+    // Third header words also form the compact current-frame active-cell list.
+    if id.y >= GRASS_MAX_CELLS { return; }
+    let cell_id = grass_blade_output.spans[id.y].active_cell;
+    if cell_id >= arrayLength(&grass_cells) { return; }
+    let span = grass_blade_output.spans[cell_id];
+    for (var k = id.x; k < span.count; k += 64u) {
+        let index = span.offset + k;
+        let b = grass_build_blade(cell_id, k);
+        if b.identity.y == 0u {
+            // Beauty and the near caster test validity before any other cached field.
+            grass_blade_output.blades[index].base.head = vec4<f32>(0.0);
+            continue;
+        }
+        grass_blade_output.blades[index].base = grass_blade_shade(b);
+        grass_blade_output.blades[index].sections[0] = grass_build_section(b, 0u);
+        let shoulder = grass_build_section(b, 2u);
+        grass_blade_output.blades[index].sections[1] = shoulder;
+        if b.tuft.z == 1.0 {
+            grass_blade_output.blades[index].sections[2] = shoulder;
+        } else {
+            grass_blade_output.blades[index].sections[2] = grass_build_section(b, 4u);
+        }
+    }
 }
 
 @vertex
 fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance: u32) -> GOut {
     return grass_vertex(vertex, instance);
 }
+
 
 struct GrassOutput {
     @location(0) color: vec4<f32>,
