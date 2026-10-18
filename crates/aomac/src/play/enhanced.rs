@@ -96,6 +96,11 @@ pub(super) fn controls() -> Vec<Control> {
         Control::slider(Lighting, "Local Lights", "AomacLampIntensity", "Lamp Intensity", "%.2fx", 1.0, 0.0, 4.0),
         Control::slider(Lighting, "Local Lights", "AomacCarriedLightIntensity", "Carried Light Intensity", "%.2fx", 1.0, 0.0, 4.0),
         Control::check(Lighting, "Material Highlights", "AomacMaterialSpecular", "Authored Material Specular (GGX + AA)"),
+        Control::check(Lighting, "Materials & Reflections", "AomacGeneratedNormals", "Generated Texture Bump Maps"),
+        Control::check(Lighting, "Materials & Reflections", "AomacMaterialMaps", "Side-loaded Material Maps"),
+        Control::check(Lighting, "Materials & Reflections", "AomacMaterialPbr", "Texture Material GGX"),
+        Control::check(Lighting, "Materials & Reflections", "AomacMaterialReflections", "Screen-space Material Reflections"),
+        Control::check(Lighting, "Materials & Reflections", "AomacEnvironmentProbe", "Observed Static Environment Probe"),
         Control::check(Ambient, "Ambient Occlusion", "AomacAmbientOcclusion", "Ambient Occlusion"),
         Control::slider(Ambient, "Ambient Occlusion", "AomacAoRadius", "Ambient Occlusion Radius", "%.2f m", 1.75, 0.0, 5.0),
         Control::slider(Ambient, "Ambient Occlusion", "AomacAoStrength", "Ambient Occlusion Strength", "%.2f", 1.5, 0.0, 2.0),
@@ -227,6 +232,27 @@ mod tests {
             _ => [control.min.as_ref(), control.max.as_ref()].into_iter().flatten().find(|value| **value != control.default).unwrap().clone(),
         }
     }
+    #[test]
+    fn material_switches_are_independent_default_off_and_live() {
+        let mut d = values();
+        let flags = |settings: ao_render::EnhancedSettings| [
+            settings.generated_normals, settings.material_maps, settings.material_pbr,
+            settings.material_reflections, settings.environment_probe,
+        ];
+        assert_eq!(flags(d.enhanced_settings()), [false; 5]);
+        for (index, name) in [
+            "AomacGeneratedNormals", "AomacMaterialMaps", "AomacMaterialPbr",
+            "AomacMaterialReflections", "AomacEnvironmentProbe",
+        ].into_iter().enumerate() {
+            assert!(d.set(name, Variant::Bool(true)));
+            let mut expected = [false; 5];
+            expected[index] = true;
+            assert_eq!(flags(d.enhanced_settings()), expected);
+            reset(&mut d, Some(PageId::Lighting));
+            assert_eq!(flags(d.enhanced_settings()), [false; 5]);
+        }
+    }
+
 
     #[test]
     fn registry_is_unique_complete_resettable_and_persistent() {

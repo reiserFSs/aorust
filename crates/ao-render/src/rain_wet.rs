@@ -58,6 +58,7 @@ impl RainWet {
         Self { layout, params, rings, streaks, splashes, wet, sheen, shelter, texture, area: [0.0; 4], samples: vec![[1e20, 0.0]; (MAP * MAP) as usize], wetness: 0.0, last_time: None, surface: None, drift: Vec3::ZERO, dummy, bindings: None }
     }
     pub(super) fn is_ready(&self) -> bool { self.rings.is_ready() && self.streaks.is_ready() && self.splashes.is_ready() && self.wet.is_ready() && self.sheen.is_ready() }
+    pub(super) fn reflection_wetness(&self) -> f32 { self.wetness }
     pub(super) fn wait(&self) { self.rings.get(); self.streaks.get(); self.splashes.get(); self.wet.get(); self.sheen.get(); }
     pub(super) fn release_targets(&mut self) { self.bindings = None; }
     pub(super) fn prepare_shelter(&mut self, queue: &wgpu::Queue, eye: Vec3, input: &WeatherInput) {

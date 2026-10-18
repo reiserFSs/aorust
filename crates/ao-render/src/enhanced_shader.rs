@@ -5,7 +5,10 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
     let ao = settings.ambient_occlusion;
     let bloom = settings.emissive_bloom;
     let hdr = settings.needs_sun_mask();
-    let material_specular = settings.material_specular;
+    let materials = settings.generated_normals || settings.material_maps || settings.material_pbr
+        || settings.material_reflections || settings.environment_probe;
+    let material_specular = settings.material_specular || settings.material_pbr;
+    let reflections = settings.material_reflections || settings.environment_probe;
     let clustered_lighting = settings.clustered_lighting;
     let local_light_shadows = settings.local_light_shadows;
     let night = settings.night_mode != crate::NightMode::AsGame;
@@ -31,6 +34,10 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
     }
     source = source.replace("    o.light = clamp(g.sun_g.rgb * max(dot(n, g.sun_dir.xyz), 0.0) + vertex_lights(o.wpos, n, 0.0)[0],", "    let ground_local = vertex_lights(o.wpos, n, 0.0)[0];\n    o.light = clamp(g.sun_g.rgb * max(dot(n, g.sun_dir.xyz), 0.0) + ground_local,");
     source = source.replace("    o.dlight = clamp(o.light + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0));", "    o.dlight = clamp(o.light + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0));\n    o.sun_share = vec4<f32>(max(o.light - clamp(ground_local, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(0.0)), 0.0);\n    o.sun_spec_share = vec4<f32>(max(o.dlight - clamp(ground_local + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(0.0)), 0.0);");
+    if reflections {
+        source = source.replace("all(emissive <= vec3<f32>(0.0))), 0.0, 0.0)", "all(emissive <= vec3<f32>(0.0))), select(0.0, 1.0, any(dl[0] > vec3<f32>(0.0)) || any(dl[1] > vec3<f32>(0.0))), 0.0)");
+        source = source.replace("    let ground_local = vertex_lights(o.wpos, n, 0.0)[0];", "    let ground_local = vertex_lights(o.wpos, n, 0.0)[0];\n    o.ao_info.y = select(0.0, 1.0, any(ground_local > vec3<f32>(0.0)));");
+    }
     if settings.sun_shadows {
         source = source.replace("clamp(i.light + ground_palette(i),", "clamp(i.light - i.sun_share * (1.0 - sun_visibility(i.wpos)) + ground_palette(i),");
         source = source.replace("ground_tile(i) * i.dlight", "ground_tile(i) * max(i.dlight - i.sun_spec_share * (1.0 - sun_visibility(i.wpos)), vec3<f32>(0.0))");
@@ -51,8 +58,11 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
     source = source.replace("@fragment\nfn fs_", "fn enhanced_original_fs_");
     source = source.replace(" -> @location(0) vec4<f32>", " -> vec4<f32>");
     source.push_str(&crate::shader_source::load("enhanced_output.wgsl", OUTPUT));
-    if settings.cloud_shadows {
+    if settings.cloud_shadows || reflections {
         source = source.replace("    @location(3) sun: vec4<f32>,", "    @location(3) sun: vec4<f32>,\n    @location(4) water_cloud: vec4<f32>,");
+    }
+    if reflections {
+        source = source.replace("    @location(4) water_cloud: vec4<f32>,", "    @location(4) water_cloud: vec4<f32>,\n    @location(5) reflection_surface: vec4<f32>,\n    @location(6) reflection_mask: vec4<f32>,");
     }
     for name in names {
         let ambient = match name.as_str() {
@@ -101,8 +111,14 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
             if name == "fs_ground_shadow" { ", vec4<f32>(1.0)".to_owned() }
             else if matches!(name.as_str(), "fs_opaque" | "fs_fade_opaque" | "fs_fade_test" | "fs_test" | "fs_blend") { ", vec4<f32>(enhanced_water_cloud(i, beauty), 0.0, 0.0, beauty.a)".to_owned() }
             else { ", vec4<f32>(0.0, 0.0, 0.0, beauty.a)".to_owned() }
-        } else { String::new() };
-        source.push_str(&format!("\n@fragment fn {name}(i: VOut) -> EnhancedOutput {{\n{geometric_normal}    let envelope = vec4<f32>(1.0);\n    let emission_sample = {emission_sample};\n    let beauty = enhanced_original_{name}({fragment_input});\n    let bounded_beauty = clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0));\n    return EnhancedOutput(beauty, {ambient}, {emission_result}, {sun}{water});\n}}\n"));
+        } else if reflections { ", vec4<f32>(0.0)".to_owned() } else { String::new() };
+        let reflection = if reflections {
+            let primary = matches!(name.as_str(), "fs_opaque" | "fs_test" | "fs_fade_opaque" | "fs_fade_test" | "fs_ground_fused" | "fs_ground_base" | "fs_ground_simple");
+            if primary {
+                ", vec4<f32>(material_shading_normal(i), material_roughness(i)), vec4<f32>(material_reflectivity(i), native_fog(i.fog), material_static_source(i), select(0.0, 1.0, i.effect == 0u && (u32(mat.native.z) & 128u) == 0u))"
+            } else { ", vec4<f32>(0.0), vec4<f32>(0.0)" }
+        } else { "" };
+        source.push_str(&format!("\n@fragment fn {name}(i: VOut) -> EnhancedOutput {{\n{geometric_normal}    let envelope = vec4<f32>(1.0);\n    let emission_sample = {emission_sample};\n    let beauty = enhanced_original_{name}({fragment_input});\n    let bounded_beauty = clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0));\n    return EnhancedOutput(beauty, {ambient}, {emission_result}, {sun}{water}{reflection});\n}}\n"));
     }
     source = source.replace("sun_visibility(i.wpos)", "sun_visibility(i.wpos, i.n, i.clip.xy)");
     if shadows {
@@ -126,7 +142,7 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
             source.replace_range(start..end, "");
         }
     }
-    for (enabled, field, location) in [(ao, "ao_info", 13), (sun_shares, "sun_share", 14), (sun_shares, "sun_spec_share", 15)] {
+    for (enabled, field, location) in [(ao || reflections, "ao_info", 13), (sun_shares, "sun_share", 14), (sun_shares, "sun_spec_share", 15)] {
         if !enabled {
             source = source.replace(&format!("select(l.{field}, vec3<f32>(0.0), prelit)"), "vec3<f32>(0.0)");
             source = source.replace(&format!("l.{field}"), "vec3<f32>(0.0)");
@@ -156,6 +172,7 @@ pub(super) fn source(settings: crate::EnhancedSettings) -> String {
     }
     if clustered_lighting || local_light_shadows { crate::clustered_lighting::apply(&mut source); }
     if material_specular { crate::authored_specular::append(&mut source, settings.night_mode == crate::NightMode::Moonlit); }
+    if materials { crate::authored_specular::append_materials(&mut source, settings); }
     if settings.needs_admitted_lights() { crate::point_shadows::apply_shader(&mut source, local_light_shadows, clustered_lighting); }
     source
 }

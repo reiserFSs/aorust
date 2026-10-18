@@ -651,6 +651,35 @@ knobs; the manifest records
 the full settings value. Selecting a profile does not change the captured world,
 camera, clock, actor equipment or lights.
 
+Material-only profiles are `generated-normals`, `material-maps`, `material-pbr`,
+`material-reflections`, and `environment-probe`; `materials` combines all five.
+`wet-reflections` combines Wet Surfaces with screen-space material reflections,
+without turning on rain or PBR. The normal-map and material controls live under
+Lighting / Materials & Reflections; folder naming and map conventions are
+documented in `docs/gui.md`. Existing profiles do not implicitly enable these
+features, preserving historical evidence controls.
+
+Headless procedural material/reflection acceptance (no client assets, server,
+window, or user-folder changes) is available with an exclusive GPU timing lock:
+
+```sh
+AOMAC_GFX_OUT=/absolute/new/material-evidence \
+  cargo test --release -p ao-render -j 2 material_graphics_evidence -- --ignored --nocapture --test-threads=1
+AOMAC_GFX_OUT=/absolute/new/reflection-evidence \
+  cargo test --release -p ao-render -j 2 observed_material_reflections_gpu_evidence -- --ignored --nocapture --test-threads=1
+cargo test --release -p ao-render -j 2 reflection_history_excludes_current_visible_actors_and_effects -- --ignored --nocapture --test-threads=1
+cargo test --release -p ao-render -j 2 wet_reflections_require_accumulated_wetness_and_exposed_floor -- --ignored --nocapture --test-threads=1
+```
+
+The material fixture covers mesh and native coarse-ground paths, explicit
+temporary normal/ORM/AO/emissive maps, live cache toggles and exact all-off
+roundtrips. Reflection evidence includes static-probe confidence, frames 1/8/40
+versus analytic-only fallback, hidden/transparent/occluded actor controls, full
+fog, wet/exposed/dry/roof-covered receivers and the seven-target combination.
+Contact/frame strips and alternating AB/BA GPU timestamp CSVs exclude PNG
+readback from timing. These are headless rendering checks, not real-window or
+retail visual-parity claims.
+
 ### Enhanced moon and night lighting
 
 The Lighting page exposes **As Game** (default), **Moonlit**, and **Dark**,

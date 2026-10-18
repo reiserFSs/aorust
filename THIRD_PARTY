@@ -210,3 +210,17 @@ Source: https://github.com/wannabuh/ao-vk (MIT, Copyright (c) 2026 wannabuh).
 The complete MIT permission and warranty notice above applies to these ports.
 Exact Gamecode-class admission, immediate revocation and native material
 vertex-buffer rendering are specific to this renderer; no artwork is copied.
+
+Enhanced texture materials and observed reflections
+===================================================
+
+Generated-normal surface-gradient conversion, GGX material response, screen-space
+reflection marching and the camera-observed environment probe adapt ao-vk
+rvk/shaders/{ffp_main,lighting,env_common}.glsl, ssr.frag, env_accum.frag,
+env_filter.frag and rvk/material_maps.h:
+https://github.com/wannabuh/ao-vk
+Inspected revision: 47fceedf61d375947be20b78d97238cb9c971ca9.
+Copyright (c) 2026 wannabuh, MIT License; the complete copyright, permission
+and warranty notice reproduced above applies. Native texture-load-time normal
+generation, RDB material identification and static-only primary-observation
+history are specific to this renderer. No upstream or game artwork is included.

@@ -85,8 +85,141 @@ fn pack(source: &mut String, field: &str) {
     }
 }
 
+/// Materials are an Enhanced-only assembly step; native textures and alpha/depth
+/// equations remain untouched. All image processing happens on texture upload.
+pub(super) fn append_materials(source: &mut String, settings: crate::EnhancedSettings) {
+    pack_material(source);
+    let mut shader = crate::shader_source::load("materials.wgsl", include_str!("materials.wgsl")).into_owned();
+    for (name, enabled) in [
+        ("MATERIAL_GENERATED", settings.generated_normals),
+        ("MATERIAL_MAPS", settings.material_maps),
+        ("MATERIAL_PBR", settings.material_pbr),
+        ("MATERIAL_STATIC_PROVENANCE", settings.material_reflections || settings.environment_probe),
+    ] {
+        shader = shader.replace(&format!("const {name}: bool = false;"), &format!("const {name}: bool = {enabled};"));
+    }
+    if source.contains("fn clustered_pixel_lights(") {
+        shader = shader.replace(
+            "vertex_lights(i.wpos, n, 0.0)[0] - vertex_lights(i.wpos, base, 0.0)[0]",
+            "clustered_pixel_lights(i.wpos, n, material_footprint) - clustered_pixel_lights(i.wpos, base, material_footprint) + clustered_directional(n) - clustered_directional(base) - g.sun_g.rgb * (max(dot(n, g.sun_dir.xyz), 0.0) - max(dot(base, g.sun_dir.xyz), 0.0))",
+        );
+    }
+    source.push_str(&shader);
+    *source = source.replace("    let envelope = vec4<f32>(1.0);", "    material_prepare(i);\n    let envelope = vec4<f32>(1.0);");
+    *source = source.replace("    authored_normal = i.n;", "    authored_normal = material_shading_normal(i);");
+    if settings.generated_normals || settings.material_maps || settings.material_pbr {
+        *source = source.replace("    var texture_color = min(t.rgb", "    if !native_unlit() && mat.emissive.w < 1.5 && i.effect == 0u { light = material_diffuse(i, light); }\n    var texture_color = min(t.rgb");
+        // Emission is added in the native pre-fog equation, never as an overlay.
+        *source = source.replace("    let lit = min(texture_color + spec,", "    texture_color += material_emissive(i);\n    let lit = min(texture_color + spec,");
+        if settings.emissive_bloom && settings.material_maps {
+            let mut multiplier = false;
+            *source = source.lines().map(|line| {
+                if line.starts_with("@fragment fn ") { multiplier = line.starts_with("@fragment fn fs_ground_shadow("); }
+                if !multiplier && line.starts_with("    let emission_sample = ") {
+                    format!("{} + vec4<f32>(material_emissive(i) * (1.0 - native_fog(i.fog)), 0.0);", line.trim_end_matches(';'))
+                } else { line.to_owned() }
+            }).collect::<Vec<_>>().join("\n");
+        }
+        // Ground has both a fused path and the native base * shadow path.
+        // Add specular/emission only once; divide by base for ZERO/SRCCOLOR.
+        for (name, fused, simple) in [
+            ("enhanced_original_fs_ground_fused", true, false),
+            ("enhanced_original_fs_ground_shadow", false, false),
+            ("enhanced_original_fs_ground_simple", true, true),
+        ] {
+            let start = source.find(&format!("fn {name}(")).expect("ground material receiver");
+            let end = start + source[start..].find("\n}").expect("ground receiver end");
+            let body = source[start..end].to_owned();
+            let body = if simple {
+                body.replace("ground_tile(i) * i.dlight.xyz", "material_ground(i, ground_tile(i), i.dlight.xyz, true)")
+                    .replace("ground_tile(i) * cluster_light", "material_ground(i, ground_tile(i), cluster_light, true)")
+                    .replace("ground_tile(i) * max(i.dlight.xyz - i.sun_spec_share.xyz * (1.0 - sun_visibility(i.wpos, i.n, i.clip.xy)), vec3<f32>(0.0))",
+                        "material_ground(i, ground_tile(i), max(i.dlight.xyz - i.sun_spec_share.xyz * (1.0 - sun_visibility(i.wpos, i.n, i.clip.xy)), vec3<f32>(0.0)), true)")
+            } else if fused {
+                body.replace("tile * light", "material_ground(i, tile, light, true)")
+            } else {
+                body.replace("mix(light, vec3<f32>(1.0)", "mix(material_ground(i, sample_clamped(tex, material_uv(i)).rgb, light, false), vec3<f32>(1.0)")
+            };
+            source.replace_range(start..end, &body);
+        }
+    }
+    if settings.material_pbr {
+        *source = source.replace("    let alpha = sqrt(clamp(2.0 / (max(power, 0.0) + 2.0) + variance, 0.0004, 1.0));", "    let alpha = material_alpha(i);");
+        *source = source.replace("    let f0 = clamp(vec3<f32>(i.light.w, i.dlight.w, i.spec.w), vec3<f32>(0.0), vec3<f32>(1.0));",
+            "    let albedo = material_albedo_value;\n    let f0 = mix(vec3<f32>(0.04), albedo, material_metallic(i));");
+        *source = source.replace(" || power <= 0.0 || !any(f0 > vec3<f32>(0.0))", "");
+        // Ground alpha testing can discard inside ground_tile; all derivatives
+        // and implicit samples for GGX were cached by material_prepare first.
+        let start = source.find("fn authored_specular(").expect("material GGX");
+        let end = start + source[start..].find("\n}").expect("material GGX end");
+        let body = source[start..end]
+            .replace("    let dx = dpdx(n);\n    let dy = dpdy(n);\n    let variance = max(dot(dx, dx), dot(dy, dy));\n", "    let variance = material_variance;\n")
+            .replace("max(length(fwidth(i.wpos)), 1e-6)", "material_footprint")
+            .replace("sun_visibility(i.wpos, i.n, i.clip.xy)", "material_visibility_value");
+        source.replace_range(start..end, &body);
+    }
+    let specular = if settings.material_pbr { "authored_specular(i, vec3<f32>(0.0))" } else { "vec3<f32>(0.0)" };
+    source.push_str(&format!("\nfn material_ground(i: VOut, base: vec3<f32>, light: vec3<f32>, fused: bool) -> vec3<f32> {{\n    let diffuse = material_diffuse(i, light);\n    let extra = {specular} + material_emissive(i);\n    return select(diffuse + extra / max(base, vec3<f32>(0.01)), base * diffuse + extra, fused);\n}}\n"));
+    if settings.material_reflections || settings.environment_probe {
+        let clustered = if source.contains("fn clustered_pixel_lights(") {
+            " && !any(clustered_pixel_lights(i.wpos, material_shading_normal(i), material_footprint) > vec3<f32>(0.0))"
+        } else { "" };
+        source.push_str(&format!("\nfn material_static_source(i: VOut) -> f32 {{\n    let local = vertex_lights(i.wpos, material_shading_normal(i), 0.0);\n    let visibility = material_static_visibility_value;\n    return select(0.0, 1.0, (u32(mat.native.z) & 128u) == 0u && (u32(mat.native.z) & 64u) == 0u && i.effect == 0u && all(mat.scroll.xy == vec2<f32>(0.0)) && i.ao_info.y == 0.0 && !any(local[0] > vec3<f32>(0.0)) && !any(local[1] > vec3<f32>(0.0)){clustered} && visibility >= 0.999);\n}}\n"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn material_switches_are_independent_and_prepare_before_discard() {
+        for settings in [
+            crate::EnhancedSettings { generated_normals: true, ..Default::default() },
+            crate::EnhancedSettings { material_maps: true, ..Default::default() },
+            crate::EnhancedSettings { material_pbr: true, ..Default::default() },
+            crate::EnhancedSettings { material_reflections: true, ..Default::default() },
+            crate::EnhancedSettings { environment_probe: true, ..Default::default() },
+        ] {
+            let source = crate::enhanced_shader::source(settings);
+            assert!(source.contains(&format!("const MATERIAL_GENERATED: bool = {};", settings.generated_normals)));
+            assert!(source.contains(&format!("const MATERIAL_MAPS: bool = {};", settings.material_maps)));
+            assert!(source.contains(&format!("const MATERIAL_PBR: bool = {};", settings.material_pbr)));
+            assert!(source.contains("material_prepare(i);"));
+            assert!(!source.contains("@location(16)"));
+            if settings.material_pbr {
+                assert!(source.contains("let alpha = material_alpha(i);"));
+                assert!(source.contains("let f0 = mix(vec3<f32>(0.04), albedo, material_metallic(i));"));
+                assert!(!source.contains(" || power <= 0.0"));
+            }
+            if settings.material_reflections || settings.environment_probe {
+                assert!(source.contains("@location(5) reflection_surface"));
+                assert!(source.contains("@location(6) reflection_mask"));
+                assert!(source.contains("i.ao_info.y == 0.0"));
+                assert!(source.contains("all(mat.scroll.xy == vec2<f32>(0.0))"));
+                assert!(source.contains("visibility >= 0.999"));
+                assert!(source.contains("any(dl[0] > vec3<f32>(0.0))"));
+                assert!(source.contains("128u"));
+            }
+        }
+        let off = crate::enhanced_shader::source(crate::EnhancedSettings::default());
+        assert!(!off.contains("fn material_prepare"));
+        assert!(!off.contains("var generated_normal_tex"));
+    }
+
+    #[test]
+    fn probe_provenance_excludes_foliage_and_the_complete_clustered_light_pool() {
+        for clustered_lighting in [false, true] {
+            let source = crate::enhanced_shader::source(crate::EnhancedSettings {
+                environment_probe: true, clustered_lighting, ..Default::default()
+            });
+            let helper = source.split("fn material_static_source(").nth(1).unwrap().split("\n}").next().unwrap();
+            assert!(helper.contains("(u32(mat.native.z) & 64u) == 0u"));
+            assert!(helper.contains("let visibility = material_static_visibility_value;"));
+            assert_eq!(helper.contains("!any(clustered_pixel_lights("), clustered_lighting);
+            if clustered_lighting {
+                assert!(helper.contains("clustered_pixel_lights(i.wpos, material_shading_normal(i), material_footprint)"));
+            }
+        }
+    }
     #[test]
     fn standalone_ggx_uses_admitted_sources_without_pixel_diffuse_override() {
         let source = crate::enhanced_shader::source(crate::EnhancedSettings {

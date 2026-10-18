@@ -35,6 +35,9 @@ mod native_fog;
 pub use native_fog::{NativeFog,SharedNativeFog,NativeFogControl};
 mod native_ground;
 mod native_texture;
+mod native_materials;
+#[cfg(test)]
+mod material_tests;
 mod native_liquid;
 mod water;
 mod water_waves;
@@ -59,6 +62,11 @@ mod enhanced;
 mod clustered_lighting;
 mod authored_specular;
 mod enhanced_shader;
+mod material_reflections;
+#[cfg(test)]
+mod material_reflection_tests;
+#[cfg(test)]
+mod material_wet_reflection_tests;
 mod moon_shadows;
 mod moon_exposure;
 mod variant;
@@ -692,6 +700,34 @@ pub struct FrameCpuTimings {
     pub bloom_ms: f64,
 }
 
+#[derive(Clone)]
+struct MaterialViews {
+    generated: wgpu::TextureView,
+    normal: wgpu::TextureView,
+    orm: wgpu::TextureView,
+    emissive: wgpu::TextureView,
+}
+
+struct MaterialSource {
+    key: TextureKey,
+    texture: ao_scene::Texture,
+    root: Option<std::path::PathBuf>,
+    views: parking_lot::Mutex<Option<MaterialViews>>,
+}
+
+struct MaterialBinding {
+    base: wgpu::TextureView,
+    env: wgpu::TextureView,
+    uniform: wgpu::Buffer,
+    source: std::sync::Arc<MaterialSource>,
+}
+
+struct PendingMaterials {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: std::thread::JoinHandle<Vec<(std::sync::Arc<MaterialSource>, native_materials::BuiltMaterial)>>,
+}
+
+
 pub struct Renderer {
     grass: Option<grass::Grass>,
     foliage: foliage::Foliage,
@@ -707,6 +743,7 @@ pub struct Renderer {
     spell_programs: spell_smoke::Programs,
     smoke_programs: spell_smoke::Programs,
     enhanced_frame: Option<enhanced::EnhancedFrame>,
+    material_reflections: Option<material_reflections::Reflections>,
     bloom: Option<bloom::Bloom>,
     grade: Option<grade::Grade>,
     temporal: Option<temporal::Temporal>,
@@ -770,6 +807,12 @@ pub struct Renderer {
     auxiliary_msaa: wgpu::TextureFormatFeatureFlags,
     water_cloud_msaa: wgpu::TextureFormatFeatureFlags,
     texture_policy: native_texture::Policy,
+    materials_root: Option<std::path::PathBuf>,
+    materials_revision: u64,
+    material_fallbacks: std::sync::OnceLock<MaterialViews>,
+    material_bindings: Vec<MaterialBinding>,
+    material_requested: (bool, bool),
+    pending_materials: Option<PendingMaterials>,
     drawn_visuals: HashMap<VisualKey, i32>,
     pending_visuals: std::cell::RefCell<HashMap<VisualKey, i32>>,
     actor_visual_retirements: Vec<(u32, u32)>,
@@ -941,7 +984,9 @@ fn compile_pipeline(
         let auxiliary = wgpu::ColorTargetState { format: enhanced::AUX, blend: state, write_mask: wgpu::ColorWrites::ALL };
         let sun_mask = settings.needs_sun_mask().then(|| auxiliary.clone());
         let water_cloud = settings.cloud_shadows.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R16Float, blend: state, write_mask: wgpu::ColorWrites::RED });
-        let targets = [Some(target), settings.ambient_occlusion.then(|| ambient_target(state, depth_write)), settings.emissive_bloom.then_some(auxiliary), sun_mask, water_cloud];
+        // The native ground lightmap multiplies existing coverage; retain its base material metadata.
+        let reflection = (settings.material_reflections || settings.environment_probe).then_some(wgpu::ColorTargetState { format: enhanced::AUX, blend: None, write_mask: if fs == "fs_ground_shadow" { wgpu::ColorWrites::empty() } else { wgpu::ColorWrites::ALL } });
+        let targets = [Some(target), settings.ambient_occlusion.then(|| ambient_target(state, depth_write)), settings.emissive_bloom.then_some(auxiliary), sun_mask, water_cloud, reflection.clone(), reflection];
         pipeline_creation::render(device, &wgpu::RenderPipelineDescriptor {
             label: Some(fs),
             // Ground effects 8-11 sample `ground_palette` (holo0) at bind group 2; liquids (12/13) use `fs_blend`,
@@ -1160,6 +1205,11 @@ impl Renderer {
         let (light_buf, light_cells_buf, light_idx_buf) = light_storage_buffers(&device, &LightGrid::new(&[]));
         let dyn_light_buf = make_dyn_light_buffer(&device);
         let globals_bg = globals_bind(&device, &g_layout, &globals, &light_buf, &light_cells_buf, &light_idx_buf, &dyn_light_buf, &sampler, &clamp_sampler);
+        let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding, visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+            count: None,
+        };
         let tex_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
@@ -1179,6 +1229,10 @@ impl Renderer {
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
                     count: None,
                 },
+                texture_entry(3),
+                texture_entry(4),
+                texture_entry(5),
+                texture_entry(6),
             ],
         });
         let holo_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1218,6 +1272,7 @@ impl Renderer {
             rain_wet: None,
             weather_particles: None,
             enhanced_frame: None,
+            material_reflections: None,
             bloom: None,
             grade: None,
             temporal: None,
@@ -1295,6 +1350,12 @@ impl Renderer {
             auxiliary_msaa,
             water_cloud_msaa,
             texture_policy: Default::default(),
+            materials_root: native_materials::default_root(),
+            materials_revision: 0,
+            material_fallbacks: std::sync::OnceLock::new(),
+            material_bindings: Vec::new(),
+            material_requested: (false, false),
+            pending_materials: None,
             sky: SkyGpu::default(),
             cloud_preferences: (true, true, false),
             sky_beauty_only: false,
@@ -1362,6 +1423,7 @@ impl Renderer {
             && self.spell_programs.ready() && self.smoke_programs.ready()
             && self.rain_wet.as_ref().is_none_or(rain_wet::RainWet::is_ready)
             && self.weather_particles.as_ref().is_none_or(weather_particles::WeatherParticles::is_ready)
+            && self.material_reflections.as_ref().is_none_or(material_reflections::Reflections::ready)
     }
 
     /// Explicit readiness barrier for zone preparation and deterministic evidence, never a frame prerequisite.
@@ -1369,6 +1431,7 @@ impl Renderer {
         self.world.wait();
         self.enhanced_pipelines.wait();
         self.bloom_pipelines.wait();
+        if let Some(pass) = &self.material_reflections { pass.wait(); }
         self.grade_pipelines.wait();
         self.shadow_pipelines.wait();
         self.ambient_occlusion.as_ref().expect("startup AO pipelines").wait();
@@ -1394,6 +1457,146 @@ impl Renderer {
     /// Enhanced "Better Mip Filtering" option (not retail, default off, audit item 12).
     pub fn set_texture_policy(&mut self, quality: i32, compressed: bool, better: bool) {
         self.texture_policy = native_texture::Policy { quality, compressed, better };
+    }
+
+    /// Side-loaded maps are resolved on the next scene/model upload or ground refresh.
+    /// `None` disables side-loading; explicit roots also let tests avoid process environment mutation.
+    pub fn set_materials_root(&mut self, root: Option<std::path::PathBuf>) {
+        if self.materials_root == root { return; }
+        self.materials_root = root;
+        self.materials_revision = self.materials_revision.wrapping_add(1);
+    }
+
+    fn material_chain_view(&self, chain: &native_materials::Chain, srgb: bool) -> wgpu::TextureView {
+        let texture = self.device.create_texture_tracked(&wgpu::TextureDescriptor {
+            label: Some("enhanced material map"),
+            size: wgpu::Extent3d { width: chain.w, height: chain.h, depth_or_array_layers: 1 },
+            mip_level_count: chain.levels.len() as u32, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: if srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm },
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[],
+        });
+        for (level, bytes) in chain.levels.iter().enumerate() {
+            let w = (chain.w >> level).max(1);
+            let h = (chain.h >> level).max(1);
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: level as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                bytes, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
+        }
+        texture.create_view_tracked(&Default::default())
+    }
+
+    fn material_fallbacks(&self) -> &MaterialViews {
+        self.material_fallbacks.get_or_init(|| {
+            let flat = self.material_chain_view(&native_materials::Chain { w: 1, h: 1, levels: vec![vec![128, 128, 255, 255]] }, false);
+            MaterialViews {
+                generated: flat.clone(), normal: flat,
+                orm: self.material_chain_view(&native_materials::Chain { w: 1, h: 1, levels: vec![vec![255, 255, 0, 0]] }, false),
+                emissive: self.material_chain_view(&native_materials::Chain { w: 1, h: 1, levels: vec![vec![0; 4]] }, true),
+            }
+        })
+    }
+
+    fn upload_material(&self, built: &native_materials::BuiltMaterial) -> MaterialViews {
+        let fallback = self.material_fallbacks();
+        MaterialViews {
+            generated: built.generated_normal.as_ref().map_or_else(|| fallback.generated.clone(), |chain| self.material_chain_view(chain, false)),
+            normal: built.side_normal.as_ref().map_or_else(|| fallback.normal.clone(), |chain| self.material_chain_view(chain, false)),
+            orm: built.orm.as_ref().map_or_else(|| {
+                if built.mask == 0 { return fallback.orm.clone(); }
+                self.material_chain_view(&native_materials::Chain { w: 1, h: 1, levels: vec![vec![255, 255, 0, built.mask]] }, false)
+            }, |chain| self.material_chain_view(chain, false)),
+            emissive: built.emissive.as_ref().map_or_else(|| fallback.emissive.clone(), |chain| self.material_chain_view(chain, true)),
+        }
+    }
+
+    fn material_selection(&self) -> native_materials::Selection {
+        native_materials::Selection { generated: self.material_requested.0, maps: self.material_requested.1 }
+    }
+
+    fn material_source(&self, key: TextureKey, texture: ao_scene::Texture, built: Option<&native_materials::BuiltMaterial>) -> std::sync::Arc<MaterialSource> {
+        // ponytail: retain one decoded RGBA source per texture for exact live toggles;
+        // replace with GPU generation only if measured decoded-texture memory pressure warrants it.
+        std::sync::Arc::new(MaterialSource {
+            key, texture, root: self.materials_root.clone(),
+            views: parking_lot::Mutex::new(built.map(|built| self.upload_material(built))),
+        })
+    }
+
+    fn material_source_build(&self, key: TextureKey, texture: &ao_scene::Texture) -> std::sync::Arc<MaterialSource> {
+        let selection = self.material_selection();
+        let built = (selection.generated || selection.maps).then(|| native_materials::build(key, &texture.rgba,
+            texture.width, texture.height, texture.source, self.materials_root.as_deref(), selection));
+        self.material_source(key, texture.clone(), built.as_ref())
+    }
+
+    fn material_bind_group(&self, binding: &MaterialBinding) -> wgpu::BindGroup {
+        let views = binding.source.views.lock();
+        let maps = views.as_ref().unwrap_or_else(|| self.material_fallbacks());
+        self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
+            label: Some("cached material binding"), layout: &self.tex_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&binding.base) },
+                wgpu::BindGroupEntry { binding: 1, resource: binding.uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&binding.env) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&maps.generated) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&maps.normal) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&maps.orm) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&maps.emissive) },
+            ],
+        })
+    }
+
+    fn rebind_materials(&mut self) {
+        let groups: Vec<_> = self.material_bindings.iter().map(|binding| self.material_bind_group(binding)).collect();
+        for (slot, group) in self.gpu.mats.iter_mut().zip(groups) { *slot = group; }
+        self.rebind_actor_materials();
+    }
+
+    fn request_materials(&mut self, settings: EnhancedSettings, defer: bool) {
+        let flags = (settings.generated_normals, settings.material_maps);
+        if flags == self.material_requested {
+            if !defer { self.finish_materials(true); }
+            return;
+        }
+        self.material_requested = flags;
+        if let Some(pending) = self.pending_materials.take() {
+            pending.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut sources: Vec<_> = self.material_bindings.iter().map(|binding| binding.source.clone()).collect();
+        sources.extend(self.actor_material_sources());
+        let mut seen = std::collections::HashSet::new();
+        sources.retain(|source| seen.insert(std::sync::Arc::as_ptr(source) as usize));
+        if !flags.0 && !flags.1 {
+            for source in sources { *source.views.lock() = None; }
+            self.rebind_materials();
+            return;
+        }
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            let mut built = Vec::with_capacity(sources.len());
+            for source in sources {
+                if worker_cancel.load(std::sync::atomic::Ordering::Relaxed) { break; }
+                let texture = &source.texture;
+                let material = native_materials::build(source.key, &texture.rgba, texture.width, texture.height,
+                    texture.source, source.root.as_deref(), native_materials::Selection { generated: flags.0, maps: flags.1 });
+                built.push((source, material));
+            }
+            built
+        });
+        self.pending_materials = Some(PendingMaterials { cancel, worker });
+        if !defer { self.finish_materials(true); }
+    }
+
+    fn finish_materials(&mut self, wait: bool) {
+        if !self.pending_materials.as_ref().is_some_and(|pending| wait || pending.worker.is_finished()) { return; }
+        let pending = self.pending_materials.take().unwrap();
+        for (source, built) in pending.worker.join().expect("material load worker") {
+            *source.views.lock() = Some(self.upload_material(&built));
+        }
+        self.rebind_materials();
     }
 
     fn texture_view(&self, rgba: &[u8], w: u32, h: u32, source: ao_scene::TextureSource) -> wgpu::TextureView {
@@ -1457,7 +1660,7 @@ impl Renderer {
     pub fn msaa_samples(&self) -> u32 { self.world.msaa }
 
     fn clamp_msaa(&self, requested: u32, settings: EnhancedSettings) -> u32 {
-        let auxiliary = settings.ambient_occlusion || settings.emissive_bloom || settings.needs_sun_mask();
+        let auxiliary = settings.ambient_occlusion || settings.emissive_bloom || settings.needs_sun_mask() || settings.material_reflections || settings.environment_probe;
         if auxiliary {
             self.msaa_supported.iter().copied().filter(|&count| count <= requested
                 && self.auxiliary_msaa.sample_count_supported(count)
@@ -1484,6 +1687,7 @@ impl Renderer {
     /// Immediate fixture setting: waits for an unseen world combination to compile on a worker.
     pub fn set_enhanced_settings(&mut self, settings: EnhancedSettings) {
         let settings = settings.clamped();
+        self.request_materials(settings, false);
         let key = variant::Key::of(settings, self.clamp_msaa(self.requested_msaa, settings));
         self.request_world(key, settings, false);
         if settings.gpu_spell_particles { self.spell_programs.wait(); }
@@ -1495,6 +1699,7 @@ impl Renderer {
     /// Keeps drawing the active variant while an unseen combination compiles on a worker.
     pub fn request_enhanced_settings(&mut self, settings: EnhancedSettings) {
         let settings = settings.clamped();
+        self.request_materials(settings, true);
         let key = variant::Key::of(settings, self.clamp_msaa(self.requested_msaa, settings));
         self.request_world(key, settings, true);
     }
@@ -1556,8 +1761,10 @@ impl Renderer {
         let changed_frame = previous.any_enabled() != settings.any_enabled()
             || previous.ambient_occlusion != settings.ambient_occlusion
             || previous.emissive_bloom != settings.emissive_bloom
-            || previous.needs_sun_mask() != settings.needs_sun_mask();
+            || previous.needs_sun_mask() != settings.needs_sun_mask()
+            || (previous.material_reflections || previous.environment_probe) != (settings.material_reflections || settings.environment_probe);
         self.enhanced_settings = settings;
+        if previous.material_reflections != settings.material_reflections || previous.environment_probe != settings.environment_probe { self.material_reflections = None; }
         if settings.enhanced_rain || settings.wet_surfaces || settings.weather_particles {
             if self.rain_wet.is_none() { self.rain_wet = Some(rain_wet::RainWet::new(&self.device, self.format)); }
         } else { self.rain_wet = None; }
@@ -1632,6 +1839,7 @@ impl Renderer {
 
     /// Call before checking targets; never install a variant partway through rendering a frame.
     pub fn settle_enhanced_world(&mut self) {
+        self.finish_materials(false);
         let Some(pending) = self.pending_world.as_mut() else { return };
         let Some(world) = pending.poll() else { return };
         let pending = self.pending_world.take().expect("pending variant");
@@ -1652,7 +1860,7 @@ impl Renderer {
     pub fn enhanced_target_bytes(&self) -> u64 {
         self.enhanced_frame.as_ref().map_or(0, |frame| {
             let pixels = u64::from(frame.size.0) * u64::from(frame.size.1);
-            let colour = 4 + 8 * (u64::from(frame.ambient.is_some()) + u64::from(frame.emissive.is_some()) + u64::from(frame.sun.is_some())) + 2 * u64::from(frame.water_cloud.is_some());
+            let colour = 4 + 8 * (u64::from(frame.ambient.is_some()) + u64::from(frame.emissive.is_some()) + u64::from(frame.sun.is_some()) + u64::from(frame.reflection_surface.is_some()) + u64::from(frame.reflection_mask.is_some())) + 2 * u64::from(frame.water_cloud.is_some());
             let samples = u64::from(frame.sample_count);
             pixels * (colour + 4 * samples + if samples > 1 { colour * samples + 4 } else { 0 })
         }) + self.ambient_occlusion.as_ref().map_or(0, ambient_occlusion::AmbientOcclusion::target_bytes)
@@ -1666,6 +1874,7 @@ impl Renderer {
             + self.motion_vectors.as_ref().map_or(0, actors::motion_vectors::MotionVectors::bytes)
             + self.post_target.as_ref().map_or(0, |target| u64::from(target.size.0) * u64::from(target.size.1) * 4)
             + self.spatial_post.as_ref().map_or(0, spatial_post::SpatialPost::bytes)
+            + self.material_reflections.as_ref().map_or(0, material_reflections::Reflections::bytes)
             + self.water.target_bytes()
     }
     /// Explicit offline instrumentation; disabled by default and owns no resources then.
@@ -1703,6 +1912,7 @@ impl Renderer {
     /// Replaces the GPU-side scene.
     pub fn upload(&mut self, scene: &Scene) {
         self.reset_post_history();
+        self.material_reflections = None;
         self.foliage_detail_state = foliage_detail::State::default();
         self.sky_dot_counter = 0.0;
         self.sky.directional_epoch = self.time;
@@ -1730,16 +1940,16 @@ impl Renderer {
             .collect();
         enum Job<'a> {
             Ground(&'a ao_scene::Texture),
-            Mip { rgba: &'a [u8], w: u32, h: u32, source: ao_scene::TextureSource, alpha_test: bool },
+            Mip { key: TextureKey, rgba: &'a [u8], w: u32, h: u32, source: ao_scene::TextureSource, alpha_test: bool },
         }
         const DEFAULT_WHITE: [u8; 4] = [255; 4];
-        let mut jobs: Vec<Job> = vec![Job::Mip { rgba: &DEFAULT_WHITE, w: 1, h: 1, source: ao_scene::TextureSource::Generated, alpha_test: false }];
+        let mut jobs: Vec<Job> = vec![Job::Mip { key: TextureKey { rdb_type: 0, id: 0 }, rgba: &DEFAULT_WHITE, w: 1, h: 1, source: ao_scene::TextureSource::Generated, alpha_test: false }];
         let mut view_of: HashMap<TextureKey, usize> = HashMap::new();
         for (k, t) in &scene.textures {
             if composite_keys.contains(k) { continue; }
             if t.width > 0 && t.height > 0 && t.rgba.len() == (t.width * t.height * 4) as usize {
                 view_of.insert(*k, jobs.len());
-                jobs.push(if k.rdb_type == 1_000_007 { Job::Ground(t) } else { Job::Mip { rgba: &t.rgba, w: t.width, h: t.height, source: t.source, alpha_test: alpha_tested.contains(k) } });
+                jobs.push(if k.rdb_type == 1_000_007 { Job::Ground(t) } else { Job::Mip { key: *k, rgba: &t.rgba, w: t.width, h: t.height, source: t.source, alpha_test: alpha_tested.contains(k) } });
             }
         }
         // CPU-side box-filter mip chain + BC/packed encoding runs across threads (audit item 10, the
@@ -1749,14 +1959,20 @@ impl Renderer {
         // scheduling, so output is byte-identical to the old fully-serial path.
         let mut built: Vec<Option<native_texture::BuiltTexture>> = Vec::with_capacity(jobs.len());
         built.resize_with(jobs.len(), || None);
+        let mut built_materials: Vec<Option<native_materials::BuiltMaterial>> = (0..jobs.len()).map(|_| None).collect();
+        let materials_root = self.materials_root.as_deref();
+        let selection = self.material_selection();
         let threads = std::thread::available_parallelism().map(std::num::NonZero::get).unwrap_or(1).min(jobs.len().max(1));
         let chunk = jobs.len().div_ceil(threads).max(1);
         std::thread::scope(|scope| {
-            for (job_chunk, built_chunk) in jobs.chunks(chunk).zip(built.chunks_mut(chunk)) {
+            for ((job_chunk, built_chunk), material_chunk) in jobs.chunks(chunk).zip(built.chunks_mut(chunk)).zip(built_materials.chunks_mut(chunk)) {
                 scope.spawn(move || {
-                    for (job, slot) in job_chunk.iter().zip(built_chunk.iter_mut()) {
-                        if let Job::Mip { rgba, w, h, source, alpha_test } = job {
+                    for ((job, slot), material_slot) in job_chunk.iter().zip(built_chunk.iter_mut()).zip(material_chunk.iter_mut()) {
+                        if let Job::Mip { key, rgba, w, h, source, alpha_test } = job {
                             *slot = Some(native_texture::build_texture_mips(policy, *source, bc_supported, rgba, *w, *h, *alpha_test));
+                            if selection.generated || selection.maps {
+                                *material_slot = Some(native_materials::build(*key, rgba, *w, *h, *source, materials_root, selection));
+                            }
                         }
                     }
                 });
@@ -1766,6 +1982,12 @@ impl Renderer {
             Job::Ground(t) => self.ground_palette_view(t),
             Job::Mip { .. } => self.upload_built_texture(b.as_ref().expect("built in parallel above")),
         }).collect();
+        let mut material_sources: Vec<_> = jobs.iter().zip(&built_materials).map(|(job, built)| match job {
+            Job::Ground(_) => self.material_source(TextureKey { rdb_type: 0, id: 0 },
+                ao_scene::Texture { width: 1, height: 1, rgba: vec![255; 4], source: ao_scene::TextureSource::Generated }, None),
+            Job::Mip { key, rgba, w, h, source, .. } => self.material_source(*key,
+                ao_scene::Texture { width: *w, height: *h, rgba: rgba.to_vec(), source: *source }, built.as_ref()),
+        }).collect();
         // Reuse the already-built actual tile mip bytes, including low-quality
         // packed conversion, instead of reducing the decoded source a second time.
         let tile_mips: HashMap<_, _> = view_of.iter().filter_map(|(key, &index)|
@@ -1773,10 +1995,12 @@ impl Renderer {
         for (key, texture) in native_ground::composite_images(&composites, &scene.textures, &tile_mips) {
             view_of.insert(key, views.len());
             views.push(self.texture_view(&texture.rgba, texture.width, texture.height, texture.source));
+            material_sources.push(self.material_source_build(key, &texture));
         }
         // One bind group per distinct (texture, base colour, emissive, glow mask).
         let mut mat_of: HashMap<(usize, usize, bool, [u32; 32]), usize> = HashMap::new();
         let mut mats: Vec<wgpu::BindGroup> = vec![];
+        let mut material_bindings = Vec::new();
         let mut material = |dev: &Renderer, view: usize, s: &ao_scene::Submesh, ground_patch: Option<&ao_scene::ground_detail::GroundPatch>, mesh: &ao_scene::Mesh| {
             let u = ground_patch.map_or_else(|| foliage::material_bounds(mat_uniform(s), s, mesh), |p| native_ground::material_uniform(s, p));
             let env_view = s.stage1_env_texture.and_then(|key| view_of.get(&key).copied()).unwrap_or(0);
@@ -1786,15 +2010,10 @@ impl Renderer {
                     contents: bytemuck::bytes_of(&u),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
-                mats.push(dev.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &dev.tex_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[view]) },
-                        wgpu::BindGroupEntry { binding: 1, resource: ub.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[env_view]) },
-                    ],
-                }));
+                let binding = MaterialBinding { base: views[view].clone(), env: views[env_view].clone(),
+                    uniform: ub, source: material_sources[view].clone() };
+                mats.push(dev.material_bind_group(&binding));
+                material_bindings.push(binding);
                 mats.len() - 1
             })
         };
@@ -1940,6 +2159,7 @@ impl Renderer {
         let grid = ([grid.origin.x, grid.origin.y, grid.origin.z, grid.cell], [grid.dims[0], grid.dims[1], grid.dims[2], 0]);
         // Keep VisualWater's style order (water, acid, lava, star, shallow), including both coplanar passes.
         self.gpu = Gpu { meshes, inst_bufs, mats, opaque, blended, liquid, insts, mesh_range, radius, grid };
+        self.material_bindings = material_bindings;
         self.foliage = foliage::Foliage::default();
         self.canopy_leaves.upload(&self.device, scene, &self.gpu);
         self.drawn_visuals.retain(|key, _| matches!(key, VisualKey::Actor(..)));
@@ -2004,6 +2224,8 @@ impl Renderer {
             }
         }
         self.sky_white_view.get_or_init(|| self.texture_view(&[255; 4], 1, 1, ao_scene::TextureSource::Generated));
+        self.material_fallbacks();
+        let material_fallbacks = self.material_fallbacks.get().unwrap();
         let is_live = |mi: usize, mesh: &ao_scene::Mesh| {
             !mesh.vertices.is_empty() && mesh.submeshes.iter().map(|s| s.indices.len()).sum::<usize>() > 0 && scene.sky.iter().any(|s| s.mesh == mi)
         };
@@ -2055,6 +2277,10 @@ impl Renderer {
                             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(key.map_or(self.sky_white_view.get().unwrap(), |k| &self.sky_views[&k])) },
                             wgpu::BindGroupEntry { binding: 1, resource: ub.as_entire_binding() },
                             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(env_key.map_or(self.sky_white_view.get().unwrap(), |k| &self.sky_views[&k])) },
+                            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&material_fallbacks.generated) },
+                            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&material_fallbacks.normal) },
+                            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&material_fallbacks.orm) },
+                            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&material_fallbacks.emissive) },
                         ],
                     }));
                     self.sky.mats.len() - 1
@@ -2247,23 +2473,20 @@ impl Renderer {
             .map(|(key, t)| (*key, native_texture::build_texture_mips(self.texture_policy, t.source, bc_supported, &t.rgba, t.width, t.height, false))).collect();
         let tile_mips: HashMap<_, _> = built.iter().filter_map(|(key, texture)| texture.ground_tile_mip().map(|mip| (*key, mip))).collect();
         let mut views: HashMap<_, _> = built.iter().filter(|(key, _)| ground.texture_materials.iter().any(|(_, k, _)| same(k, key)))
-            .map(|(key, texture)| (*key, self.upload_built_texture(texture))).collect();
+            .map(|(key, texture)| {
+                (*key, (self.upload_built_texture(texture), self.material_source_build(*key, &textures[key])))
+            }).collect();
         for (key, texture) in native_ground::composite_images(&ground.composites, textures, &tile_mips) {
-            views.insert(key, self.texture_view(&texture.rgba, texture.width, texture.height, texture.source));
+            views.insert(key, (self.texture_view(&texture.rgba, texture.width, texture.height, texture.source), self.material_source_build(key, &texture)));
         }
         for (mat,key,u) in &ground.texture_materials {
-            let Some(view) = views.get(key).or_else(|| views.iter().find(|(k,_)| same(k,key)).map(|(_,v)| v)) else { continue; };
+            let Some((view, material)) = views.get(key).or_else(|| views.iter().find(|(k,_)| same(k,key)).map(|(_,v)| v)) else { continue; };
             let uniform = self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
                 label: Some("native ground material refresh"), contents: bytemuck::bytes_of(u), usage: wgpu::BufferUsages::UNIFORM,
             });
-            self.gpu.mats[*mat] = self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
-                label: Some("native ground texture family refresh"), layout: &self.tex_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: uniform.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(view) },
-                ],
-            });
+            let binding = MaterialBinding { base: view.clone(), env: view.clone(), uniform, source: material.clone() };
+            self.gpu.mats[*mat] = self.material_bind_group(&binding);
+            self.material_bindings[*mat] = binding;
         }
     }
 
@@ -2654,6 +2877,8 @@ impl Renderer {
             enhanced_frame.and_then(|frame| frame.attachment(2)),
             enhanced_frame.and_then(|frame| frame.attachment(3)),
             enhanced_frame.and_then(|frame| frame.attachment(4)),
+            enhanced_frame.and_then(|frame| frame.attachment(5)),
+            enhanced_frame.and_then(|frame| frame.attachment(6)),
         ];
         if isolate_sky { attachments[0].as_mut().unwrap().ops.store = wgpu::StoreOp::Store; }
         let final_world = enhanced_frame.is_none() && self.heat_haze.source().is_none() && self.screen.layers.is_empty();
@@ -2848,6 +3073,7 @@ impl Renderer {
         if let Some(frame) = enhanced_frame {
             frame.resolve_depth(&mut enc);
         }
+        self.encode_material_reflections(&mut enc, vp, cam.pos, env);
         self.encode_water(&mut enc);
         if self.enhanced_settings.ambient_occlusion {
             let ao_start = timed.then(std::time::Instant::now);

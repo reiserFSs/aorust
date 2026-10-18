@@ -1670,6 +1670,19 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
         "moon-cloud-gap-shafts" => { settings.night_mode = ao_render::NightMode::Moonlit; settings.cloud_gap_shafts = true; }
         "dark-night" => settings.night_mode = ao_render::NightMode::Dark,
         "specular" => settings.material_specular = true,
+        "generated-normals" => settings.generated_normals = true,
+        "material-maps" => settings.material_maps = true,
+        "material-pbr" => settings.material_pbr = true,
+        "material-reflections" => settings.material_reflections = true,
+        "environment-probe" => settings.environment_probe = true,
+        "materials" => {
+            settings.generated_normals = true;
+            settings.material_maps = true;
+            settings.material_pbr = true;
+            settings.material_reflections = true;
+            settings.environment_probe = true;
+        }
+        "wet-reflections" => { settings.wet_surfaces = true; settings.material_reflections = true; }
         "lighting" => { settings.clustered_lighting = true; settings.local_light_shadows = true; settings.moon_shadows = true; settings.material_specular = true; settings.night_mode = ao_render::NightMode::Moonlit; }
         // Pre-soft-shadow look: 1024 maps, hard 3x3 PCF, full-strength shadow.
         "shadows-hard" => {
@@ -1926,6 +1939,13 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
     assert!(combined.local_light_shadows && combined.clustered_lighting);
     assert_eq!(graphics_fixture_settings("moonlit").unwrap().night_mode, ao_render::NightMode::Moonlit);
     assert_eq!(graphics_fixture_settings("dark-night").unwrap().night_mode, ao_render::NightMode::Dark);
+    for (index, name) in ["generated-normals", "material-maps", "material-pbr", "material-reflections", "environment-probe"].into_iter().enumerate() {
+        let settings = graphics_fixture_settings(name).unwrap();
+        let flags = [settings.generated_normals, settings.material_maps, settings.material_pbr, settings.material_reflections, settings.environment_probe];
+        assert_eq!(flags.into_iter().filter(|&flag| flag).count(), 1);
+        assert!(flags[index]);
+        assert!(settings.any_enabled());
+    }
     let neutral = graphics_fixture_settings("neutral").unwrap();
     assert!(neutral.any_enabled() && neutral.grass_density == 0.0);
     let atmosphere_flags = |s: ao_render::EnhancedSettings| [

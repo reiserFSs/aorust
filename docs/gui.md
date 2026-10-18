@@ -1393,6 +1393,58 @@ Enhanced Rain (`AomacEnhancedRain`), Wet Surfaces (`AomacWetSurfaces`), Storm Pa
 registry. Wet Surfaces does not require Enhanced Rain, and its retained wetness dries
 after native rain stops. Weather receivers require outdoor native collision roof proof;
 unknown collision tiles and indoor zones are excluded.
+
+**Lighting / Materials & Reflections** adds independent default-off DV Main
+controls: `AomacGeneratedNormals` (brightness-derived texture bump maps),
+`AomacMaterialMaps` (user-authored maps), `AomacMaterialPbr` (texture-material
+GGX), `AomacMaterialReflections` (current-screen reflections), and
+`AomacEnvironmentProbe` (accumulated static screen observations). These are
+separate from `AomacMaterialSpecular`, which preserves the authored specular
+material contract. They persist/reset through the same registry.
+
+Optional material PNGs belong in
+`~/Library/Application Support/aomac/materials/`; the client does not create
+or populate this folder. Naming follows ao-vk `docs/materials.md`:
+
+| File | Channels / convention |
+|---|---|
+| `<type>_<id>_n.png` | Tangent normal, OpenGL +Y |
+| `<type>_<id>_orm.png` | R occlusion, G roughness, B metallic |
+| `<type>_<id>_r.png` | Greyscale roughness |
+| `<type>_<id>_m.png` | Greyscale metallic |
+| `<type>_<id>_ao.png` | Greyscale ambient occlusion |
+| `<type>_<id>_e.png` | RGB emissive radiance |
+
+`<id>_<suffix>.png` is the type-independent fallback. Full-quality types are
+1010004 (world), 1010006 (ground), and 1010011 (character skins); lower-quality
+families resolve to these names. Packed ORM takes precedence over separate
+channels; missing channels default to occlusion 1, roughness 1, metallic 0.
+Maps are optional; the original RDB texture and its alpha remain authoritative.
+Generated maps are computed at texture material load/upload or by the first-enable
+background cache, never from per-frame brightness derivatives. All-off and
+GGX-only use shared fallback maps and do not probe material PNG files; disabling
+the map switches releases their per-texture GPU maps. A compact decoded texture
+source is retained per texture for exact live toggles, not a duplicate Scene.
+Normal mipmaps retain averaged-normal coherence; roughness filters as roughness⁴
+and widens with lost normal detail, reducing distant specular sparkle. Malformed
+or over-limit PNGs are rejected; map dimensions are capped at 2048.
+Replace files before reloading the relevant assets; this is not a file-watching
+texture editor. Maps alone enable normal/AO/emissive and metallic diffuse
+conservation; GGX highlights still require their own switch. See `THIRD_PARTY`
+for ao-vk attribution.
+
+Reflections use only current primary-screen sources and preserve the receiver's
+native fog extinction. Dynamic actors/effects are conservatively excluded as
+reflection sources; their depth still occludes rays. Wet floor reflectivity
+uses native retained wetness and the same outdoor collision-roof exclusion as
+Wet Surfaces. Missing screen hits use the native sky/static environment fallback.
+The probe accumulates only primary-observed static pixels, rejecting actors,
+foliage motion, UV animation, local-light contamination and actor-capable shadow
+coverage. It learns before post/weather effects, forgets on scene changes and
+teleports, and fades with camera movement and time. Roughness uses a bounded
+GGX-lobe filter. Unlike ao-vk's distance-only player exclusion, no actor colour
+is admitted into persistent probe history.
+
 Both viewers request a background world-pipeline variant and keep drawing the previous settings
 until it is ready. Variants are keyed by shadows, AO, bloom, sun-mask and clamped MSAA;
 the active set and three cached sets are retained, so a warm toggle reuses its pipelines.

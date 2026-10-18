@@ -53,6 +53,11 @@ pub struct EnhancedSettings {
     pub cloud_shadows: bool,
     pub sky_discs: bool,
     pub material_specular: bool,
+    pub generated_normals: bool,
+    pub material_maps: bool,
+    pub material_pbr: bool,
+    pub material_reflections: bool,
+    pub environment_probe: bool,
     pub clustered_lighting: bool,
     pub enhanced_rain: bool,
     pub wet_surfaces: bool,
@@ -110,6 +115,8 @@ impl Default for EnhancedSettings {
             height_haze: false, land_haze: false, valley_mist: false, volumetric_shafts: false,
             cloud_gap_shafts: false, volumetric_clouds: false, cloud_shadows: false, sky_discs: false,
             material_specular: false, clustered_lighting: false, moon_shadows: false, local_light_shadows: false,
+            generated_normals: false, material_maps: false, material_pbr: false,
+            material_reflections: false, environment_probe: false,
             point_shadow_count: 4,
             lamp_intensity: 1.0, carried_light_intensity: 1.0,
             night_mode: NightMode::AsGame, moon_intensity: 1.0, dark_night_strength: 0.6,
@@ -138,6 +145,8 @@ impl EnhancedSettings {
             || self.height_haze || self.land_haze || self.valley_mist || self.volumetric_shafts
             || self.cloud_gap_shafts || self.volumetric_clouds || self.cloud_shadows || self.sky_discs
             || self.material_specular || self.clustered_lighting || self.moon_shadows || self.local_light_shadows
+            || self.generated_normals || self.material_maps || self.material_pbr
+            || self.material_reflections || self.environment_probe
             || self.night_mode != NightMode::AsGame || self.foliage_enabled() || self.post_enabled()
             || self.water_enabled()
             || self.enhanced_rain || self.wet_surfaces || self.weather_particles
@@ -146,7 +155,9 @@ impl EnhancedSettings {
 
     /// Enhanced local-light consumers require current-frame owner admission before any source cap.
     pub(crate) fn needs_admitted_lights(self) -> bool {
-        self.clustered_lighting || self.local_light_shadows || self.material_specular
+        self.clustered_lighting || self.local_light_shadows || self.material_specular || self.material_pbr
+            || self.material_reflections || self.environment_probe
+            || self.generated_normals || self.material_maps
     }
 
     pub fn water_enabled(self) -> bool {
@@ -181,6 +192,7 @@ impl EnhancedSettings {
             || self.height_haze || self.land_haze || self.valley_mist || self.sky_discs
             || self.enhanced_rain || self.wet_surfaces || self.weather_particles
             || self.gpu_spell_particles || self.fluid_smoke
+            || self.material_pbr || self.material_reflections || self.environment_probe
     }
 
     /// Bound external preferences, replacing non-finite floats with their defaults.
@@ -230,6 +242,24 @@ impl EnhancedSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn texture_material_switches_are_independent_and_default_off() {
+        let defaults = EnhancedSettings::default();
+        assert!(!defaults.generated_normals && !defaults.material_maps && !defaults.material_pbr);
+        assert!(!defaults.material_reflections && !defaults.environment_probe);
+        for mask in 0..32 {
+            let settings = EnhancedSettings {
+                generated_normals: mask & 1 != 0, material_maps: mask & 2 != 0,
+                material_pbr: mask & 4 != 0, material_reflections: mask & 8 != 0,
+                environment_probe: mask & 16 != 0, ..defaults
+            };
+            assert_eq!(settings.any_enabled(), mask != 0);
+            assert_eq!(settings.needs_admitted_lights(), mask != 0);
+            assert_eq!(settings.needs_sun_mask(), mask & 28 != 0);
+            assert_eq!(settings.clamped(), settings);
+        }
+    }
 
     #[test]
     fn post_controls_are_off_independent_and_bounded() {

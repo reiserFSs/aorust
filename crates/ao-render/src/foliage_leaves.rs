@@ -25,7 +25,7 @@ pub(super) struct Leaves {
     enabled: bool,
 }
 struct Compiled {
-    key: (u32, bool, bool, bool, NightMode, bool, bool),
+    key: (u32, bool, bool, bool, NightMode, bool, bool, bool),
     beauty: [pipeline_creation::RenderPipeline; 2],
     shadow: pipeline_creation::RenderPipeline,
     uniform: wgpu::Buffer,
@@ -196,7 +196,7 @@ impl Leaves {
     }
 }
 impl Compiled {
-    fn new(renderer: &Renderer, key: (u32, bool, bool, bool, NightMode, bool, bool)) -> Self {
+    fn new(renderer: &Renderer, key: (u32, bool, bool, bool, NightMode, bool, bool, bool)) -> Self {
         let device = &renderer.device;
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("canopy wind"), entries: &[wgpu::BindGroupLayoutEntry {
@@ -209,7 +209,10 @@ impl Compiled {
         // Water visibility changes only the beauty attachment shape. Warm both
         // shapes together and retain one caster, wind binding and leaf buffer.
         let shaders = [false, true].map(|water| {
-            let source = shader_source((key.1, key.2, key.3, water), key.4, key.5, key.6);
+            let mut source = shader_source((key.1, key.2, key.3, water), key.4, key.5, key.6);
+            if key.7 {
+                source = source.replace("struct CanopyOutput {", "struct CanopyOutput {\n @location(5) reflection_surface: vec4<f32>,\n @location(6) reflection_mask: vec4<f32>,");
+            }
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("native canopy sprigs"), source: wgpu::ShaderSource::Wgsl(source.into()),
             })
@@ -235,8 +238,9 @@ impl Compiled {
             let shader = &shaders[usize::from(water)];
             let targets = [Some(wgpu::ColorTargetState { format: renderer.format, blend: None, write_mask: wgpu::ColorWrites::ALL }),
                 key.1.then(auxiliary).flatten(), key.2.then(auxiliary).flatten(), key.3.then(auxiliary).flatten(),
-                water.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R16Float, blend: None, write_mask: wgpu::ColorWrites::RED })];
-            let target_count = if water { 5 } else if key.3 { 4 } else if key.1 || key.2 { 3 } else { 1 };
+                water.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R16Float, blend: None, write_mask: wgpu::ColorWrites::RED }),
+                key.7.then(auxiliary).flatten(), key.7.then(auxiliary).flatten()];
+            let target_count = if key.7 { 7 } else if water { 5 } else if key.3 { 4 } else if key.1 || key.2 { 3 } else { 1 };
             pipeline_creation::render_deferred(device, &wgpu::RenderPipelineDescriptor {
             label: Some(if shadow { "canopy sun caster" } else { "canopy native lighting" }), layout: Some(if shadow { &shadow_layout } else { &beauty_layout }),
             vertex: wgpu::VertexState { module: shader, entry_point: Some(if shadow { "vs_canopy_shadow" } else { "vs_canopy" }), compilation_options: Default::default(), buffers: &buffers },
@@ -309,7 +313,7 @@ impl Renderer {
                 label: Some("native canopy sprigs"), contents: bytemuck::cast_slice(&self.canopy_leaves.baked), usage: wgpu::BufferUsages::VERTEX,
             }));
         }
-        let key = (self.world.msaa, s.ambient_occlusion, s.emissive_bloom, s.needs_sun_mask(), s.night_mode, s.moon_shadows, s.sun_shadows);
+        let key = (self.world.msaa, s.ambient_occlusion, s.emissive_bloom, s.needs_sun_mask(), s.night_mode, s.moon_shadows, s.sun_shadows, s.material_reflections || s.environment_probe);
         if self.canopy_leaves.compiled.as_ref().is_none_or(|compiled| compiled.key != key) {
             self.canopy_leaves.compiled = Some(Compiled::new(self, key));
         }

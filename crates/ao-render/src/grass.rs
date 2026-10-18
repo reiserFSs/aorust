@@ -187,7 +187,7 @@ pub(super) struct Compiled {
     pipeline: crate::pipeline_creation::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     samples: u32,
-    channels: (bool, bool, bool, bool),
+    channels: (bool, bool, bool, bool, bool),
     shadows: bool,
 }
 pub(super) struct Grass {
@@ -215,7 +215,7 @@ pub(super) struct Grass {
     surface_heights: Vec<f32>,
     surface_parities: Vec<u32>,
     samples: u32,
-    channels: (bool, bool, bool, bool),
+    channels: (bool, bool, bool, bool, bool),
     wind_phase: f64,
     filtered_wind: [f32; 3],
     benders: [[f32; 3]; MAX_BENDERS],
@@ -235,7 +235,7 @@ pub(super) struct Grass {
 }
 impl Compiled {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(device: &wgpu::Device, globals: &wgpu::BindGroupLayout, material: &wgpu::BindGroupLayout, palette: &wgpu::BindGroupLayout, samples: u32, channels: (bool, bool, bool, bool), shadows: bool, format: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device, globals: &wgpu::BindGroupLayout, material: &wgpu::BindGroupLayout, palette: &wgpu::BindGroupLayout, samples: u32, channels: (bool, bool, bool, bool, bool), shadows: bool, format: wgpu::TextureFormat) -> Self {
         let mut entries = vec![
             wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
             wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
@@ -260,8 +260,10 @@ impl Compiled {
             // HDR sun mask: blades write the same surviving sun share as the ground.
             channels.2.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL }),
             channels.3.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R16Float, blend: None, write_mask: wgpu::ColorWrites::RED }),
+            channels.4.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+            channels.4.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL }),
         ];
-        let target_count = if channels.3 { 5 } else if channels.2 { 4 } else if channels.0 || channels.1 { 3 } else { 1 };
+        let target_count = if channels.4 { 7 } else if channels.3 { 5 } else if channels.2 { 4 } else if channels.0 || channels.1 { 3 } else { 1 };
         let pipeline = crate::pipeline_creation::render_deferred(device, &wgpu::RenderPipelineDescriptor {
             label: Some("ground grass"), layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_grass"), compilation_options: Default::default(), buffers: &[] },
@@ -576,7 +578,7 @@ fn thinning_keep(distance: f32) -> f32 {
 fn hash(mut value: u32) -> u32 { value ^= value >> 16; value = value.wrapping_mul(0x7feb352d); value ^= value >> 15; value = value.wrapping_mul(0x846ca68b); value ^ (value >> 16) }
 fn cell_seed(x: u32, z: u32, tile: u16) -> u32 { hash(hash(x) ^ hash(z.rotate_left(16)) ^ u32::from(tile)) }
 
-fn shader_source(channels: (bool, bool, bool, bool), shadows: bool) -> String {
+fn shader_source(channels: (bool, bool, bool, bool, bool), shadows: bool) -> String {
     let grass = crate::shader_source::load("grass.wgsl", include_str!("grass.wgsl"))
         .replace("//__AMBIENT_FIELD__", if channels.0 { "@location(1) ambient: vec4<f32>," } else { "" })
         .replace("//__EMISSIVE_FIELD__", if channels.1 { "@location(2) emissive: vec4<f32>," } else { "" })
@@ -593,6 +595,9 @@ fn shader_source(channels: (bool, bool, bool, bool), shadows: bool) -> String {
         // Same roof-tested terrain alpha and fog contract as the ground receiver.
         .replace("//__SUN_WRITE__", if channels.2 { "let sun_luma = dot(sun_share, vec3<f32>(0.2126, 0.7152, 0.0722));\n    output.sun = vec4<f32>(sun_luma * grass_direct_visibility * (1.0 - fog), i.normal.w * (1.0 - fog), fog, 1.0);" } else { "" });
     let mut source = format!("{}\nconst GRASS_MAX_CELLS: u32 = {MAX_CELLS}u;\n{grass}", crate::shader_source::load("shader.wgsl", include_str!("shader.wgsl")));
+    if channels.4 {
+        source = source.replace("struct GrassOutput {", "struct GrassOutput {\n @location(5) reflection_surface: vec4<f32>,\n @location(6) reflection_mask: vec4<f32>,");
+    }
     if channels.3 {
         source = source.replace("output.sun =", "output.water_cloud = 0.0;\n    output.sun =");
     }
@@ -729,10 +734,10 @@ impl super::Renderer {
             return;
         };
         let samples = self.msaa_samples();
-        let channels = (settings.ambient_occlusion, settings.emissive_bloom, settings.needs_sun_mask(), self.world_key.water_cloud);
+        let channels = (settings.ambient_occlusion, settings.emissive_bloom, settings.needs_sun_mask(), self.world_key.water_cloud, settings.material_reflections || settings.environment_probe);
         let shadows = settings.sun_shadows || settings.moon_shadows;
         if let Some(grass) = &mut self.grass {
-            if grass.samples == samples && (grass.channels.0, grass.channels.1, grass.channels.2) == (channels.0, channels.1, channels.2) && grass.shadows == shadows {
+            if grass.samples == samples && (grass.channels.0, grass.channels.1, grass.channels.2, grass.channels.4) == (channels.0, channels.1, channels.2, channels.4) && grass.shadows == shadows {
                 if grass.channels.3 != channels.3 {
                     // Paired water-output programs share the same resource layout.
                     // Keep buffers, receiver bindings and interaction history intact.
@@ -1420,7 +1425,7 @@ mod blade_appearance_tests {
         for flags in 0..32 {
             let water = flags & 16 != 0;
             let (ao, bloom, shadows, hdr) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0, flags & 8 != 0 || water);
-            let source = super::shader_source((ao, bloom, hdr, water), shadows);
+            let source = super::shader_source((ao, bloom, hdr, water, false), shadows);
             assert_eq!(source.contains("output.water_cloud = 0.0;"), water);
             assert_eq!(source.contains("output.emissive = vec4<f32>(0.0);"), bloom);
             assert_eq!(source.contains("let receiving = albedo *"), ao);
@@ -1437,7 +1442,7 @@ mod blade_appearance_tests {
             assert_eq!(source.contains("grass_direct_visibility = visible;"), shadows,
                 "the HDR sun mask excludes beauty's retained shadow floor");
             // Creating the pipeline validates the shader against the real bind-group layouts.
-            let grass = super::Compiled::new(&renderer.device, &renderer.g_layout, &renderer.tex_layout, &renderer.holo_layout, 1, (ao, bloom, hdr, water), shadows, renderer.format);
+            let grass = super::Compiled::new(&renderer.device, &renderer.g_layout, &renderer.tex_layout, &renderer.holo_layout, 1, (ao, bloom, hdr, water, false), shadows, renderer.format);
             grass.wait();
             assert!(grass.is_ready());
         }
