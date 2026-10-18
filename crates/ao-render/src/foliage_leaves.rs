@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn authored_moon_lights_only_admitted_exposed_unfogged_sprigs() {
-        use ao_scene::ground_detail::GroundPatch;
+        use ao_scene::ground_detail::{GroundCell, GroundPatch};
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let mut renderer = Renderer::new(&instance, None).expect("headless leaf moon GPU");
         let key = TextureKey { rdb_type: 1010004, id: 1 };
@@ -360,11 +360,15 @@ mod tests {
                 ao_scene::Mesh {
                     vertices: vec![vertex([0.0, 0.0, 0.0]), vertex([4.0, 0.0, 0.0]),
                         vertex([0.0, 0.0, -4.0]), vertex([4.0, 0.0, -4.0])],
-                    submeshes: Vec::new(),
+                    submeshes: vec![ao_scene::Submesh::new(vec![0, 1, 2, 1, 3, 2], None)],
                 },
             ],
             instances: vec![ao_scene::Instance { mesh: 0, transform: ao_scene::IDENTITY }],
-            ground_detail: vec![GroundPatch { mesh: 1, cells: 1, cell_size: 4.0, ..Default::default() }],
+            ground_detail: vec![GroundPatch {
+                mesh: 1, cells: 1, cell_size: 4.0, height_scale: 1.0, heights: vec![0; 4],
+                fine_cells: vec![GroundCell { submesh: 0, vertices: [0, 1, 2, 3], ..Default::default() }],
+                ..Default::default()
+            }],
             environment: Some(Environment {
                 sky_color: [0.01; 3], fog_color: [0.02; 3], fog_start: 100.0, fog_end: 120.0,
                 ambient: [0.05; 3], sun_color: [0.0; 3], sun_dir: [0.0, -1.0, 0.0], sun_specular: 0.0,

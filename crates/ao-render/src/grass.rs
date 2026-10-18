@@ -1329,7 +1329,7 @@ mod blade_appearance_tests {
                 if fogged {
                     assert_eq!(images[2], images[3], "{expected:?}: moon cannot reveal fully fogged roots or tips");
                 } else {
-                    let brighter = images[2].chunks_exact(4).zip(images[3].chunks_exact(4))
+                    let brighter = images[2].as_chunks::<4>().0.iter().zip(images[3].as_chunks::<4>().0.iter())
                         .filter(|(off, on)| on[..3].iter().zip(&off[..3]).any(|(a, b)| a > b)).count();
                     assert!(brighter > 0, "{expected:?}: open native grass must receive unshadowed moon with sun shadows off");
                 }
