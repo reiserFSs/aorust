@@ -896,8 +896,8 @@ model and idle pose. Sixteen deterministic zero-delta render steps move it one
 metre along scene X. Start and end Y are sampled independently from the snapshot's
 actual `Collision::terrain_height`, using scene coordinates without Z inversion.
 The default endpoint is three metres ahead of the frozen camera in XZ; Newland
-instead ends at native pf566 statel+0x4076, mesh95575 `dry_edge_grass_small`,
-scene root `(427.2627258, 25.0000992, -332.0443726)` (endpoint Y is terrain-grounded).
+instead ends at native pf566 statel+0x4060, mesh95575 `dry_edge_grass_small`,
+scene root `(436.432_34, 25.000_1, -320.404_08)` (endpoint Y is terrain-grounded).
 The camera and native scene remain unchanged. Each step supplies the matching
 own-avatar bender; the final pose and interaction state are frozen for
 capture/timing. The manifest records the mode, step count, delta and per-view
