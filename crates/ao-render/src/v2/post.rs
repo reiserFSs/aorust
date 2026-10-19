@@ -136,20 +136,42 @@ mod tests {
         let l = luma(c);
         let roll = smooth(1.0, 3.0, peak) * 0.5;
         c = c.map(|v| v + (l - v) * roll);
-        c = c.map(|x| { let kn = 0.72; x.min(kn) + (1.0 - kn) * (1.0 - (-(x - kn).max(0.0) / (1.0 - kn)).exp()) });
+        let m = c[0].max(c[1]).max(c[2]);
+        let kn = 0.72;
+        let sh = m.min(kn) + (1.0 - kn) * (1.0 - (-(m - kn).max(0.0) / (1.0 - kn)).exp());
+        c = c.map(|v| v * sh / m.max(1e-6));
         let (s, ct) = (1.0 + (saturation - 1.0) * k, 1.0 + (contrast - 1.0) * k);
         let l = luma(c);
-        c = c.map(|v| l + (v - l) * s);
-        let top = c[0].max(c[1]).max(c[2]);
-        c.map(|v| (0.18 + (v - 0.18) * ct).max(v * 0.6).max(top * 0.15))
+        let smax = c.iter().map(|&v| l / (l - v).max(1e-6)).fold(f32::MAX, f32::min);
+        c = c.map(|v| l + (v - l) * s.min(smax));
+        let l2 = luma(c);
+        let lt = if l2 > 0.18 { 0.18 + (l2 - 0.18) * ct } else { l2 };
+        c.map(|v| v * lt / l2.max(1e-6))
     }
 
     #[test]
     fn grade_mirror_uses_the_shader_constants() {
         let wgsl = include_str!("post.wgsl");
-        for needle in ["smoothstep(0.5, 0.75, t_native)", "let k = 0.72;", "smoothstep(1.0, 3.0, peak) * 0.5", "mix(1.0, fc.grade.y, k)", "mix(1.0, fc.grade.z, k)", "vec3<f32>(0.18)"] {
+        for needle in ["smoothstep(0.5, 0.75, t_native)", "let k = 0.72;", "smoothstep(1.0, 3.0, peak) * 0.5", "mix(1.0, fc.grade.y, k)", "mix(1.0, fc.grade.z, k)", "0.18 + (l2 - 0.18)"] {
             assert!(wgsl.contains(needle), "post.wgsl changed ({needle}): update grade_cpu with it");
         }
+    }
+
+    /// The grade never rotates hue and never touches darks: a dark saturated blue (sea) keeps its RGB ratios and its luminance.
+    #[test]
+    fn grade_preserves_hue_and_darks() {
+        for c in [[0.004, 0.012, 0.05], [0.02, 0.05, 0.2], [0.1, 0.3, 1.5], [0.5, 0.3, 0.1]] {
+            let g = grade_cpu(c, 1.0, 1.0, 1.08, 1.05);
+            let hue = |c: [f32; 3]| (c[0] - c[2]).atan2(c[1] - c[2]);
+            let ratio = |c: [f32; 3]| (c[0] / c[2], c[1] / c[2]);
+            let (a, b) = (ratio(c), ratio(g));
+            // saturation 1.08 moves ratios slightly; hue angle in the (r-b, g-b) plane must stay within 3 degrees
+            let dh = (hue(g) - hue(c)).abs().to_degrees();
+            assert!(dh < 3.0, "{c:?} -> {g:?} rotated {dh} deg ({a:?} -> {b:?})");
+        }
+        let dark = [0.004, 0.012, 0.05];
+        let l = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        assert!((l(grade_cpu(dark, 1.0, 1.0, 1.08, 1.05)) - l(dark)).abs() < 1e-4, "darks must pass through unchanged");
     }
 
     /// Fairness (DESIGN section 8): over fogged pixels (T_native < 0.5) the grade is contrast- and saturation-neutral, so two fogged

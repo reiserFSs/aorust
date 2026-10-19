@@ -15,6 +15,14 @@
 @group(0) @binding(6) var dst: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(7) var halo: texture_2d<f32>;
 @group(0) @binding(8) var<uniform> ctl: Ctl;
+@group(0) @binding(9) var g3t: texture_2d<f32>;
+
+// Per-pixel emission mask: a native self-lit pixel (authored G3 emission) keeps its own colour; the bloom halo is a dark-lift that must
+// not land on it (the Newland lamp pole, one self-lit material with the head, stays at its native brightness).
+fn self_lit(q: vec2<i32>) -> f32 {
+    let e = textureLoad(g3t, q, 0).rgb;
+    return clamp(max(e.r, max(e.g, e.b)) * 4.0, 0.0, 1.0);
+}
 
 const GAMMA: f32 = 1.25;       // variance box half-extent in standard deviations
 const ALPHA_STATIC: f32 = 0.1; // history weight 0.9 at rest
@@ -89,7 +97,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
         let d = textureLoad(deptht, q, 0);
         let uv = (vec2<f32>(q) + vec2<f32>(0.5)) * fc.viewport.zw;
         let c = pow(max(textureLoad(hdrt, q, 0).rgb, vec3<f32>(0.0)), vec3<f32>(2.2)) // gamma-encoded resolve + FX (see resolve.wgsl)
-            + textureSampleLevel(halo, smp, uv, 0.0).rgb * (ctl.bloom * t_native_depth(d));
+            + textureSampleLevel(halo, smp, uv, 0.0).rgb * (ctl.bloom * t_native_depth(d) * (1.0 - self_lit(q)));
         tile[i] = vec4<f32>(tm(min(c, vec3<f32>(OUT_MAX))), d);
     }
     workgroupBarrier();

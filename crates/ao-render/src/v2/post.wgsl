@@ -49,11 +49,19 @@ fn grade(c_in: vec3<f32>, t_native: f32) -> vec3<f32> {
     // Bright, saturated highlights roll to white instead of clipping per channel.
     let peak = max(c.r, max(c.g, c.b));
     c = mix(c, vec3<f32>(luma(c)), smoothstep(1.0, 3.0, peak) * 0.5);
-    c = shoulder(c);
-    c = mix(vec3<f32>(luma(c)), c, mix(1.0, fc.grade.y, k));
-    // Contrast pivots on mid grey; the 0.6c and 0.15-of-peak floors stop dark channels clipping to 0 (near-black purple shade) without lifting
-    // dark self-lit surfaces (a floor near 0.9c did).
-    return max(mix(vec3<f32>(0.18), c, mix(1.0, fc.grade.z, k)), max(c * 0.6, vec3<f32>(max(c.r, max(c.g, c.b)) * 0.15)));
+    // Hue-preserving shoulder: compress the brightest channel and scale the pixel by the same ratio (identity below the knee).
+    let m = max(c.r, max(c.g, c.b));
+    c *= shoulder(vec3<f32>(m)).x / max(m, 1e-6);
+    // Saturation about luma, limited so no channel goes negative (a clipped channel would rotate the hue of dark saturated blues).
+    let l = luma(c);
+    let d = max(vec3<f32>(l) - c, vec3<f32>(1e-6));
+    let smax = min(l / d.x, min(l / d.y, l / d.z));
+    c = mix(vec3<f32>(l), c, min(mix(1.0, fc.grade.y, k), smax));
+    // Contrast only above mid grey, as a luminance scale (RGB ratios kept): darks are never crushed nor lifted, so no floor and no
+    // emission mask are needed; self-lit dark surfaces are untouched like everything else below the pivot.
+    let l2 = luma(c);
+    let lt = select(l2, 0.18 + (l2 - 0.18) * mix(1.0, fc.grade.z, k), l2 > 0.18);
+    return c * (lt / max(l2, 1e-6));
 }
 
 @fragment

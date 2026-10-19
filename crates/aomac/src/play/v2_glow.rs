@@ -117,8 +117,13 @@ fn graphics_v2_newland_lamp_pole_stays_native_and_head_glows() -> anyhow::Result
         save(&out, &format!("{name}-original.png"), &original)?;
         save(&out, &format!("{name}-v2.png"), &v2)?;
         save(&out, &format!("{name}-v2-nobloom.png"), &v2_flat)?;
-        // Pole: the dark (< 75 luma) Original pixels of the screen box holding the foreground lamp pole (as the v1 regression).
-        let pole = |x: usize, y: usize| (1300..1700).contains(&x) && (400..850).contains(&y) && luma_at(&original, x, y) < 75.0;
+        // Pole: the dark (< 75 luma), brown (red-dominant) Original pixels of the screen box holding the foreground lamp pole. The brown
+        // test excludes the dark green night ground behind it, which v2 may legitimately light with the moon (fairness policy).
+        let pole = |x: usize, y: usize| {
+            let p = &original[(y * SIZE.0 as usize + x) * 4..];
+            (1300..1700).contains(&x) && (400..850).contains(&y) && luma_at(&original, x, y) < 75.0
+                && f64::from(p[0]) > 1.05 * f64::from(p[1]) && f64::from(p[0]) > 1.2 * f64::from(p[2])
+        };
         let head = |x: usize, y: usize| (490..570).contains(&x) && (205..265).contains(&y);
         let (pole_original, pole_v2) = (mean_luma(&original, &pole), mean_luma(&v2, &pole));
         let (head_original, head_v2, head_flat) = (mean_luma(&original, &head), mean_luma(&v2, &head), mean_luma(&v2_flat, &head));

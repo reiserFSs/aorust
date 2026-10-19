@@ -42,7 +42,7 @@ impl Taa {
     pub(super) fn new(device: &wgpu::Device) -> Self {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("v2 taa"), entries: &[
             post::uniform_entry(0, C), post::tex_entry(1, C, false), post::depth_entry(2, C), post::tex_entry(3, C, true), post::tex_entry(4, C, false),
-            post::sampler_entry(5), post::storage_entry(6), post::tex_entry(7, C, true), post::uniform_entry(8, C),
+            post::sampler_entry(5), post::storage_entry(6), post::tex_entry(7, C, true), post::uniform_entry(8, C), post::tex_entry(9, C, false),
         ] });
         let module = post::module(device, "v2 taa", crate::shader_source::load("v2/taa.wgsl", include_str!("taa.wgsl")));
         Self {
@@ -64,7 +64,7 @@ impl Taa {
             label: Some("v2 taa"), layout: &self.layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: consts.as_entire_binding() },
-                post::view_bind(1, &t.hdr), post::view_bind(2, &t.depth), post::view_bind(3, read), post::view_bind(4, &t.g2), post::view_bind(7, halo),
+                post::view_bind(1, &t.hdr), post::view_bind(2, &t.depth), post::view_bind(3, read), post::view_bind(4, &t.g2), post::view_bind(7, halo), post::view_bind(9, &t.g3),
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                 post::view_bind(6, write),
                 wgpu::BindGroupEntry { binding: 8, resource: ctl.as_entire_binding() },

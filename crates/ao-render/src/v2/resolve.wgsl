@@ -75,8 +75,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (flags & MF_BAKED) == 0u {
         col += lamps_light(wp, n, v, vd, id.xy, albedo, select(clamp(g1.b, 0.12, 1.0), 1.0, (flags & MF_GROUND) != 0u));
     }
+    // Native fog is a per-vertex blend of GAMMA colours (D3D fixed function): mix in the gamma-encoded space the HDR target already
+    // lives in. The same T_native blended in linear light shifts dark blue water/cloud toward the (blue) fog colour: violet haze.
+    var out_g = hdr_encode(col);
     if (flags & MF_NO_FOG) == 0u {
-        col = mix(fc.fog_color.rgb, col, native_transmittance(vd));
+        out_g = mix(hdr_encode(fc.fog_color.rgb), out_g, native_transmittance(vd));
     }
-    textureStore(out, c, vec4<f32>(hdr_encode(col), 1.0));
+    textureStore(out, c, vec4<f32>(out_g, 1.0));
 }
