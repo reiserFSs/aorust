@@ -2842,6 +2842,8 @@ fn graphics_bloom_gpu_timing() -> anyhow::Result<()> {
 mod grass_shots;
 #[path = "bloom_seeds.rs"]
 mod bloom_seeds;
+#[path = "v2_glow.rs"]
+mod v2_glow;
 #[path = "weather_shots.rs"]
 mod weather_shots;
 #[path = "material_shots.rs"]

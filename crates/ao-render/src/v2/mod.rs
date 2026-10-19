@@ -4,12 +4,17 @@
 //! nothing below that branch runs for Original / Classic+. Frame graph (High): [shadows] -> G-buffer -> [AO] -> resolve
 //! -> FX (blended draws) -> post. Everything here reads only the admitted draw lists the faithful path builds.
 mod ao;
+mod bloom;
 mod consts;
 mod gbuffer;
 mod post;
 mod pyramid;
 mod resolve;
+mod taa;
 mod timers;
+
+/// G2 (actor motion) format, for the actor motion pass nested in `actors`.
+pub(crate) const G2_FORMAT: wgpu::TextureFormat = gbuffer::G2;
 
 use crate::{Camera, Renderer, Targets};
 use consts::FrameConsts;
@@ -21,7 +26,10 @@ struct Sized {
     resolve_bind: wgpu::BindGroup,
     pyramid: pyramid::Pyramid,
     ao: ao::Ao,
-    post_bind: wgpu::BindGroup,
+    bloom: bloom::BloomTargets,
+    taa: taa::TaaTargets,
+    /// `post_binds[k]` reads the TAA output of frame parity `k` (`taa.hist[1 - k]`).
+    post_binds: [wgpu::BindGroup; 2],
 }
 
 pub(crate) struct V2 {
@@ -29,14 +37,24 @@ pub(crate) struct V2 {
     pyramid: pyramid::Pipes,
     ao: ao::Pipes,
     resolve: resolve::Resolve,
+    bloom: bloom::Bloom,
+    taa_pass: taa::Taa,
+    motion: crate::actors::v2_motion::ActorMotion,
     post: post::Post,
     consts: wgpu::Buffer,
+    /// `post::Ctl`, rewritten every frame.
+    ctl: wgpu::Buffer,
     sized: Option<Sized>,
     timers: Option<timers::PassTimers>,
     frame: u32,
     prev_view_proj: Mat4,
-    /// Sub-pixel projection jitter (TAA).
+    /// Sub-pixel projection jitter + history accumulation (TAA). `AOMAC_V2_NO_TAA=1` (harness diagnostic, read once) turns the
+    /// accumulation and the jitter off for before/after stills.
     taa: bool,
+    /// What the TAA history was rendered under (`None` = no history: first frame or resize).
+    taa_key: Option<taa::HistoryKey>,
+    /// Frame parity of the TAA ping-pong.
+    taa_index: usize,
 }
 
 impl V2 {
@@ -46,16 +64,25 @@ impl V2 {
             pyramid: pyramid::Pipes::new(&r.device),
             ao: ao::Pipes::new(&r.device),
             resolve: resolve::Resolve::new(&r.device, &[]),
+            bloom: bloom::Bloom::new(&r.device),
+            taa_pass: taa::Taa::new(&r.device),
+            motion: crate::actors::v2_motion::ActorMotion::new(r),
             post: post::Post::new(&r.device, r.format),
             consts: r.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("v2 frame constants"), size: std::mem::size_of::<FrameConsts>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+            }),
+            ctl: r.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("v2 post controls"), size: std::mem::size_of::<post::Ctl>() as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
             }),
             sized: None,
             timers: None,
             frame: 0,
             prev_view_proj: Mat4::IDENTITY,
-            taa: false,
+            taa: std::env::var_os("AOMAC_V2_NO_TAA").is_none(),
+            taa_key: None,
+            taa_index: 0,
         }
     }
 }
@@ -141,8 +168,12 @@ impl Renderer {
             let pyramid = pyramid::Pyramid::new(&self.device, &v2.pyramid, &v2.consts, &targets);
             let ao = ao::Ao::new(&self.device, &v2.ao, &v2.consts, &pyramid, &targets);
             let resolve_bind = v2.resolve.bind(&self.device, &v2.consts, &targets, Some(ao.view()));
-            let post_bind = v2.post.bind(&self.device, &v2.consts, &targets.hdr);
-            v2.sized = Some(Sized { targets, resolve_bind, post_bind, pyramid, ao });
+            let bloom = v2.bloom.bind(&self.device, &v2.consts, &v2.ctl, &targets);
+            let taa = v2.taa_pass.bind(&self.device, &v2.consts, &v2.ctl, &bloom.comp, &targets);
+            let post_binds = [0, 1].map(|k| v2.post.bind(&self.device, &v2.consts, &v2.ctl, &taa.hist[1 - k], &targets.depth));
+            v2.sized = Some(Sized { targets, resolve_bind, pyramid, ao, bloom, taa, post_binds });
+            v2.taa_key = None;
+            v2.taa_index = 0;
         }
         let sized = v2.sized.as_ref().expect("sized above");
         let look = Look::from_env(&env);
@@ -153,12 +184,18 @@ impl Renderer {
         });
         // Order-independent hash of the admitted actor ids; temporal consumers reset when it changes (DESIGN section 8).
         let admission = self.admitted_actor_ids().fold(0u32, |hash, id| hash ^ id.wrapping_mul(0x9E37_79B9).rotate_left(13));
+        // TAA history is discarded on frame 0 / resize, camera cuts and any change of the admitted-actor set (a hidden actor cannot
+        // ghost); every actor pose of the motion pass shares that decision.
+        let key = taa::HistoryKey { admission, eye: cam.pos, forward: cam.forward() };
+        let history_reset = !v2.taa || taa::history_reset(v2.taa_key.as_ref(), &key);
+        v2.taa_key = Some(key);
+        let previous_unjit = if v2.frame == 0 { view_proj_unjit } else { v2.prev_view_proj };
         let consts = FrameConsts {
             view: view.to_cols_array_2d(),
             view_proj: view_proj.to_cols_array_2d(),
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             view_proj_unjit: view_proj_unjit.to_cols_array_2d(),
-            prev_view_proj_unjit: if v2.frame == 0 { view_proj_unjit } else { v2.prev_view_proj }.to_cols_array_2d(),
+            prev_view_proj_unjit: previous_unjit.to_cols_array_2d(),
             eye: cam.pos.extend(far).to_array(),
             viewport: [size.0 as f32, size.1 as f32, 1.0 / size.0 as f32, 1.0 / size.1 as f32],
             proj: [self.lens.near, far, (0.5 * self.lens.vertical_fov(aspect)).tan(), aspect],
@@ -175,6 +212,10 @@ impl Renderer {
             flags: [v2.frame, 1, admission, 0],
         };
         self.queue.write_buffer(&v2.consts, 0, bytemuck::bytes_of(&consts));
+        let post_ctl = post::Ctl { bloom: self.enhanced_settings.bloom_strength.clamp(0.0, 1.0), cas: self.enhanced_settings.cas_strength.clamp(0.0, 1.0),
+            pad: [0.0; 2], taa: [u32::from(history_reset), 0, 0, 0] };
+        self.queue.write_buffer(&v2.ctl, 0, bytemuck::bytes_of(&post_ctl));
+        v2.motion.prepare(self, view_proj_unjit, previous_unjit, history_reset);
 
         let mut enc = self.device.create_command_encoder(&Default::default());
         if let Some(timers) = &v2.timers { timers.begin_frame(); }
@@ -221,8 +262,13 @@ impl Renderer {
             });
             calls += self.v2_draw_fx(&mut pass, &v2.pipes.fx);
         }
-        // [slot 5] bloom, then TAA (+ CAS), between the FX pass and post; post then reads their output instead of `targets.hdr`.
-        v2.post.encode(&mut enc, &sized.post_bind, resolve, timer.and_then(|t| t.render("post")));
+        // [slot 5a] actor motion into G2, then bloom (seeded by G3 only; writes HDR + halo), [slot 5b] TAA, then post (CAS + grade).
+        v2.motion.encode(self, &mut enc, &targets.depth, &targets.g2, timer.and_then(|t| t.render("motion")));
+        v2.bloom.encode(&mut enc, &sized.bloom, timer.and_then(|t| t.compute("bloom")));
+        v2.taa_pass.encode(&mut enc, &sized.taa, v2.taa_index, size, timer.and_then(|t| t.compute("taa")));
+        v2.post.encode(&mut enc, &sized.post_binds[v2.taa_index], resolve, timer.and_then(|t| t.render("post")));
+        v2.motion.finish(self, &mut enc);
+        v2.taa_index ^= 1;
         if let Some(timers) = &v2.timers { timers.tail(&mut enc); timers.resolve(&mut enc); }
 
         self.drawn_visuals.extend(self.pending_visuals.get_mut().drain());
