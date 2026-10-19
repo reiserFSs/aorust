@@ -34,7 +34,7 @@ pub(crate) struct V2 {
 }
 
 impl V2 {
-    fn new(r: &Renderer) -> Self {
+    pub(crate) fn new(r: &Renderer) -> Self {
         Self {
             pipes: gbuffer::Pipes::new(r),
             resolve: resolve::Resolve::new(&r.device, &[]),

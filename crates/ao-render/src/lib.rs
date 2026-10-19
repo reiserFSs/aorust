@@ -1758,9 +1758,18 @@ impl Renderer {
         }
     }
 
+    /// Enhanced v2 builds its pipelines when selected, never inside a frame.
+    fn warm_v2(&mut self, settings: EnhancedSettings) {
+        if settings.enhanced_v2 && self.v2.is_none() {
+            let v2 = v2::V2::new(self);
+            self.v2 = Some(v2);
+        }
+    }
+
     /// Immediate fixture setting: waits for an unseen world combination to compile on a worker.
     pub fn set_enhanced_settings(&mut self, settings: EnhancedSettings) {
         let settings = settings.clamped();
+        self.warm_v2(settings);
         self.request_materials(settings, false);
         let key = variant::Key::of(settings, self.clamp_msaa(self.requested_msaa, settings));
         self.request_world(key, settings, false);
@@ -1773,6 +1782,7 @@ impl Renderer {
     /// Keeps drawing the active variant while an unseen combination compiles on a worker.
     pub fn request_enhanced_settings(&mut self, settings: EnhancedSettings) {
         let settings = settings.clamped();
+        self.warm_v2(settings);
         self.request_materials(settings, true);
         let key = variant::Key::of(settings, self.clamp_msaa(self.requested_msaa, settings));
         self.request_world(key, settings, true);
