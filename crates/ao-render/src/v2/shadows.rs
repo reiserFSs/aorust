@@ -298,7 +298,7 @@ impl Shadows {
             dyn_dirty: [true; LAYERS], commands: Default::default(),
             transforms: Vec::new(), transform_buffer: None, receive, layout, bind,
             always_rerender: std::env::var("AOMAC_V2_SHADOW_RERENDER").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
-            off: std::env::var("AOMAC_V2_SHADOWS").is_ok_and(|v| v == "off"),
+            off: std::env::var("AOMAC_V2_SHADOWS").is_ok_and(|v| v == "off") || super::off("shadows"),
         }
     }
 

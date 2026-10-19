@@ -86,14 +86,36 @@ Views: `icc-landmark-authored`, `newland-sun` (look-target camera), `newland-day
 
 ## M2 measurements (High, 1920x1200, M4 Pro, p50 of 600 samples after 120 warm-up, GPU lock held)
 
-Whole frame (first pass begin to last end): ICC day 1.97 ms, Newland day 2.28 ms, Newland night 2.50 ms (p95 2.4 / 2.7 / 3.0); design total 5.7 ms.
-Per-pass spans are non-exclusive on Metal tile GPUs (a pass's vertex work overlaps the previous pass's fragment work) and do not
-sum to the frame; the end sample of `post` (a render pass without depth) is stale, so `post` is unmeasured. Spans, ICC / Newland day:
-gbuffer 0.36 / 0.39 (row 1.10), hiz 0.054 / 0.054 (0.09), ao 0.30 / 0.28 + ao_denoise 0.13 / 0.12 (0.83; `ao_up` 0.91 / 0.85 is a
-raster span that overlaps its neighbours), clusters 0.005 / 0.012 (0.05), cube_atlas 0.10 / 0.22 (0.25; 0.32 with a carried light),
-resolve 0.18 / 0.27 (0.74), fx 0.25 / 0.42 (0.20 + water later), bloom 0.106 / 0.107 (0.18), taa 0.557 / 0.557 (0.55 incl. CAS+grade).
-Shadows: `frame` delta against `AOMAC_V2_SHADOWS=off` +0.09 steady, +0.26..0.35 with an actor (row 0.35); the `admission`/`shadows`
-timer labels (about 0.3 ms) are marker artefacts, not costs.
+Whole frame (first pass begin to last end), `AOMAC_V2_OFF` unset: ICC 2.02 ms, Newland 2.30 ms (design total 5.7 ms).
+
+On Metal tile GPUs a pass's vertex work overlaps the previous pass's fragment work, so per-pass timestamp **spans** are
+non-exclusive and do not sum to the frame. The trustworthy per-pass cost is the **marginal frame delta**: frame p50 with the pass
+switched off minus frame p50 with it on (`AOMAC_V2_OFF=<ao|bloom|cas|cube|admission|shadows>`, comma list, read once;
+`AOMAC_V2_OFF=post2` encodes post twice; images are not meaningful while a pass is off). Measured under the GPU lock,
+600 samples after 120 warm-up, noise about +-0.03 ms. Neither view draws an actor, so admission and the dynamic shadow layers are
+idle here (with an actor: shadows +0.26..0.35 ms, M2 numbers above).
+
+| Pass | DESIGN row (ms) | Span ICC / Newland | Marginal delta ICC / Newland | Note |
+|---|---|---|---|---|
+| gbuffer | 1.10 | 0.36 / 0.39 | not switchable | span is the pass |
+| shadows (cascades + moon, + admission) | 0.35 | none (label removed) | 0.06 / 0.02 | steady state, static layers cached |
+| admission | (in shadows) | none | 0.02 / 0.00 | no actors in the view |
+| hiz | 0.09 | 0.054 / 0.054 | not switchable (AO input) | span is the pass |
+| ao + ao_denoise + ao_up | 0.83 | 0.30+0.13 / 0.28+0.12; `ao_up` 0.91 / 0.90 | **0.48 / 0.41** | `ao_up` is a raster span that overlaps neighbours; use the delta |
+| cube atlas (`cube`) | 0.25 | 0.10 / 0.22 | 0.03 / 0.10 | atlas skipped once resident |
+| clusters | 0.05 | 0.005 / 0.012 | not switchable | span is the pass |
+| resolve (incl. shadow/lamp taps) | 0.74 | 0.19 / 0.28 | shadows taps: 0.05 / 0.05 | |
+| fx | (0.20 + water) | 0.25 / 0.41 | not switchable | canopy cards on Newland |
+| bloom | 0.18 | 0.105 / 0.106 | 0.13 / 0.12 | |
+| taa (incl. history resolve) | 0.55 | 0.56 / 0.56 | not switchable (post reads its history) | span is the pass |
+| cas | (in taa/post) | none | 0.01 / -0.01 (noise) | |
+| post (grade, vignette, dither) | (in taa row) | not reliable | 0.00..0.03 (post2 delta 0.016 / -0.027: below noise) | |
+
+`post`: its timestamp span cannot be made reliable on Metal (the end sample reads about 5 us with or without a depth attachment, and
+as the start of the following marker it overlaps the preceding pass), so the `post` row is no longer printed as a span. Encoding post
+twice moves the frame by less than the +-0.03 ms noise, i.e. the pass costs under about 0.03 ms at 1920x1200 on this GPU, and it
+does not meet a "> 0.05 ms" plausibility check because it genuinely is that cheap (full-screen, one tap, tile-resident). The post
+pass now has a read-only depth attachment (it also helps the TAA/post path reading the same depth).
 
 ## Review #1 (real window, only while Main allows it)
 

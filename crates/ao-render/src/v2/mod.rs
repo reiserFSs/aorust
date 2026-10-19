@@ -108,6 +108,13 @@ impl V2 {
     }
 }
 
+/// Harness diagnostic, read once: `AOMAC_V2_OFF=ao,bloom,cas,cube,post2,admission,shadows` switches optional passes off so the `frame` p50
+/// with/without gives their marginal cost (images are not meaningful while a pass is off).
+pub(super) fn off(name: &str) -> bool {
+    static LIST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| std::env::var("AOMAC_V2_OFF").unwrap_or_default()).split(',').any(|n| n == name)
+}
+
 /// Day/dusk/night lighting handed to the resolve, derived from the zone environment (authored values, pushed).
 struct Look {
     sun: Vec3,
@@ -240,10 +247,10 @@ impl Renderer {
             fog_color: Vec3::from(env.fog_color).extend(0.0).to_array(),
             fog: [env.fog_start, env.fog_end, 0.0, 0.0],
             grade: [1.0, 1.08, 1.05, 0.2],
-            flags: [v2.frame, 1, admission, look.native_ambient_packed],
+            flags: [v2.frame, u32::from(!off("ao")), admission, look.native_ambient_packed],
         };
         self.queue.write_buffer(&v2.consts, 0, bytemuck::bytes_of(&consts));
-        let post_ctl = post::Ctl { bloom: self.enhanced_settings.bloom_strength.clamp(0.0, 1.0), cas: self.enhanced_settings.cas_strength.clamp(0.0, 1.0),
+        let post_ctl = post::Ctl { bloom: self.enhanced_settings.bloom_strength.clamp(0.0, 1.0), cas: if off("cas") { 0.0 } else { self.enhanced_settings.cas_strength.clamp(0.0, 1.0) },
             pad: [0.0; 2], taa: [u32::from(history_reset), 0, 0, 0] };
         self.queue.write_buffer(&v2.ctl, 0, bytemuck::bytes_of(&post_ctl));
         v2.motion.prepare(self, view_proj_unjit, previous_unjit, history_reset);
@@ -286,7 +293,7 @@ impl Renderer {
         v2.shadows.encode(self, &mut enc, &shadow_view, (look.sun_up > 0.5).then(|| light(look.sun)), moon.map(|(dir, _)| light(dir)), &v2.admission);
         // [slot 3] pyramid + AO (writes the AO texture the resolve reads, flags.y bit 0), [slot 4] light clusters + lamp cube atlas.
         sized.pyramid.encode(&v2.pyramid, &mut enc, timer.and_then(|t| t.compute("hiz")));
-        sized.ao.encode(&v2.ao, &self.queue, &mut enc, timer, admission, jitter != [0.0, 0.0]);
+        if !off("ao") { sized.ao.encode(&v2.ao, &self.queue, &mut enc, timer, admission, jitter != [0.0, 0.0]); }
         let lamps_bind = self.encode_lamps(&mut v2.lamps, &mut enc, timer, &v2.consts, cam, view_proj, [env.fog_start, env.fog_end, far]);
         v2.resolve.encode(&mut enc, &sized.resolve_bind, &[&v2.shadows.bind, &lamps_bind], size, timer.and_then(|t| t.compute("resolve")));
         {
@@ -303,9 +310,11 @@ impl Renderer {
         }
         // [slot 5a] actor motion into G2, then bloom (seeded by G3 only; writes HDR + halo), [slot 5b] TAA, then post (CAS + grade).
         v2.motion.encode(self, &mut enc, &targets.depth, &targets.g2, || timer.and_then(|t| t.render("motion")));
-        v2.bloom.encode(&mut enc, &sized.bloom, timer.and_then(|t| t.compute("bloom")));
+        if !off("bloom") { v2.bloom.encode(&mut enc, &sized.bloom, timer.and_then(|t| t.compute("bloom"))); }
         v2.taa_pass.encode(&mut enc, &sized.taa, v2.taa_index, size, timer.and_then(|t| t.compute("taa")));
-        v2.post.encode(&mut enc, &sized.post_binds[v2.taa_index], resolve, timer.and_then(|t| t.render("post")));
+        // `AOMAC_V2_OFF=post2` (harness) encodes post twice: the frame delta is post's marginal cost (its own span is not reliable on Metal).
+        if off("post2") { v2.post.encode(&mut enc, &sized.post_binds[v2.taa_index], resolve, &targets.depth, None); }
+        v2.post.encode(&mut enc, &sized.post_binds[v2.taa_index], resolve, &targets.depth, timer.and_then(|t| t.render("post")));
         v2.motion.finish(self, &mut enc);
         v2.taa_index ^= 1;
         if let Some(timers) = &v2.timers { timers.tail(&mut enc); timers.resolve(&mut enc); }
