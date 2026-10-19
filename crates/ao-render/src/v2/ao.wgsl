@@ -17,9 +17,10 @@ const RADIUS: f32 = 1.5;          // world metres
 const SLICES: u32 = 2u;
 const STEPS: u32 = 6u;            // per side
 const MAX_PX: f32 = 96.0;         // screen radius cap (full-res pixels)
-const FALLOFF: f32 = 0.615;       // fraction of the radius over which an occluder's weight fades out
-const THIN: f32 = 0.3;            // thin-occluder compensation: how fast the horizon relaxes behind a thin object (0 = solid walls)
-const POWER: f32 = 1.5;           // contact creases read, open ground stays ~1
+const FALLOFF: f32 = 0.45;       // fraction of the radius over which an occluder's weight fades out
+const THIN: f32 = 0.15;          // thin-occluder compensation: how fast the horizon relaxes behind a thin object (0 = solid walls)
+const POWER: f32 = 2.2;          // contact creases read, open ground stays ~1
+const GRAZE: vec2<f32> = vec2<f32>(0.05, 0.35); // |n.v| range over which AO fades in; edge-on surfaces (silhouettes) stay 1
 const HALF_PI: f32 = 1.5707963;
 
 // Fully fogged (native transmittance 0) and sky texels carry no AO and contribute no occluder: AO never describes geometry the
@@ -51,9 +52,12 @@ fn gtao(@builtin(global_invocation_id) id: vec3<u32>) {
     let p = vs_pos(vec2<f32>(fp) + vec2<f32>(0.5), z);
     var n = normalize((fc.view * vec4<f32>(oct_decode(textureLoad(g1t, fp, 0).rg), 0.0)).xyz);
     let v = normalize(-p);
-    if dot(n, v) < 0.0 { n = -n; }
+    let facing = dot(n, v);
+    if facing < 0.0 { n = -n; }
 
-    let t = f32(fc.flags.x & 7u);
+    // The sampling pattern only rotates through time when TAA jitters the frame (TAA integrates it); otherwise identical frames
+    // produce identical AO (no flicker).
+    let t = select(0.0, f32(fc.flags.x & 7u), fc.jitter.x != 0.0 || fc.jitter.y != 0.0);
     let n_slice = ign(vec2<f32>(hp) + vec2<f32>(5.588238 * t));
     let n_step = ign(vec2<f32>(hp.yx) + vec2<f32>(37.0, 17.0) + vec2<f32>(5.588238 * t));
     let falloff_mul = -1.0 / (RADIUS * FALLOFF);
@@ -97,7 +101,7 @@ fn gtao(@builtin(global_invocation_id) id: vec3<u32>) {
         let arc1 = (cos_n + 2.0 * h1 * sn - cos(2.0 * h1 - ang_n)) * 0.25;
         vis += plen * (arc0 + arc1);
     }
-    textureStore(raw_out, hp, vec4<f32>(clamp(vis / f32(SLICES), 0.0, 1.0)));
+    textureStore(raw_out, hp, vec4<f32>(mix(1.0, clamp(vis / f32(SLICES), 0.0, 1.0), smoothstep(GRAZE.x, GRAZE.y, abs(facing)))));
 }
 
 // 3x3 depth-weighted blur of the raw visibility, then the temporal blend against the reprojected previous result.

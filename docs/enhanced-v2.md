@@ -25,6 +25,18 @@ G2 RG16F (motion), G3 RG11B10F (authored emission), D32F depth. The sky never wr
 Resolve (`resolve.rs`, `resolve.wgsl`): sun, hemisphere ambient, emission, native linear fog applied analytically
 (`T_native`, DESIGN section 8). Post (`post.rs`, `post.wgsl`): exposure, shoulder, grade, vignette, dither, 2.2-gamma encode.
 
+## Pyramid and AO (slot 3)
+
+`pyramid.rs/.wgsl` (`hiz`): the one depth pyramid, R32Float min VIEW depth, mips 0..7 (mip 0 = linearised view depth, `1e9`
+where the G-buffer has no geometry); two dispatches, `Pyramid::view()` exposes all mips. `ao.rs/.wgsl` (`ao`, `ao_denoise`,
+`ao_up`): half-res GTAO (2 slices x 6 steps per side, mip by sample distance, 1.5 m radius, thin-occluder compensation, edge-on
+surfaces fade to 1), 3x3 depth-bilateral blur + temporal blend (history reprojected with the unjittered matrices, depth-rejected,
+dropped on resize / admitted-actor hash change / TAA jitter toggle), then a depth-aware upsample into the full-res `R8Unorm`
+texture at resolve binding 6 (`flags.y` bit 0). AO only multiplies the hemisphere ambient term. Sky and fully fogged texels are 1
+and never act as occluders (`native_transmittance(z) > 0`). The sampling pattern only rotates through time when TAA jitters, so
+identical frames give bit-identical AO. `ao_up` is a raster pass (R8Unorm cannot be a storage target without extra features): its
+timestamp overlaps neighbouring passes on Metal, read the `frame` row for totals.
+
 ## Harness
 
 `AOMAC_GFX_SETTINGS=v2-high AOMAC_GFX_VIEW=<view> AOMAC_GFX_OUT=<new dir> AOMAC_GFX_PNG_ONLY=1 cargo test --profile fast -p aomac
