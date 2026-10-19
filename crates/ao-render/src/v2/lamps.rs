@@ -19,8 +19,10 @@ use wgpu::util::DeviceExt;
 pub(super) const MAX_LAMPS: usize = 1024;
 /// Linear gain on authored lamp colours: the design's pushed look (DESIGN 4.2), a constant rather than a setting.
 pub(super) const LAMP_GAIN: f32 = 1.6;
-/// Cube-atlas cubes: the 4 lamps nearest the eye; the cache rebuilds at most 2 actor faces per cube (8 per frame).
-const CUBES: u32 = 4;
+/// Cube-atlas cubes. Each cube costs 6 actor-face render passes (~40 us each on the M4 Pro) every frame an admitted actor can
+/// reach a lamp, because v1 schedules the faces CPU-side and only the GPU knows which <= 2 it rebuilds. Measured with an actor
+/// holding a Light Bar: 1 cube 0.25 ms, 2 cubes 0.51 ms, 4 cubes 1.51 ms (budget 0.25): one cube fits the High row.
+const CUBES: u32 = 1;
 const CLUSTERS: u32 = 16 * 9 * 24;
 const CLUSTER_STRIDE: u32 = 9;
 /// Length of the admission visibility array (V2Shadows' fixed-size buffer; index = actor interaction slot).
@@ -42,6 +44,7 @@ pub(super) struct LampRec {
 }
 
 impl LampRec {
+    #[cfg(test)]
     pub(super) fn owner(&self) -> u32 { self.axis_owner[3].to_bits() }
 }
 

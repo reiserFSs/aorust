@@ -40,10 +40,10 @@ fn lamp_face_visibility(maps: texture_depth_2d_array, matrix: mat4x4<f32>, world
 
 // Visibility of `world` from the light in cube `slot` (0..15).
 fn lamp_cube_visibility(world: vec3<f32>, range: f32, slot: u32) -> f32 {
-    let meta = point_shadow_metadata.slots[slot];
-    if meta.x <= 0.0 || meta.y < 0.0 { return 1.0; }
-    if meta.y > 0.0 {
-        let owner = u32(meta.y);
+    let state = point_shadow_metadata.slots[slot];
+    if state.x <= 0.0 || state.y < 0.0 { return 1.0; }
+    if state.y > 0.0 {
+        let owner = u32(state.y);
         if owner >= arrayLength(&lamp_owner_visibility) || lamp_owner_visibility[owner] == 0u { return 1.0; }
     }
     let delta = world - point_shadow_metadata.lights[slot].xyz;
@@ -58,7 +58,7 @@ fn lamp_cube_visibility(world: vec3<f32>, range: f32, slot: u32) -> f32 {
     if face.params.w > 0.0 {
         vis = min(vis, lamp_face_visibility(point_actor_shadow_maps, face.dynamic_matrix, world, i32(face_index), face.params.z));
     }
-    return mix(1.0, vis, clamp(meta.x, 0.0, 1.0));
+    return mix(1.0, vis, clamp(state.x, 0.0, 1.0));
 }
 
 // Soft falloff over the authored range: authored D3D coefficients when present, else an inverse-square core; either way
@@ -67,7 +67,7 @@ fn lamp_falloff(dist: f32, range: f32, atten: vec3<f32>) -> f32 {
     let t = dist / range;
     let window = clamp(1.0 - t * t * t * t, 0.0, 1.0);
     var core: f32;
-    if atten.x >= 0.0 {
+    if max(atten.x, max(atten.y, atten.z)) > 1e-3 { // authored coefficients that attenuate; a0 ~ 0 / linear markers get the soft core
         core = min(1.0 / max(atten.x + dist * (atten.y + dist * atten.z), 1e-3), 4.0);
     } else {
         let r0 = range * LAMP_CORE;
