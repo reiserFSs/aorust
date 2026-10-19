@@ -96,8 +96,8 @@ impl Renderer {
     }
 
     /// Per-pass GPU milliseconds of the last submitted v2 frame (blocks until it completes). Empty without timing.
-    pub fn v2_pass_ms(&mut self) -> anyhow::Result<Vec<(&'static str, f64)>> {
-        self.v2.as_ref().and_then(|v2| v2.timers.as_ref()).map_or(Ok(Vec::new()), |timers| timers.read(&self.device))
+    pub fn v2_pass_ms(&mut self, lag: usize) -> anyhow::Result<Vec<(&'static str, f64)>> {
+        self.v2.as_ref().and_then(|v2| v2.timers.as_ref()).map_or(Ok(Vec::new()), |timers| timers.read(&self.device, lag))
     }
 
     pub(crate) fn render_v2(&mut self, resolve: &wgpu::TextureView, t: &Targets, cam: &Camera) -> wgpu::SubmissionIndex {
@@ -211,13 +211,14 @@ impl Renderer {
         }
         // [slot 5] bloom, then TAA (+ CAS), between the FX pass and post; post then reads their output instead of `targets.hdr`.
         v2.post.encode(&mut enc, &sized.post_bind, resolve, timer.and_then(|t| t.render("post")));
-        if let Some(timers) = &v2.timers { timers.resolve(&mut enc); }
+        if let Some(timers) = &v2.timers { timers.tail(&mut enc); timers.resolve(&mut enc); }
 
         self.drawn_visuals.extend(self.pending_visuals.get_mut().drain());
         self.stats = crate::FrameStats { instances: self.vis.len(), draw_calls: calls };
         v2.prev_view_proj = view_proj_unjit;
         v2.frame = v2.frame.wrapping_add(1);
         let submission = self.queue.submit([enc.finish()]);
+        if let Some(timers) = &v2.timers { timers.submitted(&submission); }
         self.v2 = Some(v2);
         submission
     }

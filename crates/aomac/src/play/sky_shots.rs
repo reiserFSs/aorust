@@ -2075,7 +2075,9 @@ fn graphics_offline_night_preserves_fog_and_hidden_actor_isolation() -> anyhow::
             }
             off.rgba(&shot, &list)
         };
-        for profile in ["faithful", "grass", "all-no-bloom", "all-foliage", "moonlit", "moon-shadows", "dark-night", "lighting"] {
+        for profile in ["faithful", "grass", "all-no-bloom", "all-foliage", "moonlit", "moon-shadows", "dark-night", "lighting", "v2-high"] {
+            // AOMAC_GFX_FAIRNESS_PROFILE=<one profile> runs just that one (e.g. v2-high).
+            if std::env::var("AOMAC_GFX_FAIRNESS_PROFILE").is_ok_and(|only| only != profile) { continue; }
             let absent = render(profile, false, 0)?;
             let hidden = render(profile, false, 1)?;
             ensure!(absent == hidden, "{name}/{profile}: zero-alpha non-admitted body or its bender changed the image");
@@ -2104,13 +2106,17 @@ fn graphics_fixture_v2_timing(off: &mut ao_render::Offscreen, name: &str, out: &
     off.set_v2_pass_timing(true)?;
     let mut passes: Vec<&'static str> = Vec::new();
     let mut samples: Vec<Vec<f64>> = Vec::new();
-    for sample in 0..720 {
-        off.render_frozen()?;
-        let row = off.read_v2_pass_ms()?;
+    // Three frames stay in flight: reading each frame only after the next three are queued keeps the GPU at its working clock.
+    const LAG: usize = 3;
+    for sample in 0..720 + LAG {
+        if sample < 720 { off.render_frozen()?; }
+        let frame = sample.wrapping_sub(LAG);
+        if sample < LAG { continue; }
+        let row = off.read_v2_pass_ms(if sample < 720 { LAG } else { 720 + LAG - 1 - sample })?;
         anyhow::ensure!(!row.is_empty(), "v2 pass timers recorded nothing");
-        if sample == 0 { passes = row.iter().map(|(pass, _)| *pass).collect(); samples = vec![Vec::new(); passes.len()]; }
+        if frame == 0 { passes = row.iter().map(|(pass, _)| *pass).collect(); samples = vec![Vec::new(); passes.len()]; }
         anyhow::ensure!(row.len() == passes.len(), "v2 pass list changed between frames");
-        if sample >= 120 { for (i, (_, ms)) in row.into_iter().enumerate() { samples[i].push(ms); } }
+        if frame >= 120 { for (i, (_, ms)) in row.into_iter().enumerate() { samples[i].push(ms); } }
     }
     off.set_v2_pass_timing(false)?;
     let mut csv = format!("sample,{}\n", passes.join(","));

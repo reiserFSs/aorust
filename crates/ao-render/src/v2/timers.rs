@@ -1,38 +1,54 @@
-//! Per-pass GPU timers: one begin/end timestamp pair on every v2 pass, resolved and read back by the offline harness.
+//! Per-pass GPU timers: one begin/end timestamp pair on every v2 pass, resolved into a small ring so the offline harness can
+//! keep several frames in flight (a GPU that waits for the CPU every frame downclocks and inflates every number).
 //! Disabled (no queries, no readback) unless `Renderer::set_v2_pass_timing(true)`.
-use std::cell::RefCell;
+//!
+//! Metal tile GPUs sample these at encoder boundaries and overlap the vertex work of one pass with the fragment work of the
+//! previous one: per-pass spans are non-exclusive and do not sum to the frame (`frame` = first begin to last end).
+use std::cell::{Cell, RefCell};
 
 const MAX_PASSES: u32 = 32;
+const SLOTS: usize = 4;
 
 pub(super) struct PassTimers {
     queries: wgpu::QuerySet,
     resolve: wgpu::Buffer,
-    readback: wgpu::Buffer,
+    readback: Vec<wgpu::Buffer>,
     period_ns: f32,
-    names: RefCell<Vec<&'static str>>,
+    names: RefCell<[Vec<&'static str>; SLOTS]>,
+    slot: Cell<usize>,
+    submissions: RefCell<[Option<wgpu::SubmissionIndex>; SLOTS]>,
 }
+
+const SLOT_BYTES: u64 = MAX_PASSES as u64 * 16;
 
 impl PassTimers {
     pub(super) fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Self> {
         if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) { return None; }
-        let bytes = u64::from(MAX_PASSES) * 16;
         Some(Self {
-            queries: device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("v2 pass timers"), ty: wgpu::QueryType::Timestamp, count: MAX_PASSES * 2 }),
-            resolve: device.create_buffer(&wgpu::BufferDescriptor { label: Some("v2 timer resolve"), size: bytes,
+            queries: device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("v2 pass timers"), ty: wgpu::QueryType::Timestamp, count: MAX_PASSES * 2 * SLOTS as u32 }),
+            resolve: device.create_buffer(&wgpu::BufferDescriptor { label: Some("v2 timer resolve"), size: SLOT_BYTES * SLOTS as u64,
                 usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false }),
-            readback: device.create_buffer(&wgpu::BufferDescriptor { label: Some("v2 timer readback"), size: bytes,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
+            readback: (0..SLOTS).map(|_| device.create_buffer(&wgpu::BufferDescriptor { label: Some("v2 timer readback"), size: SLOT_BYTES,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })).collect(),
             period_ns: queue.get_timestamp_period(),
-            names: RefCell::new(Vec::new()),
+            names: RefCell::new(Default::default()),
+            slot: Cell::new(0),
+            submissions: RefCell::new(Default::default()),
         })
     }
 
-    pub(super) fn begin_frame(&self) { self.names.borrow_mut().clear(); }
+    /// Starts a new frame in the next ring slot.
+    pub(super) fn begin_frame(&self) {
+        let slot = (self.slot.get() + 1) % SLOTS;
+        self.slot.set(slot);
+        self.names.borrow_mut()[slot].clear();
+    }
 
     fn slot(&self, name: &'static str) -> Option<(u32, u32)> {
+        let slot = self.slot.get();
         let mut names = self.names.borrow_mut();
-        let i = names.len() as u32;
-        (i < MAX_PASSES).then(|| { names.push(name); (2 * i, 2 * i + 1) })
+        let i = names[slot].len() as u32;
+        (i < MAX_PASSES).then(|| { names[slot].push(name); let base = (slot as u32 * MAX_PASSES + i) * 2; (base, base + 1) })
     }
 
     pub(super) fn render(&self, name: &'static str) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
@@ -45,35 +61,59 @@ impl PassTimers {
         Some(wgpu::ComputePassTimestampWrites { query_set: &self.queries, beginning_of_pass_write_index: Some(begin), end_of_pass_write_index: Some(end) })
     }
 
-    /// Records the resolve + copy; call once, after every timed pass of the frame, before `finish()`.
+    /// Records the resolve + copy of this frame's slot; call once, after every timed pass of the frame.
     pub(super) fn resolve(&self, enc: &mut wgpu::CommandEncoder) {
-        let n = self.names.borrow().len() as u32;
+        let slot = self.slot.get();
+        let n = self.names.borrow()[slot].len() as u32;
         if n == 0 { return; }
-        enc.resolve_query_set(&self.queries, 0..n * 2, &self.resolve, 0);
-        enc.copy_buffer_to_buffer(&self.resolve, 0, &self.readback, 0, u64::from(n) * 16);
+        let first = slot as u32 * MAX_PASSES * 2;
+        enc.resolve_query_set(&self.queries, first..first + n * 2, &self.resolve, slot as u64 * SLOT_BYTES);
+        enc.copy_buffer_to_buffer(&self.resolve, slot as u64 * SLOT_BYTES, &self.readback[slot], 0, u64::from(n) * 16);
     }
 
-    /// Blocks until the submitted frame completes and returns `(pass, milliseconds)` in encode order.
-    pub(super) fn read(&self, device: &wgpu::Device) -> anyhow::Result<Vec<(&'static str, f64)>> {
-        let names = self.names.borrow().clone();
+    /// Remembers the submission that carries this frame's slot (call right after `queue.submit`).
+    pub(super) fn submitted(&self, submission: &wgpu::SubmissionIndex) {
+        self.submissions.borrow_mut()[self.slot.get()] = Some(submission.clone());
+    }
+
+    /// An empty compute pass that marks the end of the frame's GPU work (name `tail`); call after the last timed pass.
+    pub(super) fn tail(&self, enc: &mut wgpu::CommandEncoder) {
+        drop(enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("v2 timer tail"), timestamp_writes: self.compute("tail") }));
+    }
+
+    /// Blocks until the frame submitted `lag` frames ago (0 = the latest, at most `SLOTS - 1`) completes and returns
+    /// `(pass, milliseconds)` in encode order, led by `frame` (first begin to last end).
+    pub(super) fn read(&self, device: &wgpu::Device, lag: usize) -> anyhow::Result<Vec<(&'static str, f64)>> {
+        anyhow::ensure!(lag < SLOTS, "v2 timer lag {lag} exceeds the ring");
+        let slot = (self.slot.get() + SLOTS - lag) % SLOTS;
+        let names = self.names.borrow()[slot].clone();
         if names.is_empty() { return Ok(Vec::new()); }
-        let slice = self.readback.slice(..u64::try_from(names.len() * 16)?);
+        let slice = self.readback[slot].slice(..u64::try_from(names.len() * 16)?);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| { let _ = tx.send(result); });
-        device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| anyhow::anyhow!("v2 timer poll: {e}"))?;
-        rx.recv()??;
+        // Wait for exactly this frame's submission (later frames stay in flight), then let the map callback run.
+        let submission = self.submissions.borrow()[slot].clone();
+        device.poll(wgpu::PollType::Wait { submission_index: submission, timeout: None }).map_err(|e| anyhow::anyhow!("v2 timer wait: {e}"))?;
+        let result = loop {
+            if let Ok(result) = rx.try_recv() { break result; }
+            device.poll(wgpu::PollType::Poll).map_err(|e| anyhow::anyhow!("v2 timer poll: {e}"))?;
+        };
+        result?;
         let out = {
             let data = slice.get_mapped_range();
             let ticks: &[u64] = bytemuck::cast_slice(&data);
+            let n = names.len();
+            // Metal leaves the end sample of a render pass without a depth attachment (post) stale; such a pass is taken to end
+            // when the next encoder (the `tail` marker) begins.
+            let end_of = |i: usize| if ticks[2 * i + 1] >= ticks[2 * i] || i + 1 >= n { ticks[2 * i + 1] } else { ticks[2 * i + 2] };
             let ms = |a: u64, b: u64| b.saturating_sub(a) as f64 * f64::from(self.period_ns) / 1.0e6;
-            let begin = (0..names.len()).map(|i| ticks[2 * i]).min().unwrap_or(0);
-            let end = (0..names.len()).map(|i| ticks[2 * i + 1]).max().unwrap_or(0);
-            // "frame" = first pass begin to last pass end (includes any idle gaps between passes).
+            let begin = (0..n).map(|i| ticks[2 * i]).min().unwrap_or(0);
+            let end = (0..n).map(end_of).max().unwrap_or(0);
             std::iter::once(("frame", ms(begin, end)))
-                .chain(names.iter().enumerate().map(|(i, name)| (*name, ms(ticks[2 * i], ticks[2 * i + 1]))))
+                .chain(names.iter().enumerate().filter(|(_, name)| **name != "tail").map(|(i, name)| (*name, ms(ticks[2 * i], end_of(i)))))
                 .collect()
         };
-        self.readback.unmap();
+        self.readback[slot].unmap();
         Ok(out)
     }
 }

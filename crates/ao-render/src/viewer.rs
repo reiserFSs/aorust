@@ -1377,7 +1377,8 @@ impl Offscreen {
     pub fn set_gpu_timing(&mut self, enabled: bool) -> Result<()> { self.r.set_gpu_timing(enabled) }
     /// Enhanced v2 per-pass GPU timers (offline evidence; see `v2/timers.rs`).
     pub fn set_v2_pass_timing(&mut self, enabled: bool) -> Result<()> { self.r.set_v2_pass_timing(enabled) }
-    pub fn read_v2_pass_ms(&mut self) -> Result<Vec<(&'static str, f64)>> { self.r.v2_pass_ms() }
+    /// Per-pass ms of the frame submitted `lag` frames ago (0..=3); a lag keeps the GPU busy between samples.
+    pub fn read_v2_pass_ms(&mut self, lag: usize) -> Result<Vec<(&'static str, f64)>> { self.r.v2_pass_ms(lag) }
     pub fn set_cpu_timing(&mut self, enabled: bool) { self.r.set_cpu_timing(enabled); }
     pub fn frame_cpu_timings(&self) -> Option<crate::FrameCpuTimings> { self.r.frame_cpu_timings() }
     pub fn read_frame_gpu_ms(&mut self) -> Result<Option<f64>> { self.r.read_frame_gpu_ms() }
