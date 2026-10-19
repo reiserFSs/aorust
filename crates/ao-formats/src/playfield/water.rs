@@ -143,7 +143,9 @@ fn native_mesh(surface: &ao_scene::liquid::Surface, camera: [f32; 3], tex: &mut 
     match surface.style {
         0 => { sub.specular = [0.505f32.powf(2.2); 3]; sub.shininess = 10.0; }
         2 => sub.emissive = [1.0; 3], // native LIGHTING off: texture × authored vertex colour
-        4 => sub.emissive = [0.2f32, 0.3, 0.4].map(|c| c.powf(2.2)),
+        // DS1003db41 writes shallow material +0x44 = AMBIENT (RMaterial layout, Randy InitD3DMaterial 100409c6) = (.2,.3,.4);
+        // RViewPort::SetMaterial 1004b199 copies only +0x50 emissive, +0x38*+0x64 specular, +0x60/+0x68, so emissive stays black.
+        4 => {}
         _ => unreachable!("native_mesh only handles styles 0/2/4"),
     }
     if surface.style != 4 {
@@ -151,6 +153,9 @@ fn native_mesh(surface: &ao_scene::liquid::Surface, camera: [f32; 3], tex: &mut 
         mesh.vertices.extend_from_within(..);
         let mut ripple = sub.clone();
         ripple.indices.iter_mut().for_each(|i| *i += base);
+        // Pass 2 blob this+0x554 (DS1003db41) does not set SPECULARENABLE (0x1d); only pass-1 blob 0x4d0 does and is Reset before it.
+        // Randy reset 10041ede leaves state 0x1d = 0, so the inverse-alpha ripple adds no specular.
+        ripple.specular = [0.0; 3];
         mesh.submeshes.extend([sub, ripple]);
     } else {
         mesh.submeshes.push(sub);
@@ -246,12 +251,12 @@ mod tests {
         assert_eq!(mesh.submeshes.len(), 2, "base and inverse-alpha ripple, not one approximate pass");
         let count = mesh.vertices.len() / 2;
         assert_eq!(mesh.submeshes[1].indices, mesh.submeshes[0].indices.iter().map(|i| i + count as u32).collect::<Vec<_>>());
-        for sub in &mesh.submeshes {
+        for (pass, sub) in mesh.submeshes.iter().enumerate() {
             assert_eq!(sub.base_color, [1.0; 4], "packed source colour must not be tinted twice");
             assert_eq!(sub.texture, Some(TextureKey { rdb_type: TEXTURES, id: 6329 }));
             assert_eq!(sub.uv_scroll, [0.0; 2], "native UVs are animated by the liquid stage");
             assert_eq!(sub.shininess, 10.0);
-            assert_eq!(sub.specular, [0.505f32.powf(2.2); 3]);
+            assert_eq!(sub.specular, if pass == 0 { [0.505f32.powf(2.2); 3] } else { [0.0; 3] }, "SPECULARENABLE is pass-1 only (DS1003db41 blobs 0x4d0/0x554)");
             assert!(sub.liquid && sub.two_sided);
         }
         assert!(mesh.vertices[..count].iter().all(|v| v.normal[1] >= 0.0));
@@ -270,13 +275,24 @@ mod tests {
             assert_eq!(mesh.submeshes.len(), 2, "native default kind {kind} must not use the legacy single-pass stage");
             let count = mesh.vertices.len() / 2;
             assert_eq!(mesh.submeshes[1].indices, mesh.submeshes[0].indices.iter().map(|index| index + count as u32).collect::<Vec<_>>());
-            for sub in &mesh.submeshes {
+            for (pass, sub) in mesh.submeshes.iter().enumerate() {
                 assert_eq!(sub.texture, Some(key));
                 assert_eq!(sub.shininess, 10.0);
-                assert_eq!(sub.specular, [0.505f32.powf(2.2); 3]);
+                assert_eq!(sub.specular, if pass == 0 { [0.505f32.powf(2.2); 3] } else { [0.0; 3] });
                 assert!(sub.liquid && sub.two_sided);
             }
         }
+    }
+
+    #[test]
+    fn shallow_material_ambient_is_not_emissive() {
+        use ao_scene::liquid::{SourceTriangle, Surface};
+        let source = SourceTriangle { kind: 18, vertices: [[0.0,0.0,0.0],[80.0,0.0,0.0],[0.0,0.0,-80.0]].map(|pos| Vertex {pos,uv:[pos[0]/160.0,-pos[2]/160.0],..Default::default()}) };
+        let surface = Surface::new(0, 4, vec![source]).unwrap();
+        let key = TextureKey { rdb_type: TEXTURES, id: 6329 };
+        let mesh = native_mesh(&surface, surface.initial_camera().unwrap(), &mut |_| Some(key)).unwrap();
+        assert_eq!(mesh.submeshes.len(), 1);
+        assert_eq!(mesh.submeshes[0].emissive, [0.0; 3], "DS1003db41 (.2,.3,.4) is RMaterial+0x44 ambient; SetMaterial 1004b199 never copies it");
     }
 
     #[test]

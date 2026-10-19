@@ -47,3 +47,56 @@ fn icc_sea_contains_alpha_blended_water_pixels() -> anyhow::Result<()> {
     assert!(attenuated > 100, "native water must alpha-blend, not use the sky's additive glow: {attenuated} pixels");
     Ok(())
 }
+
+/// Open ICC sea seen from above (no terrain in the central block): the native water material must show
+/// water5 texture detail and take its colour from the authored WaterLight (DS1003f3db / 10059b98), not
+/// from a flat tint. Numbers measured 2026-10-19 (see docs/formats.md, "Native water appearance").
+#[test]
+fn icc_open_sea_shows_water5_detail_lit_by_authored_water_light() -> anyhow::Result<()> {
+    let dir = ao_gui::client_dir();
+    if !dir.join("cd_image/rdb.db").exists() {
+        eprintln!("skipping ICC open sea: no installed client at {}", dir.display());
+        return Ok(());
+    }
+    let store = ao_rdb::RecordStore::open(&dir)?;
+    let scene = ao_formats::playfield::load_playfield_at(&store, &dir, 4582, 2648.69)?;
+    let (eye, at) = ([1500.0, 40.0, -1200.0], [1500.0, 17.0, -1160.0]);
+    let out = std::env::temp_dir().join(format!("aomac-icc-open-sea-{}", std::process::id()));
+    std::fs::create_dir_all(&out)?;
+    // Mean and per-channel standard deviation of the central 200x100 block.
+    let stats = |scene: &ao_scene::Scene, name: &str| -> anyhow::Result<([f64; 3], [f64; 3])> {
+        let path = out.join(name);
+        ao_render::render_to_png_at(scene, eye, at, 640, 400, &path, 0.0)?;
+        let image = image::open(&path)?.to_rgb8();
+        let (mut sum, mut square, mut n) = ([0f64; 3], [0f64; 3], 0f64);
+        for y in 250..350 {
+            for x in 220..420 {
+                for c in 0..3 {
+                    let v = f64::from(image.get_pixel(x, y)[c]);
+                    sum[c] += v;
+                    square[c] += v * v;
+                }
+                n += 1.0;
+            }
+        }
+        let mean = sum.map(|s| s / n);
+        Ok((mean, std::array::from_fn(|c| (square[c] / n - mean[c] * mean[c]).max(0.0).sqrt())))
+    };
+    let (mean, std) = stats(&scene, "authored.png")?;
+    let mut dark = scene.clone();
+    dark.water_light = Some(([0.0; 3], dark.water_light.map_or([0.0, 1.0, 0.0], |light| light.1)));
+    let (dark_mean, _) = stats(&dark, "dark.png")?;
+    let mut flat = scene.clone();
+    let key = ao_scene::TextureKey { rdb_type: 1_010_004, id: 6329 };
+    let texture = flat.textures.get_mut(&key).expect("water5 texture");
+    let grey = (texture.rgba.as_chunks::<4>().0.iter().map(|p| u32::from(p[0])).sum::<u32>() / (texture.rgba.len() as u32 / 4)) as u8;
+    texture.rgba.as_chunks_mut::<4>().0.iter_mut().for_each(|p| p[..3].fill(grey));
+    let (_, flat_std) = stats(&flat, "flat.png")?;
+    std::fs::remove_dir_all(out)?;
+    eprintln!("ICC open sea: mean {mean:?} std {std:?} dark-light mean {dark_mean:?} flat-texture std {flat_std:?}");
+    assert!(mean[2] > mean[1] && mean[1] > mean[0], "authored 0xcc00186a blue water, fog-lifted: {mean:?}");
+    assert!(mean[2] - dark_mean[2] > 10.0, "colour must come from the authored WaterLight diffuse: lit {mean:?} vs WaterLight black {dark_mean:?}");
+    assert!((2.0..8.0).contains(&std[2]), "water5 detail must be present but low-contrast, blue std {std:?}");
+    assert!(flat_std[2] < std[2] * 0.5, "flattening water5 must remove the detail: {flat_std:?} vs {std:?}");
+    Ok(())
+}
