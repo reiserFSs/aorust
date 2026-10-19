@@ -222,7 +222,8 @@ impl Renderer {
         let (open, close) = span.map_or((None, None), |(a, b)| (Some(a), Some(b)));
         let bind = self.lamps_bind(lamps, consts, None);
         lamps.build.tick(enc, &bind, open);
-        self.encode_point_shadows(enc, cam, &mut carrier, fog_planes, false);
+        // `AOMAC_V2_OFF=cube` (harness): skip the atlas once it exists (the first frame builds it).
+        if !(super::off("cube") && self.point_shadows.is_some()) { self.encode_point_shadows(enc, cam, &mut carrier, fog_planes, false); }
         lamps.build.tick(enc, &bind, close);
         self.enhanced_settings = saved;
         lamps.carrier = Some(carrier);

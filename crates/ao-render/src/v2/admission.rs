@@ -110,7 +110,7 @@ impl Admission {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let slots_cap = 64;
         Self { pipes, reduce, reduce_layout, visibility, slots: Self::slot_buffer(device, slots_cap), slots_cap, scratch: Vec::new(), sized: None,
-            off: std::env::var("AOMAC_V2_SHADOWS").is_ok_and(|v| v == "off") }
+            off: std::env::var("AOMAC_V2_SHADOWS").is_ok_and(|v| v == "off") || super::off("admission") || super::off("shadows") }
     }
 
     fn slot_buffer(device: &wgpu::Device, cap: usize) -> wgpu::Buffer {
