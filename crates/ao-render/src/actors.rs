@@ -15,6 +15,8 @@ mod character_smoothing;
 mod smoothing_gpu;
 #[path = "shadow_actors.rs"]
 mod shadow_actors;
+#[path = "v2/actor_casters.rs"]
+mod v2_actor_casters;
 #[path = "motion_vectors.rs"]
 pub(crate) mod motion_vectors;
 // Enhanced v2 actor motion (G2): nested here to reuse the private actor layer; v2/mod.rs drives it.

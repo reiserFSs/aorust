@@ -46,9 +46,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     var spec = vec3<f32>(0.0);
     let ndl = max(dot(n, fc.sun_dir.xyz), 0.0);
     if fc.sun_dir.w > 0.5 && ndl > 0.0 {
-        let vis = 1.0;
+        let vis = sun_visibility(wp, vd, n);
         light += fc.sun_color.rgb * (ndl * vis);
         spec += fc.sun_color.rgb * (ndl * vis * 0.04 * PI * ggx_spec(n, v, fc.sun_dir.xyz, clamp(g1.b, 0.12, 1.0)));
+    }
+    let mdl = max(dot(n, fc.moon_dir.xyz), 0.0);
+    if fc.moon_dir.w > 0.5 && mdl > 0.0 {
+        light += fc.moon_color.rgb * (mdl * moon_visibility(wp, vd, n));
     }
     var ambient = mix(fc.ground_ambient.rgb, fc.sky_ambient.rgb, n.y * 0.5 + 0.5);
     if (flags & MF_GROUND) != 0u { ambient *= g1.b * 2.0; } // baked terrain lightmap share

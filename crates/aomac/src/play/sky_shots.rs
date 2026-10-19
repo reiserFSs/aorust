@@ -2075,9 +2075,10 @@ fn graphics_offline_night_preserves_fog_and_hidden_actor_isolation() -> anyhow::
             }
             off.rgba(&shot, &list)
         };
-        for profile in ["faithful", "grass", "all-no-bloom", "all-foliage", "moonlit", "moon-shadows", "dark-night", "lighting", "v2-high"] {
-            // AOMAC_GFX_FAIRNESS_PROFILE=<one profile> runs just that one (e.g. v2-high).
-            if std::env::var("AOMAC_GFX_FAIRNESS_PROFILE").is_ok_and(|only| only != profile) { continue; }
+        // AOMAC_GFX_PROFILES=v2-high (comma list) narrows the run; the default covers every profile, v2 included.
+        let only = std::env::var("AOMAC_GFX_PROFILES").ok();
+        for profile in ["faithful", "grass", "all-no-bloom", "all-foliage", "moonlit", "moon-shadows", "dark-night", "lighting", "v2-high"]
+            .into_iter().filter(|p| only.as_deref().is_none_or(|list| list.split(',').any(|o| o == *p))) {
             let absent = render(profile, false, 0)?;
             let hidden = render(profile, false, 1)?;
             ensure!(absent == hidden, "{name}/{profile}: zero-alpha non-admitted body or its bender changed the image");
