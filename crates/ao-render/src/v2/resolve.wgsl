@@ -65,8 +65,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     // the part above that floor.
     let w = fc.flags.w;
     let native_ambient = vec3<f32>(f32(w & 1023u), f32((w >> 10u) & 1023u), f32((w >> 20u) & 1023u)) / 1023.0;
-    // Terrain also carries the native lightmap's own fill (the original multiplies it on top of the device ambient): 1.5x floor.
-    light += max(ambient * ao, native_ambient * select(1.0, 1.5, (flags & MF_GROUND) != 0u));
+    // Terrain also carries the native lightmap fill the original adds on top of the device ambient: 1.5x floor.
+    // Self-lit surfaces (authored emission) keep their native look: the floor fades out with the emission.
+    let floor_gain = 1.0 - clamp(max(emission.r, max(emission.g, emission.b)) * 4.0, 0.0, 1.0);
+    light += max(ambient * ao, native_ambient * select(1.0, 1.5, (flags & MF_GROUND) != 0u) * floor_gain);
 
     var col = albedo * light + spec + emission;
     // Lamp radiance (already multiplied by albedo, with its GGX highlight): authored lights, cluster list, cube taps.
