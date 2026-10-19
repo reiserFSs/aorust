@@ -50,6 +50,8 @@ pub(super) struct Admission {
     scratch: Vec<u32>,
     sized: Option<((u32, u32), wgpu::TextureView, wgpu::BindGroup)>,
     marker: Marker,
+    /// Diagnostic (`AOMAC_V2_SHADOWS=off`): admits nobody and encodes nothing (measures the cost of shadows + admission).
+    off: bool,
 }
 
 fn compile(device: &wgpu::Device, shader: &wgpu::ShaderModule, layout: &wgpu::PipelineLayout, spec: Spec) -> RenderPipeline {
@@ -108,7 +110,8 @@ impl Admission {
         let visibility = device.create_buffer(&wgpu::BufferDescriptor { label: Some("v2 actor visibility"), size: ((SLOTS + 1) * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let slots_cap = 64;
-        Self { pipes, reduce, reduce_layout, visibility, slots: Self::slot_buffer(device, slots_cap), slots_cap, scratch: Vec::new(), sized: None, marker: Marker::new(device) }
+        Self { pipes, reduce, reduce_layout, visibility, slots: Self::slot_buffer(device, slots_cap), slots_cap, scratch: Vec::new(), sized: None, marker: Marker::new(device),
+            off: std::env::var("AOMAC_V2_SHADOWS").is_ok_and(|v| v == "off") }
     }
 
     fn slot_buffer(device: &wgpu::Device, cap: usize) -> wgpu::Buffer {
@@ -125,6 +128,7 @@ impl Admission {
     /// Slot 1. Without actor items nothing can be admitted: the visibility words are cleared and the passes are skipped (two empty
     /// marker passes keep the timer label stable).
     pub(super) fn encode(&mut self, r: &Renderer, enc: &mut wgpu::CommandEncoder, depth: &wgpu::TextureView, size: (u32, u32), timers: Option<&PassTimers>) {
+        if self.off { return; }
         if self.sized.as_ref().is_none_or(|(s, ..)| *s != size) {
             let ids = r.device.create_texture(&wgpu::TextureDescriptor { label: Some("v2 actor ids"),
                 size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,

@@ -207,6 +207,8 @@ pub(super) struct Shadows {
     /// every frame to measure the walking worst case per layer.
     always_rerender: u32,
     marker: Marker,
+    /// Diagnostic (`AOMAC_V2_SHADOWS=off`): no shadow work at all, to measure what shadows add to the frame.
+    off: bool,
 }
 
 fn layout_entry(binding: u32, ty: wgpu::BindingType, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
@@ -258,6 +260,7 @@ impl Shadows {
             transforms: Vec::new(), transform_buffer: None, receive, layout, bind, frame: 0,
             always_rerender: std::env::var("AOMAC_V2_SHADOW_RERENDER").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             marker: Marker::new(device),
+            off: std::env::var("AOMAC_V2_SHADOWS").is_ok_and(|v| v == "off"),
         }
     }
 
@@ -293,6 +296,7 @@ impl Shadows {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn encode(&mut self, r: &Renderer, enc: &mut wgpu::CommandEncoder, view: &View, sun: Option<Light>, moon: Option<Light>,
         admission: &Admission, timers: Option<&PassTimers>) {
+        if self.off { return; }
         self.frame += 1;
         let span = timers.and_then(|t| t.span("shadows"));
         self.marker.pass(enc, span.as_ref().map(|s| s.begin_render()));
