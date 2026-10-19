@@ -37,6 +37,15 @@ and never act as occluders (`native_transmittance(z) > 0`). The sampling pattern
 identical frames give bit-identical AO. `ao_up` is a raster pass (R8Unorm cannot be a storage target without extra features): its
 timestamp overlaps neighbouring passes on Metal, read the `frame` row for totals.
 
+FX colour space (canopy speckle root cause): the blended remainder (RSprite/alpha-blended leaf cards, glass, glows) is authored for
+D3D's gamma-space blend. Blended in the linear HDR target, every partial-alpha leaf-edge texel is lifted towards white: an outline of
+bright isolated pixels around each leaf (1.9x Original, `newland-sun`; TAA and AO were not involved: identical with `AOMAC_V2_NO_TAA`,
+and the leaf cards never reach the G-buffer). The resolve therefore writes the HDR target gamma-encoded (`hdr_encode`, resolve.wgsl),
+the FX wrappers return the native gamma colour/alpha unchanged, and the TAA input tile decodes (`pow 2.2`); no extra pass. CAS runs
+at `CAS_GAIN` 0.5 of the setting (full gain re-sharpened the canopy edges: +13% speckle). Regression:
+`graphics_v2_canopy_edges_are_no_noisier_than_original` (speckle <= 1.3x Original, canopy frame-to-frame < 1.5 LSB).
+The `fx` pass on Newland (0.41 ms) vs ICC (0.25 ms) is the canopy: hundreds of overlapping full-resolution blended cards, no AO/TAA work.
+
 Post stack (`motion.rs`, `bloom.rs`, `taa.rs`, `post.rs`, WGSL `motion/bloom/taa/post/post_common.wgsl`):
 - Motion (timer `motion`, only when actors are drawn): admitted opaque/alpha-tested actor items are redrawn with hardware `Equal`
   against the G-buffer depth and write displayed-pose motion into G2 (previous model + previous displayed vertices per pose; module is

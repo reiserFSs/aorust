@@ -24,7 +24,13 @@ fn load_view(name: &str) -> anyhow::Result<View> {
     let (mut scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
     let collision = ao_formats::playfield::collision::Collision::load(&store, pf)?;
     super::super::player::bake_sky_open(&collision, &mut scene);
-    let fixed = if pf == 566 { graphics_fixture_newland_camera(|point| collision.terrain_height(point))? } else { camera };
+    let grounded = if pf == 566 { Some(graphics_fixture_newland_camera(|point| collision.terrain_height(point))?) } else { None };
+    // The harness' `newland-sun` camera (see `graphics_offline_fixture`): the grounded Newland camera turned towards the sun.
+    let fixed = match (grounded, name) {
+        (Some(grounded), "newland-sun") => Camera { yaw: -std::f32::consts::FRAC_PI_2, pitch: 0.35, ..grounded },
+        (Some(grounded), _) => grounded,
+        (None, _) => camera,
+    };
     let exposure = super::super::player::grass_exposure_surface(std::rc::Rc::new(std::cell::RefCell::new(collision)));
     Ok(View { scene, fixed, exposure })
 }
@@ -208,5 +214,37 @@ fn graphics_v2_moving_actor_leaves_no_trail_and_static_camera_is_stable() -> any
     let flicker = (FRAMES - 3..FRAMES - 1).map(|k| mean_abs_diff(&background[k], &background[k + 1], &|_, _| true)).fold(0.0, f64::max);
     eprintln!("static-camera frame-to-frame mean |diff|: {flicker:.3} LSB");
     ensure!(flicker <= 1.0, "static camera flickers by {flicker:.3} LSB");
+    Ok(())
+}
+
+/// Canopy speckle: isolated bright pixels (luma more than 30 above the 5x5 median) in the Newland tree canopy of `newland-sun`
+/// (screen box x 900..1900, y 0..600). Alpha-tested / alpha-blended leaf cards used to light up a white outline when their partial
+/// alpha was blended in linear space (1.9x Original): v2 must be no noisier than Original (bound 1.3x) and stable over frames.
+#[test]
+#[ignore = "offline v2 canopy regression; requires installed client and the GPU timing lock"]
+fn graphics_v2_canopy_edges_are_no_noisier_than_original() -> anyhow::Result<()> {
+    let out = evidence_dir()?;
+    let view = load_view("newland-sun")?;
+    let region = |x: usize, y: usize| (900..1900).contains(&x) && y < 600;
+    let speckle = |rgba: &[u8]| -> usize {
+        let mut count = 0;
+        for y in 2..600 { for x in 902..1898 {
+            let mut window = [0.0_f64; 25];
+            for (k, v) in window.iter_mut().enumerate() { *v = luma_at(rgba, x + k % 5 - 2, y + k / 5 - 2); }
+            window.sort_by(f64::total_cmp);
+            if luma_at(rgba, x, y) - window[12] > 30.0 { count += 1; }
+        } }
+        count
+    };
+    let original = render_sequence(&view, graphics_fixture_settings("Original")?, None, &[None])?.remove(0);
+    let v2 = render_sequence(&view, graphics_fixture_settings("v2-high")?, None, &[None, None, None, None])?;
+    save(&out, "canopy-original.png", &original)?;
+    save(&out, "canopy-v2.png", &v2[3])?;
+    let (s_original, s_v2) = (speckle(&original), speckle(&v2[3]));
+    let flicker = mean_abs_diff(&v2[2], &v2[3], &region);
+    eprintln!("canopy speckle original {s_original} v2 {s_v2} ({:.2}x); v2 frame-to-frame mean |diff| {flicker:.3} LSB", s_v2 as f64 / s_original as f64);
+    ensure!(s_original > 1000, "fixture: the canopy region holds no foliage ({s_original})");
+    ensure!(s_v2 as f64 <= 1.3 * s_original as f64, "canopy speckle {s_v2} vs Original {s_original}");
+    ensure!(flicker <= 1.5, "canopy flickers by {flicker:.3} LSB between static-camera frames");
     Ok(())
 }

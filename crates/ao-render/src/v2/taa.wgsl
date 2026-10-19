@@ -88,7 +88,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
         let q = clamp(origin + vec2<i32>(i32(i % 10u), i32(i / 10u)), vec2<i32>(0), dims - vec2<i32>(1));
         let d = textureLoad(deptht, q, 0);
         let uv = (vec2<f32>(q) + vec2<f32>(0.5)) * fc.viewport.zw;
-        let c = max(textureLoad(hdrt, q, 0).rgb, vec3<f32>(0.0))
+        let c = pow(max(textureLoad(hdrt, q, 0).rgb, vec3<f32>(0.0)), vec3<f32>(2.2)) // gamma-encoded resolve + FX (see resolve.wgsl)
             + textureSampleLevel(halo, smp, uv, 0.0).rgb * (ctl.bloom * t_native_depth(d));
         tile[i] = vec4<f32>(tm(min(c, vec3<f32>(OUT_MAX))), d);
     }

@@ -69,7 +69,9 @@ pub(super) fn shader_source() -> String {
             // Native sky colour is gamma; the sky target is linear HDR. Blend states are the native ones.
             source.push_str(&format!("@fragment\nfn {name}(i: VOut) -> GOut {{\n    var o: GOut = g_pack(vec3<f32>(0.0), 0u, vec3<f32>(0.0, 1.0, 0.0), 0.0, vec3<f32>(0.0));\n    let c = orig_{name}(i);\n    o.sky = vec4<f32>(lin(c.rgb), c.a);\n    return o;\n}}\n"));
         } else {
-            source.push_str(&format!("@fragment\nfn {name}(i: VOut) -> @location(0) vec4<f32> {{\n    let c = orig_{name}(i);\n    return vec4<f32>(lin(c.rgb), c.a);\n}}\n"));
+            // Blended remainder: the FX pass blends in the gamma-encoded copy of the HDR image (`fxspace.rs`), exactly the native
+            // gamma-space equations of the original client; the body's gamma colour and alpha are used unchanged.
+            source.push_str(&format!("@fragment\nfn {name}(i: VOut) -> @location(0) vec4<f32> {{\n    return orig_{name}(i);\n}}\n"));
         }
     }
     source
