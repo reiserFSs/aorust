@@ -95,10 +95,32 @@ impl Span<'_> {
     pub(super) fn begin_render(&self) -> wgpu::RenderPassTimestampWrites<'_> {
         wgpu::RenderPassTimestampWrites { query_set: self.queries, beginning_of_pass_write_index: Some(self.begin), end_of_pass_write_index: None }
     }
-    pub(super) fn begin_compute(&self) -> wgpu::ComputePassTimestampWrites<'_> {
-        wgpu::ComputePassTimestampWrites { query_set: self.queries, beginning_of_pass_write_index: Some(self.begin), end_of_pass_write_index: None }
+    pub(super) fn end_render(&self) -> wgpu::RenderPassTimestampWrites<'_> {
+        wgpu::RenderPassTimestampWrites { query_set: self.queries, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(self.end) }
     }
     pub(super) fn end_compute(&self) -> wgpu::ComputePassTimestampWrites<'_> {
         wgpu::ComputePassTimestampWrites { query_set: self.queries, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(self.end) }
+    }
+}
+
+/// An (almost free) empty render pass that only carries a timestamp, so a [`Span`] exists every frame even when its real passes are
+/// skipped (an empty compute pass records no timestamp on Metal).
+pub(super) struct Marker(wgpu::TextureView);
+
+impl Marker {
+    pub(super) fn new(device: &wgpu::Device) -> Self {
+        Self(device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("v2 timer marker"), size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2, format: crate::DEPTH, usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+        }).create_view(&Default::default()))
+    }
+
+    pub(super) fn pass(&self, enc: &mut wgpu::CommandEncoder, timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>) {
+        drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("v2 timer marker"), color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &self.0,
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }), stencil_ops: None }),
+            timestamp_writes, occlusion_query_set: None, multiview_mask: None,
+        }));
     }
 }

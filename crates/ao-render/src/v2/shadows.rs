@@ -14,7 +14,7 @@
 use bytemuck::Zeroable;
 use super::admission::Admission;
 use super::resolve::Plugin;
-use super::timers::PassTimers;
+use super::timers::{Marker, PassTimers};
 use crate::sun_shadows::{CascadeFrame, ShadowUniform};
 use crate::Renderer;
 use glam::{Mat4, Vec3, Vec4};
@@ -205,6 +205,7 @@ pub(super) struct Shadows {
     frame: u64,
     /// Diagnostic for the offline harness: forces every static layer to re-render every frame (measures the walking worst case).
     always_rerender: bool,
+    marker: Marker,
 }
 
 fn layout_entry(binding: u32, ty: wgpu::BindingType, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
@@ -255,6 +256,7 @@ impl Shadows {
             dyn_dirty: [true; LAYERS], commands: Default::default(),
             transforms: Vec::new(), transform_buffer: None, receive, layout, bind, frame: 0,
             always_rerender: std::env::var_os("AOMAC_V2_SHADOW_RERENDER").is_some(),
+            marker: Marker::new(device),
         }
     }
 
@@ -292,7 +294,7 @@ impl Shadows {
         admission: &Admission, timers: Option<&PassTimers>) {
         self.frame += 1;
         let span = timers.and_then(|t| t.span("shadows"));
-        drop(enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("v2 shadows begin"), timestamp_writes: span.as_ref().map(|s| s.begin_compute()) }));
+        self.marker.pass(enc, span.as_ref().map(|s| s.begin_render()));
 
         let far = r.lens.far.unwrap_or(SHADOW_FAR).min(SHADOW_FAR).max(view.near + 0.01);
         let receiver_far = view.far.min(view.fog_end).min(far);
@@ -336,7 +338,7 @@ impl Shadows {
         receive.flags[0] = u32::from(items && receive.flags[2] != 0);
         receive.flags[1] = u32::from(items && receive.flags[3] != 0);
         r.queue.write_buffer(&self.receive, 0, bytemuck::bytes_of(&receive));
-        drop(enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("v2 shadows end"), timestamp_writes: span.as_ref().map(|s| s.end_compute()) }));
+        self.marker.pass(enc, span.as_ref().map(|s| s.end_render()));
     }
 
     /// Re-renders the static layers whose cadence is due and whose content signature changed.
