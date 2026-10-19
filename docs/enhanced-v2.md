@@ -74,3 +74,24 @@ Not yet in the cascades: grass blade and canopy-leaf casters, contact shadows, c
 graphics_offline_fixture -- --ignored --nocapture` (GPU lock first, see the aorust skill). Add `AOMAC_GFX_FRAME_TIMING=1` for
 120 warm-up + 600 sampled frames with per-pass GPU timestamps (`<view>-v2-passes.csv/.txt`, p50/p95 per pass and `frame`).
 Views: `icc-landmark-authored`, `newland-sun` (look-target camera), `newland-day`, `borealis-street-*`.
+
+## M2 measurements (High, 1920x1200, M4 Pro, p50 of 600 samples after 120 warm-up, GPU lock held)
+
+Whole frame (first pass begin to last end): ICC day 1.97 ms, Newland day 2.28 ms, Newland night 2.50 ms (p95 2.4 / 2.7 / 3.0); design total 5.7 ms.
+Per-pass spans are non-exclusive on Metal tile GPUs (a pass's vertex work overlaps the previous pass's fragment work) and do not
+sum to the frame; the end sample of `post` (a render pass without depth) is stale, so `post` is unmeasured. Spans, ICC / Newland day:
+gbuffer 0.36 / 0.39 (row 1.10), hiz 0.054 / 0.054 (0.09), ao 0.30 / 0.28 + ao_denoise 0.13 / 0.12 (0.83; `ao_up` 0.91 / 0.85 is a
+raster span that overlaps its neighbours), clusters 0.005 / 0.012 (0.05), cube_atlas 0.10 / 0.22 (0.25; 0.32 with a carried light),
+resolve 0.18 / 0.27 (0.74), fx 0.25 / 0.42 (0.20 + water later), bloom 0.106 / 0.107 (0.18), taa 0.557 / 0.557 (0.55 incl. CAS+grade).
+Shadows: `frame` delta against `AOMAC_V2_SHADOWS=off` +0.09 steady, +0.26..0.35 with an actor (row 0.35); the `admission`/`shadows`
+timer labels (about 0.3 ms) are marker artefacts, not costs.
+
+## Review #1 (real window, only while Main allows it)
+
+Options -> Enhanced -> Presets -> Graphics Preset -> "Enhanced v2 High" (preference `AomacGraphicsPreset = 5`; building the
+pipelines takes a few seconds on selection). Stand at the ICC arrival beach (the `icc-landmark` camera: x 933, z -748 looking
+toward the platform) and in Newland City on the street at x 414, z -320 (look toward the sun, yaw -90 deg, pitch +20 deg); day only.
+Look at: tree/lamp/pole shadows on grass and the platform shadow on the beach (no shimmer when turning), contact darkening at
+building bases and under the ICC overhang (no halos), stable edges while walking (TAA), cyan signs and lamp heads glowing, the lamp
+pole staying dull, and a carried Light Bar lighting the ground with the actor's shadow. Not in M2 (later milestones): authored
+sky/cloud rework, froxel haze/shafts, water material, grass/foliage in the G-buffer, night look, per-zone grade.
