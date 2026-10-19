@@ -11,6 +11,8 @@ pub enum NightMode {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EnhancedSettings {
+    /// Enhanced v2 (High tier): the separate deferred renderer in `v2/`. Independent of every v1 switch, which stay off when it is set.
+    pub enhanced_v2: bool,
     pub sun_shadows: bool,
     /// Cached Phong subdivision of nearby CAT bodies and mounted heads.
     pub character_smoothing: bool,
@@ -131,6 +133,7 @@ pub struct EnhancedSettings {
 impl Default for EnhancedSettings {
     fn default() -> Self {
         Self {
+            enhanced_v2: false,
             sun_shadows: false, ambient_occlusion: false, emissive_bloom: false, ground_grass: false, hdr: false, contact_shadows: false,
             grass_tufts: false, grass_species: false, grass_path_thinning: false, grass_gust_bands: false,
             grass_sunlight: false, grass_sun_shadows: false, grass_point_shadows: false,

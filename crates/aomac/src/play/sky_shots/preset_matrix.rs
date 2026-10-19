@@ -8,7 +8,7 @@ mod marginal;
 
 const SIZE: (u32, u32) = (1920, 1200);
 const VIEWS: [&str; 4] = ["icc-landmark-authored", "borealis-foliage-sun-high", "borealis-foliage-night", "newland-day"];
-const PRESETS: [GraphicsPreset; 4] = GraphicsPreset::ALL;
+const PRESETS: [GraphicsPreset; 4] = [GraphicsPreset::Original, GraphicsPreset::ClassicPlus, GraphicsPreset::Modern, GraphicsPreset::Ultra];
 
 #[test]
 #[ignore = "installed-client headless preset acceptance; 120 warmup + 600 GPU samples and compact 120-frame interaction sheets"]

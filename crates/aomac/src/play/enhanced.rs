@@ -4,14 +4,14 @@ use super::dvalue::{DValues, Kind, Variant};
 use super::options::model::{Ctl, Item, Opt, Page, Ty};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum GraphicsPreset { Original, ClassicPlus, Modern, Ultra }
+pub(super) enum GraphicsPreset { Original, ClassicPlus, Modern, Ultra, EnhancedV2High = 5 }
 
 impl GraphicsPreset {
-    pub const ALL: [Self; 4] = [Self::Original, Self::ClassicPlus, Self::Modern, Self::Ultra];
+    pub const ALL: [Self; 5] = [Self::Original, Self::ClassicPlus, Self::Modern, Self::Ultra, Self::EnhancedV2High];
 
     #[cfg(test)]
     pub fn name(self) -> &'static str {
-        match self { Self::Original => "Original", Self::ClassicPlus => "Classic+", Self::Modern => "Modern", Self::Ultra => "Ultra" }
+        match self { Self::Original => "Original", Self::ClassicPlus => "Classic+", Self::Modern => "Modern", Self::Ultra => "Ultra", Self::EnhancedV2High => "Enhanced v2 High" }
     }
 
     #[cfg(test)]
@@ -21,7 +21,7 @@ impl GraphicsPreset {
 
     pub fn msaa(self) -> u32 { if self == Self::ClassicPlus { 4 } else { 1 } }
     pub fn anisotropy(self) -> u16 {
-        match self { Self::Original => 1, Self::ClassicPlus => 8, Self::Modern | Self::Ultra => 16 }
+        match self { Self::Original => 1, Self::ClassicPlus => 8, Self::Modern | Self::Ultra | Self::EnhancedV2High => 16 }
     }
 
     pub fn index(self) -> i64 { self as i64 }
@@ -42,7 +42,8 @@ pub(super) fn apply_preset(d: &mut DValues, preset: GraphicsPreset) {
             && matches!(control.kind, ControlKind::Check) { Variant::Bool(true) } else { control.default };
         d.set_raw(control.name, value);
     }
-    if preset != GraphicsPreset::Original {
+    // Enhanced v2 owns its look: every v1 switch stays at its default (off).
+    if matches!(preset, GraphicsPreset::ClassicPlus | GraphicsPreset::Modern | GraphicsPreset::Ultra) {
         for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom",
             "AomacHdr", "AomacGradingEnabled", "AomacContactShadows",
             "AomacClusteredLighting", "AomacMaterialSpecular", "AomacLocalLightShadows"] {
@@ -170,7 +171,7 @@ pub(super) fn controls() -> Vec<Control> {
     use PageId::*;
     vec![
         Control::radio(Presets, "Graphics Preset", "AomacGraphicsPreset", "Graphics Preset",
-            &[("Original", 0), ("Classic+", 1), ("Modern", 2), ("Ultra", 3), ("Custom", 4)], 0, 0, 4),
+            &[("Original", 0), ("Classic+", 1), ("Modern", 2), ("Ultra", 3), ("Enhanced v2 High", 5), ("Custom", 4)], 0, 0, 5),
         Control::check(Lighting, "Sun Shadows", "AomacSunShadows", "Sun Shadows"),
         Control::radio(Lighting, "Sun Shadows", "AomacShadowMapSize", "Shadow Map Size", &[("256", 256), ("512", 512), ("1024", 1024), ("2048", 2048), ("4096", 4096)], 2048, 256, 4096),
         Control::radio(Lighting, "Sun Shadows", "AomacShadowQuality", "Shadow Receiver Quality", &[("Low", 0), ("Normal", 1)], 1, 0, 1),

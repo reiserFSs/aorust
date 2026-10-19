@@ -500,7 +500,12 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     entry.insert((scene, grass_exposure, grounded_camera, collision))
                 }
             };
-            let fixed = grounded_camera.unwrap_or(fixed);
+            let fixed = match (grounded_camera.as_ref(), name.as_str()) {
+                // The v2 look-target camera: the Newland street looking toward the sun.
+                (Some(grounded), "newland-sun" | "newland-sun-night") => Camera { yaw: -std::f32::consts::FRAC_PI_2, pitch: 0.35, ..*grounded },
+                (Some(grounded), _) => *grounded,
+                _ => fixed,
+            };
             let fixed = if matches!(name.as_str(), "borealis-foliage-ground-sun-high" | "newland-foliage-ground-day") {
                 graphics_fixture_ground_foliage_camera(scene, fixed,
                     |point| collision.borrow().ground(point),
@@ -805,7 +810,10 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     image::save_buffer(out.join(format!("{name}-emissive-mask.png")),
                         &mask, size.0, size.1, image::ColorType::Rgba8)?;
                 }
-                if measure && frame_timing {
+                if measure && frame_timing && settings.enhanced_v2 {
+                    graphics_fixture_v2_timing(&mut off, &name, &out)?;
+                }
+                if measure && frame_timing && !settings.enhanced_v2 {
                     off.prepare_frozen_rendering();
                     off.set_gpu_timing(true)?;
                     let mut frames = Vec::with_capacity(600);
@@ -997,6 +1005,9 @@ fn graphics_fixture_views(actor: &ao_net::n3::dynel::SimpleCharFullUpdate) -> Ve
     for (light, time) in [("day", 3240.0), ("dusk", 4860.0), ("night", 0.0)] {
         views.push((format!("newland-{light}"), 566, time,
             Camera::look_at([414.0, 2.5, -320.0].into(), [440.0, 1.0, -335.0].into())));
+    }
+    for (name, time) in [("newland-sun", 3240.0), ("newland-sun-night", 0.0)] {
+        views.push((name.into(), 566, time, Camera::look_at([414.0, 2.5, -320.0].into(), [440.0, 1.0, -335.0].into())));
     }
     views.push(("newland-lightbar-night".into(), 566, 0.0,
         Camera::look_at([414.0, 2.5, -320.0].into(), [440.0, 1.0, -335.0].into())));
@@ -2085,6 +2096,39 @@ fn graphics_offline_night_preserves_fog_and_hidden_actor_isolation() -> anyhow::
     Ok(())
 }
 
+/// Enhanced v2 budget evidence: 120 warm-up + 600 sampled frozen frames with per-pass GPU timestamps, written as
+/// `<view>-v2-passes.csv` (one row per frame) and `<view>-v2-passes.txt` (p50/p95 per pass, in encode order).
+fn graphics_fixture_v2_timing(off: &mut ao_render::Offscreen, name: &str, out: &std::path::Path) -> anyhow::Result<()> {
+    use std::fmt::Write;
+    off.prepare_frozen_rendering();
+    off.set_v2_pass_timing(true)?;
+    let mut passes: Vec<&'static str> = Vec::new();
+    let mut samples: Vec<Vec<f64>> = Vec::new();
+    for sample in 0..720 {
+        off.render_frozen()?;
+        let row = off.read_v2_pass_ms()?;
+        anyhow::ensure!(!row.is_empty(), "v2 pass timers recorded nothing");
+        if sample == 0 { passes = row.iter().map(|(pass, _)| *pass).collect(); samples = vec![Vec::new(); passes.len()]; }
+        anyhow::ensure!(row.len() == passes.len(), "v2 pass list changed between frames");
+        if sample >= 120 { for (i, (_, ms)) in row.into_iter().enumerate() { samples[i].push(ms); } }
+    }
+    off.set_v2_pass_timing(false)?;
+    let mut csv = format!("sample,{}\n", passes.join(","));
+    for frame in 0..samples[0].len() {
+        writeln!(csv, "{frame},{}", samples.iter().map(|s| format!("{:.6}", s[frame])).collect::<Vec<_>>().join(","))?;
+    }
+    std::fs::write(out.join(format!("{name}-v2-passes.csv")), csv)?;
+    let mut report = String::from("resolution=1920x1200\nwarmup=120\nsamples=600\nunits=milliseconds\npass p50 p95\n");
+    for (pass, series) in passes.iter().zip(&mut samples) {
+        series.sort_by(f64::total_cmp);
+        let at = |p: f64| series[(p * series.len() as f64).ceil() as usize - 1];
+        writeln!(report, "{pass} {:.4} {:.4}", at(0.5), at(0.95))?;
+    }
+    std::fs::write(out.join(format!("{name}-v2-passes.txt")), &report)?;
+    eprintln!("{name} v2 passes:\n{report}");
+    Ok(())
+}
+
 fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::EnhancedSettings> {
     if let Some(preset) = super::enhanced::GraphicsPreset::from_name(profile) {
         let mut values = super::dvalue::DValues::new(&ao_gui::client_dir());
@@ -2094,6 +2138,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
     let mut settings = ao_render::EnhancedSettings::default();
     match profile {
         "faithful" => {}
+        "v2-high" => settings.enhanced_v2 = true,
         "indirect" => settings.indirect_light = true,
         "indirect-neutral" => { settings.indirect_light = true; settings.indirect_strength = 0.0; }
         "rain" => settings.enhanced_rain = true,

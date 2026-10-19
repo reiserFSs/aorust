@@ -891,6 +891,10 @@ impl Renderer {
     /// With sun shadows enabled, the caller binds the shared receiver at group 3.
     /// Draws a native render list restricted to native distance buckets `buckets` (RViewPort::Render's first/last bucket).
     pub(crate) fn draw_actors_in(&self,pass:&mut wgpu::RenderPass,priority:i32,buckets:std::ops::RangeInclusive<i32>)->usize {
+        self.draw_actors_with(pass,&|pipe|Some(&self.world.actor_pipes[pipe]),Some(&*self.world.depth_clear_pipe),priority,buckets)
+    }
+    /// [`Self::draw_actors_in`] over an arbitrary pipeline table: `pipe_for` returns `None` for a slot the caller skips (Enhanced v2 splits opaque and blended slots across passes).
+    pub(crate) fn draw_actors_with<'a>(&self,pass:&mut wgpu::RenderPass,pipe_for:&dyn Fn(usize)->Option<&'a wgpu::RenderPipeline>,depth_clear:Option<&wgpu::RenderPipeline>,priority:i32,buckets:std::ops::RangeInclusive<i32>)->usize {
         let layer=&self.act;
         let buf=layer.bufs.get(self.frame);
         let calls=std::cell::Cell::new(0usize);
@@ -899,8 +903,10 @@ impl Renderer {
         while start<limit {
             let end=(start+1..limit).find(|&i|layer.commands[i].3).unwrap_or(limit);
             if layer.commands[start].3 && buckets.contains(&layer.commands[start].2) {
-                pass.set_pipeline(&self.world.depth_clear_pipe);
-                pass.draw(0..3,0..1);
+                if let Some(clear)=depth_clear {
+                    pass.set_pipeline(clear);
+                    pass.draw(0..3,0..1);
+                }
             }
             pass.set_bind_group(0,&self.globals_bg,&[]);
             if let Some(buf) = buf {
@@ -935,7 +941,8 @@ impl Renderer {
                     let pipe = if it.faded { faded_pipe(d.pipe) } else { d.pipe };
                     let pipe = mesh_effect_pipe(pipe, effect, d.projection_pass);
                     if pipe_c.get() != pipe {
-                        pass.set_pipeline(&self.world.actor_pipes[pipe]);
+                        let Some(actor_pipe)=pipe_for(pipe) else { continue };
+                        pass.set_pipeline(actor_pipe);
                         pipe_c.set(pipe);
                     }
                     if mat_c.get() != (it.model, d.mat) {

@@ -120,6 +120,10 @@ impl From<Vec<Slot>> for Pipelines {
 impl Pipelines {
     pub fn len(&self) -> usize { self.0.len() }
     pub fn push(&mut self, slot: Slot) { self.0.push(slot); }
+    /// The prepared pipeline of a slot, `None` when this table skipped it (Enhanced v2 prepares one class of slots per table).
+    pub fn get(&self, index: usize) -> Option<&wgpu::RenderPipeline> {
+        self.0[index].pipeline.as_ref().map(RenderPipeline::get)
+    }
     pub fn prepare_all<F: Fn(Spec) -> RenderPipeline>(&mut self, compile: &F) {
         let mut prepared: HashMap<Descriptor, usize> = HashMap::new();
         for index in 0..self.len() {

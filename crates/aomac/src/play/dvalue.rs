@@ -200,6 +200,7 @@ impl DValues {
     pub fn enhanced_settings(&self) -> ao_render::EnhancedSettings {
         let defaults = ao_render::EnhancedSettings::default();
         ao_render::EnhancedSettings {
+            enhanced_v2: self.get_i64("AomacGraphicsPreset") == Some(super::enhanced::GraphicsPreset::EnhancedV2High.index()),
             sun_shadows: self.flag("AomacSunShadows"),
             character_smoothing: self.flag("AomacCharacterSmoothing"),
             ambient_occlusion: self.flag("AomacAmbientOcclusion"),

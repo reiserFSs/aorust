@@ -1,6 +1,7 @@
 //! wgpu renderer for `ao_scene::Scene`: windowed free-fly viewer (`viewer`) and offscreen PNG path.
 
 mod actors;
+mod v2;
 mod bloom;
 mod contact_shadows;
 mod indirect_light;
@@ -915,6 +916,8 @@ pub struct Renderer {
     /// Dynamic actors drawn after the world, see `actors.rs`.
     act: actors::ActorLayer,
     screen: screen::ScreenPass,
+    /// Enhanced v2 renderer state, created on its first frame (see `v2/`).
+    v2: Option<v2::V2>,
 }
 
 /// Inactive combinations retained for switching back without recompiling.
@@ -1460,6 +1463,7 @@ impl Renderer {
             sorted: vec![],
             act: Default::default(),
             screen: Default::default(),
+            v2: None,
         };
         r.act.native_metal = adapter.get_info().backend == wgpu::Backend::Metal;
         r.warm_skin_pipeline();
@@ -2873,37 +2877,14 @@ impl Renderer {
             self.cloud_preferences.0, self.cloud_preferences.1, self.cloud_preferences.2) != 0)
     }
 
-    /// Draws one frame into `resolve` (a view of the output texture).
-    pub fn render(&mut self, resolve: &wgpu::TextureView, t: &Targets, cam: &Camera) -> wgpu::SubmissionIndex {
-        let _compile_scope = pipeline_creation::FrameGuard::enter();
-        self.poll_effect_gpu_costs();
-        let effect_guard = self.effect_profiler.as_ref().and_then(|profiler| profiler.borrow_mut().begin(false));
-        let timed = self.cpu_timings.is_some();
-        let prepare_start = timed.then(std::time::Instant::now);
-        let mut cpu = FrameCpuTimings::default();
-        self.update_liquids(cam.pos);
-        self.update_ground_detail(cam.pos);
-        self.update_lod(cam.pos.x, cam.pos.z);
-        self.step_movers();
-        self.pose_far_away(cam.pos);
-        let mut env = self.env;
-        // Select the projection before local fog evaluation: volumes must never
-        // shorten the camera far plane or change normalized sky geometry.
-        let far = self.lens.far.unwrap_or_else(|| (env.fog_end * 1.1).max(50.0));
-        if self.screen.fog_disabled { env.fog_start=f32::MAX;env.fog_end=f32::MAX; }
-        if let Some(model) = self.fog.as_mut().filter(|_| !self.screen.fog_disabled) {
-            apply_camera_fog(&mut env, model, self.lens, far, cam.pos.to_array(), self.fog_density_scale);
-        }
-        let aspect = t.size.0 as f32 / t.size.1.max(1) as f32;
-        let native_vp = Mat4::perspective_rh(self.lens.vertical_fov(aspect), aspect, self.lens.near, far) * Mat4::look_to_rh(cam.pos, cam.forward(), cam.up());
-        let vp = self.prepare_post_frame(t.size, cam, native_vp, env.fog_color);
+    /// The per-frame uniform block read by the world vertex stage (shared by the faithful path and Enhanced v2's G-buffer pass).
+    fn frame_globals(&mut self, cam: &Camera, env: &Environment, vp: Mat4, far: f32, w: &[f32; 16]) -> Globals {
         let v4 = |c: [f32; 3], w| Vec4::new(c[0], c[1], c[2], w).to_array();
         let g4 = |c: [f32; 3], w| v4(c.map(gamma), w);
-        let w = ao_scene::wave_curves(self.time);
         let (water_color, water_dir) = self.water_light.unwrap_or_default();
         self.sky_dot_counter = (self.sky_dot_counter + 0.01) % 1.0;
         let moon = self.enhanced_moonlight();
-        let mut g = Globals {
+        Globals {
             view_proj: vp.to_cols_array_2d(),
             eye: cam.pos.extend(far).to_array(),
             sun_dir: v4(Vec3::from(env.sun_dir).normalize_or_zero().to_array(), 0.0),
@@ -2941,9 +2922,11 @@ impl Renderer {
             foliage_flags: [f32::from(u8::from(self.enhanced_settings.foliage_sway)), f32::from(u8::from(self.enhanced_settings.foliage_push)), 0.0, 0.0],
             foliage_pushers: [[0.0; 4]; 16],
             foliage_owners: [[0; 4]; 4],
-        };
+        }
+    }
 
-        // Frustum cull per instance (bounding spheres), compacting survivors per mesh.
+    /// Frustum cull per instance (bounding spheres), compacting survivors per mesh; advances the instance ring and poses actors.
+    fn cull_frame(&mut self, cam: &Camera, vp: Mat4) {
         let planes = frustum_planes(&vp);
         self.vis.clear();
         self.vis_src.clear();
@@ -2961,22 +2944,10 @@ impl Renderer {
         }
         self.frame = (self.frame + 1) % INST_RING;
         self.prepare_actors(cam.pos, cam.forward(), &planes);
-        if self.enhanced_settings.needs_interaction_admission() {
-            self.interaction_admission.begin_frame(&self.device);
-            // Match the primary-admission buffer's retained power-of-two actor capacity.
-            let bytes = self.act.interaction_buffer_bytes();
-            let bytes = self.sun_shadows.as_ref().map_or(bytes, |shadows| bytes.max(shadows.actor_visibility.size()));
-            if self.interaction_admission.resize(&self.device, bytes) {
-                self.act.reset_interaction_effects();
-                self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &self.light_buf, &self.light_cells_buf, &self.light_idx_buf, &self.dyn_light_buf, &self.sampler, &self.clamp_sampler, &self.interaction_admission.buffer);
-            }
-        }
-        self.foliage.prepare(cam.pos, vp, self.act.enhanced_grass_actor_ids(env.fog_end.max(env.fog_start + 1e-3))
-            .filter(|id| self.interaction_admission.admitted.contains(id)), self.enhanced_settings.foliage_enabled() || self.enhanced_settings.fluid_smoke);
-        self.foliage_detail_state.prepare(&self.device, self.enhanced_settings.foliage_subdivision);
-        g.foliage_pushers = self.foliage.pushers();
-        g.foliage_owners = self.foliage.owners(|actor| self.act.interaction_slot(actor));
-        self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
+    }
+
+    /// Native submission order of every visible world draw: (priority, distance bucket, list, draw, visible instance).
+    fn sort_draws(&mut self, eye: Vec3) {
         self.sorted.clear();
         for (list, draws) in [&self.gpu.opaque, &self.gpu.blended, &self.gpu.liquid].into_iter().enumerate() {
             for (di, d) in draws.iter().enumerate() {
@@ -2987,46 +2958,17 @@ impl Renderer {
                     let priority = visual_priority(d, key, &self.drawn_visuals).unwrap_or([3, 5, 4][list]);
                     if priority < 0 { continue; }
                     let matrix = Mat4::from_cols_array_2d(&self.gpu.insts[instance].m);
-                    let bucket = actors::render_bucket(matrix.transform_point3(Vec3::from(d.origin)).distance(cam.pos));
+                    let bucket = actors::render_bucket(matrix.transform_point3(Vec3::from(d.origin)).distance(eye));
                     self.sorted.push((priority, bucket, list as u8, di, vi));
                 }
             }
         }
         self.sorted.sort_by(|a, b| actors::bucket_order(a.0, a.1, b.0, b.1)
             .then_with(|| b.4.cmp(&a.4)).then_with(|| a.3.cmp(&b.3)));
-        let water_cloud = self.enhanced_settings.cloud_shadows && self.sorted.iter().any(|draw| draw.2 == 2);
-        let key = variant::Key::of(self.enhanced_settings, self.world.msaa).with_water_cloud(water_cloud);
-        if key != self.world_key {
-            // Both water shapes were warmed before effects became active. This
-            // visibility-only swap must not await a cold native-quality request.
-            self.install_world(key, Default::default(), self.enhanced_settings);
-        }
-        let grass_start = timed.then(std::time::Instant::now);
-        self.prepare_enhanced_grass(cam, vp, env.fog_end.max(env.fog_start + 1e-3), 0.5 * t.size.1 as f32 / (0.5 * self.lens.vertical_fov(aspect)).tan());
-        if let Some(start) = grass_start { cpu.grass_prepare_ms = start.elapsed().as_secs_f64() * 1000.0; }
-        let isolate_sky = self.isolate_sky();
-        self.sky_beauty_only = isolate_sky;
-        if self.enhanced_settings.any_enabled() && self.enhanced_frame.as_ref().is_none_or(|frame| frame.size != t.size || frame.sample_count != self.world.msaa) {
-            self.reset_post_history();
-            self.release_effect_targets();
-            self.bloom = None;
-            self.grade = None;
-            self.enhanced_frame = Some(enhanced::EnhancedFrame::new(&self.device, self.format, t.size, self.world.msaa, self.enhanced_settings, water_cloud, &self.enhanced_pipelines));
-        }
-        if let Some(frame) = self.enhanced_frame.as_mut() {
-            frame.set_water_cloud(&self.device, water_cloud);
-        }
-        self.prepare_water(cam, vp, t.size, env);
-        self.prepare_enhanced_grade(env.fog_color);
-        self.prepare_enhanced_bloom();
-        let encode_start = timed.then(std::time::Instant::now);
-        let mut enc = self.device.create_command_encoder(&Default::default());
-        self.encode_actor_skins(&mut enc);
-        if let Some(buf) = self.gpu.inst_bufs.get(self.frame) {
-            if !self.vis.is_empty() {
-                self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&self.vis));
-            }
-        }
+    }
+
+    /// Advances the animated sky (colour fans, cloud sheets) and writes the camera-relative sky instance transforms; returns the cloud grid.
+    fn update_sky_frame(&mut self, cam: &Camera, env: &Environment, far: f32, w: &[f32; 16]) -> usize {
         for a in &mut self.sky.colors {
             a.sim.frame_at(self.time);
             let lin = |c: u32, shift: u32| srgb_to_linear(((c >> shift & 255) as f32 / 255.0 * a.gain).min(1.0));
@@ -3095,6 +3037,90 @@ impl Renderer {
             self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&xf));
             if self.enhanced_settings.sky_discs { self.sky_disc_transforms.clone_from(&xf); }
         }
+        grid
+    }
+
+    /// Draws one frame into `resolve` (a view of the output texture).
+    pub fn render(&mut self, resolve: &wgpu::TextureView, t: &Targets, cam: &Camera) -> wgpu::SubmissionIndex {
+        if self.enhanced_settings.enhanced_v2 && self.v2_eligible() { return self.render_v2(resolve, t, cam); }
+        let _compile_scope = pipeline_creation::FrameGuard::enter();
+        self.poll_effect_gpu_costs();
+        let effect_guard = self.effect_profiler.as_ref().and_then(|profiler| profiler.borrow_mut().begin(false));
+        let timed = self.cpu_timings.is_some();
+        let prepare_start = timed.then(std::time::Instant::now);
+        let mut cpu = FrameCpuTimings::default();
+        self.update_liquids(cam.pos);
+        self.update_ground_detail(cam.pos);
+        self.update_lod(cam.pos.x, cam.pos.z);
+        self.step_movers();
+        self.pose_far_away(cam.pos);
+        let mut env = self.env;
+        // Select the projection before local fog evaluation: volumes must never
+        // shorten the camera far plane or change normalized sky geometry.
+        let far = self.lens.far.unwrap_or_else(|| (env.fog_end * 1.1).max(50.0));
+        if self.screen.fog_disabled { env.fog_start=f32::MAX;env.fog_end=f32::MAX; }
+        if let Some(model) = self.fog.as_mut().filter(|_| !self.screen.fog_disabled) {
+            apply_camera_fog(&mut env, model, self.lens, far, cam.pos.to_array(), self.fog_density_scale);
+        }
+        let aspect = t.size.0 as f32 / t.size.1.max(1) as f32;
+        let native_vp = Mat4::perspective_rh(self.lens.vertical_fov(aspect), aspect, self.lens.near, far) * Mat4::look_to_rh(cam.pos, cam.forward(), cam.up());
+        let vp = self.prepare_post_frame(t.size, cam, native_vp, env.fog_color);
+        let w = ao_scene::wave_curves(self.time);
+        let mut g = self.frame_globals(cam, &env, vp, far, &w);
+
+        // Frustum cull per instance (bounding spheres), compacting survivors per mesh.
+        self.cull_frame(cam, vp);
+        if self.enhanced_settings.needs_interaction_admission() {
+            self.interaction_admission.begin_frame(&self.device);
+            // Match the primary-admission buffer's retained power-of-two actor capacity.
+            let bytes = self.act.interaction_buffer_bytes();
+            let bytes = self.sun_shadows.as_ref().map_or(bytes, |shadows| bytes.max(shadows.actor_visibility.size()));
+            if self.interaction_admission.resize(&self.device, bytes) {
+                self.act.reset_interaction_effects();
+                self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &self.light_buf, &self.light_cells_buf, &self.light_idx_buf, &self.dyn_light_buf, &self.sampler, &self.clamp_sampler, &self.interaction_admission.buffer);
+            }
+        }
+        self.foliage.prepare(cam.pos, vp, self.act.enhanced_grass_actor_ids(env.fog_end.max(env.fog_start + 1e-3))
+            .filter(|id| self.interaction_admission.admitted.contains(id)), self.enhanced_settings.foliage_enabled() || self.enhanced_settings.fluid_smoke);
+        self.foliage_detail_state.prepare(&self.device, self.enhanced_settings.foliage_subdivision);
+        g.foliage_pushers = self.foliage.pushers();
+        g.foliage_owners = self.foliage.owners(|actor| self.act.interaction_slot(actor));
+        self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
+        self.sort_draws(cam.pos);
+        let water_cloud = self.enhanced_settings.cloud_shadows && self.sorted.iter().any(|draw| draw.2 == 2);
+        let key = variant::Key::of(self.enhanced_settings, self.world.msaa).with_water_cloud(water_cloud);
+        if key != self.world_key {
+            // Both water shapes were warmed before effects became active. This
+            // visibility-only swap must not await a cold native-quality request.
+            self.install_world(key, Default::default(), self.enhanced_settings);
+        }
+        let grass_start = timed.then(std::time::Instant::now);
+        self.prepare_enhanced_grass(cam, vp, env.fog_end.max(env.fog_start + 1e-3), 0.5 * t.size.1 as f32 / (0.5 * self.lens.vertical_fov(aspect)).tan());
+        if let Some(start) = grass_start { cpu.grass_prepare_ms = start.elapsed().as_secs_f64() * 1000.0; }
+        let isolate_sky = self.isolate_sky();
+        self.sky_beauty_only = isolate_sky;
+        if self.enhanced_settings.any_enabled() && self.enhanced_frame.as_ref().is_none_or(|frame| frame.size != t.size || frame.sample_count != self.world.msaa) {
+            self.reset_post_history();
+            self.release_effect_targets();
+            self.bloom = None;
+            self.grade = None;
+            self.enhanced_frame = Some(enhanced::EnhancedFrame::new(&self.device, self.format, t.size, self.world.msaa, self.enhanced_settings, water_cloud, &self.enhanced_pipelines));
+        }
+        if let Some(frame) = self.enhanced_frame.as_mut() {
+            frame.set_water_cloud(&self.device, water_cloud);
+        }
+        self.prepare_water(cam, vp, t.size, env);
+        self.prepare_enhanced_grade(env.fog_color);
+        self.prepare_enhanced_bloom();
+        let encode_start = timed.then(std::time::Instant::now);
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        self.encode_actor_skins(&mut enc);
+        if let Some(buf) = self.gpu.inst_bufs.get(self.frame) {
+            if !self.vis.is_empty() {
+                self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&self.vis));
+            }
+        }
+        let grid = self.update_sky_frame(cam, &env, far, &w);
         if self.enhanced_settings.taa || self.enhanced_settings.motion_blur > 0.0 {
             let previous = self.post_previous_view.map_or(native_vp, |(matrix, _)| matrix);
             self.prepare_motion_vectors(t.size, native_vp, previous);
