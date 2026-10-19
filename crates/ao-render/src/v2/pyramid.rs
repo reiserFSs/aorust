@@ -137,7 +137,7 @@ mod tests {
         for texel in depth.iter_mut().skip(((h - 1) * w) as usize) { *texel = SKY; } // last row is sky
         let (m1, s1) = reduce(&depth, (w, h));
         assert_eq!(s1, (4, 2));
-        assert_eq!(m1[(1 * 4 + 3) as usize], 2.5);
+        assert_eq!(m1[4 + 3], 2.5);
         assert!(m1.iter().all(|&z| z < SKY)); // every block has some geometry
         let (m2, s2) = reduce(&m1, s1);
         assert_eq!(s2, (2, 1));

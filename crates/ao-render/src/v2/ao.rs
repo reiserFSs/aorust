@@ -150,7 +150,8 @@ mod tests {
     fn half_resolution_covers_odd_viewports() {
         assert_eq!((1921u32.div_ceil(2), 1199u32.div_ceil(2)), (961, 600));
         // The shader reads full-res texel min(2 * hp, size - 1): always inside the viewport.
-        assert!((1921 - 1).min(2 * (961 - 1)) <= 1920);
+        let (half, size) = (1921u32.div_ceil(2), 1921u32);
+        assert!((2 * (half - 1)).min(size - 1) < size);
         assert_eq!(pyramid::mip_size((1921, 1199), 1), (960, 599));
     }
 

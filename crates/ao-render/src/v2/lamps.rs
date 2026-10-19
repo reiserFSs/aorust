@@ -231,8 +231,8 @@ impl Renderer {
         let owner_slot = |id: u32| admitted.contains(&id).then(|| self.act.interaction_slot(Some(id))).filter(|&slot| slot != 0 && slot != u32::MAX && (slot as usize) < VISIBILITY_LEN);
         let zone_active = |zone: u32| self.lod.as_ref().is_none_or(|state| state.levels.get(zone as usize).is_some_and(|&level| ao_scene::StatelLod::lights_active(level)));
         lamps.recs.clear();
-        gather(&mut lamps.recs, &Source { packed: &self.light_base, zones: &self.light_zones, owners: &self.static_owners }, &zone_active, owner_slot, view_proj, cam.pos);
-        gather(&mut lamps.recs, &Source { packed: &self.dynamic_packed, zones: &[], owners: &self.dynamic_owners }, &zone_active, owner_slot, view_proj, cam.pos);
+        gather(&mut lamps.recs, &Source { packed: &self.light_base, zones: &self.light_zones, owners: &self.static_owners }, zone_active, owner_slot, view_proj, cam.pos);
+        gather(&mut lamps.recs, &Source { packed: &self.dynamic_packed, zones: &[], owners: &self.dynamic_owners }, zone_active, owner_slot, view_proj, cam.pos);
         keep_nearest(&mut lamps.recs, cam.pos);
         let count = lamps.recs.len() as u32;
         if count > 0 { self.queue.write_buffer(&lamps.lights, 0, bytemuck::cast_slice(&lamps.recs)); }
