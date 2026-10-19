@@ -94,6 +94,9 @@ fn layer_uv(v: &Vertex, index: usize, style: u32, pass: usize, time: f32, edge: 
 impl Renderer {
     /// DS1003b270 stores the inverse bool and invalidates the camera cell.
     pub fn set_realistic_water(&mut self, enabled: bool) { self.realistic_water = enabled; }
+    /// Pref `UseOffscreenSurfaceTechnology` → Randy `1004 1ed1` `SetUseOffscreenTech`. Default off (client default).
+    pub fn set_offscreen_surface_technology(&mut self, enabled: bool) { self.offscreen_surface_technology = enabled; }
+    pub fn offscreen_surface_technology(&self) -> bool { self.offscreen_surface_technology }
 
     pub(super) fn update_liquids(&mut self, camera: Vec3) {
         let wave = ao_scene::wave_curves(self.time);

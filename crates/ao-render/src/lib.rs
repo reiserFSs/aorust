@@ -841,6 +841,8 @@ pub struct Renderer {
     water: water::Water,
     heat_haze: heat_haze::HeatHaze,
     realistic_water: bool,
+    /// Pref `UseOffscreenSurfaceTechnology` (Randy `m_bUseOffscreenTechnology` 1017d333, default 0).
+    offscreen_surface_technology: bool,
     liquid_edge: [f32; 3],
     water_light: Option<([f32; 3], [f32; 3])>,
     sky: SkyGpu,
@@ -1377,6 +1379,7 @@ impl Renderer {
             shadow_timer_pending: false,
             shadow_timer_stage: shadow_pass::ShadowGpuStage::All,
             realistic_water: true,
+            offscreen_surface_technology: false,
             liquid_edge: [0.0; 3],
             water_light: None,
             far_away: vec![],
