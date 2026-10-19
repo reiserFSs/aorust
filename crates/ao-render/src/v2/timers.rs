@@ -45,6 +45,16 @@ impl PassTimers {
         Some(wgpu::ComputePassTimestampWrites { query_set: &self.queries, beginning_of_pass_write_index: Some(begin), end_of_pass_write_index: Some(end) })
     }
 
+    /// One label over several passes (work encoded by code that opens its own passes): put the first writes on a tiny
+    /// pass before that work and the second on a tiny pass after it.
+    pub(super) fn compute_span(&self, name: &'static str) -> Option<(wgpu::ComputePassTimestampWrites<'_>, wgpu::ComputePassTimestampWrites<'_>)> {
+        let (begin, end) = self.slot(name)?;
+        Some((
+            wgpu::ComputePassTimestampWrites { query_set: &self.queries, beginning_of_pass_write_index: Some(begin), end_of_pass_write_index: None },
+            wgpu::ComputePassTimestampWrites { query_set: &self.queries, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(end) },
+        ))
+    }
+
     /// Records the resolve + copy; call once, after every timed pass of the frame, before `finish()`.
     pub(super) fn resolve(&self, enc: &mut wgpu::CommandEncoder) {
         let n = self.names.borrow().len() as u32;

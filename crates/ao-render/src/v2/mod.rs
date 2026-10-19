@@ -5,6 +5,7 @@
 //! -> FX (blended draws) -> post. Everything here reads only the admitted draw lists the faithful path builds.
 mod consts;
 mod gbuffer;
+mod lamps;
 mod post;
 mod resolve;
 mod timers;
@@ -25,6 +26,8 @@ pub(crate) struct V2 {
     resolve: resolve::Resolve,
     post: post::Post,
     consts: wgpu::Buffer,
+    lamps: lamps::Lamps,
+    reserved: lamps::Reserved,
     sized: Option<Sized>,
     timers: Option<timers::PassTimers>,
     frame: u32,
@@ -35,14 +38,18 @@ pub(crate) struct V2 {
 
 impl V2 {
     fn new(r: &Renderer) -> Self {
+        let lamps = lamps::Lamps::new(&r.device);
+        let reserved = lamps::Reserved::new(&r.device);
         Self {
             pipes: gbuffer::Pipes::new(r),
-            resolve: resolve::Resolve::new(&r.device, &[]),
+            resolve: resolve::Resolve::new(&r.device, &[reserved.plugin(), lamps.plugin()]),
             post: post::Post::new(&r.device, r.format),
             consts: r.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("v2 frame constants"), size: std::mem::size_of::<FrameConsts>() as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
             }),
+            lamps,
+            reserved,
             sized: None,
             timers: None,
             frame: 0,
@@ -196,7 +203,8 @@ impl Renderer {
         // [slot 1] actor admission (ids pass + reduction against the G-buffer depth), then [slot 2] shadow maps (sun cascades static
         // + dynamic layer, moon A, lamp cubes; casters from admitted actors only), [slot 3] pyramid + AO (writes the AO texture the
         // resolve reads, flags.y bit 0), [slot 4] light clusters: all encoded here, before the resolve.
-        v2.resolve.encode(&mut enc, &sized.resolve_bind, &[], size, timer.and_then(|t| t.compute("resolve")));
+        let lamps_bind = self.encode_lamps(&mut v2.lamps, &mut enc, timer, &v2.consts, cam, view_proj, [env.fog_start, env.fog_end, far]);
+        v2.resolve.encode(&mut enc, &sized.resolve_bind, &[&v2.reserved.bind, &lamps_bind], size, timer.and_then(|t| t.compute("resolve")));
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("v2 FX"),
