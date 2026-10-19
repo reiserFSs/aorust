@@ -19,7 +19,7 @@ struct FC {
     fog_color: vec4<f32>,    // linear
     fog: vec4<f32>,          // start, end
     grade: vec4<f32>,        // exposure, saturation, contrast, vignette
-    flags: vec4<u32>,        // x frame, y bit0 = AO valid
+    flags: vec4<u32>,        // x frame, y bit0 = AO valid, z = hash of the admitted actor ids (changes when the admission set changes)
 }
 
 // World position of pixel `px` (integer coordinates) with hardware depth `d` (jittered inverse).

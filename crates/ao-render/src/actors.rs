@@ -887,6 +887,12 @@ impl Renderer {
         if smoothing_enabled { self.prepare_actor_smoothing(); }
     }
 
+    /// Actors the host gave this frame that are drawn at all (`ActorFrame::alpha > 1e-5`): the CPU admission set Enhanced v2 builds
+    /// every consumer from (shadow casters, lamp owners, benders, temporal history). A zero-alpha actor is simply absent.
+    pub(crate) fn admitted_actor_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.act.frames.iter().filter(|frame| frame.alpha > 1e-5).map(|frame| frame.id)
+    }
+
     /// Draws a native render list without changing its material pipelines.
     /// With sun shadows enabled, the caller binds the shared receiver at group 3.
     /// Draws a native render list restricted to native distance buckets `buckets` (RViewPort::Render's first/last bucket).

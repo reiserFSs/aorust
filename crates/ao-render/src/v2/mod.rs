@@ -141,6 +141,8 @@ impl Renderer {
             let budget = Vec3::from(m.world_gamma_budget?);
             Some((Vec3::from(m.toward_light).normalize_or_zero(), Vec3::new(0.235, 0.39, 0.55) * 0.4 * (budget.max_element() / 0.2).clamp(0.0, 1.0)))
         });
+        // Order-independent hash of the admitted actor ids; temporal consumers reset when it changes (DESIGN section 8).
+        let admission = self.admitted_actor_ids().fold(0u32, |hash, id| hash ^ id.wrapping_mul(0x9E37_79B9).rotate_left(13));
         let consts = FrameConsts {
             view: view.to_cols_array_2d(),
             view_proj: view_proj.to_cols_array_2d(),
@@ -160,7 +162,7 @@ impl Renderer {
             fog_color: Vec3::from(env.fog_color).extend(0.0).to_array(),
             fog: [env.fog_start, env.fog_end, 0.0, 0.0],
             grade: [1.0, 1.08, 1.05, 0.2],
-            flags: [v2.frame, 0, 0, 0],
+            flags: [v2.frame, 0, admission, 0],
         };
         self.queue.write_buffer(&v2.consts, 0, bytemuck::bytes_of(&consts));
 

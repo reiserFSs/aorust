@@ -35,7 +35,7 @@ pub(crate) struct FrameConsts {
     pub fog: [f32; 4],
     /// exposure, saturation, contrast, vignette.
     pub grade: [f32; 4],
-    /// x = frame counter, y = bit0 AO texture valid, z/w reserved.
+    /// x = frame counter, y = bit0 AO texture valid, z = hash of the admitted actor ids (changes when the set changes), w reserved.
     pub flags: [u32; 4],
 }
 
