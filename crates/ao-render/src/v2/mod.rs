@@ -3,9 +3,11 @@
 //! `Renderer::render` takes exactly one branch into [`Renderer::render_v2`] when `EnhancedSettings::enhanced_v2` is set;
 //! nothing below that branch runs for Original / Classic+. Frame graph (High): [shadows] -> G-buffer -> [AO] -> resolve
 //! -> FX (blended draws) -> post. Everything here reads only the admitted draw lists the faithful path builds.
+mod ao;
 mod consts;
 mod gbuffer;
 mod post;
+mod pyramid;
 mod resolve;
 mod timers;
 
@@ -17,11 +19,15 @@ use glam::{Mat4, Vec3};
 struct Sized {
     targets: gbuffer::Targets,
     resolve_bind: wgpu::BindGroup,
+    pyramid: pyramid::Pyramid,
+    ao: ao::Ao,
     post_bind: wgpu::BindGroup,
 }
 
 pub(crate) struct V2 {
     pipes: gbuffer::Pipes,
+    pyramid: pyramid::Pipes,
+    ao: ao::Pipes,
     resolve: resolve::Resolve,
     post: post::Post,
     consts: wgpu::Buffer,
@@ -37,6 +43,8 @@ impl V2 {
     pub(crate) fn new(r: &Renderer) -> Self {
         Self {
             pipes: gbuffer::Pipes::new(r),
+            pyramid: pyramid::Pipes::new(&r.device),
+            ao: ao::Pipes::new(&r.device),
             resolve: resolve::Resolve::new(&r.device, &[]),
             post: post::Post::new(&r.device, r.format),
             consts: r.device.create_buffer(&wgpu::BufferDescriptor {
@@ -130,9 +138,11 @@ impl Renderer {
 
         if v2.sized.as_ref().is_none_or(|s| s.targets.size != size) {
             let targets = gbuffer::Targets::new(&self.device, size);
-            let resolve_bind = v2.resolve.bind(&self.device, &v2.consts, &targets, None);
+            let pyramid = pyramid::Pyramid::new(&self.device, &v2.pyramid, &v2.consts, &targets);
+            let ao = ao::Ao::new(&self.device, &v2.ao, &v2.consts, &pyramid, &targets);
+            let resolve_bind = v2.resolve.bind(&self.device, &v2.consts, &targets, Some(ao.view()));
             let post_bind = v2.post.bind(&self.device, &v2.consts, &targets.hdr);
-            v2.sized = Some(Sized { targets, resolve_bind, post_bind });
+            v2.sized = Some(Sized { targets, resolve_bind, post_bind, pyramid, ao });
         }
         let sized = v2.sized.as_ref().expect("sized above");
         let look = Look::from_env(&env);
@@ -162,7 +172,7 @@ impl Renderer {
             fog_color: Vec3::from(env.fog_color).extend(0.0).to_array(),
             fog: [env.fog_start, env.fog_end, 0.0, 0.0],
             grade: [1.0, 1.08, 1.05, 0.2],
-            flags: [v2.frame, 0, admission, 0],
+            flags: [v2.frame, 1, admission, 0],
         };
         self.queue.write_buffer(&v2.consts, 0, bytemuck::bytes_of(&consts));
 
@@ -196,6 +206,8 @@ impl Renderer {
         // [slot 1] actor admission (ids pass + reduction against the G-buffer depth), then [slot 2] shadow maps (sun cascades static
         // + dynamic layer, moon A, lamp cubes; casters from admitted actors only), [slot 3] pyramid + AO (writes the AO texture the
         // resolve reads, flags.y bit 0), [slot 4] light clusters: all encoded here, before the resolve.
+        sized.pyramid.encode(&v2.pyramid, &mut enc, timer.and_then(|t| t.compute("hiz")));
+        sized.ao.encode(&v2.ao, &self.queue, &mut enc, timer, admission, jitter != [0.0, 0.0]);
         v2.resolve.encode(&mut enc, &sized.resolve_bind, &[], size, timer.and_then(|t| t.compute("resolve")));
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
