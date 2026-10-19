@@ -203,8 +203,9 @@ pub(super) struct Shadows {
     layout: wgpu::BindGroupLayout,
     pub(super) bind: wgpu::BindGroup,
     frame: u64,
-    /// Diagnostic for the offline harness: forces every static layer to re-render every frame (measures the walking worst case).
-    always_rerender: bool,
+    /// Diagnostic for the offline harness (`AOMAC_V2_SHADOW_RERENDER=<bit mask of layers>`, 0 = off): re-renders those static layers
+    /// every frame to measure the walking worst case per layer.
+    always_rerender: u32,
     marker: Marker,
 }
 
@@ -255,7 +256,7 @@ impl Shadows {
             cache: std::array::from_fn(|_| (StaticCache::default(), Mat4::ZERO)),
             dyn_dirty: [true; LAYERS], commands: Default::default(),
             transforms: Vec::new(), transform_buffer: None, receive, layout, bind, frame: 0,
-            always_rerender: std::env::var_os("AOMAC_V2_SHADOW_RERENDER").is_some(),
+            always_rerender: std::env::var("AOMAC_V2_SHADOW_RERENDER").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             marker: Marker::new(device),
         }
     }
@@ -348,7 +349,7 @@ impl Shadows {
         let mut planes: [[Vec4; 6]; LAYERS] = [[Vec4::ZERO; 6]; LAYERS];
         for layer in 0..LAYERS {
             let Some(matrix) = current[layer] else { continue };
-            due[layer] = self.always_rerender || self.cache[layer].0.due(CADENCE[layer], self.frame, time);
+            due[layer] = self.always_rerender >> layer & 1 != 0 || self.cache[layer].0.due(CADENCE[layer], self.frame, time);
             if due[layer] { planes[layer] = crate::frustum_planes(&matrix); }
         }
         if !due.contains(&true) { return; }
@@ -365,7 +366,7 @@ impl Shadows {
                     time: draw_state.time_alpha.then(|| r.time.to_bits()),
                 })
             }));
-            render[layer] = self.cache[layer].0.update(signature, time) || self.always_rerender;
+            render[layer] = self.cache[layer].0.update(signature, time) || self.always_rerender >> layer & 1 != 0;
             if render[layer] { self.cache[layer].1 = matrix; }
         }
         if !render.contains(&true) { return; }
@@ -464,6 +465,7 @@ impl Shadows {
 
 #[cfg(test)]
 mod tests {
+    use glam::Vec2;
     use super::*;
 
     const FOVY: f32 = 1.0;
@@ -580,5 +582,30 @@ mod tests {
         // 8 mat4 (sun static/dynamic, moon static/dynamic) + 3 vec4, 16-byte aligned for a uniform buffer.
         assert_eq!(std::mem::size_of::<Receive>(), 8 * 64 + 3 * 16);
         assert_eq!(std::mem::size_of::<Receive>() % 16, 0);
+    }
+
+    /// No shimmer under camera yaw/motion: every cascade matrix maps the world onto one fixed texel lattice, so a world point keeps its
+    /// sub-texel position in the depth map whatever the view direction (the static layer rasterises identically after a refresh).
+    #[test]
+    fn cascade_texel_lattice_is_independent_of_yaw_and_position() {
+        let sun = Vec3::new(0.3, 0.7, 0.4).normalize();
+        let probes = [Vec3::new(3.0, 0.5, -7.0), Vec3::new(-41.0, 2.0, 12.5), Vec3::new(100.25, 9.0, 80.0)];
+        let frame_at = |eye: Vec3, yaw: f32| CascadeFrame::new(eye, Vec3::new(yaw.sin(), -0.1, -yaw.cos()).normalize(), Vec3::Y, FOVY, ASPECT, 0.1, 180.0, sun, SUN_RES).unwrap();
+        let texel_phase = |frame: &CascadeFrame, k: usize, p: Vec3| {
+            let uv = Mat4::from_cols_array_2d(&frame.uniform.matrices[k]).project_point3(p).truncate() * 0.5 * SUN_RES as f32;
+            uv - uv.floor()
+        };
+        let base = frame_at(Vec3::new(120.0, 3.0, -40.0), 0.3);
+        for (eye, yaw) in [(Vec3::new(120.0, 3.0, -40.0), 1.9), (Vec3::new(123.7, 3.0, -38.1), -0.8), (Vec3::new(97.3, 5.0, -52.0), 3.0)] {
+            let other = frame_at(eye, yaw);
+            for k in 0..SUN_CASCADES {
+                for p in probes {
+                    let (a, b) = (texel_phase(&base, k, p), texel_phase(&other, k, p));
+                    let d = (a - b).abs();
+                    let d = d.min(Vec2::ONE - d);
+                    assert!(d.max_element() < 0.02, "cascade {k} lattice moved by {d:?} at yaw {yaw}");
+                }
+            }
+        }
     }
 }
