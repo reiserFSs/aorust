@@ -11,8 +11,6 @@
 @group(0) @binding(4) var src2: texture_2d<f32>;
 @group(0) @binding(5) var smp: sampler;
 @group(0) @binding(6) var dst: texture_storage_2d<rgba16float, write>;
-@group(0) @binding(7) var hdrt: texture_2d<f32>;
-@group(0) @binding(8) var<uniform> ctl: Ctl;
 
 // Linear emission peak below LO adds nothing, above HI passes unchanged (pole ~0.05 .. lamp head >= 0.5, measured).
 const KNEE_LO: f32 = 0.12;
@@ -67,16 +65,4 @@ fn up(@builtin(global_invocation_id) id: vec3<u32>) {
         + tap(src, uv + vec2<f32>(-h.x, -h.y)) + tap(src, uv + vec2<f32>(h.x, -h.y)));
     let own = textureLoad(src2, vec2<i32>(id.xy), 0).rgb;
     textureStore(dst, vec2<i32>(id.xy), vec4<f32>(mix(own, s / 12.0, UP_MIX), 1.0));
-}
-
-// HDR + bloom -> full-resolution TAA input. The halo is attenuated by the receiving geometry's native fog
-// transmittance, so a fully fogged pixel never changes (fairness: fog is never thinner, nothing lifts it).
-@compute @workgroup_size(8, 8)
-fn composite(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x >= u32(fc.viewport.x) || id.y >= u32(fc.viewport.y) { return; }
-    let c = vec2<i32>(id.xy);
-    let uv = (vec2<f32>(id.xy) + vec2<f32>(0.5)) * fc.viewport.zw;
-    let t = t_native_depth(textureLoad(deptht, c, 0));
-    let halo = tap(src, uv) * (ctl.bloom * t);
-    textureStore(dst, c, vec4<f32>(textureLoad(hdrt, c, 0).rgb + halo, 1.0));
 }

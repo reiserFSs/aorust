@@ -37,6 +37,22 @@ and never act as occluders (`native_transmittance(z) > 0`). The sampling pattern
 identical frames give bit-identical AO. `ao_up` is a raster pass (R8Unorm cannot be a storage target without extra features): its
 timestamp overlaps neighbouring passes on Metal, read the `frame` row for totals.
 
+Post stack (`motion.rs`, `bloom.rs`, `taa.rs`, `post.rs`, WGSL `motion/bloom/taa/post/post_common.wgsl`):
+- Motion (timer `motion`, only when actors are drawn): admitted opaque/alpha-tested actor items are redrawn with hardware `Equal`
+  against the G-buffer depth and write displayed-pose motion into G2 (previous model + previous displayed vertices per pose; module is
+  nested in `actors.rs` for the private actor layer). G2 = 0 means "static: reproject from depth", >= 32 means "no history".
+- Bloom (timer `bloom`): half-res, 5-level dual filter, threshold-free, seeded ONLY by G3 emission x native transmittance behind a soft
+  knee (0.12..0.45 on the brightest channel, linear): the Newland lamp pole keeps its native look, the head glows. The halo is added in
+  HDR before TAA by the TAA input stage at `EnhancedSettings::bloom_strength` (default 0.6), attenuated by the receiving pixel's
+  `T_native` (a fully fogged pixel never changes).
+- TAA (timer `taa`): Halton-8 jitter, catmull-rom history, 3x3 variance clip, depth-dilated motion, ping-pong RGBA16F history. History
+  is discarded (`taa::history_reset`) on frame 0/resize, camera cut (> 5 m or > 25 deg per frame) and any change of the admitted-actor
+  hash. `AOMAC_V2_NO_TAA=1` (read once at start) disables jitter and accumulation for before/after stills.
+- Post: CAS (`EnhancedSettings::cas_strength`, skipped for `T_native < 0.15`), then the grade; saturation and contrast fade to identity for
+  `T_native < 0.5` so the grade cannot recover fogged contrast (`post::tests::grade_is_contrast_neutral_over_fog`).
+- Regressions (`play/v2_glow.rs`, ignored, GPU lock): lamp pole <= 1.25x Original and head halo; admission flip leaves no history residue
+  (byte-identical frames 2-3); a walking actor leaves no trail; a static camera does not flicker.
+
 ## Harness
 
 `AOMAC_GFX_SETTINGS=v2-high AOMAC_GFX_VIEW=<view> AOMAC_GFX_OUT=<new dir> AOMAC_GFX_PNG_ONLY=1 cargo test --profile fast -p aomac

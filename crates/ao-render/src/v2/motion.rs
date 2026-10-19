@@ -118,9 +118,10 @@ impl ActorMotion {
         }
     }
 
-    /// The G2 pass (always opened, so its timer slot is stable between frames).
-    pub(crate) fn encode(&self, r: &Renderer, enc: &mut wgpu::CommandEncoder, depth: &wgpu::TextureView, g2: &wgpu::TextureView, timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>) {
+    /// The G2 pass; nothing is encoded (and no timer slot taken, `timestamp_writes` is only called when it runs) without actor items.
+    pub(crate) fn encode<'t>(&self, r: &Renderer, enc: &mut wgpu::CommandEncoder, depth: &wgpu::TextureView, g2: &wgpu::TextureView, timestamp_writes: impl FnOnce() -> Option<wgpu::RenderPassTimestampWrites<'t>>) {
         let layer = &r.act;
+        if layer.items.is_empty() { return; }
         for pose in self.poses.values() {
             let control = [0, u32::from(!pose.ready || pose.cut || self.reset), 0, 0];
             r.queue.write_buffer(&pose.uniform, 0, bytemuck::bytes_of(&Uniform {
@@ -131,7 +132,7 @@ impl ActorMotion {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: g2, resolve_target: None, depth_slice: None,
                 ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: depth, depth_ops: None, stencil_ops: None }),
-            timestamp_writes, occlusion_query_set: None, multiview_mask: None,
+            timestamp_writes: timestamp_writes(), occlusion_query_set: None, multiview_mask: None,
         });
         let Some(instances) = layer.bufs.get(r.frame) else { return };
         pass.set_bind_group(0, &r.globals_bg, &[]);

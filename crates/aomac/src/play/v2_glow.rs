@@ -44,15 +44,15 @@ fn render_sequence(view: &View, settings: ao_render::EnhancedSettings, model: Op
     off.host.enhanced_settings = Some(settings);
     off.host.grass_exposure = Some(view.exposure.clone());
     off.host.grass_wind = ao_formats::weather::State::clear().wind;
+    // The scene upload of the first frame resets actors: load the world first, then hand over the model.
+    off.frame(&mut shot, 0.0);
+    off.warm_grass_tiles();
+    off.wait_for_pipeline_warmup();
     if let Some(model) = model { off.host.actor_models.push((super::super::avatar::MODEL_KEY, model.clone())); }
     let mut frames = Vec::new();
-    for (index, step) in steps.iter().enumerate() {
+    for step in steps {
         if let Some(frame) = step { off.host.actors.push(frame.clone()); }
         let list = off.frame(&mut shot, 0.0);
-        if index == 0 {
-            off.warm_grass_tiles();
-            off.wait_for_pipeline_warmup();
-        }
         frames.push(off.rgba(&shot, &list)?);
     }
     Ok(frames)

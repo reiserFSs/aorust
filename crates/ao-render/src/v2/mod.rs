@@ -168,8 +168,8 @@ impl Renderer {
             let pyramid = pyramid::Pyramid::new(&self.device, &v2.pyramid, &v2.consts, &targets);
             let ao = ao::Ao::new(&self.device, &v2.ao, &v2.consts, &pyramid, &targets);
             let resolve_bind = v2.resolve.bind(&self.device, &v2.consts, &targets, Some(ao.view()));
-            let bloom = v2.bloom.bind(&self.device, &v2.consts, &v2.ctl, &targets);
-            let taa = v2.taa_pass.bind(&self.device, &v2.consts, &v2.ctl, &bloom.comp, &targets);
+            let bloom = v2.bloom.bind(&self.device, &v2.consts, &targets);
+            let taa = v2.taa_pass.bind(&self.device, &v2.consts, &v2.ctl, &bloom.halo, &targets);
             let post_binds = [0, 1].map(|k| v2.post.bind(&self.device, &v2.consts, &v2.ctl, &taa.hist[1 - k], &targets.depth));
             v2.sized = Some(Sized { targets, resolve_bind, pyramid, ao, bloom, taa, post_binds });
             v2.taa_key = None;
@@ -263,7 +263,7 @@ impl Renderer {
             calls += self.v2_draw_fx(&mut pass, &v2.pipes.fx);
         }
         // [slot 5a] actor motion into G2, then bloom (seeded by G3 only; writes HDR + halo), [slot 5b] TAA, then post (CAS + grade).
-        v2.motion.encode(self, &mut enc, &targets.depth, &targets.g2, timer.and_then(|t| t.render("motion")));
+        v2.motion.encode(self, &mut enc, &targets.depth, &targets.g2, || timer.and_then(|t| t.render("motion")));
         v2.bloom.encode(&mut enc, &sized.bloom, timer.and_then(|t| t.compute("bloom")));
         v2.taa_pass.encode(&mut enc, &sized.taa, v2.taa_index, size, timer.and_then(|t| t.compute("taa")));
         v2.post.encode(&mut enc, &sized.post_binds[v2.taa_index], resolve, timer.and_then(|t| t.render("post")));

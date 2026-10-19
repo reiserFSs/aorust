@@ -867,7 +867,7 @@ impl Renderer {
         if !xf.is_empty() {
             self.queue.write_buffer(&layer.bufs[self.frame], 0, bytemuck::cast_slice(&xf));
         }
-        if self.enhanced_settings.taa || self.enhanced_settings.motion_blur > 0.0 {
+        if self.enhanced_settings.taa || self.enhanced_settings.motion_blur > 0.0 || self.enhanced_settings.enhanced_v2 {
             layer.motion_instances = xf;
         } else {
             layer.motion_instances.clear();
