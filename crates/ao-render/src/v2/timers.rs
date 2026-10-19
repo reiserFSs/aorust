@@ -115,7 +115,9 @@ impl Marker {
         }).create_view(&Default::default()))
     }
 
+    /// Does nothing without timestamps (timing disabled), so production frames carry no marker passes.
     pub(super) fn pass(&self, enc: &mut wgpu::CommandEncoder, timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>) {
+        if timestamp_writes.is_none() { return; }
         drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("v2 timer marker"), color_attachments: &[],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &self.0,

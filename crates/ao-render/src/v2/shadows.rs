@@ -23,8 +23,8 @@ use std::ops::Range;
 const SUN_CASCADES: usize = 3;
 const LAYERS: usize = SUN_CASCADES + 1; // + moon A
 const SUN_RES: u32 = 2048;
-/// Dynamic (actor) layers are cleared every frame, so they are cheaper than the cached world layers; texels stay under 3 cm in cascade 0.
-const SUN_DYN_RES: u32 = 2048;
+/// Dynamic (actor) layers are cleared and stored every frame, so they are a quarter of the cached world layers' size (4 cm texels in cascade 0).
+const SUN_DYN_RES: u32 = 1024;
 const MOON_RES: u32 = 1024;
 const MOON_DYN_RES: u32 = 1024;
 /// The sun cascades never reach beyond this, whatever the lens far plane (as v1).
