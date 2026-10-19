@@ -1901,6 +1901,73 @@ fn graphics_fixture_snapshot_keys_share_only_matching_playfield_and_time() -> an
     Ok(())
 }
 
+/// Newland street lamps are one fully self-lit material (pole and head). Modern's emissive glare used to
+/// add the dull-brown pole's own colour back on top of itself (pole ~1.6x Original); the head must still glow.
+#[test]
+#[ignore = "offline Modern lamp regression; requires installed client and the GPU timing lock"]
+fn graphics_modern_newland_lamp_pole_stays_native_and_head_glows() -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    let dir = ao_gui::client_dir();
+    let store = ao_rdb::RecordStore::open(&dir)?;
+    let weather = ao_formats::weather::State::clear();
+    let size = (1920u32, 1200u32);
+    let actor = graphics_fixture_actor()?;
+    let luma = |rgba: &[u8], at: &dyn Fn(usize, usize) -> bool| {
+        let (mut sum, mut count) = (0.0, 0.0);
+        for y in 0..size.1 as usize { for x in 0..size.0 as usize {
+            if !at(x, y) { continue; }
+            let p = &rgba[(y * size.0 as usize + x) * 4..];
+            sum += 0.2126 * f64::from(p[0]) + 0.7152 * f64::from(p[1]) + 0.0722 * f64::from(p[2]);
+            count += 1.0;
+        } }
+        sum / count
+    };
+    for name in ["newland-day", "newland-night"] {
+        let (_, pf, time, _) = graphics_fixture_views(&actor).into_iter().find(|view| view.0 == name).context("view")?;
+        ao_scene::crt_srand(1);
+        let (mut scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
+        let collision = ao_formats::playfield::collision::Collision::load(&store, pf)?;
+        super::player::bake_sky_open(&collision, &mut scene);
+        let fixed = graphics_fixture_newland_camera(|point| collision.terrain_height(point))?;
+        let exposure = super::player::grass_exposure_surface(std::rc::Rc::new(std::cell::RefCell::new(collision)));
+        let render = |profile: &str| -> anyhow::Result<Vec<u8>> {
+            ao_scene::crt_srand(1);
+            let mut lens = camera::lens(scene.lens.unwrap_or_default(), false);
+            lens.far = Some(camera::far_plane(camera::VIEW_DISTANCE));
+            let mut shot = Shot { gui: Gui::new(&dir, None)?, scene: Some(scene.clone()), camera: fixed, lens };
+            let mut off = Offscreen::evidence(&shot, size)?;
+            off.fixed_camera(Some(fixed));
+            off.host.msaa_samples = Some(1);
+            off.host.anisotropy = Some(1);
+            off.host.enhanced_settings = Some(graphics_fixture_settings(profile)?);
+            off.host.grass_exposure = Some(exposure.clone());
+            off.host.grass_wind = weather.wind;
+            let list = off.frame(&mut shot, 0.0);
+            off.warm_grass_tiles();
+            off.wait_for_pipeline_warmup();
+            off.rgba(&shot, &list)
+        };
+        let original = render("Original")?;
+        let modern = render("Modern")?;
+        // Pole: the dark (< 75 luma) Original pixels of the screen box holding the foreground lamp pole.
+        let pole = |x: usize, y: usize| {
+            (1300..1700).contains(&x) && (400..850).contains(&y) && {
+                let p = &original[(y * size.0 as usize + x) * 4..];
+                0.2126 * f64::from(p[0]) + 0.7152 * f64::from(p[1]) + 0.0722 * f64::from(p[2]) < 75.0
+            }
+        };
+        let head = |x: usize, y: usize| (490..570).contains(&x) && (205..265).contains(&y);
+        let (pole_original, pole_modern) = (luma(&original, &pole), luma(&modern, &pole));
+        let (head_original, head_modern) = (luma(&original, &head), luma(&modern, &head));
+        // Bound 1.25: Modern's HDR exposure/grade legitimately lifts a lit pole by ~1.17x (measured with
+        // glare off); the bug measured 1.58x (day) / 1.24x-and-golden (night), i.e. self-added glare.
+        ensure!(pole_modern <= 1.25 * pole_original, "{name}: pole {pole_modern:.1} vs Original {pole_original:.1}");
+        // The authored lamp head keeps its glow: measured 1.29x (day) / 1.20x (night).
+        ensure!(head_modern >= 1.10 * head_original, "{name}: head {head_modern:.1} vs Original {head_original:.1}");
+    }
+    Ok(())
+}
+
 /// Night lighting may exceed faithful; fog extinction and non-admitted actor isolation may not.
 #[test]
 #[ignore = "offline night fog/admission regression; requires installed client and a new AOMAC_GFX_OUT"]

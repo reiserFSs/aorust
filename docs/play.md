@@ -3272,3 +3272,15 @@ replica across the three inspected motion poses. The visible before/after
 sheet shows gentler body/head contours while weapons retain their original
 topology. Retained PNGs/strips/CSV/report:
 `~/aomac-handoff/gfx/parity/CharSmooth/synthetic60/`.
+
+## Newland lamp pole under Modern bloom
+
+Bisect (Modern, `newland-day`; luma of the pole vs Original 45.5): bloom off 53.4, HDR off 64.2, everything else
+(clustered lighting, specular, grading, local shadows, AO, night mode) ≈ 72.9, full Modern 71.8. The street lamp is one
+fully self-lit material (emissive floor >= 1 on pole and head, Randy SetMaterial 1004b199), so the pole's dull-brown
+colour was seeded as glare and added back onto itself. `bloom.wgsl` `seed_at` now scales the authored emission by
+`smoothstep(0.35, 0.7, peak channel)`: dim self-lit surfaces (pole peak 0.1-0.2) keep their native look, bright heads,
+windows and neon (peak ~1) glow unchanged. Pole luma Modern/Original: 1.58 -> 1.16 (day), 1.24 -> 1.02 (night); head 1.29/1.20.
+Regression: `graphics_modern_newland_lamp_pole_stays_native_and_head_glows` (ignored, installed client; pole <= 1.25x Original
+because Modern's exposure/grade alone lifts it 1.17x, head >= 1.10x). Borealis lightbar night / ICC platform frames unchanged.
+Sheets: `~/aomac-handoff/gfx/lampglow/`.

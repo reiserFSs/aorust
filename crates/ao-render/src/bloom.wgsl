@@ -15,6 +15,8 @@ const KNEE: f32 = 0.03125;
 const HIGHLIGHT_GAIN: f32 = 3.0;
 // Share of a level's output taken from the coarser, wider level.
 const UP_MIX: f32 = 0.6;
+const EMISSION_KNEE_LOW: f32 = 0.35;
+const EMISSION_KNEE_HIGH: f32 = 0.7;
 @vertex fn fullscreen(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
     let p = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
     return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
@@ -23,7 +25,11 @@ const UP_MIX: f32 = 0.6;
 fn seed_at(q: vec2<i32>) -> vec4<f32> {
     let dims = vec2<i32>(textureDimensions(fine));
     if any(q < vec2<i32>(0)) || any(q >= dims) { return vec4<f32>(0.0); }
-    let emission = max(textureLoad(fine, q, 0).rgb, vec3<f32>(0.0));
+    let emitted = max(textureLoad(fine, q, 0).rgb, vec3<f32>(0.0));
+    // A self-lit material floor (Newland lamp pole: whole mesh emissive, dull brown albedo) radiates only its
+    // own dim colour; glare needs radiance. Soft knee on the authored emission's peak channel, so dull
+    // self-lit surfaces keep their native look and bright lamp heads, windows and neon glow unchanged.
+    let emission = emitted * smoothstep(EMISSION_KNEE_LOW, EMISSION_KNEE_HIGH, max(emitted.r, max(emitted.g, emitted.b)));
     let colour = max(textureLoad(seed, q, 0).rgb, vec3<f32>(0.0));
     var rgb = min(emission, min(colour, vec3<f32>(1.0)));
     var a = 0.0;
