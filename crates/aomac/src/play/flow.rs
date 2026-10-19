@@ -1768,6 +1768,7 @@ impl Frontend for Play {
                 host.spaceships_shown = h.dvalues.prefs.get_int("IsSpaceShipsShown", super::dvalue::Kind::Char).unwrap_or(1) != 0;
                 host.smooth_animations = h.dvalues.prefs.get_int("SmoothAnimations", super::dvalue::Kind::Login).unwrap_or(1) != 0;
                 host.realistic_water = h.dvalues.prefs.get_int("RealisticWater", super::dvalue::Kind::Login).unwrap_or(1) != 0;
+                host.offscreen_surface_technology = h.dvalues.prefs.get_int("UseOffscreenSurfaceTechnology", super::dvalue::Kind::Char).unwrap_or(0) != 0;
                 host.cloud_preferences = Some((
                     h.dvalues.prefs.get_int("RealisticClouds", super::dvalue::Kind::Login).unwrap_or(1) != 0,
                     h.dvalues.prefs.get_int("SimpleClouds", super::dvalue::Kind::Login).unwrap_or(1) != 0,

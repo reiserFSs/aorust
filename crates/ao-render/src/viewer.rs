@@ -83,6 +83,8 @@ pub struct Host {
     pub previous_visible_actors: HashSet<u32>,
     /// Live native liquid subdivision preference, not a liquid visibility switch.
     pub realistic_water: bool,
+    /// Character preference `UseOffscreenSurfaceTechnology` (DisplaySystem 0x10078843 -> Randy 0x10041ed1), live.
+    pub offscreen_surface_technology: bool,
     /// EnvPrefs15/16, consumed by both the real viewer and offscreen harness.
     pub cloud_preferences: Option<(bool, bool)>,
     /// Native terrain quality / full-quality-radius DValues; consumed on the next frame.
@@ -272,7 +274,7 @@ impl Host {
         let effect_gpu_error = None;
         let enhanced_requested = None;
         let enhanced_runtime_suspended = false;
-        Host { effect_gpu_profiling_suppressed: false, enhanced_suspended, effect_gpu_overlay, slow_frame_log, effect_gpu_costs, effect_gpu_error, enhanced_requested, enhanced_runtime_suspended, weather_input: Default::default(), post_focus: None, grade_lut_root, camera_underwater: None, enhanced_settings: None, enhanced_switch: None, grass_wind: [0.0; 3], grass_exposure: None, grass_benders: vec![], actor_visual_resets: vec![], actor_visual_retirements: vec![], pointer_warp: None, smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
+        Host { effect_gpu_profiling_suppressed: false, enhanced_suspended, effect_gpu_overlay, slow_frame_log, effect_gpu_costs, effect_gpu_error, enhanced_requested, enhanced_runtime_suspended, weather_input: Default::default(), post_focus: None, grade_lut_root, camera_underwater: None, enhanced_settings: None, enhanced_switch: None, grass_wind: [0.0; 3], grass_exposure: None, grass_benders: vec![], actor_visual_resets: vec![], actor_visual_retirements: vec![], pointer_warp: None, smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, offscreen_surface_technology: false, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -816,6 +818,7 @@ impl State {
         }
         self.renderer.set_spaceships_shown(g.host.spaceships_shown);
         self.renderer.set_realistic_water(g.host.realistic_water);
+        self.renderer.set_offscreen_surface_technology(g.host.offscreen_surface_technology);
         if let Some((realistic,simple))=g.host.cloud_preferences.take() {self.renderer.set_cloud_preferences(realistic,simple,false);}
         if let Some((quality, radius)) = g.host.ground_detail.take() {
             self.renderer.set_ground_detail(quality, radius);
@@ -1532,6 +1535,7 @@ impl Offscreen {
         }
         self.r.set_spaceships_shown(self.host.spaceships_shown);
         self.r.set_realistic_water(self.host.realistic_water);
+        self.r.set_offscreen_surface_technology(self.host.offscreen_surface_technology);
         if let Some((realistic,simple))=self.host.cloud_preferences.take() {self.r.set_cloud_preferences(realistic,simple,false);}
         self.r.settle_enhanced_world();
         if !self.targets.matches_renderer(&self.r) {
@@ -1777,6 +1781,10 @@ mod tests {
     #[test]
     fn mouse_lag_fix_defaults_to_no_gpu_barrier() {
         assert!(!Host::headless().mouse_lag_fix);
+    }
+    #[test]
+    fn offscreen_surface_technology_defaults_off() {
+        assert!(!Host::headless().offscreen_surface_technology);
     }
     #[test]
     fn vertical_sync_preference_selects_the_surface_present_mode() {

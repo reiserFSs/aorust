@@ -58,6 +58,7 @@ client's `prefs/` (the install is read-only). `SaveUserConfig` 0x10067f57 saves 
   **`ViewDistance 0.8 (0..1)`**; then one `InitDefaultInt(key, default, 0, 999999999)` per `InputConfig_t` hot key that has a `KEY_` id (28, `options/keys.rs` `FIXED`; ported, `Login.cfg` ints `KEY_NAME <key|mods>`, applied by `LoadKeyboard` 0x1012488b; docs/gui.md "Hot key pages"). `SetDefaultCharPrefs` `[GUI 0x1012447a]`: `IsFirstTime 1`,
   `ShowDropItemDialog 1`, `IsOrgNameShownOverHead 1`, `IsSpaceShipsShown 1`, `BuildMenuX/Y 0 (0..9999)`, `BuildMenuCX/CY 0 (0..1000)`, `IsFactionTitleShown 1`, `WaitForVertSync 0`, `MouseLagFix 0`,
   `UseOffscreenSurfaceTechnology 0`, `FadeCharacter 1`, floats `FadeCharacterStartDist 1.5 (0.1..10)`, `FadeCharacterEndDist 0.7 (0.1..10)`, `FadeCharacterEndAlpha 0.15 (0..1)`.
+  `UseOffscreenSurfaceTechnology` drives live rendering (Video option `#OffscreSurfaceTechnol`; Randy 0x10041ed1), superseding "no artificial visual toggle".
 
 ## 4. The commands `[GUI]`
 

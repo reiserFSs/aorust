@@ -285,6 +285,11 @@ fn window_opens_with_the_stored_values_and_clicks_write_them_back() {
     assert!(!r.gui.checked(r.win(), &c));
     r.click(&c);
     assert_eq!(r.d.prefs.get_int("MouseLagFix", Kind::Char), Some(1));
+    // Video tab check `#OffscreSurfaceTechnol`: char int pref, default off, written live by the click (flow.rs forwards it each frame)
+    let c = r.show("UseOffscreenSurfaceTechnology");
+    assert!(!r.gui.checked(r.win(), &c));
+    r.click(&c);
+    assert_eq!(r.d.prefs.get_int("UseOffscreenSurfaceTechnology", Kind::Char), Some(1));
     // bit of an int: `VisualFlags` bit 2 (helmet) is set in the default 31
     let bit = r.opt.win.as_ref().unwrap().controls.iter().find(|c| c.opt.var == "VisualFlags" && c.opt.bit == Some(2)).unwrap().name.clone();
     r.show("VisualFlags");
