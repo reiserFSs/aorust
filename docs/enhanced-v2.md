@@ -102,7 +102,7 @@ idle here (with an actor: shadows +0.26..0.35 ms, M2 numbers above).
 | admission | (in shadows) | none | 0.02 / 0.00 | no actors in the view |
 | hiz | 0.09 | 0.054 / 0.054 | not switchable (AO input) | span is the pass |
 | ao + ao_denoise + ao_up | 0.83 | 0.30+0.13 / 0.28+0.12; `ao_up` 0.91 / 0.90 | **0.48 / 0.41** | `ao_up` is a raster span that overlaps neighbours; use the delta |
-| cube atlas (`cube`) | 0.25 | 0.10 / 0.22 | 0.03 / 0.10 | atlas skipped once resident |
+| cube atlas (`cube`) | 0.40 (was 0.25; raised by decision 2026-10-20) | 0.10 / 0.22; about 0.35 with a carried light | 0.03 / 0.10 | atlas skipped once resident. With a carried light the actor's bounding sphere reaches all 6 cube faces and v1 encodes one face pass per face per frame, about 50 us each (6 x 50 us = 0.30 ms plus the cache); only the GPU knows which faces rebuild, so the CPU cannot skip them safely. Accepted: whole frames are 2.0-2.6 ms against 5.7 |
 | clusters | 0.05 | 0.005 / 0.012 | not switchable | span is the pass |
 | resolve (incl. shadow/lamp taps) | 0.74 | 0.19 / 0.28 | shadows taps: 0.05 / 0.05 | |
 | fx | (0.20 + water) | 0.25 / 0.41 | not switchable | canopy cards on Newland |
