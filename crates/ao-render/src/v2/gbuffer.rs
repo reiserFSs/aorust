@@ -115,8 +115,9 @@ fn compile(device: &wgpu::Device, shader: &wgpu::ShaderModule, layouts: &[wgpu::
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            // The sky never writes depth: depth == 1 is how every consumer recognises "no geometry".
-            format: DEPTH, depth_write_enabled: Some(depth_write && class != Class::Sky), depth_compare: Some(compare), stencil: Default::default(),
+            // Sky layers that write depth in the native path (`flip_depth`) keep doing so: they occlude geometry beyond the dome. The
+            // `skyfix` pass then resets depth to 1 wherever no surface was written (depth == 1 means "no geometry" for every consumer).
+            format: DEPTH, depth_write_enabled: Some(depth_write), depth_compare: Some(compare), stencil: Default::default(),
             bias: if bias { wgpu::DepthBiasState { constant: -1, slope_scale: 0.0, clamp: 0.0 } } else { Default::default() },
         }),
         multisample: Default::default(),

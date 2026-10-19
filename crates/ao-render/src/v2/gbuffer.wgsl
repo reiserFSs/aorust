@@ -17,7 +17,7 @@ fn g_pack(albedo_g: vec3<f32>, flags: u32, n: vec3<f32>, aux: f32, emission: vec
     var o: GOut;
     o.sky = vec4<f32>(0.0);
     o.g0 = vec4<f32>(albedo_g, f32(flags) / 255.0);
-    o.g1 = vec4<f32>(oct_encode(n), aux, 0.0);
+    o.g1 = vec4<f32>(oct_encode(n), aux, 1.0); // a = 1 marks a written surface (skyfix.wgsl)
     o.g2 = vec4<f32>(0.0);
     o.g3 = vec4<f32>(emission, 0.0);
     return o;

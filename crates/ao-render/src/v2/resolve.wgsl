@@ -61,7 +61,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     var ambient = mix(fc.ground_ambient.rgb, fc.sky_ambient.rgb, n.y * 0.5 + 0.5);
     if (flags & MF_GROUND) != 0u { ambient *= g1.b * 2.0; } // baked terrain lightmap share
-    light += ambient * ao;
+    // Shade never falls below the native device ambient (flags.w, 3 x 10 bit): AO and the baked terrain lightmap only darken
+    // the part above that floor.
+    let w = fc.flags.w;
+    let native_ambient = vec3<f32>(f32(w & 1023u), f32((w >> 10u) & 1023u), f32((w >> 20u) & 1023u)) / 1023.0;
+    // Terrain also carries the native lightmap's own fill (the original multiplies it on top of the device ambient): 1.5x floor.
+    light += max(ambient * ao, native_ambient * select(1.0, 1.5, (flags & MF_GROUND) != 0u));
 
     var col = albedo * light + spec + emission;
     // Lamp radiance (already multiplied by albedo, with its GGX highlight): authored lights, cluster list, cube taps.
