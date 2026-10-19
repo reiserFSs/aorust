@@ -3,11 +3,15 @@
 //! `Renderer::render` takes exactly one branch into [`Renderer::render_v2`] when `EnhancedSettings::enhanced_v2` is set;
 //! nothing below that branch runs for Original / Classic+. Frame graph (High): [shadows] -> G-buffer -> [AO] -> resolve
 //! -> FX (blended draws) -> post. Everything here reads only the admitted draw lists the faithful path builds.
+mod admission;
 mod consts;
 mod gbuffer;
 mod post;
 mod resolve;
+mod shadows;
 mod timers;
+
+pub(crate) use admission::item_slots;
 
 use crate::{Camera, Renderer, Targets};
 use consts::FrameConsts;
@@ -24,6 +28,8 @@ pub(crate) struct V2 {
     pipes: gbuffer::Pipes,
     resolve: resolve::Resolve,
     post: post::Post,
+    admission: admission::Admission,
+    shadows: shadows::Shadows,
     consts: wgpu::Buffer,
     sized: Option<Sized>,
     timers: Option<timers::PassTimers>,
@@ -35,10 +41,17 @@ pub(crate) struct V2 {
 
 impl V2 {
     fn new(r: &Renderer) -> Self {
+        let admission = admission::Admission::new(r);
+        let shadows = shadows::Shadows::new(r, admission.visibility());
+        let plugins = [
+            shadows.plugin(),
+        ];
         Self {
             pipes: gbuffer::Pipes::new(r),
-            resolve: resolve::Resolve::new(&r.device, &[]),
+            resolve: resolve::Resolve::new(&r.device, &plugins),
             post: post::Post::new(&r.device, r.format),
+            admission,
+            shadows,
             consts: r.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("v2 frame constants"), size: std::mem::size_of::<FrameConsts>() as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
@@ -193,10 +206,16 @@ impl Renderer {
             });
             calls += self.v2_draw_g(&mut pass, &v2.pipes.g, grid);
         }
-        // [slot 1] actor admission (ids pass + reduction against the G-buffer depth), then [slot 2] shadow maps (sun cascades static
-        // + dynamic layer, moon A, lamp cubes; casters from admitted actors only), [slot 3] pyramid + AO (writes the AO texture the
-        // resolve reads, flags.y bit 0), [slot 4] light clusters: all encoded here, before the resolve.
-        v2.resolve.encode(&mut enc, &sized.resolve_bind, &[], size, timer.and_then(|t| t.compute("resolve")));
+        // [slot 1] actor admission: only this frame's actors (alpha > 0) are drawn into an id target depth-tested against the G-buffer
+        // depth and reduced to `v2.admission.visibility()` (layout in admission.rs), read by the actor shadow layers and by lamps.
+        v2.admission.encode(self, &mut enc, &targets.depth, size, timer);
+        // [slot 2] shadow maps: sun cascades + moon A, a cached static layer (world only) and a per-frame actor layer each.
+        let light = |dir: Vec3| shadows::Light { dir, strength: crate::sun_shadows::horizon_fade(dir.y) };
+        let shadow_view = shadows::View { eye: cam.pos, forward: cam.forward(), up: cam.up(), fovy: self.lens.vertical_fov(aspect), aspect,
+            near: self.lens.near, far, fog_end: env.fog_end, time: self.time };
+        v2.shadows.encode(self, &mut enc, &shadow_view, (look.sun_up > 0.5).then(|| light(look.sun)), moon.map(|(dir, _)| light(dir)), &v2.admission, timer);
+        // [slot 3] pyramid + AO (writes the AO texture the resolve reads, flags.y bit 0), [slot 4] light clusters: encoded here too.
+        v2.resolve.encode(&mut enc, &sized.resolve_bind, &[&v2.shadows.bind], size, timer.and_then(|t| t.compute("resolve")));
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("v2 FX"),

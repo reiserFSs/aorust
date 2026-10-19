@@ -483,7 +483,7 @@ use bytemuck::Zeroable;
 
 
 // These are exactly the descriptor fields that vary between eligible slots.
-fn pipeline_key(spec: super::PipelineSpec, primary: bool) -> Option<(bool, bool, bool, bool, wgpu::CompareFunction, bool)> {
+pub(crate) fn pipeline_key(spec: super::PipelineSpec, primary: bool) -> Option<(bool, bool, bool, bool, wgpu::CompareFunction, bool)> {
     use super::Blend;
     if primary {
         let base_write = spec.sprite || matches!(spec.blend, Blend::Opaque | Blend::AlphaTest);

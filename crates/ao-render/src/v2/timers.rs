@@ -45,6 +45,12 @@ impl PassTimers {
         Some(wgpu::ComputePassTimestampWrites { query_set: &self.queries, beginning_of_pass_write_index: Some(begin), end_of_pass_write_index: Some(end) })
     }
 
+    /// One label over several consecutive passes: give the first pass `begin_*` and the last `end_*`.
+    pub(super) fn span(&self, name: &'static str) -> Option<Span<'_>> {
+        let (begin, end) = self.slot(name)?;
+        Some(Span { queries: &self.queries, begin, end })
+    }
+
     /// Records the resolve + copy; call once, after every timed pass of the frame, before `finish()`.
     pub(super) fn resolve(&self, enc: &mut wgpu::CommandEncoder) {
         let n = self.names.borrow().len() as u32;
@@ -75,5 +81,24 @@ impl PassTimers {
         };
         self.readback.unmap();
         Ok(out)
+    }
+}
+
+/// Timestamp indices of one [`PassTimers::span`]: the label's time is first pass begin -> last pass end.
+pub(super) struct Span<'a> {
+    queries: &'a wgpu::QuerySet,
+    begin: u32,
+    end: u32,
+}
+
+impl Span<'_> {
+    pub(super) fn begin_render(&self) -> wgpu::RenderPassTimestampWrites<'_> {
+        wgpu::RenderPassTimestampWrites { query_set: self.queries, beginning_of_pass_write_index: Some(self.begin), end_of_pass_write_index: None }
+    }
+    pub(super) fn begin_compute(&self) -> wgpu::ComputePassTimestampWrites<'_> {
+        wgpu::ComputePassTimestampWrites { query_set: self.queries, beginning_of_pass_write_index: Some(self.begin), end_of_pass_write_index: None }
+    }
+    pub(super) fn end_compute(&self) -> wgpu::ComputePassTimestampWrites<'_> {
+        wgpu::ComputePassTimestampWrites { query_set: self.queries, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(self.end) }
     }
 }
