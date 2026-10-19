@@ -133,12 +133,13 @@ impl Look {
         Self {
             sun,
             sun_up: if up > 0.0 { 1.0 } else { 0.0 },
-            // Warmer and brighter key than authored (DESIGN 4.2), cool shade fill, warm ground bounce.
+            // Warmer and brighter key than authored (DESIGN 4.2). The hemisphere fill keeps the AUTHORED ambient hue: a blue/orange tint on
+            // it rotated every shaded surface (ICC platform hull +12 deg from Original); only its brightness is lifted (x1.4 sky, x1.3 ground).
             sun_color: Vec3::from(env.sun_color) * 1.2 * up,
             // The shade floor: the native device ambient (resolve.wgsl `light += max(ambient * ao, floor)`), 3 x 10 bit in flags.w.
             native_ambient_packed: pack_unorm3(ambient),
-            sky_ambient: ambient * Vec3::new(1.15, 1.45, 1.9),
-            ground_ambient: ambient * Vec3::new(1.7, 1.25, 1.0),
+            sky_ambient: ambient * 1.42,
+            ground_ambient: ambient * 1.33,
         }
     }
 }

@@ -2091,7 +2091,7 @@ fn graphics_v2_icc_sea_matches_original() -> anyhow::Result<()> {
     };
     let hue_gap = |a: f64, b: f64| { let d = (a - b).abs() % 360.0; d.min(360.0 - d) };
     // Open sea and the horizon haze band (left of the platform, above the open sea).
-    for (name, rect) in [("open sea", (650, 980, 720, 900)), ("horizon", (250, 900, 640, 690)), ("cloud mesh", (250, 900, 480, 630))] {
+    for (name, rect) in [("open sea", (650, 980, 720, 900)), ("horizon", (250, 900, 640, 690)), ("cloud mesh", (250, 900, 480, 630)), ("platform hull", (1000, 1500, 380, 560))] {
         let (o, v) = (mean_hue(&original, rect.0, rect.1, rect.2.min(rect.3), rect.2.max(rect.3)), mean_hue(&v2_image, rect.0, rect.1, rect.2.min(rect.3), rect.2.max(rect.3)));
         eprintln!("ICC_HUE {name}: original {o:.1} v2 {v:.1}");
         ensure!(hue_gap(o, v) <= 4.0, "{name}: v2 hue {v:.1} deg is more than 4 deg from Original {o:.1}");

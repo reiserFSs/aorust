@@ -117,17 +117,28 @@ fn graphics_v2_newland_lamp_pole_stays_native_and_head_glows() -> anyhow::Result
         save(&out, &format!("{name}-original.png"), &original)?;
         save(&out, &format!("{name}-v2.png"), &v2)?;
         save(&out, &format!("{name}-v2-nobloom.png"), &v2_flat)?;
-        // Pole: the dark (< 75 luma), brown (red-dominant) Original pixels of the screen box holding the foreground lamp pole. The brown
-        // test excludes the dark green night ground behind it, which v2 may legitimately light with the moon (fairness policy).
-        let pole = |x: usize, y: usize| {
-            let p = &original[(y * SIZE.0 as usize + x) * 4..];
-            (1300..1700).contains(&x) && (400..850).contains(&y) && luma_at(&original, x, y) < 75.0
-                && f64::from(p[0]) > 1.05 * f64::from(p[1]) && f64::from(p[0]) > 1.2 * f64::from(p[2])
+        // Pole: GEOMETRY mask. A second capture of the same view (Original) repaints every fully self-lit submesh (emissive >= 1 on all
+        // channels: the lamp pole and head are one such material) flat magenta with no texture; the pixels that come out magenta are
+        // exactly the visible lamp surface (depth-correct, occluders such as canopy excluded). Pole = lamp pixels in the foreground box.
+        let mut masked = View { scene: view.scene.clone(), fixed: view.fixed, exposure: view.exposure.clone() };
+        let mut lamp_submeshes = 0;
+        for mesh in &mut masked.scene.meshes { for sub in &mut mesh.submeshes {
+            if sub.emissive.iter().all(|&e| e >= 1.0) { sub.texture = None; sub.base_color = [1.0, 0.0, 1.0, 1.0]; lamp_submeshes += 1; }
+        } }
+        ensure!(lamp_submeshes > 0, "{name}: no fully self-lit submesh in the scene");
+        let mask_image = render_sequence(&masked, graphics_fixture_settings("Original")?, None, &[None])?.remove(0);
+        save(&out, &format!("{name}-lamp-mask.png"), &mask_image)?;
+        let lamp = |x: usize, y: usize| {
+            let p = &mask_image[(y * SIZE.0 as usize + x) * 4..];
+            f64::from(p[0]) > 1.5 * f64::from(p[1]) && f64::from(p[2]) > 1.5 * f64::from(p[1])
         };
+        let pole = |x: usize, y: usize| (1300..1700).contains(&x) && (400..850).contains(&y) && lamp(x, y);
+        let pole_pixels = (400..850).flat_map(|y| (1300..1700).map(move |x| (x, y))).filter(|&(x, y)| pole(x, y)).count();
+        ensure!(pole_pixels > 300, "{name}: lamp mask covers only {pole_pixels} pole pixels");
         let head = |x: usize, y: usize| (490..570).contains(&x) && (205..265).contains(&y);
         let (pole_original, pole_v2) = (mean_luma(&original, &pole), mean_luma(&v2, &pole));
         let (head_original, head_v2, head_flat) = (mean_luma(&original, &head), mean_luma(&v2, &head), mean_luma(&v2_flat, &head));
-        eprintln!("{name}: pole original {pole_original:.1} v2 {pole_v2:.1} ({:.3}x); head original {head_original:.1} v2 {head_v2:.1} v2-no-bloom {head_flat:.1}", pole_v2 / pole_original);
+        eprintln!("{name}: pole_pixels {pole_pixels} pole original {pole_original:.1} v2 {pole_v2:.1} ({:.3}x); head original {head_original:.1} v2 {head_v2:.1} v2-no-bloom {head_flat:.1}", pole_v2 / pole_original);
         ensure!(pole_v2 <= 1.25 * pole_original, "{name}: pole {pole_v2:.1} vs Original {pole_original:.1}");
         ensure!(head_v2 >= 1.05 * head_flat, "{name}: head {head_v2:.1} has no bloom halo over its non-bloom value {head_flat:.1}");
     }
