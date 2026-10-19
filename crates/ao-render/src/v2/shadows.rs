@@ -29,45 +29,43 @@ const MOON_RES: u32 = 1024;
 const MOON_DYN_RES: u32 = 1024;
 /// The sun cascades never reach beyond this, whatever the lens far plane (as v1).
 const SHADOW_FAR: f32 = 180.0;
-/// Extra metres around the moon fit: its static layer may be up to a quarter second (a few metres of walking) stale.
-const MOON_GUARD: f32 = 6.0;
+/// Extra metres of slack baked into each STATIC layer's fit (sun cascades 0..2, moon): the layer stays valid while the camera's
+/// frustum slice remains inside it, so walking re-renders a cascade only after about this much travel (the slack costs ~7% texel size).
+const GUARD: [f32; LAYERS] = [1.5, 4.0, 12.0, 6.0];
+/// Shortest time between two re-renders of a layer whose frustum slice left it (moon A: at most 4 Hz).
+const MIN_INTERVAL: [f64; LAYERS] = [0.0, 0.0, 0.0, 0.25];
+/// Layers holding time-animated casters (scrolling alpha, wind) are refreshed at this rate.
+const ANIMATED_INTERVAL: f64 = 0.25;
+/// A stored layer is aligned with the light while it is within 0.05 degrees of it (the sun moves about that per 10 s).
+const ALIGNED_COS: f32 = 0.999_999_6;
 
-/// How often a static layer re-checks its content signature.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) enum Cadence {
-    /// Every `period` frames, offset by `phase` so that the layers never refresh in the same frame.
-    Frames { period: u64, phase: u64 },
-    /// At most this often (seconds).
-    Seconds(f64),
-}
-
-const CADENCE: [Cadence; LAYERS] = [
-    Cadence::Frames { period: 1, phase: 0 },
-    Cadence::Frames { period: 2, phase: 1 },
-    Cadence::Frames { period: 4, phase: 2 },
-    Cadence::Seconds(0.25),
-];
-
-/// Cached-layer bookkeeping. The layer is valid for exactly the signature it was last rendered with.
+/// Cached-layer bookkeeping: what the layer was last rendered with.
 #[derive(Default, Debug)]
 pub(super) struct StaticCache {
+    /// Content signature of the rendered casters; `None` = never rendered.
     signature: Option<u64>,
-    checked: f64,
+    /// Hash of the whole static world when it was last compared.
+    world: u64,
+    animated: bool,
+    rendered: f64,
 }
 
 impl StaticCache {
-    /// Whether the signature has to be (re)computed now: never rendered, or its cadence slot came up.
-    pub(super) fn due(&self, cadence: Cadence, frame: u64, time: f64) -> bool {
-        self.signature.is_none() || match cadence {
-            Cadence::Frames { period, phase } => (frame + phase) % period == 0,
-            Cadence::Seconds(interval) => time - self.checked >= interval || time < self.checked,
-        }
+    /// Whether the layer must be re-rendered now. `covered`: the stored matrix still contains the camera's frustum slice and is
+    /// aligned with the light. `world`: cheap hash of the whole static world (instances, visibility, revisions). The expensive
+    /// per-layer `signature_now` (casters inside the stored frustum) is only evaluated when `world` changed.
+    pub(super) fn needs_render(&mut self, covered: bool, world: u64, time: f64, min_interval: f64, signature_now: impl FnOnce() -> u64) -> bool {
+        let Some(signature) = self.signature else { return true };
+        let elapsed = time - self.rendered;
+        if !covered { return elapsed >= min_interval || elapsed < 0.0; }
+        if self.animated && (elapsed >= ANIMATED_INTERVAL || elapsed < 0.0) { return true; }
+        if self.world == world { return false; }
+        if signature_now() == signature { self.world = world; return false; }
+        true
     }
 
-    /// Records a check with the layer's current content `signature`; true when the layer must be re-rendered.
-    pub(super) fn update(&mut self, signature: u64, time: f64) -> bool {
-        self.checked = time;
-        self.signature.replace(signature) != Some(signature)
+    pub(super) fn rendered(&mut self, signature: u64, world: u64, animated: bool, time: f64) {
+        *self = Self { signature: Some(signature), world, animated, rendered: time };
     }
 }
 
@@ -79,23 +77,49 @@ pub(super) struct Caster {
     pub material: u32,
     pub pipe: u32,
     pub transform: [[f32; 4]; 4],
-    /// Seconds bits for draws whose alpha coverage animates; other draws never depend on time.
-    pub time: Option<u32>,
 }
 
-/// Content signature of one static layer: the cascade matrix plus every caster inside it.
-pub(super) fn static_signature(matrix: &Mat4, world_revision: u64, casters: impl Iterator<Item = Caster>) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    let mut word = |w: u32| hash = (hash ^ u64::from(w)).wrapping_mul(0x0000_0100_0000_01b3);
-    for value in matrix.to_cols_array() { word(value.to_bits()); }
-    word(world_revision as u32);
-    word((world_revision >> 32) as u32);
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Self { Self(0xcbf2_9ce4_8422_2325) }
+    fn word(&mut self, w: u32) { self.0 = (self.0 ^ u64::from(w)).wrapping_mul(0x0000_0100_0000_01b3); }
+    fn mat(&mut self, m: &[[f32; 4]; 4]) { for v in m.as_flattened() { self.word(v.to_bits()); } }
+}
+
+/// Content signature of one static layer: the world revision plus every caster inside its frustum (not its matrix: whether the layer
+/// still covers the view is a separate question).
+pub(super) fn static_signature(world_revision: u64, casters: impl Iterator<Item = Caster>) -> u64 {
+    let mut hash = Fnv::new();
+    hash.word(world_revision as u32);
+    hash.word((world_revision >> 32) as u32);
     for caster in casters {
-        for w in [caster.draw, caster.slot, caster.revision as u32, (caster.revision >> 32) as u32, caster.material, caster.pipe] { word(w); }
-        for value in caster.transform.as_flattened() { word(value.to_bits()); }
-        word(caster.time.map_or(0, |t| t | 1));
+        for w in [caster.draw, caster.slot, caster.revision as u32, (caster.revision >> 32) as u32, caster.material, caster.pipe] { hash.word(w); }
+        hash.mat(&caster.transform);
     }
-    hash
+    hash.0
+}
+
+/// The eight corners of the camera frustum slice `start..end` (view depth).
+fn slice_corners(view: &View, start: f32, end: f32) -> [Vec3; 8] {
+    let forward = view.forward.normalize_or_zero();
+    let right = forward.cross(view.up).normalize_or_zero();
+    let up = right.cross(forward);
+    let tan = (view.fovy * 0.5).tan();
+    std::array::from_fn(|i| {
+        let depth = if i < 4 { start } else { end };
+        let (sx, sy) = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)][i % 4];
+        view.eye + forward * depth + right * (sx * tan * depth * view.aspect) + up * (sy * tan * depth)
+    })
+}
+
+/// Whether every corner lies inside the layer's depth map with a 3-texel border (PCF) and inside its depth range.
+fn contains(matrix: &Mat4, corners: &[Vec3], resolution: u32) -> bool {
+    let border = 6.0 / resolution as f32;
+    corners.iter().all(|&c| {
+        let p = matrix.project_point3(c);
+        p.x.abs() <= 1.0 - border && p.y.abs() <= 1.0 - border && p.z > 0.0 && p.z < 1.0
+    })
 }
 
 /// Texel-snapped orthographic fit of the camera frustum slice `start..end` seen from `toward_light` (same construction as
@@ -148,6 +172,16 @@ pub(super) struct Light {
     pub strength: f32,
 }
 
+/// This frame's fit of one layer: the camera frustum slice it must cover (view depth), the light direction and the tight matrix the
+/// per-frame actor layer is rendered with.
+#[derive(Clone, Copy)]
+struct Fit {
+    start: f32,
+    end: f32,
+    dir: Vec3,
+    tight: Mat4,
+}
+
 /// Mirror of `struct Receive` in `shadows.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -179,6 +213,13 @@ fn depth_array(device: &wgpu::Device, label: &str, resolution: u32, layers: u32)
     }
 }
 
+/// A static depth layer: its cache state, the matrix it was rendered with (sampled with this one) and the light it was lit from.
+struct StaticLayer {
+    cache: StaticCache,
+    matrix: Mat4,
+    dir: Vec3,
+}
+
 /// A caster pass target: matrices uniform + the bind group the v1 caster pipelines expect at group 3.
 struct Target {
     uniform: wgpu::Buffer,
@@ -192,8 +233,8 @@ pub(super) struct Shadows {
     moon_dyn: DepthArray,
     static_targets: [Target; LAYERS],
     dyn_targets: [Target; LAYERS],
-    /// Cache state + the matrix the layer was rendered with.
-    cache: [(StaticCache, Mat4); LAYERS],
+    /// What each static layer was rendered with.
+    layers: [StaticLayer; LAYERS],
     /// Dynamic layers that may hold actor depth and so must be cleared.
     dyn_dirty: [bool; LAYERS],
     commands: [Vec<(usize, Range<u32>)>; LAYERS],
@@ -202,7 +243,6 @@ pub(super) struct Shadows {
     receive: wgpu::Buffer,
     layout: wgpu::BindGroupLayout,
     pub(super) bind: wgpu::BindGroup,
-    frame: u64,
     /// Diagnostic for the offline harness (`AOMAC_V2_SHADOW_RERENDER=<bit mask of layers>`, 0 = off): re-renders those static layers
     /// every frame to measure the walking worst case per layer.
     always_rerender: u32,
@@ -255,9 +295,9 @@ impl Shadows {
         Self {
             sun_static, sun_dyn, moon_static, moon_dyn,
             static_targets: std::array::from_fn(|_| target()), dyn_targets: std::array::from_fn(|_| target()),
-            cache: std::array::from_fn(|_| (StaticCache::default(), Mat4::ZERO)),
+            layers: std::array::from_fn(|_| StaticLayer { cache: StaticCache::default(), matrix: Mat4::ZERO, dir: Vec3::ZERO }),
             dyn_dirty: [true; LAYERS], commands: Default::default(),
-            transforms: Vec::new(), transform_buffer: None, receive, layout, bind, frame: 0,
+            transforms: Vec::new(), transform_buffer: None, receive, layout, bind,
             always_rerender: std::env::var("AOMAC_V2_SHADOW_RERENDER").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             marker: Marker::new(device),
             off: std::env::var("AOMAC_V2_SHADOWS").is_ok_and(|v| v == "off"),
@@ -297,48 +337,52 @@ impl Shadows {
     pub(super) fn encode(&mut self, r: &Renderer, enc: &mut wgpu::CommandEncoder, view: &View, sun: Option<Light>, moon: Option<Light>,
         admission: &Admission, timers: Option<&PassTimers>) {
         if self.off { return; }
-        self.frame += 1;
         let span = timers.and_then(|t| t.span("shadows"));
         self.marker.pass(enc, span.as_ref().map(|s| s.begin_render()));
 
         let far = r.lens.far.unwrap_or(SHADOW_FAR).min(SHADOW_FAR).max(view.near + 0.01);
         let receiver_far = view.far.min(view.fog_end).min(far);
         let casters = || r.gpu.insts.iter().filter(|inst| !inst.hidden).map(|inst| (inst.center, inst.radius));
-        // Current-frame cascade matrices (static fit; the dynamic layers use them as they are, the static layers when they refresh).
-        let mut current: [Option<Mat4>; LAYERS] = [None; LAYERS];
+        let mut fits: [Option<Fit>; LAYERS] = [None; LAYERS];
         let mut receive = Receive::zeroed();
         let mut sun_frame = None;
         if let Some(light) = sun {
             sun_frame = CascadeFrame::new(view.eye, view.forward, view.up, view.fovy, view.aspect, view.near, far, light.dir, SUN_RES);
             if let Some(frame) = sun_frame.as_mut() {
                 frame.include_caster_depth(casters());
-                for k in 0..SUN_CASCADES { current[k] = Some(Mat4::from_cols_array_2d(&frame.uniform.matrices[k])); }
-                receive.splits = frame.uniform.splits;
+                let splits = frame.uniform.splits;
+                let mut start = splits[3];
+                for k in 0..SUN_CASCADES {
+                    fits[k] = Some(Fit { start, end: splits[k], dir: light.dir.normalize(), tight: Mat4::from_cols_array_2d(&frame.uniform.matrices[k]) });
+                    start = splits[k] - (splits[k] - start) * 0.1;
+                }
+                receive.splits = splits;
                 receive.fade[0] = light.strength;
-                receive.fade[1] = frame.uniform.splits[2].min(receiver_far).max(frame.uniform.splits[1] + 0.01);
+                receive.fade[1] = splits[2].min(receiver_far).max(splits[1] + 0.01);
                 receive.flags[2] = 1;
             }
         }
         if let Some(light) = moon {
-            let matrix = fit_slice(view.eye, view.forward, view.fovy, view.aspect, view.near, receiver_far.max(view.near + 1.0), receiver_far.max(view.near + 1.0), light.dir, MOON_RES, MOON_GUARD)
-                .map(|m| crate::shadow_coverage::include_caster_depth(m, casters()));
-            if let Some(matrix) = matrix {
-                current[SUN_CASCADES] = Some(matrix);
+            let range = receiver_far.max(view.near + 1.0);
+            if let Some(tight) = fit_slice(view.eye, view.forward, view.fovy, view.aspect, view.near, range, range, light.dir, MOON_RES, 0.0) {
+                fits[SUN_CASCADES] = Some(Fit { start: view.near, end: range, dir: light.dir.normalize(),
+                    tight: crate::shadow_coverage::include_caster_depth(tight, casters()) });
                 receive.fade[2] = light.strength;
-                receive.fade[3] = receiver_far.max(view.near + 1.0);
+                receive.fade[3] = range;
                 receive.flags[3] = 1;
             }
         }
 
-        self.refresh_static(r, enc, &current, sun_frame.as_ref(), view);
+        self.refresh_static(r, enc, &fits, view, far, sun_frame.as_ref());
         let items = r.v2_has_actor_items();
+        let current = fits.map(|fit| fit.map(|fit| fit.tight));
         self.draw_dynamic(r, enc, &current, sun_frame.as_ref(), admission, items);
 
         for k in 0..SUN_CASCADES {
-            receive.sun_static[k] = self.cache[k].1.to_cols_array_2d();
+            receive.sun_static[k] = self.layers[k].matrix.to_cols_array_2d();
             receive.sun_dyn[k] = current[k].unwrap_or(Mat4::ZERO).to_cols_array_2d();
         }
-        receive.moon_static = self.cache[SUN_CASCADES].1.to_cols_array_2d();
+        receive.moon_static = self.layers[SUN_CASCADES].matrix.to_cols_array_2d();
         receive.moon_dyn = current[SUN_CASCADES].unwrap_or(Mat4::ZERO).to_cols_array_2d();
         receive.flags[0] = u32::from(items && receive.flags[2] != 0);
         receive.flags[1] = u32::from(items && receive.flags[3] != 0);
@@ -346,32 +390,69 @@ impl Shadows {
         self.marker.pass(enc, span.as_ref().map(|s| s.end_render()));
     }
 
-    /// Re-renders the static layers whose cadence is due and whose content signature changed.
-    fn refresh_static(&mut self, r: &Renderer, enc: &mut wgpu::CommandEncoder, current: &[Option<Mat4>; LAYERS], sun_frame: Option<&CascadeFrame>, view: &View) {
-        let time = f64::from(view.time);
-        let mut due = [false; LAYERS];
-        let mut planes: [[Vec4; 6]; LAYERS] = [[Vec4::ZERO; 6]; LAYERS];
-        for layer in 0..LAYERS {
-            let Some(matrix) = current[layer] else { continue };
-            due[layer] = self.always_rerender >> layer & 1 != 0 || self.cache[layer].0.due(CADENCE[layer], self.frame, time);
-            if due[layer] { planes[layer] = crate::frustum_planes(&matrix); }
+    /// Cheap hash of everything that can change a static caster anywhere in the world (instances, visibility, revisions).
+    fn world_hash(r: &Renderer) -> u64 {
+        let mut hash = Fnv::new();
+        for w in [r.point_world_revision as u32, (r.point_world_revision >> 32) as u32, u32::from(r.spaceships_shown), r.far_away.len() as u32,
+            r.movers.len() as u32, r.gpu.insts.len() as u32, r.drawn_visuals.len() as u32] { hash.word(w); }
+        for instance in &r.gpu.insts {
+            hash.word(u32::from(instance.hidden));
+            hash.mat(&instance.m);
         }
-        if !due.contains(&true) { return; }
-        for list in &mut self.commands { list.clear(); }
-        self.world_commands(r, &due, &planes);
+        // Order-independent: visual node states (doors, lifts) that hide or show a draw.
+        let nodes = r.drawn_visuals.iter().fold(0u64, |acc, entry| {
+            use std::hash::{Hash, Hasher};
+            let mut each = std::hash::DefaultHasher::new();
+            entry.hash(&mut each);
+            acc ^ each.finish()
+        });
+        hash.word(nodes as u32);
+        hash.word((nodes >> 32) as u32);
+        hash.0
+    }
+
+    /// Casters of `layer` inside `matrix`' frustum (left in `self.commands[layer]`), their content signature and whether any of them
+    /// is time-animated.
+    fn gather(&mut self, r: &Renderer, layer: usize, matrix: &Mat4) -> (u64, bool) {
+        self.world_commands(r, layer, &crate::frustum_planes(matrix));
+        let animated = self.commands[layer].iter().any(|(draw, _)| {
+            let draw = &r.gpu.opaque[*draw];
+            draw.time_alpha || (draw.vegetation && (r.enhanced_settings.foliage_sway || r.enhanced_settings.foliage_push))
+        });
+        let signature = static_signature(r.point_world_revision, self.commands[layer].iter().flat_map(|(draw, range)| {
+            let draw_state = &r.gpu.opaque[*draw];
+            range.clone().map(move |slot| Caster {
+                draw: *draw as u32, slot, revision: r.point_mesh_revisions.get(draw_state.mesh).copied().unwrap_or(0),
+                material: draw_state.mat as u32, pipe: draw_state.pipe as u32, transform: r.gpu.insts[slot as usize].m,
+            })
+        }));
+        (signature, animated)
+    }
+
+    /// Re-renders the static layers whose stored matrix no longer covers the camera's frustum slice (or the light moved), whose casters
+    /// changed, or whose animated casters are due.
+    fn refresh_static(&mut self, r: &Renderer, enc: &mut wgpu::CommandEncoder, fits: &[Option<Fit>; LAYERS], view: &View, far: f32, sun_frame: Option<&CascadeFrame>) {
+        let world = Self::world_hash(r);
+        let time = f64::from(view.time);
         let mut render = [false; LAYERS];
         for layer in 0..LAYERS {
-            let Some(matrix) = current[layer].filter(|_| due[layer]) else { continue };
-            let signature = static_signature(&matrix, r.point_world_revision, self.commands[layer].iter().flat_map(|(draw, range)| {
-                let draw_state = &r.gpu.opaque[*draw];
-                range.clone().map(move |slot| Caster {
-                    draw: *draw as u32, slot, revision: r.point_mesh_revisions.get(draw_state.mesh).copied().unwrap_or(0),
-                    material: draw_state.mat as u32, pipe: draw_state.pipe as u32, transform: r.gpu.insts[slot as usize].m,
-                    time: draw_state.time_alpha.then(|| r.time.to_bits()),
-                })
-            }));
-            render[layer] = self.cache[layer].0.update(signature, time) || self.always_rerender >> layer & 1 != 0;
-            if render[layer] { self.cache[layer].1 = matrix; }
+            let Some(fit) = fits[layer] else { continue };
+            let resolution = if layer < SUN_CASCADES { SUN_RES } else { MOON_RES };
+            let stored = self.layers[layer].matrix;
+            let covered = self.layers[layer].dir.dot(fit.dir) >= ALIGNED_COS && contains(&stored, &slice_corners(view, fit.start, fit.end), resolution);
+            let mut cache = std::mem::take(&mut self.layers[layer].cache);
+            let need = self.always_rerender >> layer & 1 != 0 || cache.needs_render(covered, world, time, MIN_INTERVAL[layer], || self.gather(r, layer, &stored).0);
+            self.layers[layer].cache = cache;
+            if !need { continue; }
+            let reach = if layer < SUN_CASCADES { far } else { fit.end };
+            let Some(matrix) = fit_slice(view.eye, view.forward, view.fovy, view.aspect, fit.start, fit.end, reach, fit.dir, resolution, GUARD[layer]) else { continue };
+            let matrix = crate::shadow_coverage::include_caster_depth(matrix, r.gpu.insts.iter().filter(|inst| !inst.hidden).map(|inst| (inst.center, inst.radius)));
+            let (signature, animated) = self.gather(r, layer, &matrix);
+            let slot = &mut self.layers[layer];
+            slot.matrix = matrix;
+            slot.dir = fit.dir;
+            slot.cache.rendered(signature, world, animated, time);
+            render[layer] = true;
         }
         if !render.contains(&true) { return; }
         self.sync_transforms(r);
@@ -380,11 +461,9 @@ impl Shadows {
             let mut uniform = ShadowUniform::zeroed();
             if layer < SUN_CASCADES {
                 if let Some(frame) = sun_frame { uniform.matrices = frame.uniform.matrices; }
-                uniform.matrices[layer] = self.cache[layer].1.to_cols_array_2d();
                 uniform.control[0] = layer as u32;
-            } else {
-                uniform.matrices[0] = self.cache[layer].1.to_cols_array_2d();
             }
+            uniform.matrices[if layer < SUN_CASCADES { layer } else { 0 }] = self.layers[layer].matrix.to_cols_array_2d();
             r.queue.write_buffer(&self.static_targets[layer].uniform, 0, bytemuck::bytes_of(&uniform));
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("v2 static shadow layer"), color_attachments: &[],
@@ -412,8 +491,9 @@ impl Shadows {
         }
     }
 
-    /// Static world casters per due layer, in draw/instance order (consecutive instances of one draw coalesce).
-    fn world_commands(&mut self, r: &Renderer, due: &[bool; LAYERS], planes: &[[Vec4; 6]; LAYERS]) {
+    /// Static world casters inside one frustum, in draw/instance order (consecutive instances of one draw coalesce).
+    fn world_commands(&mut self, r: &Renderer, layer: usize, planes: &[Vec4; 6]) {
+        self.commands[layer].clear();
         for (index, draw) in r.gpu.opaque.iter().enumerate() {
             if draw.count == 0 || !r.shadow_pipelines.pipelines.get(&(false, draw.pipe, false)).is_some_and(Option::is_some) { continue; }
             let vegetation = draw.vegetation && r.enhanced_settings.foliage_enabled();
@@ -425,10 +505,8 @@ impl Shadows {
                 if crate::visual_priority(draw, key, &r.drawn_visuals).is_some_and(|priority| priority < 0) { continue; }
                 // Length-preserving foliage moves <= .895 of its height (v1 bound).
                 let radius = if vegetation { instance.radius * 3.0 + 0.001 } else { instance.radius };
-                for layer in (0..LAYERS).filter(|&l| due[l]) {
-                    if crate::shadow_coverage::admits_sphere(&[planes[layer]], instance.center, radius) {
-                        crate::shadow_pass::push_static_shadow_command(&mut self.commands[layer], index, slot as u32);
-                    }
+                if crate::shadow_coverage::admits_sphere(&[*planes], instance.center, radius) {
+                    crate::shadow_pass::push_static_shadow_command(&mut self.commands[layer], index, slot as u32);
                 }
             }
         }
@@ -475,22 +553,13 @@ mod tests {
     const FOVY: f32 = 1.0;
     const ASPECT: f32 = 1.5;
 
-    /// The eight corners of the camera frustum slice `start..end`.
-    fn slice_corners(eye: Vec3, forward: Vec3, up: Vec3, start: f32, end: f32) -> Vec<Vec3> {
-        let right = forward.cross(up).normalize();
-        let up = right.cross(forward);
-        let mut corners = Vec::new();
-        for depth in [start, end] {
-            let h = (FOVY * 0.5).tan() * depth;
-            for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
-                corners.push(eye + forward * depth + right * (sx * h * ASPECT) + up * (sy * h));
-            }
-        }
-        corners
+    fn view_at(eye: Vec3, forward: Vec3) -> View {
+        View { eye, forward, up: Vec3::Y, fovy: FOVY, aspect: ASPECT, near: 0.1, far: 180.0, fog_end: 180.0, time: 0.0 }
     }
 
-    fn contains(matrix: &Mat4, corners: &[Vec3]) -> bool {
-        corners.iter().all(|&c| {
+    /// Every corner of the camera frustum slice `start..end` inside the unit light cube.
+    fn inside(matrix: &Mat4, eye: Vec3, forward: Vec3, start: f32, end: f32) -> bool {
+        slice_corners(&view_at(eye, forward), start, end).iter().all(|&c| {
             let p = matrix.project_point3(c);
             p.x.abs() <= 1.0 && p.y.abs() <= 1.0 && (0.0..=1.0).contains(&p.z)
         })
@@ -507,7 +576,7 @@ mod tests {
             let mut start = splits[3];
             for k in 0..SUN_CASCADES {
                 let matrix = Mat4::from_cols_array_2d(&frame.uniform.matrices[k]);
-                assert!(contains(&matrix, &slice_corners(eye, forward, Vec3::Y, start, splits[k])), "cascade {k} misses its slice at yaw {yaw}");
+                assert!(inside(&matrix, eye, forward, start, splits[k]), "cascade {k} misses its slice at yaw {yaw}");
                 start = splits[k] - (splits[k] - start) * 0.1;
             }
         }
@@ -521,64 +590,74 @@ mod tests {
         // Same slice, no guard: identical matrix to v1's first cascade.
         let first = fit_slice(eye, forward, FOVY, ASPECT, 0.1, frame.uniform.splits[0], 180.0, moon, MOON_RES, 0.0).unwrap();
         for (a, b) in first.to_cols_array().iter().zip(frame.uniform.matrices[0].as_flattened()) { assert_eq!(a, b); }
-        let whole = fit_slice(eye, forward, FOVY, ASPECT, 0.1, 150.0, 150.0, moon, MOON_RES, MOON_GUARD).unwrap();
-        assert!(contains(&whole, &slice_corners(eye, forward, Vec3::Y, 0.1, 150.0)));
+        let whole = fit_slice(eye, forward, FOVY, ASPECT, 0.1, 150.0, 150.0, moon, MOON_RES, GUARD[3]).unwrap();
+        assert!(inside(&whole, eye, forward, 0.1, 150.0));
         // Texel snapping: sub-texel camera motion does not move the grid.
-        let moved = fit_slice(eye + Vec3::new(1e-4, 0.0, 0.0), forward, FOVY, ASPECT, 0.1, 150.0, 150.0, moon, MOON_RES, MOON_GUARD).unwrap();
+        let moved = fit_slice(eye + Vec3::new(1e-4, 0.0, 0.0), forward, FOVY, ASPECT, 0.1, 150.0, 150.0, moon, MOON_RES, GUARD[3]).unwrap();
         assert_eq!(whole, moved);
         assert!(fit_slice(eye, forward, FOVY, ASPECT, 0.1, 150.0, 150.0, Vec3::ZERO, MOON_RES, 0.0).is_none());
     }
 
     fn caster(slot: u32) -> Caster {
-        Caster { draw: 1, slot, revision: 4, material: 2, pipe: 3, transform: Mat4::IDENTITY.to_cols_array_2d(), time: None }
+        Caster { draw: 1, slot, revision: 4, material: 2, pipe: 3, transform: Mat4::IDENTITY.to_cols_array_2d() }
     }
 
     #[test]
-    fn signature_tracks_matrix_revision_and_transforms_only() {
-        let m = Mat4::from_translation(Vec3::new(1.0, 2.0, 3.0));
-        let base = static_signature(&m, 9, [caster(0), caster(1)].into_iter());
-        assert_eq!(base, static_signature(&m, 9, [caster(0), caster(1)].into_iter()), "same static world, same signature");
-        assert_ne!(base, static_signature(&(m * Mat4::from_translation(Vec3::X)), 9, [caster(0), caster(1)].into_iter()), "cascade matrix");
-        assert_ne!(base, static_signature(&m, 10, [caster(0), caster(1)].into_iter()), "world revision");
-        assert_ne!(base, static_signature(&m, 9, [caster(0)].into_iter()), "caster set");
+    fn signature_tracks_revision_casters_and_transforms_only() {
+        let base = static_signature(9, [caster(0), caster(1)].into_iter());
+        assert_eq!(base, static_signature(9, [caster(0), caster(1)].into_iter()), "same static world, same signature");
+        assert_ne!(base, static_signature(10, [caster(0), caster(1)].into_iter()), "world revision");
+        assert_ne!(base, static_signature(9, [caster(0)].into_iter()), "caster set");
         let mut moved = caster(1);
         moved.transform[3][0] = 5.0;
-        assert_ne!(base, static_signature(&m, 9, [caster(0), moved].into_iter()), "instance transform");
-        let mut animated = caster(1);
-        animated.time = Some(1.0f32.to_bits());
-        assert_ne!(base, static_signature(&m, 9, [caster(0), animated].into_iter()), "animated alpha");
+        assert_ne!(base, static_signature(9, [caster(0), moved].into_iter()), "instance transform");
     }
 
     #[test]
-    fn cache_survives_actor_changes_and_rerenders_on_matrix_or_revision_change() {
-        let m = Mat4::from_translation(Vec3::new(1.0, 2.0, 3.0));
+    fn cache_survives_actor_activity_and_rerenders_on_content_or_coverage_change() {
+        let signature = |revision| static_signature(revision, [caster(0)].into_iter());
         let mut cache = StaticCache::default();
-        let cadence = Cadence::Frames { period: 1, phase: 0 };
-        assert!(cache.due(cadence, 0, 0.0));
-        assert!(cache.update(static_signature(&m, 1, [caster(0)].into_iter()), 0.0), "first frame renders");
-        // Actors come, go and move for 100 frames: the signature function has no actor input at all, so the layer never re-renders.
-        for frame in 1..100u64 {
-            assert!(cache.due(cadence, frame, frame as f64));
-            assert!(!cache.update(static_signature(&m, 1, [caster(0)].into_iter()), frame as f64), "actor activity must not touch the static layer");
-        }
-        assert!(cache.update(static_signature(&Mat4::from_translation(Vec3::new(1.0, 2.0, 3.1)), 1, [caster(0)].into_iter()), 100.0), "matrix change");
-        assert!(!cache.update(static_signature(&Mat4::from_translation(Vec3::new(1.0, 2.0, 3.1)), 1, [caster(0)].into_iter()), 101.0));
-        assert!(cache.update(static_signature(&Mat4::from_translation(Vec3::new(1.0, 2.0, 3.1)), 2, [caster(0)].into_iter()), 102.0), "revision change");
+        assert!(cache.needs_render(false, 7, 0.0, 0.0, || unreachable!()), "a layer that was never rendered renders at once");
+        cache.rendered(signature(1), 7, false, 0.0);
+        // 100 frames in which actors come, go and move: they are no input of the world hash, the stored matrix still covers the
+        // view, so the layer is neither re-rendered nor even re-hashed.
+        for frame in 1..100 { assert!(!cache.needs_render(true, 7, f64::from(frame), 0.0, || unreachable!("actors must not trigger a signature check"))); }
+        // Something changed elsewhere in the world: same casters inside this layer -> kept (and the world hash remembered).
+        assert!(!cache.needs_render(true, 8, 100.0, 0.0, || signature(1)));
+        assert!(!cache.needs_render(true, 8, 101.0, 0.0, || unreachable!()));
+        // A caster inside this layer changed (revision / transform): re-render.
+        assert!(cache.needs_render(true, 9, 102.0, 0.0, || signature(2)));
+        // The view left the stored matrix: re-render.
+        assert!(cache.needs_render(false, 8, 103.0, 0.0, || unreachable!()));
     }
 
     #[test]
-    fn sun_layers_refresh_in_different_frames_and_the_moon_at_most_four_hertz() {
-        let mut counts = [0; SUN_CASCADES];
-        for frame in 0..64u64 {
-            let due: Vec<usize> = (0..SUN_CASCADES).filter(|&k| StaticCache { signature: Some(1), checked: 0.0 }.due(CADENCE[k], frame, 0.0)).collect();
-            assert!(due.len() <= 2 && !(due.contains(&1) && due.contains(&2)), "frame {frame}: {due:?}");
-            for k in due { counts[k] += 1; }
+    fn moon_layer_refreshes_at_most_four_hertz_and_animated_layers_at_the_animated_rate() {
+        let mut cache = StaticCache::default();
+        cache.rendered(1, 1, false, 10.0);
+        assert!(!cache.needs_render(false, 1, 10.2, MIN_INTERVAL[3], || 1), "moon layer, 0.2 s after its last render");
+        assert!(cache.needs_render(false, 1, 10.25, MIN_INTERVAL[3], || 1));
+        assert!(cache.needs_render(false, 1, 10.0, MIN_INTERVAL[0], || 1), "an uncovered sun layer re-renders at once");
+        cache.rendered(1, 1, true, 20.0);
+        assert!(!cache.needs_render(true, 1, 20.1, 0.0, || 1));
+        assert!(cache.needs_render(true, 1, 20.25, 0.0, || 1), "animated casters refresh at 4 Hz");
+        assert!(cache.needs_render(true, 1, 5.0, 0.0, || 1), "a clock that went backwards (scene reload) re-renders");
+    }
+
+    #[test]
+    fn slack_keeps_a_walked_cascade_valid_and_a_long_walk_does_not() {
+        let sun = Vec3::new(0.3, 0.7, 0.4).normalize();
+        let frame = CascadeFrame::new(Vec3::ZERO, -Vec3::Z, Vec3::Y, FOVY, ASPECT, 0.1, 180.0, sun, SUN_RES).unwrap();
+        let mut start = 0.1;
+        for k in 0..SUN_CASCADES {
+            let end = frame.uniform.splits[k];
+            let stored = fit_slice(Vec3::ZERO, -Vec3::Z, FOVY, ASPECT, start, end, 180.0, sun, SUN_RES, GUARD[k]).unwrap();
+            let covers = |eye: Vec3| contains(&stored, &slice_corners(&view_at(eye, -Vec3::Z), start, end), SUN_RES);
+            assert!(covers(Vec3::ZERO), "cascade {k}");
+            assert!(covers(Vec3::new(0.5 * GUARD[k], 0.0, 0.0)) && covers(Vec3::new(0.0, 0.0, -0.5 * GUARD[k])), "cascade {k}: half the slack");
+            assert!(!covers(Vec3::new(end, 0.0, 0.0)), "cascade {k}: a walk of one cascade length must re-render");
+            start = end - (end - start) * 0.1;
         }
-        assert_eq!(counts, [64, 32, 16]);
-        let cache = StaticCache { signature: Some(1), checked: 10.0 };
-        assert!(!cache.due(CADENCE[3], 0, 10.2));
-        assert!(cache.due(CADENCE[3], 0, 10.25));
-        assert!(StaticCache::default().due(CADENCE[3], 0, 0.0), "never-rendered moon layer renders at once");
     }
 
     #[test]
