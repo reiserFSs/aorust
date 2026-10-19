@@ -59,6 +59,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     light += ambient * ao;
 
     var col = albedo * light + spec + emission;
+    // Lamp radiance (already multiplied by albedo, with its GGX highlight): authored lights, cluster list, cube taps.
+    if (flags & MF_BAKED) == 0u {
+        col += lamps_light(wp, n, v, vd, id.xy, albedo, select(clamp(g1.b, 0.12, 1.0), 1.0, (flags & MF_GROUND) != 0u));
+    }
     if (flags & MF_NO_FOG) == 0u {
         col = mix(fc.fog_color.rgb, col, native_transmittance(vd));
     }

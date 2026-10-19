@@ -8,6 +8,7 @@ mod bloom;
 mod admission;
 mod consts;
 mod gbuffer;
+mod lamps;
 mod post;
 mod pyramid;
 mod resolve;
@@ -49,6 +50,7 @@ pub(crate) struct V2 {
     consts: wgpu::Buffer,
     /// `post::Ctl`, rewritten every frame.
     ctl: wgpu::Buffer,
+    lamps: lamps::Lamps,
     sized: Option<Sized>,
     timers: Option<timers::PassTimers>,
     frame: u32,
@@ -66,8 +68,10 @@ impl V2 {
     pub(crate) fn new(r: &Renderer) -> Self {
         let admission = admission::Admission::new(r);
         let shadows = shadows::Shadows::new(r, admission.visibility());
+        let lamps = lamps::Lamps::new(&r.device, admission.visibility());
         let plugins = [
             shadows.plugin(),
+            lamps.plugin(),
         ];
         Self {
             pipes: gbuffer::Pipes::new(r),
@@ -88,6 +92,7 @@ impl V2 {
                 label: Some("v2 post controls"), size: std::mem::size_of::<post::Ctl>() as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
             }),
+            lamps,
             sized: None,
             timers: None,
             frame: 0,
@@ -264,10 +269,11 @@ impl Renderer {
         let shadow_view = shadows::View { eye: cam.pos, forward: cam.forward(), up: cam.up(), fovy: self.lens.vertical_fov(aspect), aspect,
             near: self.lens.near, far, fog_end: env.fog_end, time: self.time };
         v2.shadows.encode(self, &mut enc, &shadow_view, (look.sun_up > 0.5).then(|| light(look.sun)), moon.map(|(dir, _)| light(dir)), &v2.admission, timer);
-        // [slot 3] pyramid + AO (writes the AO texture the resolve reads, flags.y bit 0), [slot 4] light clusters go here.
+        // [slot 3] pyramid + AO (writes the AO texture the resolve reads, flags.y bit 0), [slot 4] light clusters + lamp cube atlas.
         sized.pyramid.encode(&v2.pyramid, &mut enc, timer.and_then(|t| t.compute("hiz")));
         sized.ao.encode(&v2.ao, &self.queue, &mut enc, timer, admission, jitter != [0.0, 0.0]);
-        v2.resolve.encode(&mut enc, &sized.resolve_bind, &[&v2.shadows.bind], size, timer.and_then(|t| t.compute("resolve")));
+        let lamps_bind = self.encode_lamps(&mut v2.lamps, &mut enc, timer, &v2.consts, cam, view_proj, [env.fog_start, env.fog_end, far]);
+        v2.resolve.encode(&mut enc, &sized.resolve_bind, &[&v2.shadows.bind, &lamps_bind], size, timer.and_then(|t| t.compute("resolve")));
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("v2 FX"),
