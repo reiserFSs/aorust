@@ -63,12 +63,6 @@ impl PassTimers {
         Some(wgpu::ComputePassTimestampWrites { query_set: &self.queries, beginning_of_pass_write_index: Some(begin), end_of_pass_write_index: Some(end) })
     }
 
-    /// One label over several consecutive passes: give the first pass `begin_*` and the last `end_*`.
-    pub(super) fn span(&self, name: &'static str) -> Option<Span<'_>> {
-        let (begin, end) = self.slot(name)?;
-        Some(Span { queries: &self.queries, begin, end })
-    }
-
     /// One label over several passes (work encoded by code that opens its own passes): put the first writes on a tiny
     /// pass before that work and the second on a tiny pass after it.
     pub(super) fn compute_span(&self, name: &'static str) -> Option<(wgpu::ComputePassTimestampWrites<'_>, wgpu::ComputePassTimestampWrites<'_>)> {
@@ -137,26 +131,7 @@ impl PassTimers {
     }
 }
 
-/// Timestamp indices of one [`PassTimers::span`]: the label's time is first pass begin -> last pass end.
-pub(super) struct Span<'a> {
-    queries: &'a wgpu::QuerySet,
-    begin: u32,
-    end: u32,
-}
-
-impl Span<'_> {
-    pub(super) fn begin_render(&self) -> wgpu::RenderPassTimestampWrites<'_> {
-        wgpu::RenderPassTimestampWrites { query_set: self.queries, beginning_of_pass_write_index: Some(self.begin), end_of_pass_write_index: None }
-    }
-    pub(super) fn end_render(&self) -> wgpu::RenderPassTimestampWrites<'_> {
-        wgpu::RenderPassTimestampWrites { query_set: self.queries, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(self.end) }
-    }
-    pub(super) fn end_compute(&self) -> wgpu::ComputePassTimestampWrites<'_> {
-        wgpu::ComputePassTimestampWrites { query_set: self.queries, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(self.end) }
-    }
-}
-
-/// An (almost free) empty render pass that only carries a timestamp, so a [`Span`] exists every frame even when its real passes are
+/// An (almost free) empty render pass that only carries a timestamp,
 /// skipped (an empty compute pass records no timestamp on Metal).
 pub(super) struct Marker(wgpu::TextureView);
 

@@ -16,7 +16,7 @@
 //! * Usage `STORAGE | COPY_SRC | COPY_DST`.
 //!
 //! `Admission::slots()` is the matching per-actor-item vertex stream (item index -> slot) the shadow casters read at location 12.
-use super::timers::{Marker, PassTimers};
+
 use crate::pipeline_creation::{self, RenderPipeline};
 use crate::pipelines::{Pipelines, Spec};
 use crate::{Renderer, DEPTH};
@@ -49,7 +49,6 @@ pub(super) struct Admission {
     slots_cap: usize,
     scratch: Vec<u32>,
     sized: Option<((u32, u32), wgpu::TextureView, wgpu::BindGroup)>,
-    marker: Marker,
     /// Diagnostic (`AOMAC_V2_SHADOWS=off`): admits nobody and encodes nothing (measures the cost of shadows + admission).
     off: bool,
 }
@@ -110,7 +109,7 @@ impl Admission {
         let visibility = device.create_buffer(&wgpu::BufferDescriptor { label: Some("v2 actor visibility"), size: ((SLOTS + 1) * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let slots_cap = 64;
-        Self { pipes, reduce, reduce_layout, visibility, slots: Self::slot_buffer(device, slots_cap), slots_cap, scratch: Vec::new(), sized: None, marker: Marker::new(device),
+        Self { pipes, reduce, reduce_layout, visibility, slots: Self::slot_buffer(device, slots_cap), slots_cap, scratch: Vec::new(), sized: None,
             off: std::env::var("AOMAC_V2_SHADOWS").is_ok_and(|v| v == "off") }
     }
 
@@ -125,9 +124,9 @@ impl Admission {
     /// Per actor item: its interaction slot (vertex stream, location 12 of the actor shadow casters).
     pub(super) fn slots(&self) -> &wgpu::Buffer { &self.slots }
 
-    /// Slot 1. Without actor items nothing can be admitted: the visibility words are cleared and the passes are skipped (two empty
-    /// marker passes keep the timer label stable).
-    pub(super) fn encode(&mut self, r: &Renderer, enc: &mut wgpu::CommandEncoder, depth: &wgpu::TextureView, size: (u32, u32), timers: Option<&PassTimers>) {
+    /// Slot 1. Without actor items nothing can be admitted: the visibility words are cleared and the passes are skipped. No timer
+    /// label: a span here would include waiting behind the G-buffer; measure it as the `frame` delta of `AOMAC_V2_SHADOWS=off`.
+    pub(super) fn encode(&mut self, r: &Renderer, enc: &mut wgpu::CommandEncoder, depth: &wgpu::TextureView, size: (u32, u32)) {
         if self.off { return; }
         if self.sized.as_ref().is_none_or(|(s, ..)| *s != size) {
             let ids = r.device.create_texture(&wgpu::TextureDescriptor { label: Some("v2 actor ids"),
@@ -142,12 +141,7 @@ impl Admission {
         }
         r.v2_item_slots(&mut self.scratch);
         enc.clear_buffer(&self.visibility, 0, None);
-        let span = timers.and_then(|t| t.span("admission"));
-        if self.scratch.is_empty() {
-            self.marker.pass(enc, span.as_ref().map(|s| s.begin_render()));
-            self.marker.pass(enc, span.as_ref().map(|s| s.end_render()));
-            return;
-        }
+        if self.scratch.is_empty() { return; }
         let (_, ids, bind) = self.sized.as_ref().expect("sized above");
         if self.scratch.len() > self.slots_cap {
             self.slots_cap = self.scratch.len().next_power_of_two();
@@ -160,12 +154,12 @@ impl Admission {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: ids, resolve_target: None, depth_slice: None,
                     ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: depth, depth_ops: None, stencil_ops: None }),
-                timestamp_writes: span.as_ref().map(|s| s.begin_render()), occlusion_query_set: None, multiview_mask: None,
+                timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
             });
             pass.set_bind_group(0, &r.globals_bg, &[]);
             r.v2_draw_actor_parts(&mut pass, &self.slots, true, &|slot| self.pipes.get(slot));
         }
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("v2 admission reduce"), timestamp_writes: span.as_ref().map(|s| s.end_compute()) });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("v2 admission reduce"), timestamp_writes: None });
         pass.set_pipeline(&self.reduce);
         pass.set_bind_group(0, bind, &[]);
         pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);

@@ -1979,6 +1979,57 @@ fn graphics_modern_newland_lamp_pole_stays_native_and_head_glows() -> anyhow::Re
     Ok(())
 }
 
+/// Mean gamma-space Rec.709 luma of a rectangle of an RGBA8 image.
+fn v2_region_luma(rgba: &[u8], width: u32, rect: (u32, u32, u32, u32)) -> f32 {
+    let (x0, y0, x1, y1) = rect;
+    let mut sum = 0.0;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let p = &rgba[((y * width + x) * 4) as usize..];
+            sum += 0.2126 * f32::from(p[0]) + 0.7152 * f32::from(p[1]) + 0.0722 * f32::from(p[2]);
+        }
+    }
+    sum / ((x1 - x0) * (y1 - y0)) as f32
+}
+
+/// Enhanced v2 look regressions on two finished fixture runs of the same views, one per profile:
+/// `AOMAC_GFX_REF_DIR` (profile `faithful`) and `AOMAC_GFX_V2_DIR` (profile `v2-high`), each holding `newland-sun.png` and
+/// `icc-landmark-authored.png`. (1) No non-sky pixel appears in the Newland sky: wherever the original shows bright sky (a far
+/// station beyond the sky dome once leaked through as grey slabs), v2 must be bright too. (2) Shade never drops below the
+/// original: the ICC overhang underside and the shaded beach are not darker than Original.
+#[test]
+#[ignore = "offline v2 look regression; needs two fixture runs (faithful and v2-high) of newland-sun and icc-landmark-authored"]
+fn graphics_v2_sky_has_no_foreign_pixels_and_shade_stays_above_original() -> anyhow::Result<()> {
+    use anyhow::Context;
+    let load = |var: &str, file: &str| -> anyhow::Result<Vec<u8>> {
+        let dir = PathBuf::from(std::env::var_os(var).with_context(|| format!("set {var}"))?);
+        Ok(image::open(dir.join(file))?.to_rgba8().into_raw())
+    };
+    let width = 1920u32;
+    let luma = |p: &[u8]| 0.2126 * f32::from(p[0]) + 0.7152 * f32::from(p[1]) + 0.0722 * f32::from(p[2]);
+    let (reference, v2) = (load("AOMAC_GFX_REF_DIR", "newland-sun.png")?, load("AOMAC_GFX_V2_DIR", "newland-sun.png")?);
+    let (mut sky, mut foreign) = (0, 0);
+    // Upper left, between the antenna poles: sky in Original.
+    for y in (0..300).step_by(2) {
+        for x in (0..760).step_by(2) {
+            let i = ((y * width + x) * 4) as usize;
+            let original = luma(&reference[i..]);
+            if original > 190.0 {
+                sky += 1;
+                if luma(&v2[i..]) < 0.6 * original { foreign += 1; }
+            }
+        }
+    }
+    anyhow::ensure!(sky > 1000, "the sky region lost its sky ({sky} samples)");
+    anyhow::ensure!(foreign * 500 <= sky, "{foreign} of {sky} Original-sky pixels are not sky in v2 (floating slabs)");
+    let (reference, v2) = (load("AOMAC_GFX_REF_DIR", "icc-landmark-authored.png")?, load("AOMAC_GFX_V2_DIR", "icc-landmark-authored.png")?);
+    for (name, rect) in [("overhang underside", (20, 20, 400, 150)), ("shaded beach", (900, 800, 1300, 870))] {
+        let (original, now) = (v2_region_luma(&reference, width, rect), v2_region_luma(&v2, width, rect));
+        anyhow::ensure!(now >= 0.9 * original, "{name}: v2 luma {now:.1} is below 90% of Original {original:.1}");
+    }
+    Ok(())
+}
+
 /// Night lighting may exceed faithful; fog extinction and non-admitted actor isolation may not.
 #[test]
 #[ignore = "offline night fog/admission regression; requires installed client and a new AOMAC_GFX_OUT"]

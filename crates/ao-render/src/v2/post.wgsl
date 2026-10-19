@@ -50,7 +50,8 @@ fn grade(c_in: vec3<f32>, t_native: f32) -> vec3<f32> {
     c = mix(c, vec3<f32>(luma(c)), smoothstep(1.0, 3.0, peak) * 0.5);
     c = shoulder(c);
     c = mix(vec3<f32>(luma(c)), c, mix(1.0, fc.grade.y, k));
-    return max(mix(vec3<f32>(0.18), c, mix(1.0, fc.grade.z, k)), vec3<f32>(0.0)); // contrast pivots on mid grey
+    // Contrast pivots on mid grey; the 0.9 floor keeps dark channels from being clipped to 0 (near-black purple shade).
+    return max(mix(vec3<f32>(0.18), c, mix(1.0, fc.grade.z, k)), c * 0.9);
 }
 
 @fragment

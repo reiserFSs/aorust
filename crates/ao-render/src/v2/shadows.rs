@@ -14,7 +14,7 @@
 use bytemuck::Zeroable;
 use super::admission::Admission;
 use super::resolve::Plugin;
-use super::timers::{Marker, PassTimers};
+
 use crate::sun_shadows::{CascadeFrame, ShadowUniform};
 use crate::Renderer;
 use glam::{Mat4, Vec3, Vec4};
@@ -246,7 +246,6 @@ pub(super) struct Shadows {
     /// Diagnostic for the offline harness (`AOMAC_V2_SHADOW_RERENDER=<bit mask of layers>`, 0 = off): re-renders those static layers
     /// every frame to measure the walking worst case per layer.
     always_rerender: u32,
-    marker: Marker,
     /// Diagnostic (`AOMAC_V2_SHADOWS=off`): no shadow work at all, to measure what shadows add to the frame.
     off: bool,
 }
@@ -299,7 +298,6 @@ impl Shadows {
             dyn_dirty: [true; LAYERS], commands: Default::default(),
             transforms: Vec::new(), transform_buffer: None, receive, layout, bind,
             always_rerender: std::env::var("AOMAC_V2_SHADOW_RERENDER").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
-            marker: Marker::new(device),
             off: std::env::var("AOMAC_V2_SHADOWS").is_ok_and(|v| v == "off"),
         }
     }
@@ -335,10 +333,8 @@ impl Shadows {
     /// Slot 2. `sun` / `moon`: the lights that cast shadows this frame (None = inactive; their layers are left alone).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn encode(&mut self, r: &Renderer, enc: &mut wgpu::CommandEncoder, view: &View, sun: Option<Light>, moon: Option<Light>,
-        admission: &Admission, timers: Option<&PassTimers>) {
+        admission: &Admission) {
         if self.off { return; }
-        let span = timers.and_then(|t| t.span("shadows"));
-        self.marker.pass(enc, span.as_ref().map(|s| s.begin_render()));
 
         let far = r.lens.far.unwrap_or(SHADOW_FAR).min(SHADOW_FAR).max(view.near + 0.01);
         let receiver_far = view.far.min(view.fog_end).min(far);
@@ -387,7 +383,6 @@ impl Shadows {
         receive.flags[0] = u32::from(items && receive.flags[2] != 0);
         receive.flags[1] = u32::from(items && receive.flags[3] != 0);
         r.queue.write_buffer(&self.receive, 0, bytemuck::bytes_of(&receive));
-        self.marker.pass(enc, span.as_ref().map(|s| s.end_render()));
     }
 
     /// Cheap hash of everything that can change a static caster anywhere in the world (instances, visibility, revisions).

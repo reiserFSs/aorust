@@ -140,7 +140,7 @@ mod tests {
         let (s, ct) = (1.0 + (saturation - 1.0) * k, 1.0 + (contrast - 1.0) * k);
         let l = luma(c);
         c = c.map(|v| l + (v - l) * s);
-        c.map(|v| (0.18 + (v - 0.18) * ct).max(0.0))
+        c.map(|v| (0.18 + (v - 0.18) * ct).max(v * 0.9))
     }
 
     #[test]

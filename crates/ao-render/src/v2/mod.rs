@@ -13,6 +13,7 @@ mod post;
 mod pyramid;
 mod resolve;
 mod shadows;
+mod skyfix;
 mod taa;
 mod timers;
 
@@ -34,6 +35,7 @@ struct Sized {
     taa: taa::TaaTargets,
     /// `post_binds[k]` reads the TAA output of frame parity `k` (`taa.hist[1 - k]`).
     post_binds: [wgpu::BindGroup; 2],
+    skyfix_bind: wgpu::BindGroup,
 }
 
 pub(crate) struct V2 {
@@ -43,6 +45,7 @@ pub(crate) struct V2 {
     resolve: resolve::Resolve,
     bloom: bloom::Bloom,
     taa_pass: taa::Taa,
+    skyfix: skyfix::SkyFix,
     motion: crate::actors::v2_motion::ActorMotion,
     post: post::Post,
     admission: admission::Admission,
@@ -80,6 +83,7 @@ impl V2 {
             resolve: resolve::Resolve::new(&r.device, &plugins),
             bloom: bloom::Bloom::new(&r.device),
             taa_pass: taa::Taa::new(&r.device),
+            skyfix: skyfix::SkyFix::new(&r.device),
             motion: crate::actors::v2_motion::ActorMotion::new(r),
             post: post::Post::new(&r.device, r.format),
             admission,
@@ -111,6 +115,7 @@ struct Look {
     sun_color: Vec3,
     sky_ambient: Vec3,
     ground_ambient: Vec3,
+    native_ambient_packed: u32,
 }
 
 impl Look {
@@ -123,9 +128,28 @@ impl Look {
             sun_up: if up > 0.0 { 1.0 } else { 0.0 },
             // Warmer and brighter key than authored (DESIGN 4.2), cool shade fill, warm ground bounce.
             sun_color: Vec3::from(env.sun_color) * 1.2 * up,
+            // The shade floor: the native device ambient (resolve.wgsl `light += max(ambient * ao, floor)`), 3 x 10 bit in flags.w.
+            native_ambient_packed: pack_unorm3(ambient),
             sky_ambient: ambient * Vec3::new(1.15, 1.45, 1.9),
-            ground_ambient: ambient * Vec3::new(1.7, 1.25, 0.8),
+            ground_ambient: ambient * Vec3::new(1.7, 1.25, 1.0),
         }
+    }
+}
+
+/// 3 x 10-bit unorm (`x | y << 10 | z << 20`), inputs clamped to 0..=1.
+fn pack_unorm3(v: Vec3) -> u32 {
+    let q = |c: f32| (c.clamp(0.0, 1.0) * 1023.0).round() as u32;
+    q(v.x) | q(v.y) << 10 | q(v.z) << 20
+}
+
+#[cfg(test)]
+mod look_tests {
+    use super::*;
+
+    #[test]
+    fn native_ambient_floor_round_trips_through_flags_w() {
+        let p = pack_unorm3(Vec3::new(0.0, 0.5, 2.0));
+        assert_eq!((p & 1023, p >> 10 & 1023, p >> 20 & 1023), (0, 512, 1023));
     }
 }
 
@@ -188,7 +212,8 @@ impl Renderer {
             let bloom = v2.bloom.bind(&self.device, &v2.consts, &targets);
             let taa = v2.taa_pass.bind(&self.device, &v2.consts, &v2.ctl, &bloom.halo, &targets);
             let post_binds = [0, 1].map(|k| v2.post.bind(&self.device, &v2.consts, &v2.ctl, &taa.hist[1 - k], &targets.depth));
-            v2.sized = Some(Sized { targets, resolve_bind, pyramid, ao, bloom, taa, post_binds });
+            let skyfix_bind = v2.skyfix.bind(&self.device, &targets.g1);
+            v2.sized = Some(Sized { targets, resolve_bind, pyramid, ao, bloom, taa, post_binds, skyfix_bind });
             v2.taa_key = None;
             v2.taa_index = 0;
         }
@@ -226,7 +251,7 @@ impl Renderer {
             fog_color: Vec3::from(env.fog_color).extend(0.0).to_array(),
             fog: [env.fog_start, env.fog_end, 0.0, 0.0],
             grade: [1.0, 1.08, 1.05, 0.2],
-            flags: [v2.frame, 1, admission, 0],
+            flags: [v2.frame, 1, admission, look.native_ambient_packed],
         };
         self.queue.write_buffer(&v2.consts, 0, bytemuck::bytes_of(&consts));
         let post_ctl = post::Ctl { bloom: self.enhanced_settings.bloom_strength.clamp(0.0, 1.0), cas: self.enhanced_settings.cas_strength.clamp(0.0, 1.0),
@@ -261,14 +286,15 @@ impl Renderer {
             });
             calls += self.v2_draw_g(&mut pass, &v2.pipes.g, grid);
         }
+        v2.skyfix.encode(&mut enc, &sized.skyfix_bind, &targets.depth);
         // [slot 1] actor admission: only this frame's actors (alpha > 0) are drawn into an id target depth-tested against the G-buffer
         // depth and reduced to `v2.admission.visibility()` (layout in admission.rs), read by the actor shadow layers and by lamps.
-        v2.admission.encode(self, &mut enc, &targets.depth, size, timer);
+        v2.admission.encode(self, &mut enc, &targets.depth, size);
         // [slot 2] shadow maps: sun cascades + moon A, a cached static layer (world only) and a per-frame actor layer each.
         let light = |dir: Vec3| shadows::Light { dir, strength: crate::sun_shadows::horizon_fade(dir.y) };
         let shadow_view = shadows::View { eye: cam.pos, forward: cam.forward(), up: cam.up(), fovy: self.lens.vertical_fov(aspect), aspect,
             near: self.lens.near, far, fog_end: env.fog_end, time: self.time };
-        v2.shadows.encode(self, &mut enc, &shadow_view, (look.sun_up > 0.5).then(|| light(look.sun)), moon.map(|(dir, _)| light(dir)), &v2.admission, timer);
+        v2.shadows.encode(self, &mut enc, &shadow_view, (look.sun_up > 0.5).then(|| light(look.sun)), moon.map(|(dir, _)| light(dir)), &v2.admission);
         // [slot 3] pyramid + AO (writes the AO texture the resolve reads, flags.y bit 0), [slot 4] light clusters + lamp cube atlas.
         sized.pyramid.encode(&v2.pyramid, &mut enc, timer.and_then(|t| t.compute("hiz")));
         sized.ao.encode(&v2.ao, &self.queue, &mut enc, timer, admission, jitter != [0.0, 0.0]);
