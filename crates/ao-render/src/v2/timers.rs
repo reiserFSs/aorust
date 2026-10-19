@@ -17,6 +17,7 @@ pub(super) struct PassTimers {
     names: RefCell<[Vec<&'static str>; SLOTS]>,
     slot: Cell<usize>,
     submissions: RefCell<[Option<wgpu::SubmissionIndex>; SLOTS]>,
+    marker: Marker,
 }
 
 const SLOT_BYTES: u64 = MAX_PASSES as u64 * 16;
@@ -34,6 +35,7 @@ impl PassTimers {
             names: RefCell::new(Default::default()),
             slot: Cell::new(0),
             submissions: RefCell::new(Default::default()),
+            marker: Marker::new(device),
         })
     }
 
@@ -92,9 +94,10 @@ impl PassTimers {
         self.submissions.borrow_mut()[self.slot.get()] = Some(submission.clone());
     }
 
-    /// An empty compute pass that marks the end of the frame's GPU work (name `tail`); call after the last timed pass.
+    /// A 1x1 render pass that marks the end of the frame's GPU work (name `tail`; an empty compute pass records no timestamp on
+    /// Metal); call after the last timed pass.
     pub(super) fn tail(&self, enc: &mut wgpu::CommandEncoder) {
-        drop(enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("v2 timer tail"), timestamp_writes: self.compute("tail") }));
+        self.marker.pass(enc, self.render("tail"));
     }
 
     /// Blocks until the frame submitted `lag` frames ago (0 = the latest, at most `SLOTS - 1`) completes and returns

@@ -123,8 +123,8 @@ impl Look {
             sun_up: if up > 0.0 { 1.0 } else { 0.0 },
             // Warmer and brighter key than authored (DESIGN 4.2), cool shade fill, warm ground bounce.
             sun_color: Vec3::from(env.sun_color) * 1.2 * up,
-            sky_ambient: ambient * Vec3::new(0.72, 0.91, 1.2),
-            ground_ambient: ambient * Vec3::new(1.1, 0.8, 0.5),
+            sky_ambient: ambient * Vec3::new(1.15, 1.45, 1.9),
+            ground_ambient: ambient * Vec3::new(1.7, 1.25, 0.8),
         }
     }
 }
