@@ -378,9 +378,9 @@ impl Shadows {
         let current = fits.map(|fit| fit.map(|fit| fit.tight));
         self.draw_dynamic(r, enc, &current, sun_frame.as_ref(), admission, items);
 
-        for k in 0..SUN_CASCADES {
+        for (k, fit) in current.iter().take(SUN_CASCADES).enumerate() {
             receive.sun_static[k] = self.layers[k].matrix.to_cols_array_2d();
-            receive.sun_dyn[k] = current[k].unwrap_or(Mat4::ZERO).to_cols_array_2d();
+            receive.sun_dyn[k] = fit.unwrap_or(Mat4::ZERO).to_cols_array_2d();
         }
         receive.moon_static = self.layers[SUN_CASCADES].matrix.to_cols_array_2d();
         receive.moon_dyn = current[SUN_CASCADES].unwrap_or(Mat4::ZERO).to_cols_array_2d();
@@ -515,8 +515,8 @@ impl Shadows {
     /// The dynamic layers: cleared every frame (only when they hold something), then admitted-actor casters.
     fn draw_dynamic(&mut self, r: &Renderer, enc: &mut wgpu::CommandEncoder, current: &[Option<Mat4>; LAYERS], sun_frame: Option<&CascadeFrame>,
         admission: &Admission, items: bool) {
-        for layer in 0..LAYERS {
-            let Some(matrix) = current[layer] else { continue };
+        for (layer, fit) in current.iter().enumerate() {
+            let Some(matrix) = *fit else { continue };
             if !items && !self.dyn_dirty[layer] { continue; }
             if items {
                 let mut uniform = ShadowUniform::zeroed();
@@ -574,10 +574,10 @@ mod tests {
             let frame = CascadeFrame::new(eye, forward, Vec3::Y, FOVY, ASPECT, 0.1, 180.0, sun, SUN_RES).unwrap();
             let splits = frame.uniform.splits;
             let mut start = splits[3];
-            for k in 0..SUN_CASCADES {
+            for (k, &end) in splits.iter().take(SUN_CASCADES).enumerate() {
                 let matrix = Mat4::from_cols_array_2d(&frame.uniform.matrices[k]);
-                assert!(inside(&matrix, eye, forward, start, splits[k]), "cascade {k} misses its slice at yaw {yaw}");
-                start = splits[k] - (splits[k] - start) * 0.1;
+                assert!(inside(&matrix, eye, forward, start, end), "cascade {k} misses its slice at yaw {yaw}");
+                start = end - (end - start) * 0.1;
             }
         }
     }
@@ -649,12 +649,12 @@ mod tests {
         let sun = Vec3::new(0.3, 0.7, 0.4).normalize();
         let frame = CascadeFrame::new(Vec3::ZERO, -Vec3::Z, Vec3::Y, FOVY, ASPECT, 0.1, 180.0, sun, SUN_RES).unwrap();
         let mut start = 0.1;
-        for k in 0..SUN_CASCADES {
+        for (k, &guard) in GUARD.iter().take(SUN_CASCADES).enumerate() {
             let end = frame.uniform.splits[k];
-            let stored = fit_slice(Vec3::ZERO, -Vec3::Z, FOVY, ASPECT, start, end, 180.0, sun, SUN_RES, GUARD[k]).unwrap();
+            let stored = fit_slice(Vec3::ZERO, -Vec3::Z, FOVY, ASPECT, start, end, 180.0, sun, SUN_RES, guard).unwrap();
             let covers = |eye: Vec3| contains(&stored, &slice_corners(&view_at(eye, -Vec3::Z), start, end), SUN_RES);
             assert!(covers(Vec3::ZERO), "cascade {k}");
-            assert!(covers(Vec3::new(0.5 * GUARD[k], 0.0, 0.0)) && covers(Vec3::new(0.0, 0.0, -0.5 * GUARD[k])), "cascade {k}: half the slack");
+            assert!(covers(Vec3::new(0.5 * guard, 0.0, 0.0)) && covers(Vec3::new(0.0, 0.0, -0.5 * guard)), "cascade {k}: half the slack");
             assert!(!covers(Vec3::new(end, 0.0, 0.0)), "cascade {k}: a walk of one cascade length must re-render");
             start = end - (end - start) * 0.1;
         }
