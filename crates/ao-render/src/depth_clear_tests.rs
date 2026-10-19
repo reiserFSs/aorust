@@ -104,8 +104,8 @@ struct Out { @builtin(position) p: vec4<f32>, @location(0) color: vec4<f32> }
                 let stages=if !reference {0..5}else{match segment {0=>0..2,1=>2..4,_=>4..5}};
                 for stage in stages {
                     if !reference {
-                        if stage==2 {r.draw_actors(&mut pass,2);}
-                        if stage==4 {r.draw_actors(&mut pass,6);}
+                        if stage==2 {r.draw_actors_in(&mut pass,2,0..=i32::MAX);}
+                        if stage==4 {r.draw_actors_in(&mut pass,6,0..=i32::MAX);}
                     }
                     // The clear replaces pipeline state; subsequent draws must rebind.
                     pass.set_pipeline(&pipe);

@@ -76,26 +76,31 @@ impl HeatHaze {
         self.velocity.fill(Vec2::ZERO);
         self.active = false;
     }
-    pub fn update<'a>(&mut self, size: (u32, u32), vp: Mat4, eye: Vec3, forward: Vec3, spheres: impl Iterator<Item = &'a [f32; 4]>) {
+    fn init_grid(&mut self) {
+        if !self.uv.is_empty() { return; }
+        self.uv.extend((0..COUNT).map(base));
+        self.velocity.resize(COUNT, Vec2::ZERO);
+        self.vertices.extend((0..COUNT).map(|index| Vertex {
+            position: [(index % WIDTH) as f32 / 59.0 * 2.0 - 1.0, 1.0 - (index / WIDTH) as f32 / 29.0 * 2.0],
+            uv: [0.0; 2],
+        }));
+    }
+    /// `offscreen`: Randy's offscreen technology is active, so VisualOffscreen2Screen (list 10) presents render target 1
+    /// through the grid every frame, not only while a lava sphere perturbs it (the grid then relaxes to its base UVs).
+    pub fn update<'a>(&mut self, size: (u32, u32), vp: Mat4, eye: Vec3, forward: Vec3, spheres: impl Iterator<Item = &'a [f32; 4]>, offscreen: bool) {
         self.active = false;
         let mut spheres = spheres.peekable();
-        if spheres.peek().is_none() { return; }
+        if spheres.peek().is_none() && !offscreen { return; }
         if self.gpu.as_ref().and_then(|gpu| gpu.target.as_ref()).is_some_and(|target| target.size != size) {
             self.uv.iter_mut().enumerate().for_each(|(index, uv)| *uv = base(index));
         }
+        if offscreen { self.init_grid(); }
         let planes = frustum_planes(&vp);
         for sphere in spheres {
             let center = Vec3::new(sphere[0], sphere[1], sphere[2]);
             let depth = (center - eye).dot(forward);
             if depth <= 0.0 || depth >= 100.0 || frustum_culls_sphere(&planes, center, sphere[3]) { continue; }
-            if self.uv.is_empty() {
-                self.uv.extend((0..COUNT).map(base));
-                self.velocity.resize(COUNT, Vec2::ZERO);
-                self.vertices.extend((0..COUNT).map(|index| Vertex {
-                    position: [(index % WIDTH) as f32 / 59.0 * 2.0 - 1.0, 1.0 - (index / WIDTH) as f32 / 29.0 * 2.0],
-                    uv: [0.0; 2],
-                }));
-            }
+            self.init_grid();
             // Native uses the camera-space sphere depth only. The perturbation
             // centre is random in screen UV space, not the projected sphere centre.
             let center = Vec2::new(random(), random());
@@ -103,6 +108,7 @@ impl HeatHaze {
             perturb(&mut self.velocity, center, radius, 0.005 / depth.max(1.0));
             self.active = true;
         }
+        self.active |= offscreen;
         if !self.active { return; }
         integrate(&mut self.uv, &mut self.velocity);
     }
@@ -181,7 +187,7 @@ mod tests {
         let mut heat = HeatHaze::default();
         heat.reset();
         assert_eq!(ao_scene::crt_rand(), expected.rand());
-        heat.update((64, 64), Mat4::IDENTITY, Vec3::ZERO, Vec3::NEG_Z, std::iter::empty());
+        heat.update((64, 64), Mat4::IDENTITY, Vec3::ZERO, Vec3::NEG_Z, std::iter::empty(), false);
         assert_eq!(ao_scene::crt_rand(), expected.rand(), "no visible sphere must not repeat environment initialization");
         heat.reset();
         for _ in 0..5400 { expected.rand(); }
@@ -211,19 +217,28 @@ mod tests {
         let vp = Mat4::perspective_rh(1.0, 1.0, 0.1, 500.0);
         let mut heat = HeatHaze::default();
         let distant = [[0.0, 0.0, -101.0, 10.0]];
-        heat.update((64, 64), vp, Vec3::ZERO, Vec3::NEG_Z, distant.iter());
+        heat.update((64, 64), vp, Vec3::ZERO, Vec3::NEG_Z, distant.iter(), false);
         assert!(!heat.active && heat.uv.is_empty());
         let near = [[0.0, 0.0, -10.0, 10.0]];
-        heat.update((64, 64), vp, Vec3::ZERO, Vec3::NEG_Z, near.iter());
+        heat.update((64, 64), vp, Vec3::ZERO, Vec3::NEG_Z, near.iter(), false);
         assert!(heat.active);
         assert_eq!(heat.uv.len(), COUNT);
         assert!(heat.velocity.iter().any(|v| v.length_squared() > 0.0));
         let previous = heat.uv.clone();
-        heat.update((64, 64), vp, Vec3::ZERO, Vec3::NEG_Z, std::iter::empty());
+        heat.update((64, 64), vp, Vec3::ZERO, Vec3::NEG_Z, std::iter::empty(), false);
         assert!(!heat.active);
         assert_eq!(heat.uv, previous, "native empty queue uses the copy branch without advancing its grid");
         heat.reset();
         assert!(heat.velocity.iter().all(|&velocity| velocity == Vec2::ZERO));
         assert!(heat.uv.iter().enumerate().all(|(index, &uv)| uv == base(index)));
+    }
+
+    #[test]
+    fn offscreen_technology_presents_the_base_grid_every_frame() {
+        let mut heat = HeatHaze::default();
+        heat.update((64, 64), Mat4::IDENTITY, Vec3::ZERO, Vec3::NEG_Z, std::iter::empty(), true);
+        assert!(heat.active, "VisualOffscreen2Screen presents render target 1 even with no lava sphere");
+        assert_eq!(heat.uv.len(), COUNT);
+        assert!(heat.uv.iter().enumerate().all(|(index, &uv)| uv == base(index)), "unperturbed grid stays at its base UVs");
     }
 }

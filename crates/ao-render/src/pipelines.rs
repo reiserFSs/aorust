@@ -90,16 +90,18 @@ impl Spec {
             19 => ("fs_foliage_blend_soft", Some(wgpu::BlendState::ALPHA_BLENDING), false),
             20 => ("fs_foliage_sprite_core", Some(wgpu::BlendState::ALPHA_BLENDING), true),
             21 => ("fs_foliage_sprite_soft", Some(wgpu::BlendState::ALPHA_BLENDING), false),
+            // DS1003d13a/1003b9c9 blob +0x5d8: SRCALPHA/INVSRCALPHA, default Z write, LESSEQUAL.
+            22 | 23 => ("fs_refraction", Some(wgpu::BlendState::ALPHA_BLENDING), true),
             _ => (fs, state, depth_write),
         };
         Descriptor {
             fs, state, depth_write, actor,
-            vs: if effect == 14 { "vs_sky_points" } else if (15..=17).contains(&effect) { "vs_lava" } else if (8..=11).contains(&effect) { "vs_ground" } else if matches!(effect, 12 | 13) { "vs_liquid" } else if actor && matches!(effect, 1 | 4..=6) { "vs_actor" } else if sky { "vs_sky" } else if env { "vs_env" } else if actor { "vs_actor" } else { "vs" },
+            vs: if effect == 14 { "vs_sky_points" } else if effect == 22 { "vs_refraction" } else if effect == 23 { "vs_refraction_shallow" } else if (15..=17).contains(&effect) { "vs_lava" } else if (8..=11).contains(&effect) { "vs_ground" } else if matches!(effect, 12 | 13) { "vs_liquid" } else if actor && matches!(effect, 1 | 4..=6) { "vs_actor" } else if sky { "vs_sky" } else if env { "vs_env" } else if actor { "vs_actor" } else { "vs" },
             holo: effect == 1 || (8..=11).contains(&effect),
             points: effect == 14,
             cull: !two_sided && !matches!(effect, 1 | 4..=6),
             // Randy 10041f98 and DS 1006c61d retain LESSEQUAL.
-            compare: if effect == 2 { wgpu::CompareFunction::LessEqual } else { compare.unwrap_or(if sky { wgpu::CompareFunction::Always } else if env || matches!(effect, 0..=7 | 10 | 12 | 13 | 15..=21) { wgpu::CompareFunction::LessEqual } else { wgpu::CompareFunction::Less }) },
+            compare: if effect == 2 { wgpu::CompareFunction::LessEqual } else { compare.unwrap_or(if sky { wgpu::CompareFunction::Always } else if env || matches!(effect, 0..=7 | 10 | 12 | 13 | 15..=23) { wgpu::CompareFunction::LessEqual } else { wgpu::CompareFunction::Less }) },
             bias: effect == 7,
         }
     }

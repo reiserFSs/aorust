@@ -94,12 +94,17 @@ fn layer_uv(v: &Vertex, index: usize, style: u32, pass: usize, time: f32, edge: 
 impl Renderer {
     /// DS1003b270 stores the inverse bool and invalidates the camera cell.
     pub fn set_realistic_water(&mut self, enabled: bool) { self.realistic_water = enabled; }
-    /// Pref `UseOffscreenSurfaceTechnology` → Randy `1004 1ed1` `SetUseOffscreenTech`. Default off (client default).
-    pub fn set_offscreen_surface_technology(&mut self, enabled: bool) { self.offscreen_surface_technology = enabled; }
+    /// Pref `UseOffscreenSurfaceTechnology` -> Randy `10041ed1` `SetUseOffscreenTech` (default off). Turning it off deletes
+    /// render targets 1..4 (`SetFeatureUsage` `100431c7` else branch -> `10041566`), so the liquid must request them again.
+    pub fn set_offscreen_surface_technology(&mut self, enabled: bool) {
+        self.offscreen_surface_technology = enabled;
+        if !enabled { self.offscreen_armed = false; }
+    }
     pub fn offscreen_surface_technology(&self) -> bool { self.offscreen_surface_technology }
 
     pub(super) fn update_liquids(&mut self, camera: Vec3) {
         let wave = ao_scene::wave_curves(self.time);
+        let mut requested = false;
         for run in &mut self.liquids {
             let cell = (Surface::cell(camera.to_array()), self.realistic_water);
             let changed = run.cell.is_none_or(|previous| previous.1 != cell.1 || (self.realistic_water && previous.0 != cell.0));
@@ -132,6 +137,8 @@ impl Renderer {
                 }
             }
             if run.indices.is_empty() { continue; }
+            // DS10040d3d: a drawn liquid calls Randy_t::SetFeatureUsage(0x20) (render targets 1 and 2).
+            requested |= matches!(run.source.style, 0 | 4);
             let edge = &mut self.liquid_edge[match run.source.style { 1 => 2, 2 => 1, _ => 0 }];
             if !matches!(run.source.style, 3 | 4) { next_edge_phase(edge, run.source.style); }
             // Visibility is from the *previous* frame's frustum cull (this frame's isn't computed yet when
@@ -168,6 +175,7 @@ impl Renderer {
                 if changed { self.queue.write_buffer(indices, 0, bytemuck::cast_slice(&run.gpu_indices)); }
             }
         }
+        self.offscreen_requested = requested;
     }
 }
 

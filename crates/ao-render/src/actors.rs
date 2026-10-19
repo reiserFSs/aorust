@@ -889,7 +889,8 @@ impl Renderer {
 
     /// Draws a native render list without changing its material pipelines.
     /// With sun shadows enabled, the caller binds the shared receiver at group 3.
-    pub(crate) fn draw_actors(&self,pass:&mut wgpu::RenderPass,priority:i32)->usize {
+    /// Draws a native render list restricted to native distance buckets `buckets` (RViewPort::Render's first/last bucket).
+    pub(crate) fn draw_actors_in(&self,pass:&mut wgpu::RenderPass,priority:i32,buckets:std::ops::RangeInclusive<i32>)->usize {
         let layer=&self.act;
         let buf=layer.bufs.get(self.frame);
         let calls=std::cell::Cell::new(0usize);
@@ -897,7 +898,7 @@ impl Renderer {
         let limit=layer.commands.partition_point(|command|command.0<=priority);
         while start<limit {
             let end=(start+1..limit).find(|&i|layer.commands[i].3).unwrap_or(limit);
-            if layer.commands[start].3 {
+            if layer.commands[start].3 && buckets.contains(&layer.commands[start].2) {
                 pass.set_pipeline(&self.world.depth_clear_pipe);
                 pass.draw(0..3,0..1);
             }
@@ -962,7 +963,7 @@ impl Renderer {
                 }
             };
             for command in &layer.commands[start..end] {
-                if let Some(index)=command.1 {one(pass,index);}
+                if let Some(index)=command.1.filter(|_|buckets.contains(&command.2)) {one(pass,index);}
             }
             start=end;
         }

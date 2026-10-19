@@ -189,6 +189,46 @@ fn fs_lava_crust(i: VOut) -> @location(0) vec4<f32> {
     return vec4<f32>(mix(a.rgb, g.fog_g.rgb, i.fog), a.a * b.a);
 }
 
+// RViewPort::RenderRefraction list 4 -> VisualLiquid slot +0x3c = DS1003d13a -> 1003b9c9(this, viewport, 0 | 4). Only with Randy's
+// offscreen technology (render target 2 = copy of the scene so far). Blob this+0x5d8: LIGHTING off, SRCALPHA/INVSRCALPHA, COLOROP
+// SELECTARG1 TEXTURE, ALPHAOP SELECTARG1 DIFFUSE, address MIRROR, fog on. The lit RGB of the transformed buffer is therefore unused;
+// only the diffuse alpha byte written below survives. Wave table `(camera+0x90)[16]` is indexed i & 15 for u and (i+1) & 15 for v.
+fn wave16(i: u32) -> f32 { let k = i & 15u; return g.wave[k >> 2u][k & 3u]; }
+fn mirror_uv(t: f32) -> f32 { let m = t - 2.0 * floor(t * 0.5); return select(m, 2.0 - m, m > 1.0); }
+// 1003b9c9: fwd.y = camera quaternion applied to (0,0,1); band centre c = .5 - .5 * (fwd.y * 1.414); tent width 5; alpha = round(m*m*(1-|fy|)^2*255 - .49999) when m > .2.
+fn refraction_band_alpha(y_up: f32, fy: f32) -> f32 {
+    let c = 0.5 - 0.5 * (fy * 1.414);
+    let t = (y_up - c) * 5.0;
+    let m = select(1.0 - t, t + 1.0, t <= 0.0);
+    let k = (1.0 - abs(fy)) * (1.0 - abs(fy));
+    return select(0.0, clamp(round(m * k * m * 255.0 - 0.49999), 0.0, 255.0) / 255.0, m > 0.2);
+}
+@vertex
+fn vs_refraction(v: VIn, @builtin(vertex_index) vi: u32) -> VOut {
+    var o = vtx(v);
+    let ndc = o.clip.xy / o.clip.w;
+    let fy = -g.view[1][2];
+    let y_up = 0.5 + 0.5 * ndc.y;
+    // u = x/W + wave[i]*.005; v = (1 - y/H) + wave[i+1]*.015 + fwd.y*1.414 (1003b9c9: the image is vertically mirrored about the horizon).
+    o.uv = vec2<f32>(wave16(vi) * 0.005 + (0.5 + 0.5 * ndc.x), wave16(vi + 1u) * 0.015 + y_up + fy * 1.414);
+    o.color = vec4<f32>(1.0, 1.0, 1.0, refraction_band_alpha(y_up, fy));
+    return o;
+}
+// param 4 (shallow): u = wave[i]*.165 + x/W, v = wave[i+1]*.165 + y/H (screen y down), alpha 255.
+@vertex
+fn vs_refraction_shallow(v: VIn, @builtin(vertex_index) vi: u32) -> VOut {
+    var o = vtx(v);
+    let ndc = o.clip.xy / o.clip.w;
+    o.uv = vec2<f32>(wave16(vi) * 0.165 + (0.5 + 0.5 * ndc.x), wave16(vi + 1u) * 0.165 + (0.5 - 0.5 * ndc.y));
+    o.color = vec4<f32>(1.0);
+    return o;
+}
+@fragment
+fn fs_refraction(i: VOut) -> @location(0) vec4<f32> {
+    let t = sample_clamped(tex, vec2<f32>(mirror_uv(i.uv.x), mirror_uv(i.uv.y)));
+    return vec4<f32>(mix(t.rgb, g.fog_g.rgb, native_fog(i.fog)), i.color.a);
+}
+
 // Actor overrides share the submesh's linear storage domain. Independent enable lanes preserve `None`, including power 0.
 @vertex
 fn vs_actor(v: VIn, @location(8) emissive: vec4<f32>, @location(9) specular: vec4<f32>, @location(10) power: vec4<f32>, @location(11) uv: vec4<f32>) -> VOut {

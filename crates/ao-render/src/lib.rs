@@ -42,6 +42,7 @@ mod native_materials;
 #[cfg(test)]
 mod material_tests;
 mod native_liquid;
+mod refraction;
 mod water;
 mod water_waves;
 mod water_dynamics;
@@ -307,7 +308,9 @@ const SKY_CULL_PIPE: usize = SKY_GLOW_PIPE + 1;
 const SKY_NATIVE_PIPE: usize = SKY_CULL_PIPE + 8;
 const SKY_POINT_PIPE: usize = SKY_NATIVE_PIPE + 3;
 const SKY_LAST_PIPE: usize = SKY_POINT_PIPE;
-const WORLD_MATERIAL_STATE_PIPE: usize = native_liquid::PIPE + 5;
+/// DS1003b5e9/1003bebf/1003c356 native liquid passes (`PIPE`..+4), then the two `RenderRefraction` band pipelines (effects 22, 23).
+const REFRACTION_PIPE: usize = native_liquid::PIPE + 5;
+const WORLD_MATERIAL_STATE_PIPE: usize = native_liquid::PIPE + 7;
 const WORLD_COMPARE_PIPE: usize = WORLD_MATERIAL_STATE_PIPE + 18;
 const WORLD_ONE_PIPE: usize = WORLD_COMPARE_PIPE + 108;
 const SKY_STATE_PIPE: usize = WORLD_ONE_PIPE + 2;
@@ -843,6 +846,11 @@ pub struct Renderer {
     realistic_water: bool,
     /// Pref `UseOffscreenSurfaceTechnology` (Randy `m_bUseOffscreenTechnology` 1017d333, default 0).
     offscreen_surface_technology: bool,
+    /// A liquid requested Randy feature 0x20 (DS10040d3d) in an earlier frame: render targets 1/2 exist (see `refraction.rs`).
+    offscreen_armed: bool,
+    /// Set by `update_liquids` when this frame has a visible water/shallow liquid; arms the targets for the next frame.
+    offscreen_requested: bool,
+    refraction: refraction::Refraction,
     liquid_edge: [f32; 3],
     water_light: Option<([f32; 3], [f32; 3])>,
     sky: SkyGpu,
@@ -1111,7 +1119,7 @@ fn build_pipelines() -> (Pipelines, Pipelines, Pipelines) {
                 ((blend, two, false, false, false, false), write != matches!(blend, Blend::Opaque | Blend::AlphaTest), Some(compare))))));
     let mut pipes: Vec<_> = pipe_specs.clone().map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite, false, false, 0, None))
         .chain(std::iter::once(mk(Blend::Additive, true, true, false, false, false, false, false, 14, None)))
-        .chain([12, 13, 15, 16, 17].into_iter().map(|effect| mk(Blend::AlphaBlend, true, false, false, false, false, false, false, effect, None)))
+        .chain([12, 13, 15, 16, 17, 22, 23].into_iter().map(|effect| mk(Blend::AlphaBlend, true, false, false, false, false, false, false, effect, None)))
         .chain(depth_specs.clone().map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite, false, true, 0, None)))
         .collect();
     assert_eq!(pipes.len(), WORLD_COMPARE_PIPE);
@@ -1380,6 +1388,9 @@ impl Renderer {
             shadow_timer_stage: shadow_pass::ShadowGpuStage::All,
             realistic_water: true,
             offscreen_surface_technology: false,
+            offscreen_armed: false,
+            offscreen_requested: false,
+            refraction: Default::default(),
             liquid_edge: [0.0; 3],
             water_light: None,
             far_away: vec![],
@@ -3096,12 +3107,16 @@ impl Renderer {
         self.prepare_grass_shadow_receiver();
         self.prepare_atmosphere_stack(&mut enc, vp, cam.pos, far, env);
         self.encode_water_bottom(&mut enc);
+        // Randy offscreen technology: targets exist from the frame after a liquid requested them (DS10040d3d -> SetFeatureUsage 0x20).
+        let offscreen = self.offscreen_active();
+        if self.offscreen_surface_technology { self.offscreen_armed |= self.offscreen_requested; }
+        if offscreen { self.prepare_refraction(t.size); }
         let inst_buf = self.gpu.inst_bufs.get(self.frame);
         let sky_buf = self.sky.bufs.get(self.frame);
 
         let calls = std::cell::Cell::new(0usize);
         self.screen.prepare(&self.device,&self.queue,self.format,t.size);
-        self.heat_haze.update(t.size, vp, cam.pos, cam.forward(), self.liquids.iter().flat_map(|run| run.heat_spheres.iter()));
+        self.heat_haze.update(t.size, vp, cam.pos, cam.forward(), self.liquids.iter().flat_map(|run| run.heat_spheres.iter()), offscreen);
         self.heat_haze.prepare(&self.device, &self.queue, self.format, t.size);
         let world_resolve = self.heat_haze.source().unwrap_or(resolve);
         let enhanced_frame = self.enhanced_frame.as_ref();
@@ -3137,7 +3152,7 @@ impl Renderer {
                 color_attachments: &attachments[..if isolate_sky { 1 } else { enhanced_frame.map_or(1, enhanced::EnhancedFrame::target_count) }],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: enhanced_frame.map_or(&t.depth, |frame| &frame.depth),
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: if split_effect_cost || isolate_sky || enhanced_frame.is_some() { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: if split_effect_cost || isolate_sky || offscreen || enhanced_frame.is_some() { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),
                     stencil_ops: None,
                 }),
                 timestamp_writes: timestamps.and_then(|(begin, end)| {
@@ -3196,7 +3211,9 @@ impl Renderer {
             // frame native if any are present rather than replaying soft pixels
             // against a depth buffer from a different native clear interval.
             let split_foliage = self.enhanced_settings.foliage_edges && self.screen.depth_clears.is_empty();
-            let world_phase = |pass: &mut wgpu::RenderPass, priority: i32| {
+            // `buckets`: RViewPort::Render's first/last distance bucket (DS100793b8 splits lists 3-6 at bucket 500 = 100 m when
+            // Randy's offscreen technology is active). Liquids sit in bucket 999 (DS10040d3d), so list 4 is always "far".
+            let world_phase_in = |pass: &mut wgpu::RenderPass, priority: i32, buckets: std::ops::RangeInclusive<i32>| {
                 pass.set_bind_group(0, &self.globals_bg, &[]);
                 // Grass replaces group 3; restore the shared receiver at phase entry.
                 self.bind_world_receiver(pass);
@@ -3205,7 +3222,8 @@ impl Renderer {
                     pass.set_vertex_buffer(1, inst.slice(..));
                     let first = self.sorted.partition_point(|command| command.0 < priority);
                     let last = self.sorted.partition_point(|command| command.0 <= priority);
-                    for &(_, _, list, di, vi) in &self.sorted[first..last] {
+                    for &(_, bucket, list, di, vi) in &self.sorted[first..last] {
+                        if list != 2 && !buckets.contains(&bucket) { continue; }
                         let d = &[&self.gpu.opaque, &self.gpu.blended, &self.gpu.liquid][list as usize][di];
                         let core = (split_foliage && d.vegetation)
                             .then(|| foliage_edges::pipeline(&self.world.pipes, d.pipe, false)).flatten();
@@ -3216,7 +3234,7 @@ impl Renderer {
                         }
                     }
                 }
-                calls.set(calls.get() + self.draw_actors(pass, priority));
+                calls.set(calls.get() + self.draw_actors_in(pass, priority, buckets.clone()));
                 if let Some(inst) = inst_buf.filter(|_| split_foliage) {
                     pass.set_bind_group(0, &self.globals_bg, &[]);
                     self.bind_world_receiver(pass);
@@ -3226,7 +3244,8 @@ impl Renderer {
                     let last = self.sorted.partition_point(|command| command.0 <= priority);
                     // Replay only the complementary soft coverage, preserving
                     // native relative order and never crossing a priority.
-                    for &(_, _, list, di, vi) in &self.sorted[first..last] {
+                    for &(_, bucket, list, di, vi) in &self.sorted[first..last] {
+                        if list != 2 && !buckets.contains(&bucket) { continue; }
                         let d = &[&self.gpu.opaque, &self.gpu.blended, &self.gpu.liquid][list as usize][di];
                         if !d.vegetation { continue; }
                         if let Some(pipe) = foliage_edges::pipeline(&self.world.pipes, d.pipe, true) {
@@ -3235,6 +3254,7 @@ impl Renderer {
                     }
                 }
             };
+            let world_phase = |pass: &mut wgpu::RenderPass, priority: i32| world_phase_in(pass, priority, 0..=i32::MAX);
             if let Some(sky) = sky_buf {
                 pass.set_vertex_buffer(1, sky.slice(..));
                 for (d, k) in &self.sky.draws {
@@ -3267,7 +3287,7 @@ impl Renderer {
                     color_attachments: &attachments[..enhanced_frame.map_or(1, enhanced::EnhancedFrame::target_count)],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                         view: enhanced_frame.map_or(&t.depth, |frame| &frame.depth),
-                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: if split_effect_cost || enhanced_frame.is_some() { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: if split_effect_cost || offscreen || enhanced_frame.is_some() { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),
                         stencil_ops: None,
                     }),
                     timestamp_writes: timestamps.and_then(|(_, end)| end.map(|index| wgpu::RenderPassTimestampWrites {
@@ -3313,6 +3333,21 @@ impl Renderer {
                     &attachments[..enhanced_frame.map_or(1, enhanced::EnhancedFrame::target_count)],
                     enhanced_frame.map_or(&t.depth, |frame| &frame.depth));
             }
+            if offscreen {
+                // DS100793b8 with render targets 1/2: Render(0..2) full range; Render(3,4,0,500,0x707); Render(5,6,0,0x707,500);
+                // list 9 copies target 1 into target 2; RenderRefraction(4,4,0,0x707,500); then the near buckets 499..0.
+                for priority in [1, 2] { world_phase(&mut pass, priority); }
+                world_phase_in(&mut pass, 3, 500..=i32::MAX);
+                world_phase(&mut pass, 4);
+                for priority in [5, 6] { world_phase_in(&mut pass, priority, 500..=i32::MAX); }
+                drop(pass);
+                if let Some(source) = self.heat_haze.source() { self.encode_refraction_copy(&mut enc, source); }
+                pass = effect_gpu::resume_world_pass(&mut enc, "RenderRefraction list 4", &attachments[..1], &t.depth);
+                if let Some(inst) = inst_buf { calls.set(calls.get() + self.draw_refraction(&mut pass, inst)); }
+                world_phase_in(&mut pass, 3, 0..=499);
+                for priority in [5, 6] { world_phase_in(&mut pass, priority, 0..=499); }
+                for priority in [10, 7] { world_phase(&mut pass, priority); }
+            } else {
             // Complete native opaque scenery/actors before depth-writing canopy.
             for priority in [1, 2, 3] {
                 world_phase(&mut pass, priority);
@@ -3333,6 +3368,7 @@ impl Renderer {
             // Keep native transparency order: liquid list 4 must blend over leaves.
             for priority in [4, 5, 6, 10, 7] {
                 world_phase(&mut pass, priority);
+            }
             }
         }
         if let Some(frame) = enhanced_frame {
@@ -3449,6 +3485,25 @@ pub fn render_to_png(scene: &Scene, eye: [f32; 3], look_at: [f32; 3], width: u32
 /// [`render_to_png`] with the scrolling textures (`Submesh::uv_scroll`) at `time` seconds.
 pub fn render_to_png_at(scene: &Scene, eye: [f32; 3], look_at: [f32; 3], width: u32, height: u32, path: &Path, time: f32) -> Result<()> {
     render_to_png_actors(scene, &[] as &[(u64, Scene)], vec![], eye, look_at, width, height, path, time)
+}
+
+/// [`render_to_png_at`] with the client pref `UseOffscreenSurfaceTechnology` set to `offscreen`. The first frame lets the liquid
+/// request Randy's render targets (DS10040d3d); the PNG is the second frame, which uses them when the pref is on.
+#[allow(clippy::too_many_arguments)]
+pub fn render_to_png_offscreen(scene: &Scene, eye: [f32; 3], look_at: [f32; 3], width: u32, height: u32, path: &Path, time: f32, offscreen: bool) -> Result<()> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let mut r = Renderer::new(&instance, None)?;
+    r.upload(scene);
+    r.seek(time);
+    r.set_offscreen_surface_technology(offscreen);
+    let targets = Targets::new(&r, width, height);
+    let out = r.device.create_texture_tracked(&wgpu::TextureDescriptor {
+        label: None, size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,
+        dimension: wgpu::TextureDimension::D2, format: r.format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+    });
+    let camera = Camera::look_at(eye.into(), look_at.into());
+    for _ in 0..2 { r.render(&out.create_view_tracked(&Default::default()), &targets, &camera); }
+    texture_to_png(&r, &out, width, height, path)
 }
 
 /// [`render_to_png_at`] with dynamic actors on top of the scene (`models` for [`Renderer::add_actor_model`], `actors` for [`Renderer::set_actors`]).

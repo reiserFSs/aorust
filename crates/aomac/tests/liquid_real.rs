@@ -100,3 +100,41 @@ fn icc_open_sea_shows_water5_detail_lit_by_authored_water_light() -> anyhow::Res
     assert!(flat_std[2] < std[2] * 0.5, "flattening water5 must remove the detail: {flat_std:?} vs {std:?}");
     Ok(())
 }
+
+/// Randy offscreen technology (pref `UseOffscreenSurfaceTechnology`, default off) + VisualLiquid `RenderRefraction` (DS 1003d13a/1003b9c9).
+/// Off: byte-identical to the default render. On: render target 1 is presented through the heat-haze grid and the horizon
+/// band (alpha = tent around the horizon, mirrored target-2 sample) changes the sea there.
+#[test]
+fn icc_offscreen_technology_is_off_by_default_and_adds_the_horizon_refraction_band() -> anyhow::Result<()> {
+    let dir = ao_gui::client_dir();
+    if !dir.join("cd_image/rdb.db").exists() {
+        eprintln!("skipping ICC offscreen technology: no installed client at {}", dir.display());
+        return Ok(());
+    }
+    let store = ao_rdb::RecordStore::open(&dir)?;
+    let scene = ao_formats::playfield::load_playfield_at(&store, &dir, 4582, 2648.69)?;
+    let (eye, at) = ([933.5, 26.0, -748.0], [933.5 - 59.0, 26.0 + 4.6, -748.0 + 81.0]);
+    let out = std::env::temp_dir().join(format!("aomac-icc-offscreen-{}", std::process::id()));
+    std::fs::create_dir_all(&out)?;
+    let shot = |name: &str, offscreen: Option<bool>| -> anyhow::Result<image::RgbaImage> {
+        let path = out.join(name);
+        match offscreen {
+            None => { ao_render::render_to_png_at(&scene, eye, at, 640, 400, &path, 0.0)?; }
+            Some(on) => { ao_render::render_to_png_offscreen(&scene, eye, at, 640, 400, &path, 0.0, on)?; }
+        }
+        Ok(image::open(&path)?.to_rgba8())
+    };
+    let default = shot("default.png", None)?;
+    let off = shot("off.png", Some(false))?;
+    let on = shot("on.png", Some(true))?;
+    std::fs::remove_dir_all(&out)?;
+    // The pref off path is the untouched faithful frame (single-frame default vs two-frame option-off differ only by the water phase clock).
+    let differing = |a: &image::RgbaImage, b: &image::RgbaImage, rows: std::ops::Range<u32>| a.enumerate_pixels()
+        .filter(|(x, y, p)| rows.contains(y) && p.0.iter().zip(b.get_pixel(*x, *y).0).any(|(l, r)| (i16::from(*l) - i16::from(r)).abs() > 6)).count();
+    let off_vs_default = differing(&off, &default, 0..400);
+    let on_vs_off = differing(&on, &off, 0..400);
+    eprintln!("ICC offscreen: option-off vs default {off_vs_default} px, option-on vs off {on_vs_off} px");
+    assert!(off_vs_default < 640 * 400 / 50, "option off must not change the frame: {off_vs_default}");
+    assert!(on_vs_off > 640 * 400 / 20, "option on must change the frame (target-1 present + band): {on_vs_off}");
+    Ok(())
+}
