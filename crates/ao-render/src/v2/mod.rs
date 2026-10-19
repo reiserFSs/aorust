@@ -37,7 +37,7 @@ impl V2 {
     fn new(r: &Renderer) -> Self {
         Self {
             pipes: gbuffer::Pipes::new(r),
-            resolve: resolve::Resolve::new(&r.device),
+            resolve: resolve::Resolve::new(&r.device, &[]),
             post: post::Post::new(&r.device, r.format),
             consts: r.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("v2 frame constants"), size: std::mem::size_of::<FrameConsts>() as u64,
@@ -136,6 +136,11 @@ impl Renderer {
         }
         let sized = v2.sized.as_ref().expect("sized above");
         let look = Look::from_env(&env);
+        // Moon A: the shadowed night key, lit by the authored moon pose; colour per DESIGN 4.2 (art tuning, not authored data).
+        let moon = self.shadow_moon.and_then(|m| {
+            let budget = Vec3::from(m.world_gamma_budget?);
+            Some((Vec3::from(m.toward_light).normalize_or_zero(), Vec3::new(0.235, 0.39, 0.55) * 0.4 * (budget.max_element() / 0.2).clamp(0.0, 1.0)))
+        });
         let consts = FrameConsts {
             view: view.to_cols_array_2d(),
             view_proj: view_proj.to_cols_array_2d(),
@@ -148,8 +153,8 @@ impl Renderer {
             jitter: [jitter[0], jitter[1], v2.frame as f32, self.time],
             sun_dir: look.sun.extend(look.sun_up).to_array(),
             sun_color: look.sun_color.extend(0.0).to_array(),
-            moon_dir: [0.0; 4],
-            moon_color: [0.0; 4],
+            moon_dir: moon.map_or([0.0; 4], |(dir, _)| dir.extend(1.0).to_array()),
+            moon_color: moon.map_or([0.0; 4], |(_, color)| color.extend(0.0).to_array()),
             sky_ambient: look.sky_ambient.extend(0.0).to_array(),
             ground_ambient: look.ground_ambient.extend(0.0).to_array(),
             fog_color: Vec3::from(env.fog_color).extend(0.0).to_array(),
@@ -186,7 +191,10 @@ impl Renderer {
             });
             calls += self.v2_draw_g(&mut pass, &v2.pipes.g, grid);
         }
-        v2.resolve.encode(&mut enc, &sized.resolve_bind, size, timer.and_then(|t| t.compute("resolve")));
+        // [slot 1] actor admission (ids pass + reduction against the G-buffer depth), then [slot 2] shadow maps (sun cascades static
+        // + dynamic layer, moon A, lamp cubes; casters from admitted actors only), [slot 3] pyramid + AO (writes the AO texture the
+        // resolve reads, flags.y bit 0), [slot 4] light clusters: all encoded here, before the resolve.
+        v2.resolve.encode(&mut enc, &sized.resolve_bind, &[], size, timer.and_then(|t| t.compute("resolve")));
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("v2 FX"),
@@ -199,6 +207,7 @@ impl Renderer {
             });
             calls += self.v2_draw_fx(&mut pass, &v2.pipes.fx);
         }
+        // [slot 5] bloom, then TAA (+ CAS), between the FX pass and post; post then reads their output instead of `targets.hdr`.
         v2.post.encode(&mut enc, &sized.post_bind, resolve, timer.and_then(|t| t.render("post")));
         if let Some(timers) = &v2.timers { timers.resolve(&mut enc); }
 

@@ -7,6 +7,13 @@ pub(super) struct Resolve {
     dummy_ao: wgpu::TextureView,
 }
 
+/// A lighting module that extends the resolve: `wgsl` is concatenated before `resolve.wgsl` and declares its bindings at
+/// group `k + 1` (k = its index in the plugin list); `resolve.wgsl` calls the functions it defines.
+pub(super) struct Plugin<'a> {
+    pub wgsl: String,
+    pub layout: &'a wgpu::BindGroupLayout,
+}
+
 fn float_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding, visibility: wgpu::ShaderStages::COMPUTE,
@@ -16,7 +23,7 @@ fn float_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 }
 
 impl Resolve {
-    pub(super) fn new(device: &wgpu::Device) -> Self {
+    pub(super) fn new(device: &wgpu::Device, plugins: &[Plugin<'_>]) -> Self {
         let mut entries = vec![
             wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
@@ -28,12 +35,14 @@ impl Resolve {
         entries.push(wgpu::BindGroupLayoutEntry { binding: 7, visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: super::gbuffer::HDR, view_dimension: wgpu::TextureViewDimension::D2 }, count: None });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("v2 resolve"), entries: &entries });
-        let source = format!("{}\n{}\n{}",
-            crate::shader_source::load("v2/common.wgsl", include_str!("common.wgsl")),
-            crate::shader_source::load("v2/packing.wgsl", include_str!("packing.wgsl")),
-            crate::shader_source::load("v2/resolve.wgsl", include_str!("resolve.wgsl")));
+        let mut source = format!("{}\n{}\n", crate::shader_source::load("v2/common.wgsl", include_str!("common.wgsl")),
+            crate::shader_source::load("v2/packing.wgsl", include_str!("packing.wgsl")));
+        for plugin in plugins { source.push_str(&plugin.wgsl); source.push('\n'); }
+        source.push_str(&crate::shader_source::load("v2/resolve.wgsl", include_str!("resolve.wgsl")));
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("v2 resolve"), source: wgpu::ShaderSource::Wgsl(source.into()) });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("v2 resolve"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
+        let mut layouts = vec![Some(&layout)];
+        layouts.extend(plugins.iter().map(|plugin| Some(plugin.layout)));
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("v2 resolve"), bind_group_layouts: &layouts, immediate_size: 0 });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("v2 resolve"), layout: Some(&pipeline_layout), module: &module, entry_point: Some("main"),
             compilation_options: Default::default(), cache: None,
@@ -62,10 +71,12 @@ impl Resolve {
         })
     }
 
-    pub(super) fn encode(&self, enc: &mut wgpu::CommandEncoder, bind: &wgpu::BindGroup, size: (u32, u32), timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>) {
+    /// `extra[k]` is bound at group `k + 1`, in the order of the plugins given to [`Resolve::new`].
+    pub(super) fn encode(&self, enc: &mut wgpu::CommandEncoder, bind: &wgpu::BindGroup, extra: &[&wgpu::BindGroup], size: (u32, u32), timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>) {
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("v2 resolve"), timestamp_writes });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, bind, &[]);
+        for (k, group) in extra.iter().enumerate() { pass.set_bind_group(k as u32 + 1, *group, &[]); }
         pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
     }
 }
