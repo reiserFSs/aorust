@@ -142,17 +142,6 @@ fn pack_unorm3(v: Vec3) -> u32 {
     q(v.x) | q(v.y) << 10 | q(v.z) << 20
 }
 
-#[cfg(test)]
-mod look_tests {
-    use super::*;
-
-    #[test]
-    fn native_ambient_floor_round_trips_through_flags_w() {
-        let p = pack_unorm3(Vec3::new(0.0, 0.5, 2.0));
-        assert_eq!((p & 1023, p >> 10 & 1023, p >> 20 & 1023), (0, 512, 1023));
-    }
-}
-
 impl Renderer {
     /// v2 replaces the world pass only; GUI viewports, depth-clear layers and other native screens stay faithful.
     pub(crate) fn v2_eligible(&self) -> bool {
@@ -329,5 +318,16 @@ impl Renderer {
         if let Some(timers) = &v2.timers { timers.submitted(&submission); }
         self.v2 = Some(v2);
         submission
+    }
+}
+
+#[cfg(test)]
+mod look_tests {
+    use super::*;
+
+    #[test]
+    fn native_ambient_floor_round_trips_through_flags_w() {
+        let p = pack_unorm3(Vec3::new(0.0, 0.5, 2.0));
+        assert_eq!((p & 1023, p >> 10 & 1023, p >> 20 & 1023), (0, 512, 1023));
     }
 }

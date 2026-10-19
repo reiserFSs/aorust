@@ -1979,7 +1979,6 @@ fn graphics_modern_newland_lamp_pole_stays_native_and_head_glows() -> anyhow::Re
     Ok(())
 }
 
-<<<<<<< ours
 /// Mean gamma-space Rec.709 luma of a rectangle of an RGBA8 image.
 fn v2_region_luma(rgba: &[u8], width: u32, rect: (u32, u32, u32, u32)) -> f32 {
     let (x0, y0, x1, y1) = rect;
@@ -2028,7 +2027,9 @@ fn graphics_v2_sky_has_no_foreign_pixels_and_shade_stays_above_original() -> any
         let (original, now) = (v2_region_luma(&reference, width, rect), v2_region_luma(&v2, width, rect));
         anyhow::ensure!(now >= 0.9 * original, "{name}: v2 luma {now:.1} is below 90% of Original {original:.1}");
     }
-=======
+    Ok(())
+}
+
 /// The ICC sea is a translucent dark blend over the lit seabed. v2 once blended it in linear HDR (the native blend is gamma
 /// space) and its grade crushed dark values to black: the sea read brown-purple. v2 must be at least as close to Original over
 /// the sea region as Classic+ is, and within a fixed bound.
@@ -2076,7 +2077,6 @@ fn graphics_v2_icc_sea_matches_original() -> anyhow::Result<()> {
     eprintln!("ICC_SEA_MEAN_ABS_DIFF classic_plus={classic:.3} v2={v2:.3}");
     // Classic+ is Original plus MSAA (1.0 measured); v2 re-lights the seabed (3.6 measured after the fix, 17.8 before it).
     ensure!(v2 <= 5.0, "v2 sea mean abs diff {v2:.2} vs Original exceeds 5.0 (Classic+ {classic:.2})");
->>>>>>> theirs
     Ok(())
 }
 
