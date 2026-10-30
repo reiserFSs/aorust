@@ -142,6 +142,8 @@ pub(super) fn off(name: &str) -> bool {
 struct Look {
     sun: Vec3,
     sun_up: f32,
+    /// Horizon fade of the shadowed key (1 by day, 0 once the sun is down); the authored key stays on, unshadowed, as fill.
+    sun_fade: f32,
     sun_color: Vec3,
     sky_ambient: Vec3,
     ground_ambient: Vec3,
@@ -156,9 +158,10 @@ impl Look {
         Self {
             sun,
             sun_up: if up > 0.0 { 1.0 } else { 0.0 },
+            sun_fade: up,
             // Warmer and brighter key than authored (DESIGN 4.2). The hemisphere fill keeps the AUTHORED ambient hue: a blue/orange tint on
             // it rotated every shaded surface (ICC platform hull +12 deg from Original); only its brightness is lifted (x1.4 sky, x1.3 ground).
-            sun_color: Vec3::from(env.sun_color) * 1.2 * up,
+            sun_color: Vec3::from(env.sun_color),
             // The shade floor: the native device ambient (resolve.wgsl `light += max(ambient * ao, floor)`), 3 x 10 bit in flags.w.
             native_ambient_packed: pack_unorm3(ambient),
             sky_ambient: ambient * 1.42,
@@ -331,7 +334,7 @@ impl Renderer {
             proj: [self.lens.near, far, (0.5 * self.lens.vertical_fov(aspect)).tan(), aspect],
             jitter: [jitter[0], jitter[1], v2.frame as f32, self.time],
             sun_dir: look.sun.extend(look.sun_up).to_array(),
-            sun_color: look.sun_color.extend(0.0).to_array(),
+            sun_color: look.sun_color.extend(look.sun_fade).to_array(),
             moon_dir: moon.map_or([0.0; 4], |(dir, _)| dir.extend(1.0).to_array()),
             moon_color: moon.map_or([0.0; 4], |(_, color)| color.extend(0.0).to_array()),
             sky_ambient: look.sky_ambient.extend(0.0).to_array(),

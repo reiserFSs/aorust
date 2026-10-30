@@ -22,7 +22,7 @@ pub(crate) struct FrameConsts {
     pub jitter: [f32; 4],
     /// Toward the sun; w = 1 when the sun lights (and shadows) the world.
     pub sun_dir: [f32; 4],
-    /// Linear radiance.
+    /// Linear radiance of the authored key (never faded); w = horizon fade of its shadowed/specular share (below the horizon it is unshadowed fill).
     pub sun_color: [f32; 4],
     /// Moon A, the shadowed night key: toward the moon, w = 1 when active.
     pub moon_dir: [f32; 4],

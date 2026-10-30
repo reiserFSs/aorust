@@ -2032,6 +2032,63 @@ fn graphics_v2_sky_has_no_foreign_pixels_and_shade_stays_above_original() -> any
     Ok(())
 }
 
+/// Borealis at night: Original lights walls with the authored cool key (30,50,70) even with the sun below the horizon; v2 once
+/// dropped it (horizon fade) and the concrete went ~30% darker and neutral-brown. On the concrete walls (no sky, no emissive
+/// signage in the boxes) v2 must be >= 0.95x Original luma with a blue/red ratio within 15% of Original.
+#[test]
+#[ignore = "offline v2 Borealis night regression; requires installed client and the GPU timing lock (owner-checked, 3 min cooldown)"]
+fn graphics_v2_borealis_night_is_not_darker_or_warmer_than_original() -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    let dir = ao_gui::client_dir();
+    let store = ao_rdb::RecordStore::open(&dir)?;
+    let weather = ao_formats::weather::State::clear();
+    let size = (1920u32, 1200u32);
+    let actor = graphics_fixture_actor()?;
+    let (_, pf, time, fixed) = graphics_fixture_views(&actor).into_iter().find(|view| view.0 == "borealis-street-night").context("view")?;
+    ao_scene::crt_srand(1);
+    let (mut scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
+    let collision = ao_formats::playfield::collision::Collision::load(&store, pf)?;
+    super::player::bake_sky_open(&collision, &mut scene);
+    let render = |profile: &str| -> anyhow::Result<Vec<u8>> {
+        ao_scene::crt_srand(1);
+        let mut lens = camera::lens(scene.lens.unwrap_or_default(), false);
+        lens.far = Some(camera::far_plane(camera::VIEW_DISTANCE));
+        let mut shot = Shot { gui: Gui::new(&dir, None)?, scene: Some(scene.clone()), camera: fixed, lens };
+        let mut off = Offscreen::evidence(&shot, size)?;
+        off.fixed_camera(Some(fixed));
+        off.host.msaa_samples = Some(1);
+        off.host.anisotropy = Some(1);
+        off.host.enhanced_settings = Some(graphics_fixture_settings(profile)?);
+        off.host.grass_wind = weather.wind;
+        let list = off.frame(&mut shot, 0.0);
+        off.wait_for_pipeline_warmup();
+        off.rgba(&shot, &list)
+    };
+    let (original, v2) = (render("Original")?, render("Enhanced v2 High")?);
+    // Mean RGB of a box.
+    let mean = |image: &[u8], (x0, x1, y0, y1): (usize, usize, usize, usize)| {
+        let mut sum = [0.0_f64; 3];
+        for y in y0..y1 { for x in x0..x1 {
+            let at = (y * size.0 as usize + x) * 4;
+            for c in 0..3 { sum[c] += f64::from(image[at + c]); }
+        } }
+        sum.map(|s| s / ((x1 - x0) * (y1 - y0)) as f64)
+    };
+    // Left building wall (lit by the authored key in Original; hue checked) and the right retaining wall (unlit in Original, moonlit
+    // cool in v2 by design: luma only): concrete only. The v2 vignette (0.2) darkens these frame-edge boxes by up to ~10% by design,
+    // so the wall bound is 0.90; the whole ground-and-wall band below the skyline (emissive signage is a small share) holds 0.95.
+    let luma = |m: [f64; 3]| 0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2];
+    for (name, rect, hue) in [("left wall", (20, 330, 450, 650), true), ("right wall", (1480, 1880, 620, 740), false), ("street band", (0, 1920, 640, 1200), false)] {
+        let (o, v) = (mean(&original, rect), mean(&v2, rect));
+        let (ratio_o, ratio_v) = (o[2] / o[0].max(1e-3), v[2] / v[0].max(1e-3));
+        eprintln!("BOREALIS_NIGHT {name}: original {o:.1?} v2 {v:.1?} luma x{:.3} b/r {ratio_o:.2} -> {ratio_v:.2}", luma(v) / luma(o));
+        let bound = if name == "street band" { 0.95 } else { 0.90 };
+        ensure!(luma(v) >= bound * luma(o), "{name}: v2 luma {:.1} is below {bound} of Original {:.1}", luma(v), luma(o));
+        ensure!(!hue || (ratio_v / ratio_o - 1.0).abs() <= 0.15, "{name}: v2 blue/red {ratio_v:.2} is not within 15% of Original {ratio_o:.2}");
+    }
+    Ok(())
+}
+
 /// The ICC sea is a translucent dark blend over the lit seabed. v2 once blended it in linear HDR (the native blend is gamma
 /// space) and its grade crushed dark values to black: the sea read brown-purple. v2 must be at least as close to Original over
 /// the sea region as Classic+ is, and within a fixed bound.

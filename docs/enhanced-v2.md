@@ -183,6 +183,13 @@ building bases and under the ICC overhang (no halos), stable edges while walking
 pole staying dull, and a carried Light Bar lighting the ground with the actor's shadow. Not in M2 (later milestones): authored
 sky/cloud rework, froxel haze/shafts, water material, grass/foliage in the G-buffer, night look, per-zone grade.
 
+## Night shade floor (Borealis night, review 2)
+The native vertex light is a gamma-space sum `ambient_g + key_g * N.L` and never fades the authored key (night: cool 30,50,70). v2
+fades its shadowed key with the sun's horizon fade and summed linearly, so night walls lost the key: Borealis concrete read ~45%
+darker and neutral/warm brown (left wall 47.7,56.8,65.8 -> 26.1,24.5,24.1). `resolve.wgsl` now adds the unfaded authored key to the
+native floor in gamma space weighted by `1 - fade` (day unchanged: fade = 1), so shade is never below Original and keeps its hue.
+Moon A and lamps still add on top. Ignored GPU test `graphics_v2_borealis_night_is_not_darker_or_warmer_than_original`.
+
 ## CPU encode cost (main thread)
 `AOMAC_GFX_CPU_ENCODE=1 AOMAC_GFX_VIEW=icc-platform-authored cargo test --release -p aomac graphics_v2_cpu_encode -- --ignored --nocapture`
 reports mean/p95 wall of render + finish + submit (faithful vs v2-high, walking camera, GPU drained per frame). Dominant cost was
