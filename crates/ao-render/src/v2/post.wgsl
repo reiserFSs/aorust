@@ -78,7 +78,8 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let d = (uv - vec2<f32>(0.5)) * vec2<f32>(fc.proj.w, 1.0);
     c *= 1.0 - fc.grade.w * dot(d, d) * 1.6;
     var g = pow(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
-    let n = hash12(frag.xy + vec2<f32>(f32(fc.flags.x & 255u) * 17.0, 3.0)) + hash12(frag.yx * 1.37) - 1.0;
+    // Spatial-only triangular dither: stable per output pixel (a frame-varying term shimmers every dark gradient on a static camera).
+    let n = hash12(frag.xy) + hash12(frag.yx * 1.37) - 1.0;
     g += vec3<f32>(n / 255.0);
     return vec4<f32>(g, 1.0);
 }

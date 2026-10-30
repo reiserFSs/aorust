@@ -47,10 +47,16 @@ impl Pipes {
     }
 }
 
-/// True when the denoise must not read the history: nothing valid yet (first frame / resize), the admitted-actor set changed
-/// (DESIGN section 8: history must not carry a hidden actor's signal across an admission change), or TAA jitter was toggled.
-fn history_reset(valid: bool, last_hash: u32, hash: u32, last_jitter: bool, jitter: bool) -> bool {
-    !valid || last_hash != hash || last_jitter != jitter
+/// Why the denoise must not read the history, `None` when it is kept (also the `AOMAC_V2_TEMPORAL_TRACE` log text): nothing valid
+/// yet (first frame / resize), the admitted-actor set changed (DESIGN section 8: history must not carry a hidden actor's signal
+/// across an admission change), or TAA jitter was toggled.
+fn reset_reason(valid: bool, last_hash: u32, hash: u32, last_jitter: bool, jitter: bool) -> Option<&'static str> {
+    if !valid { Some("first-frame/resize") } else if last_hash != hash { Some("admission-change") } else if last_jitter != jitter { Some("jitter-toggle") } else { None }
+}
+
+/// Uniform words of `params` (`vec4<u32>` in ao.wgsl): x = reset, yz = bit patterns of the jitter (pixels) that produced the history.
+fn params_words(reset: bool, history_jitter: [f32; 2]) -> [u32; 4] {
+    [u32::from(reset), history_jitter[0].to_bits(), history_jitter[1].to_bits(), 0]
 }
 
 /// Size-dependent AO resources and the temporal state that belongs to them.
@@ -65,7 +71,8 @@ pub(super) struct Ao {
     params: wgpu::Buffer,
     valid: Cell<bool>,
     hash: Cell<u32>,
-    jitter: Cell<bool>,
+    /// Jitter (pixels) of the frame that wrote the history `hist[parity ^ 1]`; the denoise looks the reprojected texel up through it.
+    jitter: Cell<[f32; 2]>,
     parity: Cell<usize>,
 }
 
@@ -92,16 +99,19 @@ impl Ao {
         let up = |p: usize| device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("v2 ao upsample"), layout: &pipes.l_up,
             entries: &[fc(), entry(1, pyramid.view()), entry(8, &hist[p])] });
         Self { view, half, gtao_bind, denoise_bind: [denoise(0), denoise(1)], up_bind: [up(0), up(1)], params,
-            valid: Cell::new(false), hash: Cell::new(0), jitter: Cell::new(false), parity: Cell::new(0) }
+            valid: Cell::new(false), hash: Cell::new(0), jitter: Cell::new([0.0; 2]), parity: Cell::new(0) }
     }
 
     /// Full-resolution `R8Unorm` AO, 1 = open; bound to the resolve at binding 6 and valid after [`Ao::encode`].
     pub(super) fn view(&self) -> &wgpu::TextureView { &self.view }
 
-    /// Encodes `ao`, `ao_denoise` and `ao_up` (after the pyramid of the same frame). `admission` = `FrameConsts.flags.z`.
-    pub(super) fn encode(&self, pipes: &Pipes, queue: &wgpu::Queue, enc: &mut wgpu::CommandEncoder, timer: Option<&PassTimers>, admission: u32, jitter: bool) {
-        let reset = history_reset(self.valid.get(), self.hash.get(), admission, self.jitter.get(), jitter);
-        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&[u32::from(reset), 0, 0, 0]));
+    /// Encodes `ao`, `ao_denoise` and `ao_up` (after the pyramid of the same frame). `admission` = `FrameConsts.flags.z`, `jitter` = this
+    /// frame's projection jitter in pixels (`FrameConsts.jitter.xy`). Returns why the history was reset, if it was (temporal trace).
+    pub(super) fn encode(&self, pipes: &Pipes, queue: &wgpu::Queue, enc: &mut wgpu::CommandEncoder, timer: Option<&PassTimers>, admission: u32, jitter: [f32; 2]) -> Option<&'static str> {
+        let (last, now) = (self.jitter.get(), jitter != [0.0; 2]);
+        let reason = reset_reason(self.valid.get(), self.hash.get(), admission, last != [0.0; 2], now);
+        let reset = reason.is_some();
+        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params_words(reset, last)));
         let p = self.parity.get();
         self.valid.set(true);
         self.hash.set(admission);
@@ -129,6 +139,7 @@ impl Ao {
         pass.set_pipeline(&pipes.up);
         pass.set_bind_group(0, &self.up_bind[p], &[]);
         pass.draw(0..3, 0..1);
+        reason
     }
 }
 
@@ -136,6 +147,8 @@ impl Ao {
 mod tests {
     use super::*;
     use crate::v2::pyramid;
+
+    fn history_reset(valid: bool, last_hash: u32, hash: u32, last_jitter: bool, jitter: bool) -> bool { reset_reason(valid, last_hash, hash, last_jitter, jitter).is_some() }
 
     #[test]
     fn history_resets_on_first_frame_admission_change_and_jitter_toggle() {
@@ -163,5 +176,33 @@ mod tests {
         let clip = proj * glam::Vec4::new(0.0, 0.0, -end, 1.0);
         let limit = crate::ambient_occlusion::fog_depth_limit(near, far, end);
         assert!((limit - clip.z / clip.w).abs() < 1e-5);
+    }
+}
+
+#[cfg(test)]
+mod jitter_tests {
+    use super::*;
+
+    /// CPU mirror of the AO jitter bookkeeping (1-D, pixels): a surface at unjittered position `s` lands at `s + jitter`; `vs_pos`
+    /// subtracts the current jitter, the denoise adds the history's jitter after the unjittered reprojection.
+    #[test]
+    fn static_surface_is_found_in_the_history_texel_that_sampled_it() {
+        let (s, ja, jb) = (100.37_f32, 0.31, -0.22);
+        let landed_a = s + ja;
+        let landed_b = s + jb;
+        let reconstructed = landed_b - jb;
+        assert!((reconstructed - s).abs() < 1e-4, "vs_pos must undo the current jitter");
+        let lookup = reconstructed + ja; // static camera: unjittered reprojection is the identity
+        assert!((lookup - landed_a).abs() < 1e-4, "history lookup must apply the previous frame's jitter");
+        assert!((lookup - landed_b).abs() > 0.4 * (ja - jb).abs(), "ignoring the jitter shifts the lookup by (ja - jb)");
+        let wgsl = include_str!("ao.wgsl");
+        assert!(wgsl.contains("(pix - fc.jitter.xy) * fc.viewport.zw") && wgsl.contains("jp * fc.viewport.zw") && wgsl.contains("half_centre(hp)"));
+    }
+
+    #[test]
+    fn params_carry_reset_and_previous_jitter_bits() {
+        let w = params_words(true, [0.25, -0.5]);
+        assert_eq!((w[0], f32::from_bits(w[1]), f32::from_bits(w[2])), (1, 0.25, -0.5));
+        assert_eq!(params_words(false, [0.0; 2])[0], 0);
     }
 }

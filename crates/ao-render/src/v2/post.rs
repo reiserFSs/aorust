@@ -127,6 +127,16 @@ mod tests {
         assert!(wgsl.contains("bloom: f32,") && wgsl.contains("cas: f32,") && wgsl.contains("pad: vec2<f32>,") && wgsl.contains("taa: vec4<u32>,"));
     }
 
+    /// The dither is spatial-only: no frame counter, time or jitter may enter the noise (a frame-varying dither shimmers every
+    /// dark gradient on a frozen camera).
+    #[test]
+    fn dither_has_no_temporal_term() {
+        let wgsl = include_str!("post.wgsl");
+        let line = wgsl.lines().find(|l| l.trim_start().starts_with("let n = hash12(")).expect("dither line");
+        assert!(!line.contains("fc.") && !line.contains("flags") && !line.contains("frame"), "{line}");
+        assert_eq!(line.trim(), "let n = hash12(frag.xy) + hash12(frag.yx * 1.37) - 1.0;");
+    }
+
     /// CPU mirror of `grade()` in post.wgsl (same constants, read back from the shader source below).
     fn grade_cpu(c: [f32; 3], t_native: f32, exposure: f32, saturation: f32, contrast: f32) -> [f32; 3] {
         let luma = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];

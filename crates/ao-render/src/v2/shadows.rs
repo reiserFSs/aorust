@@ -4,8 +4,10 @@
 //!   cascade over the whole range.
 //! * Every cascade has two depth layers. The STATIC layer holds world casters only (never an actor: it is drawn from the static
 //!   instance list, which has no actor code path) and is cached: it is re-rendered only when its content signature (cascade matrix,
-//!   the casters inside it, their transforms and mesh revisions) changes, checked on a per-cascade cadence (near every frame, the
-//!   others time-sliced; the moon at most 4 Hz). The receiver samples a static layer with the matrix it was rendered with, so a
+//!   the casters inside it, their transforms and mesh revisions) changes, or the scene time changes while it holds animated casters.
+//!   Those refreshes re-render with the SAME cached matrix (only the depth range may grow for newly streamed casters); the layer is
+//!   refitted only when the camera slice or the light (compared with the light it was rendered from) leaves it. The dynamic layer
+//!   reuses the covering static matrix. The receiver samples a static layer with the matrix it was rendered with, so a
 //!   late refresh never moves a shadow. The DYNAMIC layer is cleared every frame and holds admitted actors only: the actor shadow
 //!   fragment shader discards every fragment whose actor slot is 0 in `Admission::visibility()` (current-frame GPU revocation).
 //! * Receiver: `min` of the two layers, 3x3 PCF, bounded slope bias, 10% cascade crossfade, fade-out toward the last split and
@@ -32,10 +34,10 @@ const SHADOW_FAR: f32 = 180.0;
 /// Extra metres of slack baked into each STATIC layer's fit (sun cascades 0..2, moon): the layer stays valid while the camera's
 /// frustum slice remains inside it, so walking re-renders a cascade only after about this much travel (the slack costs ~7% texel size).
 const GUARD: [f32; LAYERS] = [1.5, 4.0, 12.0, 6.0];
-/// Shortest time between two re-renders of a layer whose frustum slice left it (moon A: at most 4 Hz).
+/// Shortest time between two refits of a layer whose frustum slice left it (moon A: at most 4 Hz).
 const MIN_INTERVAL: [f64; LAYERS] = [0.0, 0.0, 0.0, 0.25];
-/// Layers holding time-animated casters (scrolling alpha, wind) are refreshed at this rate.
-const ANIMATED_INTERVAL: f64 = 0.25;
+/// `AOMAC_V2_TEMPORAL_TRACE=1` (same flag as the temporal pass): log the per-frame shadow cache decisions.
+static TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("AOMAC_V2_TEMPORAL_TRACE").is_ok_and(|v| v == "1"));
 /// A stored layer is aligned with the light while it is within 0.05 degrees of it (the sun moves about that per 10 s).
 const ALIGNED_COS: f32 = 0.999_999_6;
 
@@ -50,18 +52,35 @@ pub(super) struct StaticCache {
     rendered: f64,
 }
 
+/// Why a static layer is rendered this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Reason {
+    /// Never rendered.
+    First,
+    /// The frustum slice or the light left the stored matrix (the only reason that refits).
+    Left,
+    /// The scene time changed while the layer holds animated casters.
+    Animated,
+    /// A caster inside the layer changed.
+    Content,
+    /// `AOMAC_V2_SHADOW_RERENDER`.
+    Forced,
+}
+
 impl StaticCache {
-    /// Whether the layer must be re-rendered now. `covered`: the stored matrix still contains the camera's frustum slice and is
-    /// aligned with the light. `world`: cheap hash of the whole static world (instances, visibility, revisions). The expensive
-    /// per-layer `signature_now` (casters inside the stored frustum) is only evaluated when `world` changed.
-    pub(super) fn needs_render(&mut self, covered: bool, world: u64, time: f64, min_interval: f64, signature_now: impl FnOnce() -> u64) -> bool {
-        let Some(signature) = self.signature else { return true };
-        let elapsed = time - self.rendered;
-        if !covered { return elapsed >= min_interval || elapsed < 0.0; }
-        if self.animated && (elapsed >= ANIMATED_INTERVAL || elapsed < 0.0) { return true; }
-        if self.world == world { return false; }
-        if signature_now() == signature { self.world = world; return false; }
-        true
+    /// Why the layer must be re-rendered now (`None` = keep it). `covered`: the stored matrix still contains the camera's frustum
+    /// slice and is aligned with the light. `world`: cheap hash of the whole static world (instances, visibility, revisions). The
+    /// expensive per-layer `signature_now` (casters inside the stored frustum) is only evaluated when `world` changed.
+    pub(super) fn needs_render(&mut self, covered: bool, world: u64, time: f64, min_interval: f64, signature_now: impl FnOnce() -> u64) -> Option<Reason> {
+        let Some(signature) = self.signature else { return Some(Reason::First) };
+        if !covered {
+            let elapsed = time - self.rendered;
+            return (elapsed >= min_interval || elapsed < 0.0).then_some(Reason::Left);
+        }
+        if self.animated && time != self.rendered { return Some(Reason::Animated); }
+        if self.world == world { return None; }
+        if signature_now() == signature { self.world = world; return None; }
+        Some(Reason::Content)
     }
 
     pub(super) fn rendered(&mut self, signature: u64, world: u64, animated: bool, time: f64) {
@@ -217,7 +236,27 @@ fn depth_array(device: &wgpu::Device, label: &str, resolution: u32, layers: u32)
 struct StaticLayer {
     cache: StaticCache,
     matrix: Mat4,
+    /// The light direction the matrix was fitted for. Only a refit updates it, so slow cumulative sun drift adds up against it.
     dir: Vec3,
+}
+
+impl StaticLayer {
+    /// The stored matrix still contains the frustum slice and its light is within `ALIGNED_COS` of `light`.
+    fn covers(&self, light: Vec3, corners: &[Vec3], resolution: u32) -> bool {
+        self.dir.dot(light) >= ALIGNED_COS && contains(&self.matrix, corners, resolution)
+    }
+}
+
+/// The actor layer renders and is sampled with the covering static cascade's matrix (same snap, no per-frame refit); `tight` is the
+/// fallback before the static layer has ever been fitted.
+fn dynamic_matrix(stored: Mat4, tight: Mat4) -> Mat4 {
+    if stored == Mat4::ZERO { tight } else { stored }
+}
+
+fn matrix_hash(matrix: &Mat4) -> u64 {
+    let mut hash = Fnv::new();
+    hash.mat(&matrix.to_cols_array_2d());
+    hash.0
 }
 
 /// A caster pass target: matrices uniform + the bind group the v1 caster pipelines expect at group 3.
@@ -371,7 +410,10 @@ impl Shadows {
 
         self.refresh_static(r, enc, &fits, view, far, sun_frame.as_ref());
         let items = r.v2_has_actor_items();
-        let current = fits.map(|fit| fit.map(|fit| fit.tight));
+        let mut current: [Option<Mat4>; LAYERS] = [None; LAYERS];
+        for ((slot, fit), layer) in current.iter_mut().zip(&fits).zip(&self.layers) {
+            *slot = fit.map(|fit| dynamic_matrix(layer.matrix, fit.tight));
+        }
         self.draw_dynamic(r, enc, &current, sun_frame.as_ref(), admission, items);
 
         for (k, fit) in current.iter().take(SUN_CASCADES).enumerate() {
@@ -424,30 +466,44 @@ impl Shadows {
         (signature, animated)
     }
 
-    /// Re-renders the static layers whose stored matrix no longer covers the camera's frustum slice (or the light moved), whose casters
-    /// changed, or whose animated casters are due.
+    /// Re-renders the static layers whose stored matrix no longer covers the camera's frustum slice (refit), or, with the matrix kept
+    /// (depth range only grown), whose casters changed or whose animated casters are due (scene time changed).
     fn refresh_static(&mut self, r: &Renderer, enc: &mut wgpu::CommandEncoder, fits: &[Option<Fit>; LAYERS], view: &View, far: f32, sun_frame: Option<&CascadeFrame>) {
         let world = Self::world_hash(r);
         let time = f64::from(view.time);
         let mut render = [false; LAYERS];
+        let casters = || r.gpu.insts.iter().filter(|inst| !inst.hidden).map(|inst| (inst.center, inst.radius));
         for layer in 0..LAYERS {
             let Some(fit) = fits[layer] else { continue };
             let resolution = if layer < SUN_CASCADES { SUN_RES } else { MOON_RES };
             let stored = self.layers[layer].matrix;
-            let covered = self.layers[layer].dir.dot(fit.dir) >= ALIGNED_COS && contains(&stored, &slice_corners(view, fit.start, fit.end), resolution);
+            let covered = self.layers[layer].covers(fit.dir, &slice_corners(view, fit.start, fit.end), resolution);
             let mut cache = std::mem::take(&mut self.layers[layer].cache);
-            let need = self.always_rerender >> layer & 1 != 0 || cache.needs_render(covered, world, time, MIN_INTERVAL[layer], || self.gather(r, layer, &stored).0);
+            let forced = self.always_rerender >> layer & 1 != 0;
+            let reason = if forced { Some(Reason::Forced) } else { cache.needs_render(covered, world, time, MIN_INTERVAL[layer], || self.gather(r, layer, &stored).0) };
             self.layers[layer].cache = cache;
-            if !need { continue; }
-            let reach = if layer < SUN_CASCADES { far } else { fit.end };
-            let Some(matrix) = fit_slice(view.eye, view.forward, view.fovy, view.aspect, fit.start, fit.end, reach, fit.dir, resolution, GUARD[layer]) else { continue };
-            let matrix = crate::shadow_coverage::include_caster_depth(matrix, r.gpu.insts.iter().filter(|inst| !inst.hidden).map(|inst| (inst.center, inst.radius)));
+            let Some(reason) = reason else {
+                if *TRACE { eprintln!("[v2 shadows t={time:.3}] layer {layer} static=no matrix={:016x}", matrix_hash(&stored)); }
+                continue;
+            };
+            let refit = !covered || reason == Reason::Forced;
+            let matrix = if refit {
+                let reach = if layer < SUN_CASCADES { far } else { fit.end };
+                let Some(matrix) = fit_slice(view.eye, view.forward, view.fovy, view.aspect, fit.start, fit.end, reach, fit.dir, resolution, GUARD[layer]) else { continue };
+                crate::shadow_coverage::include_caster_depth(matrix, casters())
+            } else {
+                // Same lattice and XY extent; newly streamed casters may still need a deeper range.
+                crate::shadow_coverage::include_caster_depth(stored, casters())
+            };
             let (signature, animated) = self.gather(r, layer, &matrix);
             let slot = &mut self.layers[layer];
             slot.matrix = matrix;
-            slot.dir = fit.dir;
+            if refit { slot.dir = fit.dir; }
             slot.cache.rendered(signature, world, animated, time);
             render[layer] = true;
+            if *TRACE {
+                eprintln!("[v2 shadows t={time:.3}] layer {layer} static=yes reason={reason:?} refit={refit} matrix={:016x}", matrix_hash(&matrix));
+            }
         }
         if !render.contains(&true) { return; }
         self.sync_transforms(r);
@@ -512,12 +568,14 @@ impl Shadows {
         admission: &Admission, items: bool) {
         for (layer, fit) in current.iter().enumerate() {
             let Some(matrix) = *fit else { continue };
+            if *TRACE { eprintln!("[v2 shadows] layer {layer} dynamic matrix={:016x} static={:016x}", matrix_hash(&matrix), matrix_hash(&self.layers[layer].matrix)); }
             if !items && !self.dyn_dirty[layer] { continue; }
             if items {
                 let mut uniform = ShadowUniform::zeroed();
                 if layer < SUN_CASCADES {
                     if let Some(frame) = sun_frame { uniform.matrices = frame.uniform.matrices; }
                     uniform.control[0] = layer as u32;
+                    uniform.matrices[layer] = matrix.to_cols_array_2d();
                 } else {
                     uniform.matrices[0] = matrix.to_cols_array_2d();
                 }
@@ -542,7 +600,7 @@ impl Shadows {
 
 #[cfg(test)]
 mod tests {
-    use glam::Vec2;
+    use glam::{Quat, Vec2};
     use super::*;
 
     const FOVY: f32 = 1.0;
@@ -612,31 +670,79 @@ mod tests {
     fn cache_survives_actor_activity_and_rerenders_on_content_or_coverage_change() {
         let signature = |revision| static_signature(revision, [caster(0)].into_iter());
         let mut cache = StaticCache::default();
-        assert!(cache.needs_render(false, 7, 0.0, 0.0, || unreachable!()), "a layer that was never rendered renders at once");
+        assert_eq!(cache.needs_render(false, 7, 0.0, 0.0, || unreachable!()), Some(Reason::First), "a layer that was never rendered renders at once");
         cache.rendered(signature(1), 7, false, 0.0);
         // 100 frames in which actors come, go and move: they are no input of the world hash, the stored matrix still covers the
         // view, so the layer is neither re-rendered nor even re-hashed.
-        for frame in 1..100 { assert!(!cache.needs_render(true, 7, f64::from(frame), 0.0, || unreachable!("actors must not trigger a signature check"))); }
+        for frame in 1..100 { assert_eq!(cache.needs_render(true, 7, f64::from(frame), 0.0, || unreachable!("actors must not trigger a signature check")), None); }
         // Something changed elsewhere in the world: same casters inside this layer -> kept (and the world hash remembered).
-        assert!(!cache.needs_render(true, 8, 100.0, 0.0, || signature(1)));
-        assert!(!cache.needs_render(true, 8, 101.0, 0.0, || unreachable!()));
+        assert_eq!(cache.needs_render(true, 8, 100.0, 0.0, || signature(1)), None);
+        assert_eq!(cache.needs_render(true, 8, 101.0, 0.0, || unreachable!()), None);
         // A caster inside this layer changed (revision / transform): re-render.
-        assert!(cache.needs_render(true, 9, 102.0, 0.0, || signature(2)));
+        assert_eq!(cache.needs_render(true, 9, 102.0, 0.0, || signature(2)), Some(Reason::Content));
         // The view left the stored matrix: re-render.
-        assert!(cache.needs_render(false, 8, 103.0, 0.0, || unreachable!()));
+        assert_eq!(cache.needs_render(false, 8, 103.0, 0.0, || unreachable!()), Some(Reason::Left));
     }
 
     #[test]
-    fn moon_layer_refreshes_at_most_four_hertz_and_animated_layers_at_the_animated_rate() {
+    fn moon_refits_at_most_four_hertz_and_animated_layers_refresh_at_every_changed_scene_time() {
         let mut cache = StaticCache::default();
         cache.rendered(1, 1, false, 10.0);
-        assert!(!cache.needs_render(false, 1, 10.2, MIN_INTERVAL[3], || 1), "moon layer, 0.2 s after its last render");
-        assert!(cache.needs_render(false, 1, 10.25, MIN_INTERVAL[3], || 1));
-        assert!(cache.needs_render(false, 1, 10.0, MIN_INTERVAL[0], || 1), "an uncovered sun layer re-renders at once");
+        assert_eq!(cache.needs_render(false, 1, 10.2, MIN_INTERVAL[3], || 1), None, "moon layer, 0.2 s after its last render");
+        assert!(cache.needs_render(false, 1, 10.25, MIN_INTERVAL[3], || 1).is_some());
+        assert!(cache.needs_render(false, 1, 10.0, MIN_INTERVAL[0], || 1).is_some(), "an uncovered sun layer re-renders at once");
         cache.rendered(1, 1, true, 20.0);
-        assert!(!cache.needs_render(true, 1, 20.1, 0.0, || 1));
-        assert!(cache.needs_render(true, 1, 20.25, 0.0, || 1), "animated casters refresh at 4 Hz");
-        assert!(cache.needs_render(true, 1, 5.0, 0.0, || 1), "a clock that went backwards (scene reload) re-renders");
+        assert_eq!(cache.needs_render(true, 1, 20.0, 0.0, || 1), None, "same scene time: nothing to animate");
+        assert_eq!(cache.needs_render(true, 1, 20.016, 0.0, || 1), Some(Reason::Animated), "every changed time, not 4 Hz");
+        assert_eq!(cache.needs_render(true, 1, 5.0, 0.0, || 1), Some(Reason::Animated), "a clock that went backwards (scene reload) re-renders");
+    }
+
+    #[test]
+    fn animated_refresh_keeps_the_matrix_and_depth_grows_only_for_new_casters() {
+        let sun = Vec3::new(0.3, 0.7, 0.4).normalize();
+        let stored = fit_slice(Vec3::ZERO, -Vec3::Z, FOVY, ASPECT, 0.1, 20.0, 180.0, sun, SUN_RES, GUARD[0]).unwrap();
+        let known = [(Vec3::new(0.0, 0.0, -10.0), 1.0)];
+        let stored = crate::shadow_coverage::include_caster_depth(stored, known.into_iter());
+        // Every animated refresh (a new scene time each) with the same casters: bit-identical matrix.
+        let mut matrix = stored;
+        for _ in 0..100 { matrix = crate::shadow_coverage::include_caster_depth(matrix, known.into_iter()); }
+        assert_eq!(matrix, stored);
+        // A newly streamed caster toward the light, inside the XY footprint but beyond the depth range, grows the range only.
+        let center = Vec3::new(0.0, 0.0, -10.0) + sun * 300.0;
+        let before = stored.project_point3(center);
+        assert!(!(0.0..=1.0).contains(&before.z), "premise: outside the stored depth range");
+        let grown = crate::shadow_coverage::include_caster_depth(stored, known.into_iter().chain([(center, 1.0)]));
+        let after = grown.project_point3(center);
+        assert!((0.0..=1.0).contains(&after.z), "new caster inside the range: {after:?}");
+        let probe = Vec3::new(1.0, 2.0, -7.0);
+        assert_eq!(stored.project_point3(probe).truncate(), grown.project_point3(probe).truncate(), "XY lattice unchanged");
+    }
+
+    #[test]
+    fn cumulative_sun_drift_eventually_refits_while_refreshes_keep_the_stored_light() {
+        let sun = Vec3::new(0.3, 0.7, 0.4).normalize();
+        let corners = slice_corners(&view_at(Vec3::ZERO, -Vec3::Z), 0.1, 20.0);
+        let layer = StaticLayer {
+            cache: StaticCache::default(), dir: sun,
+            matrix: fit_slice(Vec3::ZERO, -Vec3::Z, FOVY, ASPECT, 0.1, 20.0, 180.0, sun, SUN_RES, GUARD[0]).unwrap(),
+        };
+        // 0.01 degrees per step (one frame's drift): each step alone is far inside the tolerance, the sum is not.
+        let step = Quat::from_rotation_y(0.01f32.to_radians());
+        let (mut light, mut refit_at) = (sun, None);
+        for n in 1..=40 {
+            light = step * light;
+            assert!(layer.dir.dot(step * layer.dir) >= ALIGNED_COS, "one step is within tolerance");
+            if !layer.covers(light, &corners, SUN_RES) { refit_at = Some(n); break; }
+        }
+        assert!(refit_at.is_some_and(|n| n > 1), "drift accumulates against the stored light: {refit_at:?}");
+    }
+
+    #[test]
+    fn dynamic_layer_uses_the_covering_static_matrix() {
+        let tight = Mat4::from_scale(Vec3::splat(2.0));
+        let stored = Mat4::from_translation(Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(dynamic_matrix(stored, tight), stored);
+        assert_eq!(dynamic_matrix(Mat4::ZERO, tight), tight, "before the first static fit");
     }
 
     #[test]

@@ -56,6 +56,8 @@ pub(crate) struct V2 {
     lamps: lamps::Lamps,
     sized: Option<Sized>,
     timers: Option<timers::PassTimers>,
+    /// `timers` was created for the live overlay/slow-frame profiler (not the harness), so it is dropped when that profiler stops.
+    live_timers: bool,
     frame: u32,
     prev_view_proj: Mat4,
     /// Sub-pixel projection jitter + history accumulation (TAA). `AOMAC_V2_NO_TAA=1` (harness diagnostic, read once) turns the
@@ -99,6 +101,7 @@ impl V2 {
             lamps,
             sized: None,
             timers: None,
+            live_timers: false,
             frame: 0,
             prev_view_proj: Mat4::IDENTITY,
             taa: std::env::var_os("AOMAC_V2_NO_TAA").is_none(),
@@ -164,8 +167,29 @@ impl Renderer {
         }
         let timers = enabled.then(|| timers::PassTimers::new(&self.device, &self.queue)).flatten();
         anyhow::ensure!(timers.is_some() || !enabled, "v2 pass timing needs TIMESTAMP_QUERY");
-        self.v2.as_mut().expect("created above").timers = timers;
+        let v2 = self.v2.as_mut().expect("created above");
+        v2.timers = timers;
+        v2.live_timers = false;
         Ok(())
+    }
+
+    /// Ctrl+Shift+O overlay / slow-frame log: while the live profiler is on, time the v2 passes (rows named as the fixture's:
+    /// shadows, gbuffer, hiz, ao, ..., post, `frame`) and feed the oldest completed ring slot into its rolling costs.
+    /// Nothing is allocated or read back while the profiler is off.
+    fn sync_live_v2_timers(&self, v2: &mut V2) {
+        let Some(profiler) = &self.effect_profiler else {
+            if v2.live_timers { v2.timers = None; v2.live_timers = false; }
+            return;
+        };
+        if v2.timers.is_none() {
+            v2.timers = timers::PassTimers::new(&self.device, &self.queue);
+            v2.live_timers = v2.timers.is_some();
+        }
+        if !v2.live_timers { return; }
+        // Lag 3 of the 4-slot ring is the slot about to be reused: its frame finished long ago, so the wait is ~free.
+        if let Some(Ok(rows)) = v2.timers.as_ref().map(|timers| timers.read(&self.device, 3)) {
+            if !rows.is_empty() { profiler.borrow_mut().record_external(&rows); }
+        }
     }
 
     /// Per-pass GPU milliseconds of the last submitted v2 frame (blocks until it completes). Empty without timing.
@@ -176,6 +200,7 @@ impl Renderer {
     pub(crate) fn render_v2(&mut self, resolve: &wgpu::TextureView, t: &Targets, cam: &Camera) -> wgpu::SubmissionIndex {
         let _compile_scope = crate::pipeline_creation::FrameGuard::enter();
         let mut v2 = self.v2.take().unwrap_or_else(|| V2::new(self));
+        self.sync_live_v2_timers(&mut v2);
         self.update_liquids(cam.pos);
         self.update_ground_detail(cam.pos);
         self.update_lod(cam.pos.x, cam.pos.z);
@@ -221,12 +246,14 @@ impl Renderer {
             let budget = Vec3::from(m.world_gamma_budget?);
             Some((Vec3::from(m.toward_light).normalize_or_zero(), Vec3::new(0.235, 0.39, 0.55) * 0.4 * (budget.max_element() / 0.2).clamp(0.0, 1.0)))
         });
-        // Order-independent hash of the admitted actor ids; temporal consumers reset when it changes (DESIGN section 8).
-        let admission = self.admitted_actor_ids().fold(0u32, |hash, id| hash ^ id.wrapping_mul(0x9E37_79B9).rotate_left(13));
-        // TAA history is discarded on frame 0 / resize, camera cuts and any change of the admitted-actor set (a hidden actor cannot
+        // Order-independent, non-cancelling hash of the actor items actually DRAWN this frame (post-cull actor layer, not every host
+        // frame: projectiles/props that never reach a pixel list do not churn it); temporal consumers reset when it changes (DESIGN section 8).
+        let (admission, drawn_items) = admission::drawn_set_hash(self.drawn_actor_items());
+        // TAA history is discarded on frame 0 / resize, camera cuts and any change of the drawn-actor set (a hidden actor cannot
         // ghost); every actor pose of the motion pass shares that decision.
         let key = taa::HistoryKey { admission, eye: cam.pos, forward: cam.forward() };
-        let history_reset = !v2.taa || taa::history_reset(v2.taa_key.as_ref(), &key);
+        let taa_reset = if v2.taa { taa::reset_reason(v2.taa_key.as_ref(), &key) } else { Some("taa-off") };
+        let history_reset = taa_reset.is_some();
         v2.taa_key = Some(key);
         let previous_unjit = if v2.frame == 0 { view_proj_unjit } else { v2.prev_view_proj };
         let consts = FrameConsts {
@@ -294,7 +321,7 @@ impl Renderer {
         v2.shadows.encode(self, &mut enc, &shadow_view, (look.sun_up > 0.5).then(|| light(look.sun)), moon.map(|(dir, _)| light(dir)), &v2.admission);
         // [slot 3] pyramid + AO (writes the AO texture the resolve reads, flags.y bit 0), [slot 4] light clusters + lamp cube atlas.
         sized.pyramid.encode(&v2.pyramid, &mut enc, timer.and_then(|t| t.compute("hiz")));
-        if !off("ao") { sized.ao.encode(&v2.ao, &self.queue, &mut enc, timer, admission, jitter != [0.0, 0.0]); }
+        let ao_reset = if off("ao") { None } else { sized.ao.encode(&v2.ao, &self.queue, &mut enc, timer, admission, jitter) };
         let lamps_bind = self.encode_lamps(&mut v2.lamps, &mut enc, timer, &v2.consts, cam, view_proj, [env.fog_start, env.fog_end, far]);
         v2.resolve.encode(&mut enc, &sized.resolve_bind, &[&v2.shadows.bind, &lamps_bind], size, timer.and_then(|t| t.compute("resolve")));
         {
@@ -323,6 +350,10 @@ impl Renderer {
         self.drawn_visuals.extend(self.pending_visuals.get_mut().drain());
         self.stats = crate::FrameStats { instances: self.vis.len(), draw_calls: calls };
         v2.prev_view_proj = view_proj_unjit;
+        if taa::trace_enabled() {
+            taa::trace(&taa::TraceFrame { frame: v2.frame, time: self.time, eye: cam.pos, forward: cam.forward(), jitter, admission, drawn_items,
+                taa_reset, ao_reset });
+        }
         v2.frame = v2.frame.wrapping_add(1);
         let submission = self.queue.submit([enc.finish()]);
         if let Some(timers) = &v2.timers { timers.submitted(&submission); }

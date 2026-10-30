@@ -32,6 +32,20 @@ pub(crate) fn item_slots(actors: impl Iterator<Item = u32>, out: &mut Vec<u32>) 
     for (index, actor) in actors.enumerate() { out.push(*first.entry(actor).or_insert(index as u32 + 1)); }
 }
 
+/// Order-independent signature of the actor items actually drawn this frame (`(actor id, mesh index)` of the post-cull actor
+/// layer, NOT every host frame): the wrapping SUM of avalanche-mixed item hashes, so a duplicated id adds instead of cancelling
+/// (an XOR fold turned two equal items into 0) and item order never matters. Returns `(hash, item count)`.
+pub(crate) fn drawn_set_hash(items: impl Iterator<Item = (u32, usize)>) -> (u32, usize) {
+    let (mut sum, mut count) = (0u32, 0usize);
+    for (actor, mesh) in items {
+        let mut h = actor.wrapping_mul(0x9E37_79B9) ^ (mesh as u32).wrapping_add(1).wrapping_mul(0x85EB_CA6B);
+        h ^= h >> 15; h = h.wrapping_mul(0x2C1B_3C6D); h ^= h >> 12; h = h.wrapping_mul(0x297A_2D39); h ^= h >> 15;
+        sum = sum.wrapping_add(h);
+        count += 1;
+    }
+    (sum, count)
+}
+
 /// CPU mirror of `admission.wgsl`: which slots end up admitted for an id image.
 #[cfg(test)]
 fn reduce(ids: &[u32], len: usize) -> Vec<u32> {
@@ -186,5 +200,23 @@ mod tests {
         let admitted: Vec<usize> = (0..len).filter(|&i| visible[i] != 0).collect();
         assert_eq!(admitted, [3, 8, SLOTS], "slot 0 and out-of-range ids are never admitted");
         assert!(reduce(&[], len).iter().all(|&v| v == 0), "an empty id image admits nobody (cleared every frame)");
+    }
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::drawn_set_hash;
+
+    #[test]
+    fn drawn_hash_is_order_independent_and_never_self_cancelling() {
+        let a = [(7, 0), (9, 0), (7, 1), (12, 0)];
+        let b = [(12, 0), (7, 1), (9, 0), (7, 0)];
+        assert_eq!(drawn_set_hash(a.into_iter()), drawn_set_hash(b.into_iter()));
+        let one = drawn_set_hash([(5, 0)].into_iter());
+        let two = drawn_set_hash([(5, 0), (5, 0)].into_iter());
+        assert_ne!(two.0, 0, "duplicate items must not cancel to the empty hash");
+        assert_ne!(one, two);
+        assert_eq!(drawn_set_hash(std::iter::empty()), (0, 0));
+        assert_ne!(drawn_set_hash([(1, 0), (2, 0)].into_iter()).0, drawn_set_hash([(1, 0), (3, 0)].into_iter()).0, "a different actor changes the hash");
     }
 }

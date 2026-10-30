@@ -10,7 +10,7 @@ const HIZ_SKY: f32 = 1.0e9;
 @group(0) @binding(4) var raw_in: texture_2d<f32>;
 @group(0) @binding(5) var hist_prev: texture_2d<f32>;       // rg = AO, view depth of the previous frame's denoised texel
 @group(0) @binding(6) var hist_out: texture_storage_2d<rg32float, write>;
-@group(0) @binding(7) var<uniform> params: vec4<u32>;       // x = 1: drop the history (admission change, resize, jitter toggle)
+@group(0) @binding(7) var<uniform> params: vec4<u32>;       // x = 1: drop the history (admission change, resize, jitter toggle); yz = bitcast f32 jitter (pixels) of the frame that wrote the history
 @group(0) @binding(8) var hist_in: texture_2d<f32>;
 
 const RADIUS: f32 = 1.5;          // world metres
@@ -27,12 +27,16 @@ const HALF_PI: f32 = 1.5707963;
 // native fog hides (the `ambient_occlusion::fog_depth_limit` rule, expressed in view depth).
 fn visible(z: f32) -> bool { return z < HIZ_SKY * 0.5 && native_transmittance(z) > 0.0; }
 
-// View-space position of full-res pixel centre `pix` at view depth `z` (the sub-pixel TAA jitter is ignored).
+// View-space position of the surface seen at full-res fragment position `pix` (pixel centres at +0.5) at view depth `z`. The HiZ was
+// rasterised with the jittered projection: the surface at unjittered screen position s lands at s + jitter, so it is undone here.
 fn vs_pos(pix: vec2<f32>, z: f32) -> vec3<f32> {
-    let uv = pix * fc.viewport.zw;
+    let uv = (pix - fc.jitter.xy) * fc.viewport.zw;
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     return vec3<f32>(ndc.x * fc.proj.z * fc.proj.w * z, ndc.y * fc.proj.z * z, -z);
 }
+
+// Full-res fragment position of half-res texel `hp`'s centre (the 2x2 block's centre): the phase `up_fs` interpolates around.
+fn half_centre(hp: vec2<i32>) -> vec2<f32> { return vec2<f32>(hp) * 2.0 + vec2<f32>(1.0); }
 
 fn ign(p: vec2<f32>) -> f32 { return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715)))); }
 
@@ -49,7 +53,8 @@ fn gtao(@builtin(global_invocation_id) id: vec3<u32>) {
         textureStore(raw_out, hp, vec4<f32>(1.0));
         return;
     }
-    let p = vs_pos(vec2<f32>(fp) + vec2<f32>(0.5), z);
+    let c0 = half_centre(hp);
+    let p = vs_pos(c0, z);
     var n = normalize((fc.view * vec4<f32>(oct_decode(textureLoad(g1t, fp, 0).rg), 0.0)).xyz);
     let v = normalize(-p);
     let facing = dot(n, v);
@@ -83,7 +88,7 @@ fn gtao(@builtin(global_invocation_id) id: vec3<u32>) {
             let mip = u32(clamp(log2(off_px) - 3.0, 0.0, 4.0));
             for (var side = 0u; side < 2u; side++) {
                 let o = omega * off_px * select(-1.0, 1.0, side == 0u);
-                let c = vec2<i32>(floor(vec2<f32>(fp) + vec2<f32>(0.5) + o));
+                let c = vec2<i32>(floor(c0 + o));
                 if any(c < vec2<i32>(0)) || any(c >= fd) { continue; }
                 let zs = textureLoad(hiz, clamp(c, vec2<i32>(0), fd - vec2<i32>(1)) >> vec2<u32>(mip), i32(mip)).r;
                 if !visible(zs) { continue; }
@@ -132,14 +137,16 @@ fn denoise(@builtin(global_invocation_id) id: vec3<u32>) {
     let ao = pow(clamp(sum / max(wsum, 1e-4), 0.0, 1.0), POWER);
 
     // Reproject through the unjittered matrices: world position from the view matrix, then the previous frame's clip.
-    let p = vs_pos(vec2<f32>(fp) + vec2<f32>(0.5), z0);
+    let p = vs_pos(half_centre(hp), z0);
     let rot = mat3x3<f32>(fc.view[0].xyz, fc.view[1].xyz, fc.view[2].xyz);
     let wp = fc.eye.xyz + transpose(rot) * p;
     let pc = fc.prev_view_proj_unjit * vec4<f32>(wp, 1.0);
     var blend = 0.0;
     var hist = ao;
     if params.x == 0u && pc.w > 0.0 {
-        let uv = vec2<f32>(pc.x / pc.w * 0.5 + 0.5, 0.5 - pc.y / pc.w * 0.5);
+        // The history texel that saw this surface point sampled it through the previous frame's jitter: look it up at uv + jitter_prev.
+        let jp = vec2<f32>(bitcast<f32>(params.y), bitcast<f32>(params.z));
+        let uv = vec2<f32>(pc.x / pc.w * 0.5 + 0.5, 0.5 - pc.y / pc.w * 0.5) + jp * fc.viewport.zw;
         let ph = uv * vec2<f32>(hd) - vec2<f32>(0.5);
         let base = vec2<i32>(floor(ph));
         let f = ph - vec2<f32>(base);

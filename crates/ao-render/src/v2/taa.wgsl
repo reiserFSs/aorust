@@ -1,11 +1,18 @@
-// Enhanced v2 temporal anti-aliasing: Halton-8 jittered input, catmull-rom history, 3x3 variance clip, depth-dilated motion.
-// `common.wgsl`, `packing.wgsl`, `post_common.wgsl` precede this file.
+// Enhanced v2 temporal anti-aliasing: Halton-8 jittered input reconstructed on the unjittered output grid, catmull-rom history,
+// 3x3 variance clip, depth-dilated motion, history weight 1/sample-count. `common.wgsl`, `packing.wgsl`, `post_common.wgsl` precede this file.
+//
+// Jitter: the G-buffer is rasterised with the projection shifted by `fc.jitter.xy` pixels, so render pixel p shows the scene at the
+// unjittered position p + 0.5 - jitter. The output (history) grid is the UNJITTERED one: the colour of output pixel o is the render
+// image bilinearly reconstructed at o + 0.5 + jitter, and the 3x3 variance bounds are built from the same reconstruction of the
+// neighbouring output pixels (hence the 12x12 tile: 8x8 + 2-pixel halo). Treating the jittered sample as sitting at the pixel centre
+// would make the whole image wobble by the jitter every frame.
 //
 // Input = resolved HDR + the bloom halo (half-res `halo`, attenuated by the receiving geometry's native fog transmittance, so a
-// fully fogged pixel never changes), assembled once per 10x10 workgroup tile. Motion: actors write real per-pixel motion into G2
+// fully fogged pixel never changes), assembled once per tile. Motion: actors write real per-pixel motion into G2
 // (`motion.rs`); everything else is zero there and is reprojected from the depth buffer with the unjittered current/previous
-// matrices. A G2 value >= 32 is the "no valid history" sentinel. History is the un-sharpened accumulation (CAS runs in post);
-// `ctl.taa.x` discards it (CPU-decided resets).
+// matrices. A G2 value >= 32 is the "no valid history" sentinel. History is the un-sharpened accumulation (CAS runs in post) and its
+// alpha is the sample count n (capped at MAX_COUNT); the blend weight is 1/n, so a static pixel converges to the mean of its jittered
+// samples instead of an exponential average that keeps chasing the newest jitter. `ctl.taa.x` discards the history (CPU-decided resets).
 @group(0) @binding(0) var<uniform> fc: FC;
 @group(0) @binding(1) var hdrt: texture_2d<f32>;
 @group(0) @binding(2) var deptht: texture_depth_2d;
@@ -25,12 +32,27 @@ fn self_lit(q: vec2<i32>) -> f32 {
 }
 
 const GAMMA: f32 = 1.25;       // variance box half-extent in standard deviations
-const ALPHA_STATIC: f32 = 0.1; // history weight 0.9 at rest
-const ALPHA_MOVING: f32 = 0.35;
+const MAX_COUNT: f32 = 32.0;   // history sample-count cap (weight floor 1/32)
+const REJECT_COUNT: f32 = 8.0; // count a clipped (rejected) history falls back to (1 or 4 left 74..94-code thin-pole flicker, 8 gives 63)
+const MOVING_COUNT: f32 = 2.9; // count cap at speed >= 4 px/frame (weight 0.35)
 const OUT_MAX: f32 = 16000.0;
+const TILE: i32 = 12;
 
-// (tone-compressed colour of HDR + halo, hardware depth) of the 10x10 tile around the workgroup.
-var<workgroup> tile: array<vec4<f32>, 100>;
+// (tone-compressed colour of HDR + halo, hardware depth) of the 12x12 tile around the workgroup (2-pixel halo).
+var<workgroup> tile: array<vec4<f32>, 144>;
+
+fn tile_at(t: vec2<i32>) -> vec3<f32> { return tile[t.y * TILE + t.x].rgb; }
+
+// Colour of the unjittered output pixel whose own render pixel is tile cell `t`: the render image reconstructed (bilinear) at
+// pixel centre + jitter. |jitter| < 0.5, so one neighbour per axis.
+fn recon(t: vec2<i32>) -> vec3<f32> {
+    let j = fc.jitter.xy;
+    let d = vec2<i32>(select(-1, 1, j.x >= 0.0), select(-1, 1, j.y >= 0.0));
+    let w = abs(j);
+    let top = mix(tile_at(t), tile_at(t + vec2<i32>(d.x, 0)), w.x);
+    let bot = mix(tile_at(t + vec2<i32>(0, d.y)), tile_at(t + d), w.x);
+    return mix(top, bot, w.y);
+}
 
 fn ndc_uv(clip: vec4<f32>) -> vec2<f32> {
     let n = clip.xy / clip.w;
@@ -91,9 +113,9 @@ fn clip_aabb(lo: vec3<f32>, hi: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
 fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>,
         @builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec3<u32>) {
     let dims = vec2<i32>(fc.viewport.xy);
-    let origin = vec2<i32>(wg.xy) * 8 - vec2<i32>(1);
-    for (var i = li; i < 100u; i += 64u) {
-        let q = clamp(origin + vec2<i32>(i32(i % 10u), i32(i / 10u)), vec2<i32>(0), dims - vec2<i32>(1));
+    let origin = vec2<i32>(wg.xy) * 8 - vec2<i32>(2);
+    for (var i = li; i < 144u; i += 64u) {
+        let q = clamp(origin + vec2<i32>(i32(i) % TILE, i32(i) / TILE), vec2<i32>(0), dims - vec2<i32>(1));
         let d = textureLoad(deptht, q, 0);
         let uv = (vec2<f32>(q) + vec2<f32>(0.5)) * fc.viewport.zw;
         let c = pow(max(textureLoad(hdrt, q, 0).rgb, vec3<f32>(0.0)), vec3<f32>(2.2)) // gamma-encoded resolve + FX (see resolve.wgsl)
@@ -103,7 +125,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
     workgroupBarrier();
     if id.x >= u32(dims.x) || id.y >= u32(dims.y) { return; }
     let px = vec2<i32>(id.xy);
-    let centre = vec2<i32>(lid.xy) + vec2<i32>(1);
+    let centre = vec2<i32>(lid.xy) + vec2<i32>(2);
 
     var m1 = vec3<f32>(0.0);
     var m2 = vec3<f32>(0.0);
@@ -113,37 +135,46 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
     var near_off = vec2<i32>(0);
     for (var y = -1; y <= 1; y++) {
         for (var x = -1; x <= 1; x++) {
-            let s = tile[(centre.y + y) * 10 + centre.x + x];
-            m1 += s.rgb;
-            m2 += s.rgb * s.rgb;
-            lo = min(lo, s.rgb);
-            hi = max(hi, s.rgb);
-            if s.w < near_d { near_d = s.w; near_off = vec2<i32>(x, y); }
+            let s = recon(centre + vec2<i32>(x, y));
+            m1 += s;
+            m2 += s * s;
+            lo = min(lo, s);
+            hi = max(hi, s);
+            let sd = tile[(centre.y + y) * TILE + centre.x + x].w;
+            if sd < near_d { near_d = sd; near_off = vec2<i32>(x, y); }
         }
     }
     let mean = m1 / 9.0;
     let sigma = sqrt(max(m2 / 9.0 - mean * mean, vec3<f32>(0.0)));
     let blo = max(mean - GAMMA * sigma, lo);
     let bhi = min(mean + GAMMA * sigma, hi);
-    let cur_t = tile[centre.y * 10 + centre.x].rgb;
+    let cur_t = recon(centre);
     let cur_lin = tm_inv(cur_t);
 
     // Depth-dilated motion: the nearest surface of the 3x3 decides (actor G2 motion wins over depth reprojection).
     let near_px = clamp(px + near_off, vec2<i32>(0), dims - vec2<i32>(1));
     var mv = textureLoad(motiont, near_px, 0).xy;
     if mv.x == 0.0 && mv.y == 0.0 { mv = static_motion(near_px, near_d); }
+    // The history lives on the unjittered output grid: look it up at the output pixel centre minus the motion.
     let uv = (vec2<f32>(id.xy) + vec2<f32>(0.5)) * fc.viewport.zw;
     let huv = uv - mv;
     let valid = ctl.taa.x == 0u && abs(mv.x) < 32.0 && abs(mv.y) < 32.0
         && all(huv > vec2<f32>(0.0)) && all(huv < vec2<f32>(1.0));
     var out_lin = cur_lin;
+    var count = 1.0;
     if valid {
         let hist_t = tm(min(sample_history(huv), vec3<f32>(OUT_MAX)));
         let clipped = clip_aabb(blo, bhi, hist_t);
         let speed = length(mv * fc.viewport.xy);
         let reject = clamp(length(hist_t - clipped) * 4.0, 0.0, 1.0);
-        let a = clamp(mix(ALPHA_STATIC, ALPHA_MOVING, clamp(speed * 0.25, 0.0, 1.0)) + 0.3 * reject, 0.0, 1.0);
-        out_lin = tm_inv(mix(clipped, cur_t, a));
+        // Sample count: +1 per frame up to MAX_COUNT, capped lower while moving. A clipped history falls back to at most REJECT_COUNT
+        // samples, not 1: the clip alone already bounds ghosting to the local colour box, while a full restart makes every thin
+        // high-contrast feature (poles, wires, signs) re-show the raw jittered sample each frame (frozen camera, 1 px pole: 94..154 codes).
+        let prev_count = clamp(textureSampleLevel(hist, smp, huv, 0.0).a, 0.0, MAX_COUNT);
+        let cap = mix(MAX_COUNT, MOVING_COUNT, clamp(speed * 0.25, 0.0, 1.0));
+        let grown = min(prev_count + 1.0, cap);
+        count = max(mix(grown, min(grown, REJECT_COUNT), reject), 1.0);
+        out_lin = tm_inv(mix(clipped, cur_t, 1.0 / count));
     }
-    textureStore(dst, px, vec4<f32>(min(out_lin, vec3<f32>(OUT_MAX)), 1.0));
+    textureStore(dst, px, vec4<f32>(min(out_lin, vec3<f32>(OUT_MAX)), count));
 }

@@ -103,7 +103,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 pub use gui::GuiRenderer;
-pub use viewer::{run_frontend, GameInput, Offscreen, run_viewer, run_viewer_hooked, run_viewer_live, FrameHook, Frontend, Host, LiveSky};
+pub use viewer::{run_frontend, set_world_playing, GameInput, Offscreen, run_viewer, run_viewer_hooked, run_viewer_live, FrameHook, Frontend, Host, LiveSky};
 pub use actors::{frustum_culls_sphere, POSE_MARGIN};
 
 /// Downward-clamps `requested` to the closest level present in `supported` (1 is always valid even when `supported` omits it; a pure

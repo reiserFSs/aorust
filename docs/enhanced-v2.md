@@ -23,15 +23,17 @@ blended slot). Targets: sky colour RGBA16F, G0 RGBA8 (gamma albedo + flags), G1 
 G2 RG16F (motion), G3 RG11B10F (authored emission), D32F depth. The sky never writes depth.
 
 Resolve (`resolve.rs`, `resolve.wgsl`): sun, hemisphere ambient, emission, native linear fog applied analytically
-(`T_native`, DESIGN section 8). Post (`post.rs`, `post.wgsl`): exposure, shoulder, grade, vignette, dither, 2.2-gamma encode.
+(`T_native`, DESIGN section 8). Post (`post.rs`, `post.wgsl`): exposure, shoulder, grade, vignette, dither (spatial-only: stable per
+output pixel, no frame/time term), 2.2-gamma encode.
 
 ## Pyramid and AO (slot 3)
 
 `pyramid.rs/.wgsl` (`hiz`): the one depth pyramid, R32Float min VIEW depth, mips 0..7 (mip 0 = linearised view depth, `1e9`
 where the G-buffer has no geometry); two dispatches, `Pyramid::view()` exposes all mips. `ao.rs/.wgsl` (`ao`, `ao_denoise`,
 `ao_up`): half-res GTAO (2 slices x 6 steps per side, mip by sample distance, 1.5 m radius, thin-occluder compensation, edge-on
-surfaces fade to 1), 3x3 depth-bilateral blur + temporal blend (history reprojected with the unjittered matrices, depth-rejected,
-dropped on resize / admitted-actor hash change / TAA jitter toggle), then a depth-aware upsample into the full-res `R8Unorm`
+surfaces fade to 1), 3x3 depth-bilateral blur + temporal blend (history reprojected with the unjittered matrices and looked up through
+the previous frame's jitter, positions reconstructed with the current jitter undone, half-res texel centre = 2x2 block centre,
+depth-rejected, dropped on resize / drawn-actor hash change / TAA jitter toggle), then a depth-aware upsample into the full-res `R8Unorm`
 texture at resolve binding 6 (`flags.y` bit 0). AO only multiplies the hemisphere ambient term. Sky and fully fogged texels are 1
 and never act as occluders (`native_transmittance(z) > 0`). The sampling pattern only rotates through time when TAA jitters, so
 identical frames give bit-identical AO. `ao_up` is a raster pass (R8Unorm cannot be a storage target without extra features): its
@@ -54,9 +56,14 @@ Post stack (`motion.rs`, `bloom.rs`, `taa.rs`, `post.rs`, WGSL `motion/bloom/taa
   knee (0.12..0.45 on the brightest channel, linear): the Newland lamp pole keeps its native look, the head glows. The halo is added in
   HDR before TAA by the TAA input stage at `EnhancedSettings::bloom_strength` (default 0.6), attenuated by the receiving pixel's
   `T_native` (a fully fogged pixel never changes).
-- TAA (timer `taa`): Halton-8 jitter, catmull-rom history, 3x3 variance clip, depth-dilated motion, ping-pong RGBA16F history. History
-  is discarded (`taa::history_reset`) on frame 0/resize, camera cut (> 5 m or > 25 deg per frame) and any change of the admitted-actor
-  hash. `AOMAC_V2_NO_TAA=1` (read once at start) disables jitter and accumulation for before/after stills.
+- TAA (timer `taa`): Halton-8 jitter; the jittered render is reconstructed on the UNJITTERED output grid (bilinear at pixel + jitter,
+  12x12 tile with a 2-pixel halo, variance bounds from the reconstructed neighbours), catmull-rom history, 3x3 variance clip,
+  depth-dilated motion, ping-pong RGBA16F history whose alpha is the sample count (blend weight 1/n, n <= 32, capped near 3 while moving,
+  restarted by a rejected history). History is discarded (`taa::reset_reason`) on frame 0/resize, camera cut (> 5 m or > 25 deg per
+  frame) and any change of the drawn-actor hash (`admission::drawn_set_hash`: order-independent SUM of mixed `(actor, mesh)` hashes of the
+  post-cull actor items, so duplicates never cancel and undrawn host frames never churn it). `AOMAC_V2_NO_TAA=1` (read once at start)
+  disables jitter and accumulation for before/after stills. `AOMAC_V2_TEMPORAL_TRACE=1` (read once, zero cost when unset) logs per frame
+  on stderr: frame, time, dt, eye, forward, jitter, drawn-actor hash/item count and whether/why the TAA and AO histories reset.
 - Post: CAS (`EnhancedSettings::cas_strength`, skipped for `T_native < 0.15`), then the grade; saturation and contrast fade to identity for
   `T_native < 0.5` so the grade cannot recover fogged contrast (`post::tests::grade_is_contrast_neutral_over_fog`).
 - Regressions (`play/v2_glow.rs`, ignored, GPU lock): lamp pole <= 1.25x Original and head halo; admission flip leaves no history residue
@@ -71,9 +78,13 @@ Shadows (`shadows.rs` + `shadows.wgsl`, slot 2, label `shadows`; resolve plugin 
 cascades, 2048^2) plus Moon A (one 1024^2 cascade, when `moon_dir.w` is set). Every cascade has a STATIC layer (world casters only,
 cached; sampled with the matrix it was rendered with) and a DYNAMIC layer (admitted actors only, cleared every frame, 1024^2 for the
 sun); the receiver takes the `min` of both 3x3 PCF taps (slope-scaled bounded bias, 10% cascade crossfade, fade to lit at the last
-split / fog end, `horizon_fade`). A static layer is re-rendered only when the camera's frustum slice leaves it (each is fitted
-with 1.5 / 4 / 12 m of slack, moon 6 m and at most 4 Hz), the light moves more than 0.05 degrees, or a caster inside it changes
-(content signature; the cheap world hash is checked every frame). Time-animated casters refresh at 4 Hz. Diagnostics for the harness:
+split / fog end, `horizon_fade`). A static layer is fitted once (1.5 / 4 / 12 m of slack, moon 6 m) and then keeps its matrix: it is
+refitted only when the camera's frustum slice leaves it (moon at most 4 Hz) or the light is more than 0.05 degrees away from the light
+it was fitted with (the stored light only changes on a refit, so slow sun drift accumulates until it refits). A caster change inside it
+(content signature; the cheap world hash is checked every frame) or a changed scene time while it holds time-animated casters
+(scrolling alpha, wind) re-renders it every time with the SAME matrix, growing only the depth range for newly streamed casters. The
+dynamic (actor) layer is rendered and sampled with the covering static cascade's matrix (same snap, never refitted per frame).
+`AOMAC_V2_TEMPORAL_TRACE=1` logs the per-frame cache decision (reason, refit, matrix hash, dynamic matrix) per layer. Diagnostics for the harness:
 `AOMAC_V2_SHADOWS=off` (no shadow work), `AOMAC_V2_SHADOW_RERENDER=<layer bit mask>` (force static re-renders every frame).
 Not yet in the cascades: grass blade and canopy-leaf casters, contact shadows, cloud shadows (later milestones).
 
@@ -83,6 +94,30 @@ Not yet in the cascades: grass blade and canopy-leaf casters, contact shadows, c
 graphics_offline_fixture -- --ignored --nocapture` (GPU lock first, see the aorust skill). Add `AOMAC_GFX_FRAME_TIMING=1` for
 120 warm-up + 600 sampled frames with per-pass GPU timestamps (`<view>-v2-passes.csv/.txt`, p50/p95 per pass and `frame`).
 Views: `icc-landmark-authored`, `newland-sun` (look-target camera), `newland-day`, `borealis-street-*`.
+
+Temporal stability (flicker/shaking): `AOMAC_GFX_TEMPORAL_REGRESSION=1 AOMAC_GFX_SETTINGS=v2-high AOMAC_GFX_VIEW=icc-landmark-authored
+AOMAC_GFX_OUT=<new dir> cargo test --profile fast -p aomac graphics_temporal_stability -- --ignored --nocapture` (GPU lock first). Renders
+64 warm + 24 measured consecutive frames for Original and the preset in the same run, in four modes: frozen camera, +-1 mm camera
+micro-motion, animated scene time (dt jitter 4..20 ms; other modes pass dt 0, so effect time is explicit), all without an actor
+(steady state), and `churn` = frozen camera with a real actor shown/hidden every 8 frames (the toggle pair is excluded). Per mode it prints
+`TEMPORAL mode= preset= whole= shadow= edge= worst=` and writes `temporal-<mode>-<preset>.csv` (mean abs RGB delta overall, in shadow
+pixels = non-edge pixels < 0.7x their 17x17 mean, in Sobel-edge pixels, and worst single channel). Frozen, micro and churn v2 must stay
+<= max(1.2 x Original, 0.25) whole and shadow, <= max(1.2 x Original, 1.0) edge; frozen and micro also worst <= max(1.2 x Original, 64).
+Churn worst is unbounded: an admission change resets history by fairness design, so that frame is the raw jittered one. A failure keeps
+`temporal-<mode>-<preset>-worst-a/b.png`. `AOMAC_GFX_TEMPORAL_PROBE=x,y` prints `PROBE mode preset frame r g b` per measured frame.
+
+### Diagnostics (real window, all read once, zero cost when unset)
+
+- `AOMAC_FRAME_DUMP=<absolute dir>,<N>` writes N **consecutive presented** frames of the final swapchain colour (after the GUI, read
+  back before present; the dump blocks on each readback) as `frame_000000.png`... Use `/tmp/<you>/...`; a relative dir is rejected.
+  `AOMAC_FRAME_DUMP_DELAY=<seconds>` waits that long after Play reports the world playing (character in the world, loading screen
+  gone; `ao_render::set_world_playing`, called by the Play loop every frame) before the first frame.
+- `AOMAC_FREEZE_CAMERA=1` renders from the camera captured on the first playing frame (no idle follow motion); compare a frozen
+  dump against a normal one, and against Original, to separate camera motion from renderer flicker.
+- Ctrl+Shift+O (`AomacEffectGpuOverlay`) and `AomacSlowFrameLog` now show v2: while the live profiler is on the v2 pass timers
+  (`shadows, gbuffer, hiz, ao, ao_denoise, ao_up, resolve, fx, bloom, taa, post, frame`, as in the fixture) feed its 120-frame
+  rolling costs from the oldest ring slot (3 frames back); spans are non-exclusive (see M2). Off = no queries, no readback.
+- `AOMAC_PERF=1` also prints `frame_ms avg/p95/worst` every 5 s; slow frames (>50 ms) log `total` wall ms.
 
 ## M2 measurements (High, 1920x1200, M4 Pro, p50 of 600 samples after 120 warm-up, GPU lock held)
 

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 mod ao_grain;
 mod preset_matrix;
+mod temporal;
 
 struct Shot {
     gui: Gui,
@@ -1899,16 +1900,16 @@ fn graphics_fixture_snapshot_keys_share_only_matching_playfield_and_time() -> an
     for (_, pf, time, _) in &views {
         *keys.entry((*pf, time.to_bits())).or_default() += 1;
     }
-    assert_eq!(views.len(), 29);
+    assert_eq!(views.len(), 31);
     assert_eq!(keys.len(), 10);
     assert_eq!(keys[&(4582, 2648.69_f32.to_bits())], 7);
     assert_eq!(keys[&(630, 2648.69_f32.to_bits())], 1);
     assert_eq!(keys[&(800, 0.0_f32.to_bits())], 5);
     assert_eq!(keys[&(800, 3240.0_f32.to_bits())], 4);
     assert_eq!(keys[&(127, 3240.0_f32.to_bits())], 1);
-    assert_eq!(keys[&(566, 3240.0_f32.to_bits())], 4);
+    assert_eq!(keys[&(566, 3240.0_f32.to_bits())], 5);
     assert_eq!(keys[&(566, 4860.0_f32.to_bits())], 1);
-    assert_eq!(keys[&(566, 0.0_f32.to_bits())], 2);
+    assert_eq!(keys[&(566, 0.0_f32.to_bits())], 3);
     Ok(())
 }
 
@@ -2701,7 +2702,7 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
     let actor = graphics_fixture_actor().unwrap();
     assert_eq!(actor.name, "Testy");
     let views = graphics_fixture_views(&actor);
-    assert_eq!(views.iter().map(|view| &view.0).collect::<std::collections::HashSet<_>>().len(), 29);
+    assert_eq!(views.iter().map(|view| &view.0).collect::<std::collections::HashSet<_>>().len(), 31);
     let waterfall = views.iter().find(|view| view.0 == "pleasant-meadows-waterfall-native-authored").unwrap();
     assert_eq!((waterfall.1, waterfall.2), (630, 2648.69));
     for (light, expected_time) in [("day", 3240.0), ("dusk", 4860.0), ("night", 0.0)] {

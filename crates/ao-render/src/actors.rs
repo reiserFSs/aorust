@@ -898,6 +898,12 @@ impl Renderer {
         self.act.frames.iter().filter(|frame| frame.alpha > 1e-5).map(|frame| frame.id)
     }
 
+    /// `(actor id, mesh index)` of every actor item actually drawn this frame (after alpha/priority/frustum culling in
+    /// [`Self::prepare_actors`]); the Enhanced v2 temporal-history admission hash is built from this, not from the host frames.
+    pub(crate) fn drawn_actor_items(&self) -> impl Iterator<Item = (u32, usize)> + '_ {
+        self.act.items.iter().map(|item| (item.actor, item.mesh))
+    }
+
     /// Draws a native render list without changing its material pipelines.
     /// With sun shadows enabled, the caller binds the shared receiver at group 3.
     /// Draws a native render list restricted to native distance buckets `buckets` (RViewPort::Render's first/last bucket).

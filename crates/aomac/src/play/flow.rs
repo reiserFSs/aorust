@@ -1737,6 +1737,9 @@ impl Frontend for Play {
             self.zone_timing_dynels_seen = true;
             self.zt(&format!("dynels_visible n={}", self.zone.dynels.len()));
         }
+        // Diagnostics readiness (AOMAC_FRAME_DUMP_DELAY / AOMAC_FREEZE_CAMERA): character in the world, loading screen gone.
+        ao_render::set_world_playing(self.screen == Screen::InWorld && self.player.is_some() && !self.loading_active
+            && matches!(self.fade, Fade::Hold) && self.world_ready && self.world_scene.is_none());
         if self.screen == Screen::InWorld {
             // Complete camp before world updates can emit more sounds into the login lifecycle.
             self.camp_frame(dt, host);

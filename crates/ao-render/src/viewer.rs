@@ -21,6 +21,9 @@ mod window_prefs;
 #[path = "frame_diagnostics.rs"]
 mod frame_diagnostics;
 use frame_diagnostics::FrameDiagnostics;
+#[path = "frame_dump.rs"]
+mod frame_dump;
+pub use frame_dump::set_world_playing;
 
 /// What a [`Frontend`] can ask of the window/renderer between frames.
 pub struct Host {
@@ -559,6 +562,13 @@ struct State {
     hook: Option<FrameHook>,
     /// `Host::screenshot`, drained from `run_gui` and captured after this frame renders (`frame`'s F12 handling).
     pending_screenshot: Option<std::path::PathBuf>,
+    /// `AOMAC_FRAME_DUMP` / `AOMAC_FREEZE_CAMERA` (read once at startup); `frozen_cam` is the camera captured when Play first reported playing.
+    frame_dump: Option<frame_dump::FrameDump>,
+    freeze_camera: bool,
+    frozen_cam: Option<Camera>,
+    /// `AOMAC_PERF`: per-frame wall milliseconds of the current 5 s window.
+    perf_ms: Vec<f32>,
+    perf_ms_t: Instant,
 }
 
 /// Called once per frame with listener position, delta, and renderer (including drainable ship sounds).
@@ -646,7 +656,7 @@ impl State {
         renderer.upload(scene);
         let size = window.inner_size();
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: if std::env::var_os("AOMAC_FRAME_DUMP").is_some() { wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC } else { wgpu::TextureUsages::RENDER_ATTACHMENT },
             format: renderer.format,
             width: size.width.max(1),
             height: size.height.max(1),
@@ -706,6 +716,11 @@ impl State {
             live: live.map(LiveRun::new),
             hook,
             pending_screenshot: None,
+            frame_dump: frame_dump::FrameDump::from_env(),
+            freeze_camera: frame_dump::freeze_camera_requested(),
+            frozen_cam: None,
+            perf_ms: Vec::new(),
+            perf_ms_t: now,
         })
     }
 
@@ -882,6 +897,15 @@ impl State {
         let dt = (now - self.last).as_secs_f32().min(100.0);
         self.last = now;
         self.clock += dt;
+        if self.perf {
+            self.perf_ms.push(dt * 1000.0);
+            if self.perf_ms_t.elapsed() >= Duration::from_secs(5) {
+                let (avg, p95, worst) = frame_dump::frame_stats(&mut self.perf_ms);
+                eprintln!("AOMAC_PERF frame_ms avg={avg:.2} p95={p95:.2} worst={worst:.2} over {} frames (5 s)", self.perf_ms.len());
+                self.perf_ms.clear();
+                self.perf_ms_t = Instant::now();
+            }
+        }
         self.renderer.time = self.clock;
         self.renderer.advance_grass_wind(dt);
         if let Some(sun) = LiveRun::advance(&mut self.live, &mut self.renderer, dt) {
@@ -916,6 +940,12 @@ impl State {
         }
         self.raw_mouse.set_active(self.looking && self.focused && !self.fly());
         let (gui_out, quit) = self.run_gui(dt, &mut diagnostics);
+        // AOMAC_FREEZE_CAMERA=1: from the first frame Play reports the world playing, render from that exact camera.
+        if self.freeze_camera && frame_dump::world_playing() {
+            let frozen = *self.frozen_cam.get_or_insert(self.cam);
+            self.cam = frozen;
+            if let Some(g) = &mut self.gui { g.host.camera = frozen; }
+        }
         self.renderer.settle_enhanced_world();
         if !self.targets.matches_renderer(&self.renderer) {
             self.targets = Targets::new(&self.renderer, self.config.width, self.config.height);
@@ -963,6 +993,12 @@ impl State {
             if let Some(t) = t { self.perf_times[2] += t.elapsed().as_secs_f64(); }
         }
         diagnostics.mark(5);
+        // AOMAC_FRAME_DUMP: the final swapchain colour of every presented frame, read back before present (blocks while dumping).
+        if let Some(path) = self.frame_dump.as_mut().and_then(|d| d.next_path(frame_dump::world_playing(), Instant::now())) {
+            if let Err(e) = crate::capture_frame_to_png(&self.renderer, &frame.texture, self.config.width, self.config.height, path.clone()) {
+                eprintln!("AOMAC_FRAME_DUMP: {}: {e}", path.display());
+            }
+        }
         if self.gui.as_ref().is_some_and(|g| g.host.mouse_lag_fix) {
             if let Some(previous) = self.previous_submission.take() {
                 if let Err(error) = self.renderer.device.poll(wgpu::PollType::Wait { submission_index: Some(previous), timeout: None }) {

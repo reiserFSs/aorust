@@ -119,6 +119,11 @@ impl EffectGpuProfiler {
         for slot in &mut self.slots { slot.discard = true; }
     }
 
+    /// Rows measured outside pass interception (v2 pass timers) as one world-domain batch.
+    pub(crate) fn record_external(&mut self, rows: &[(&'static str, f64)]) {
+        record_batch(&mut self.costs, &mut self.rolling, false, rows);
+    }
+
     pub(crate) fn begin(&mut self, gui: bool) -> Option<RecordingGuard> {
         ACTIVE.with(|active| {
             let mut active = active.borrow_mut();
