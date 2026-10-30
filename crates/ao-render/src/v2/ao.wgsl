@@ -10,8 +10,21 @@ const HIZ_SKY: f32 = 1.0e9;
 @group(0) @binding(4) var raw_in: texture_2d<f32>;
 @group(0) @binding(5) var hist_prev: texture_2d<f32>;       // rg = AO, view depth of the previous frame's denoised texel
 @group(0) @binding(6) var hist_out: texture_storage_2d<rg32float, write>;
-@group(0) @binding(7) var<uniform> params: vec4<u32>;       // x = 1: drop the history (admission change, resize, jitter toggle); yz = bitcast f32 jitter (pixels) of the frame that wrote the history
+@group(0) @binding(7) var<uniform> params: vec4<u32>;       // x = 1: drop the history (set-wide admission change, resize, jitter toggle); yz = bitcast f32 jitter (pixels) of the frame that wrote the history
 @group(0) @binding(8) var hist_in: texture_2d<f32>;
+@group(0) @binding(9) var<uniform> regions: Rects;           // admission-changed pixel regions (region.rs, full-res pixels): no history inside
+
+struct Rects {
+    count: vec4<u32>,
+    r: array<vec4<f32>, 16>,
+}
+fn in_region(p: vec2<f32>) -> bool {
+    for (var i = 0u; i < regions.count.x; i++) {
+        let r = regions.r[i];
+        if p.x >= r.x && p.y >= r.y && p.x < r.z && p.y < r.w { return true; }
+    }
+    return false;
+}
 
 const RADIUS: f32 = 1.5;          // world metres
 const SLICES: u32 = 2u;
@@ -143,7 +156,7 @@ fn denoise(@builtin(global_invocation_id) id: vec3<u32>) {
     let pc = fc.prev_view_proj_unjit * vec4<f32>(wp, 1.0);
     var blend = 0.0;
     var hist = ao;
-    if params.x == 0u && pc.w > 0.0 {
+    if params.x == 0u && pc.w > 0.0 && !in_region(vec2<f32>(hp) * 2.0 + vec2<f32>(1.0)) {
         // The history texel that saw this surface point sampled it through the previous frame's jitter: look it up at uv + jitter_prev.
         let jp = vec2<f32>(bitcast<f32>(params.y), bitcast<f32>(params.z));
         let uv = vec2<f32>(pc.x / pc.w * 0.5 + 0.5, 0.5 - pc.y / pc.w * 0.5) + jp * fc.viewport.zw;

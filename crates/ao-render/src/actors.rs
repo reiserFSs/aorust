@@ -188,6 +188,8 @@ pub(crate) struct ActorLayer {
     bufs: Vec<wgpu::Buffer>,
     cap: usize,
     items: Vec<Item>,
+    /// World bounding sphere of `items[i]` (the frustum-cull sphere); Enhanced v2's region-limited admission reset projects it.
+    item_spheres: Vec<(Vec3, f32)>,
     motion_instances: Vec<ActorInstance>,
     commands: Vec<(i32, Option<usize>, i32, bool, usize)>,
     /// Evicted actors' skin vertex buffers, by model: every actor of a model shares its vertex count/byte size (see
@@ -784,6 +786,7 @@ impl Renderer {
         let smoothing_enabled = self.enhanced_settings().character_smoothing;
         let layer = &mut self.act;
         layer.items.clear();
+        layer.item_spheres.clear();
         let mut xf: Vec<ActorInstance> = vec![];
         for f in &layer.frames {
             // `RVisual_t::Rasterize` (randy31 0x1004d84a) draws nothing at a transparency <= 1e-5 (`_DAT_10095a08`)
@@ -836,6 +839,7 @@ impl Renderer {
                     smoothing: smoothing_enabled && f.character && model.native_skin.is_some()
                         && base.w_axis.truncate().distance_squared(cam) <= 225.0
                         && (mi == 0 || f.part_attractors.get(mi) == Some(&Some(0))) && mesh.smoothing.is_some() });
+                layer.item_spheres.push((c, r));
                 // m0.w carries `alpha - 1` to the shader (the affine matrix' unused column element)
                 let mut a = m.to_cols_array_2d();
                 a[0][3] = alpha.min(1.0) - 1.0;
@@ -902,6 +906,11 @@ impl Renderer {
     /// [`Self::prepare_actors`]); the Enhanced v2 temporal-history admission hash is built from this, not from the host frames.
     pub(crate) fn drawn_actor_items(&self) -> impl Iterator<Item = (u32, usize)> + '_ {
         self.act.items.iter().map(|item| (item.actor, item.mesh))
+    }
+
+    /// [`Self::drawn_actor_items`] with each item's world bounding sphere `(centre, radius)`.
+    pub(crate) fn drawn_actor_spheres(&self) -> impl Iterator<Item = ((u32, usize), (Vec3, f32))> + '_ {
+        self.act.items.iter().zip(&self.act.item_spheres).map(|(item, &sphere)| ((item.actor, item.mesh), sphere))
     }
 
     /// Draws a native render list without changing its material pipelines.

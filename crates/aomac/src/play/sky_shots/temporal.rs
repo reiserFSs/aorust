@@ -68,20 +68,23 @@ struct Delta {
     worst: u8,
 }
 
-/// Mean absolute RGB delta overall and inside the previous frame's shadow/edge classes, plus the worst single channel.
-fn delta(a: &Analysed, b: &Analysed) -> Delta {
+/// Mean absolute RGB delta overall and inside the previous frame's shadow/edge classes, plus the worst single channel, over the pixels
+/// not set in `exclude` (empty = all pixels).
+fn delta(a: &Analysed, b: &Analysed, exclude: &[bool]) -> Delta {
     let (mut whole, mut shadow, mut edge, mut worst) = (0u64, 0u64, 0u64, 0u8);
-    let (mut shadow_n, mut edge_n) = (0u64, 0u64);
+    let (mut whole_n, mut shadow_n, mut edge_n) = (0u64, 0u64, 0u64);
     for (i, (p, q)) in a.rgba.as_chunks::<4>().0.iter().zip(b.rgba.as_chunks::<4>().0.iter()).enumerate() {
+        if exclude.get(i).copied().unwrap_or(false) { continue; }
         let d = [0, 1, 2].map(|c| p[c].abs_diff(q[c]));
         let s = u64::from(d[0]) + u64::from(d[1]) + u64::from(d[2]);
         whole += s;
+        whole_n += 1;
         worst = worst.max(d[0]).max(d[1]).max(d[2]);
         if a.shadow[i] { shadow += s; shadow_n += 1; }
         if a.edge[i] { edge += s; edge_n += 1; }
     }
     let mean = |sum: u64, n: u64| if n == 0 { 0.0 } else { sum as f64 / (3 * n) as f64 };
-    Delta { whole: mean(whole, (a.rgba.len() / 4) as u64), shadow: mean(shadow, shadow_n), edge: mean(edge, edge_n), worst }
+    Delta { whole: mean(whole, whole_n), shadow: mean(shadow, shadow_n), edge: mean(edge, edge_n), worst }
 }
 
 /// `max(1.2 x Original, floor)`.
@@ -90,6 +93,8 @@ fn bound(original: f64, floor: f64) -> f64 { (1.2 * original).max(floor) }
 struct Run {
     /// (frame index, delta, skipped: an actor toggle at this frame legitimately changes pixels).
     rows: Vec<(usize, Delta, bool)>,
+    /// The same frames' delta over the whole image (actor rects included), for the report only.
+    all: Vec<Delta>,
     worst: (Vec<u8>, Vec<u8>),
 }
 
@@ -126,6 +131,35 @@ fn lcg(state: &mut u32) -> f32 {
     (*state >> 8) as f32 / (1u32 << 24) as f32
 }
 
+/// Pixel bounds of the bounding cube of a sphere (the actor's body) under `view_proj`, grown 2x + 64 px per side: the padded rect
+/// the renderer drops history in (1.25x + 24 px) with slack, so the churn metric excludes only what the region reset may touch.
+fn actor_rect(view_proj: glam::Mat4, centre: Vec3, radius: f32) -> [f32; 4] {
+    let (w, h) = (SIZE.0 as f32, SIZE.1 as f32);
+    let (mut lo, mut hi) = (glam::Vec2::splat(f32::MAX), glam::Vec2::splat(f32::MIN));
+    for corner in 0..8 {
+        let o = Vec3::new(if corner & 1 == 0 { -radius } else { radius }, if corner & 2 == 0 { -radius } else { radius }, if corner & 4 == 0 { -radius } else { radius });
+        let clip = view_proj * (centre + o).extend(1.0);
+        assert!(clip.w > 1e-3, "fixture actor behind the camera");
+        let p = glam::Vec2::new((clip.x / clip.w * 0.5 + 0.5) * w, (0.5 - clip.y / clip.w * 0.5) * h);
+        lo = lo.min(p);
+        hi = hi.max(p);
+    }
+    let (c, half) = ((lo + hi) * 0.5, (hi - lo) * 0.5 * 2.0 + glam::Vec2::splat(64.0));
+    [(c.x - half.x).max(0.0), (c.y - half.y).max(0.0), (c.x + half.x).min(w), (c.y + half.y).min(h)]
+}
+
+/// `true` for every pixel inside any of `rects`.
+fn rect_mask(rects: &[[f32; 4]]) -> Vec<bool> {
+    let (w, h) = (SIZE.0 as usize, SIZE.1 as usize);
+    let mut mask = vec![false; w * h];
+    for r in rects {
+        for y in (r[1] as usize)..(r[3].ceil() as usize).min(h) {
+            for x in (r[0] as usize)..(r[2].ceil() as usize).min(w) { mask[y * w + x] = true; }
+        }
+    }
+    mask
+}
+
 #[test]
 #[ignore = "offline temporal stability regression; opt-in AOMAC_GFX_TEMPORAL_REGRESSION=1, installed client, GPU timing lock"]
 fn graphics_temporal_stability_matches_original() -> anyhow::Result<()> {
@@ -152,6 +186,21 @@ fn graphics_temporal_stability_matches_original() -> anyhow::Result<()> {
     let mut avatar = super::super::avatar::Avatar::new(&store, &dir, 25988, &actor,
         ao_formats::character::actor::ActorAssets::new(&store)?)?;
     avatar.set_transform(actor_at.to_array(), 0.0);
+    // Stress mode: 12 actors on a 3 x 4 grid around the single churn actor, toggling at staggered periods (a crowded platform).
+    let right = fixed.forward().cross(Vec3::Y).normalize();
+    let stress_spots: Vec<Vec3> = std::iter::once(actor_at).chain((0..11).map(|k| {
+        let mut p = actor_at + right * ((k % 4) as f32 - 1.5) * 2.5 + fixed.forward() * ((k / 4) as f32 * 3.0 - 3.0);
+        p.y = collision.borrow().terrain_height(p.to_array()).unwrap_or(actor_at.y);
+        p
+    })).collect();
+    let masks: Vec<[f32; 4]> = {
+        let mut lens = camera::lens(scene.lens.unwrap_or_default(), false);
+        lens.far = Some(camera::far_plane(camera::VIEW_DISTANCE));
+        let aspect = SIZE.0 as f32 / SIZE.1 as f32;
+        let view_proj = glam::Mat4::perspective_rh(lens.vertical_fov(aspect), aspect, lens.near, lens.far.unwrap_or(1000.0))
+            * glam::Mat4::look_to_rh(fixed.pos, fixed.forward(), fixed.up());
+        stress_spots.iter().map(|p| actor_rect(view_proj, *p + Vec3::Y, 1.6)).collect()
+    };
 
     let probe = match std::env::var("AOMAC_GFX_TEMPORAL_PROBE") {
         Ok(value) => {
@@ -162,8 +211,10 @@ fn graphics_temporal_stability_matches_original() -> anyhow::Result<()> {
         }
         Err(_) => None,
     };
-    let run = |mode: &str, preset: &str, settings: ao_render::EnhancedSettings| -> anyhow::Result<Run> {
-        let churn = mode == "churn";
+    let mut run = |mode: &str, preset: &str, settings: ao_render::EnhancedSettings| -> anyhow::Result<Run> {
+        let churn = mode == "churn" || mode == "stress";
+        let spots = if mode == "stress" { &stress_spots[..] } else { &stress_spots[..1] };
+        let outside: Vec<bool> = if churn { rect_mask(&masks[..spots.len()]) } else { Vec::new() };
         ao_scene::crt_srand(1);
         let mut lens = camera::lens(scene.lens.unwrap_or_default(), false);
         lens.far = Some(camera::far_plane(camera::VIEW_DISTANCE));
@@ -177,13 +228,14 @@ fn graphics_temporal_stability_matches_original() -> anyhow::Result<()> {
         off.host.grass_wind = weather.wind;
         let foliage = settings.foliage_enabled() || settings.interaction_enabled();
         if foliage { off.host.grass_exposure = Some(super::super::player::grass_exposure_surface(collision.clone())); }
-        off.host.actor_models.push((super::super::avatar::MODEL_KEY, std::sync::Arc::new(avatar.model().clone())));
         off.frame(&mut shot, 0.0);
         if foliage { off.warm_grass_tiles(); }
         off.wait_for_pipeline_warmup();
+        // The scene upload of the first frame resets actors: the model must be handed over AFTER it, or the churn actor is never drawn.
+        off.host.actor_models.push((super::super::avatar::MODEL_KEY, std::sync::Arc::new(avatar.model().clone())));
         off.prepare_frozen_rendering();
         let (mut rng, mut z) = (12345u32, 0.0_f32);
-        let (mut previous, mut rows) = (None::<Analysed>, Vec::new());
+        let (mut previous, mut rows, mut all) = (None::<Analysed>, Vec::new(), Vec::new());
         let mut worst = (0u8, Vec::new(), Vec::new());
         for index in 0..=WARM + MEASURED {
             let mut camera = fixed;
@@ -199,12 +251,18 @@ fn graphics_temporal_stability_matches_original() -> anyhow::Result<()> {
                 _ => {}
             }
             off.fixed_camera(Some(camera));
-            let shown = churn && index % 16 >= 8;
-            if shown {
-                off.host.dynamic_lights.extend(avatar.lights());
-                off.host.actors.push(avatar.frame());
-                off.host.post_focus = Some(actor_at.to_array());
-                if foliage { off.host.grass_benders.push(ao_render::GrassBender { actor: None, position: actor_at.to_array() }); }
+            for (k, &spot) in spots.iter().enumerate() {
+                let shown = if mode == "stress" { (index + 3 * k) % (6 + 2 * k) >= 3 + k } else { churn && index % 16 >= 8 };
+                if !shown { continue; }
+                avatar.set_transform(spot.to_array(), 0.0);
+                let mut frame = avatar.frame();
+                frame.id += k as u32;
+                off.host.actors.push(frame);
+                if mode != "stress" {
+                    off.host.dynamic_lights.extend(avatar.lights());
+                    off.host.post_focus = Some(actor_at.to_array());
+                    if foliage { off.host.grass_benders.push(ao_render::GrassBender { actor: None, position: actor_at.to_array() }); }
+                }
             }
             off.frame(&mut shot, dt);
             if index < WARM { continue; }
@@ -215,21 +273,25 @@ fn graphics_temporal_stability_matches_original() -> anyhow::Result<()> {
                 eprintln!("PROBE {mode} {preset} {index} {} {} {}", p[0], p[1], p[2]);
             }
             if let Some(before) = &previous {
-                let d = delta(before, &current);
-                // Only the churn pair where the actor appears or disappears changes real pixels legitimately.
-                let toggle = churn && index % 8 == 0;
+                let d = delta(before, &current, &outside);
+                // Only the single-actor churn pair where the actor appears or disappears changes real pixels outside its rect
+                // legitimately (its lights); the stress mode toggles somebody every frame and skips nothing.
+                let toggle = mode == "churn" && index % 8 == 0;
                 rows.push((index, d, toggle));
+                all.push(delta(before, &current, &[]));
                 if !toggle && d.worst >= worst.0 { worst = (d.worst, before.rgba.clone(), current.rgba.clone()); }
             }
             previous = Some(current);
         }
-        Ok(Run { rows, worst: (worst.1, worst.2) })
+        Ok(Run { rows, all, worst: (worst.1, worst.2) })
     };
 
     let (original_settings, v2_settings) = (graphics_fixture_settings("Original")?, graphics_fixture_settings(&profile)?);
     let (mut failed, mut table) = (Vec::new(), String::new());
     writeln!(table, "mode,preset,whole,shadow,edge,worst")?;
-    for mode in ["frozen", "micro", "animated", "churn"] {
+    // `AOMAC_GFX_TEMPORAL_MODES=churn,stress` runs only those modes (default: all five).
+    let only = std::env::var("AOMAC_GFX_TEMPORAL_MODES").unwrap_or_default();
+    for mode in ["frozen", "micro", "animated", "churn", "stress"].into_iter().filter(|m| only.is_empty() || only.split(',').any(|o| o == *m)) {
         let mut summaries = Vec::new();
         for (preset, settings) in [("original", original_settings), (profile.as_str(), v2_settings)] {
             let result = run(mode, preset, settings)?;
@@ -240,14 +302,15 @@ fn graphics_temporal_stability_matches_original() -> anyhow::Result<()> {
             std::fs::write(out.join(format!("temporal-{mode}-{preset}.csv")), csv)?;
             let s = result.summary();
             writeln!(table, "{mode},{preset},{:.4},{:.4},{:.4},{}", s.whole, s.shadow, s.edge, s.worst)?;
-            eprintln!("TEMPORAL mode={mode} preset={preset} whole={:.4} shadow={:.4} edge={:.4} worst={}", s.whole, s.shadow, s.edge, s.worst);
+            let all: Vec<_> = result.rows.iter().zip(&result.all).filter(|(r, _)| !r.2).map(|(_, d)| d.whole).collect();
+            eprintln!("TEMPORAL mode={mode} preset={preset} whole={:.4} shadow={:.4} edge={:.4} worst={} (whole image incl. actor rects: mean {:.4} peak {:.4})",
+                s.whole, s.shadow, s.edge, s.worst, all.iter().sum::<f64>() / all.len().max(1) as f64, all.iter().fold(0.0_f64, |a, &b| a.max(b)));
             summaries.push((s, result));
         }
-        // Animated time is real motion: numbers only, no bound. Churn worst pixel is a reset (raw jittered frame by
-        // fairness design: no stale actor residue in history), printed and in the CSV, unbounded.
+        // Animated time is real motion: numbers only, no bound. Churn / stress measure OUTSIDE the toggling actors' padded rects (the
+        // region-limited admission reset leaves everything else converged), so they hold the frozen bounds, worst pixel included.
         if mode == "animated" { continue; }
-        let mut broken = failures(mode, summaries[0].0, summaries[1].0);
-        if mode == "churn" { broken.retain(|f| !f.contains(": worst ")); }
+        let broken = failures(mode, summaries[0].0, summaries[1].0);
         if !broken.is_empty() {
             let (a, b) = &summaries[1].1.worst;
             for (suffix, image) in [("a", a), ("b", b)] {
@@ -270,12 +333,15 @@ fn temporal_metrics_are_zero_for_identical_frames_and_see_single_pixel_changes()
     let mut a = flat(w, h, 100);
     for y in 0..h { for x in w / 2..w { let i = (y * w + x) * 4; a[i..i + 3].fill(200); } }
     let before = analyse(a.clone(), (w, h));
-    let same = delta(&before, &analyse(a.clone(), (w, h)));
+    let same = delta(&before, &analyse(a.clone(), (w, h)), &[]);
     assert_eq!((same.whole, same.shadow, same.edge, same.worst), (0.0, 0.0, 0.0, 0));
     assert!(before.edge[15 * w + w / 2] && !before.edge[15 * w + 5], "the step is an edge, the flat side is not");
     let mut b = a;
     b[(15 * w + w / 2) * 4] = 150;
-    let d = delta(&before, &analyse(b, (w, h)));
+    let d = delta(&before, &analyse(b.clone(), (w, h)), &[]);
+    let mut masked = vec![false; w * h];
+    masked[15 * w + w / 2] = true;
+    assert_eq!(delta(&before, &analyse(b, (w, h)), &masked).worst, 0, "the changed pixel lies in the excluded rect");
     assert_eq!(d.worst, 50);
     assert!(d.edge > 0.0 && d.whole > 0.0 && d.shadow == 0.0);
 }

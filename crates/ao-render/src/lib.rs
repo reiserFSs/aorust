@@ -918,6 +918,10 @@ pub struct Renderer {
     screen: screen::ScreenPass,
     /// Enhanced v2 renderer state, created on its first frame (see `v2/`).
     v2: Option<v2::V2>,
+    /// In-flight `V2::new` on a worker thread (see `Renderer::start_v2`).
+    v2_build: Option<std::thread::JoinHandle<v2::V2>>,
+    /// v2 settings requested while `v2_build` runs; applied by `poll_v2`.
+    v2_waiting: Option<EnhancedSettings>,
 }
 
 /// Inactive combinations retained for switching back without recompiling.
@@ -1463,7 +1467,7 @@ impl Renderer {
             sorted: vec![],
             act: Default::default(),
             screen: Default::default(),
-            v2: None,
+            v2: None, v2_build: None, v2_waiting: None,
         };
         r.act.native_metal = adapter.get_info().backend == wgpu::Backend::Metal;
         r.warm_skin_pipeline();
@@ -1758,18 +1762,11 @@ impl Renderer {
         }
     }
 
-    /// Enhanced v2 builds its pipelines when selected, never inside a frame.
-    fn warm_v2(&mut self, settings: EnhancedSettings) {
-        if settings.enhanced_v2 && self.v2.is_none() {
-            let v2 = v2::V2::new(self);
-            self.v2 = Some(v2);
-        }
-    }
-
     /// Immediate fixture setting: waits for an unseen world combination to compile on a worker.
     pub fn set_enhanced_settings(&mut self, settings: EnhancedSettings) {
         let settings = settings.clamped();
-        self.warm_v2(settings);
+        self.v2_waiting = None;
+        if settings.enhanced_v2 { self.start_v2(); self.finish_v2(true); }
         self.request_materials(settings, false);
         let key = variant::Key::of(settings, self.clamp_msaa(self.requested_msaa, settings));
         self.request_world(key, settings, false);
@@ -1782,7 +1779,12 @@ impl Renderer {
     /// Keeps drawing the active variant while an unseen combination compiles on a worker.
     pub fn request_enhanced_settings(&mut self, settings: EnhancedSettings) {
         let settings = settings.clamped();
-        self.warm_v2(settings);
+        // v2 builds on a worker; until it lands the previous settings (and path) keep rendering.
+        self.v2_waiting = None;
+        if settings.enhanced_v2 {
+            self.start_v2();
+            if !self.finish_v2(false) { self.v2_waiting = Some(settings); return; }
+        }
         self.request_materials(settings, true);
         let key = variant::Key::of(settings, self.clamp_msaa(self.requested_msaa, settings));
         self.request_world(key, settings, true);
@@ -3052,6 +3054,7 @@ impl Renderer {
 
     /// Draws one frame into `resolve` (a view of the output texture).
     pub fn render(&mut self, resolve: &wgpu::TextureView, t: &Targets, cam: &Camera) -> wgpu::SubmissionIndex {
+        self.poll_v2();
         if self.enhanced_settings.enhanced_v2 && self.v2_eligible() { return self.render_v2(resolve, t, cam); }
         let _compile_scope = pipeline_creation::FrameGuard::enter();
         self.poll_effect_gpu_costs();

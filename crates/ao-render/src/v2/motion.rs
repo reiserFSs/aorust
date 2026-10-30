@@ -42,7 +42,7 @@ fn transform_cut(previous: [[f32; 4]; 4], current: [[f32; 4]; 4]) -> bool {
 }
 
 impl ActorMotion {
-    pub(crate) fn new(r: &Renderer) -> Self {
+    pub(crate) fn new(r: &crate::v2::Seed) -> Self {
         let layout = r.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("v2 actor motion pose"), entries: &[
                 wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,

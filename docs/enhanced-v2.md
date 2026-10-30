@@ -13,6 +13,15 @@ edits to it are pure extractions (`frame_globals`, `cull_frame`, `sort_draws`, `
 `baseline_differing_bytes=0` for Original (MSAA 1) and Classic+ (MSAA 4) on `icc-landmark-authored`,
 `borealis-street-sun-high`, `borealis-street-night`, `newland-day`.
 
+### Selecting v2 at runtime (no freeze)
+
+`V2::new` (all shader modules/pipelines, ~5.1 s synchronous measured) runs on a worker (`Renderer::start_v2`, from a `v2::Seed`
+of cloned device/layout handles). `request_enhanced_settings` with `enhanced_v2` returns at once (22 us) and holds the settings
+in `v2_waiting`; the previous path and settings keep rendering; `poll_v2` (top of `render`) applies them once the build lands.
+`set_enhanced_settings` (fixtures) and `render_v2`/`set_v2_pass_timing` block on the build. Same path covers a stored v2
+preference at startup. Test: `cargo test --release -p ao-render runtime_selection_builds_off_the_render_thread -- --nocapture`
+(request 22 us, ready after 2.25 s, worst old-path frame 4.2 ms).
+
 ## Frame graph (implemented)
 
 `[shadows] -> G-buffer -> [AO] -> resolve (compute) -> FX (blended draws, forward into HDR) -> [TAA/bloom] -> post`
@@ -33,7 +42,7 @@ where the G-buffer has no geometry); two dispatches, `Pyramid::view()` exposes a
 `ao_up`): half-res GTAO (2 slices x 6 steps per side, mip by sample distance, 1.5 m radius, thin-occluder compensation, edge-on
 surfaces fade to 1), 3x3 depth-bilateral blur + temporal blend (history reprojected with the unjittered matrices and looked up through
 the previous frame's jitter, positions reconstructed with the current jitter undone, half-res texel centre = 2x2 block centre,
-depth-rejected, dropped on resize / drawn-actor hash change / TAA jitter toggle), then a depth-aware upsample into the full-res `R8Unorm`
+depth-rejected, dropped on resize / massive drawn-set change / TAA jitter toggle and inside the changed-admission rects), then a depth-aware upsample into the full-res `R8Unorm`
 texture at resolve binding 6 (`flags.y` bit 0). AO only multiplies the hemisphere ambient term. Sky and fully fogged texels are 1
 and never act as occluders (`native_transmittance(z) > 0`). The sampling pattern only rotates through time when TAA jitters, so
 identical frames give bit-identical AO. `ao_up` is a raster pass (R8Unorm cannot be a storage target without extra features): its
@@ -60,14 +69,23 @@ Post stack (`motion.rs`, `bloom.rs`, `taa.rs`, `post.rs`, WGSL `motion/bloom/taa
   12x12 tile with a 2-pixel halo, variance bounds from the reconstructed neighbours), catmull-rom history, 3x3 variance clip,
   depth-dilated motion, ping-pong RGBA16F history whose alpha is the sample count (blend weight 1/n, n <= 32, capped near 3 while moving,
   restarted by a rejected history). History is discarded (`taa::reset_reason`) on frame 0/resize, camera cut (> 5 m or > 25 deg per
-  frame) and any change of the drawn-actor hash (`admission::drawn_set_hash`: order-independent SUM of mixed `(actor, mesh)` hashes of the
-  post-cull actor items, so duplicates never cancel and undrawn host frames never churn it). `AOMAC_V2_NO_TAA=1` (read once at start)
-  disables jitter and accumulation for before/after stills. `AOMAC_V2_TEMPORAL_TRACE=1` (read once, zero cost when unset) logs per frame
+  frame) and a massive drawn-actor-set change; an ordinary admission change only drops it inside the changed items' padded screen rects
+  (Admission regions below; `admission::drawn_set_hash`, the order-independent SUM of mixed `(actor, mesh)` hashes, is trace-only now).
+  `AOMAC_V2_NO_TAA=1` (read once at start) disables jitter and accumulation for before/after stills. `AOMAC_V2_TEMPORAL_TRACE=1` (read once, zero cost when unset) logs per frame
   on stderr: frame, time, dt, eye, forward, jitter, drawn-actor hash/item count and whether/why the TAA and AO histories reset.
 - Post: CAS (`EnhancedSettings::cas_strength`, skipped for `T_native < 0.15`), then the grade; saturation and contrast fade to identity for
   `T_native < 0.5` so the grade cannot recover fogged contrast (`post::tests::grade_is_contrast_neutral_over_fog`).
 - Regressions (`play/v2_glow.rs`, ignored, GPU lock): lamp pole <= 1.25x Original and head halo; admission flip leaves no history residue
-  (byte-identical frames 2-3); a walking actor leaves no trail; a static camera does not flicker.
+  (frames 2-3 byte-identical to the no-actor reference outside the actor's box, mean <= 1 / max <= 16 on its old pixels); a walking
+  actor leaves no trail; a static camera does not flicker.
+Admission regions (`region.rs`): every frame the drawn `(actor, mesh)` items are diffed against the previous frame's; an item in exactly
+one of the two is changed. Its world bounding sphere (from the frame it existed in) is projected with BOTH the previous and current
+unjittered view-projection, unioned, grown 1.25x plus 24 px (contact shadow, AO halo) and overlapping rects merged (<= 16). TAA
+(`taa.wgsl` binding 10) and the AO denoise (`ao.wgsl` binding 9) read them as one small uniform and treat pixels inside as history-less;
+everything else keeps its history. More than 16 clusters, > 75% of the screen covered, or > 8 and > 50% of the actors changed (zone
+change, mass respawn) fall back to the full reset, as do camera cuts, resize, the first frame and a TAA toggle. Actors that stay drawn
+are the motion vectors' job. Trace: `regions=N` and reason `admission-region` (`admission-change` = full fallback).
+`AOMAC_V2_OFF=admission-region` (read once) restores the old behaviour (any set change resets everything) for before/after runs.
 Admission (`admission.rs`, slot 1, label `admission`): after the G-buffer only this frame's actors (alpha > 1e-5) are drawn into an
 R32Uint id target depth-tested against the G-buffer depth, then reduced to `Admission::visibility()`, a fixed 8193-word storage
 array indexed by the actor interaction slot (layout frozen, documented at the top of the file). It is read by the dynamic shadow
@@ -97,13 +115,16 @@ Views: `icc-landmark-authored`, `newland-sun` (look-target camera), `newland-day
 
 Temporal stability (flicker/shaking): `AOMAC_GFX_TEMPORAL_REGRESSION=1 AOMAC_GFX_SETTINGS=v2-high AOMAC_GFX_VIEW=icc-landmark-authored
 AOMAC_GFX_OUT=<new dir> cargo test --profile fast -p aomac graphics_temporal_stability -- --ignored --nocapture` (GPU lock first). Renders
-64 warm + 24 measured consecutive frames for Original and the preset in the same run, in four modes: frozen camera, +-1 mm camera
+64 warm + 24 measured consecutive frames for Original and the preset in the same run, in five modes: frozen camera, +-1 mm camera
 micro-motion, animated scene time (dt jitter 4..20 ms; other modes pass dt 0, so effect time is explicit), all without an actor
-(steady state), and `churn` = frozen camera with a real actor shown/hidden every 8 frames (the toggle pair is excluded). Per mode it prints
+(steady state), `churn` = frozen camera with a real actor shown/hidden every 8 frames (the toggle pair is excluded), and `stress` = 12
+actors toggling at staggered 6..28-frame periods (nothing excluded). Churn and stress are measured OUTSIDE the actors' screen rects
+(bounding cube of the body, 2x + 64 px per side, a superset of the 1.25x + 24 px rect the renderer drops history in): the region-limited
+admission reset must leave the rest of the screen converged. Per mode it prints
 `TEMPORAL mode= preset= whole= shadow= edge= worst=` and writes `temporal-<mode>-<preset>.csv` (mean abs RGB delta overall, in shadow
-pixels = non-edge pixels < 0.7x their 17x17 mean, in Sobel-edge pixels, and worst single channel). Frozen, micro and churn v2 must stay
-<= max(1.2 x Original, 0.25) whole and shadow, <= max(1.2 x Original, 1.0) edge; frozen and micro also worst <= max(1.2 x Original, 64).
-Churn worst is unbounded: an admission change resets history by fairness design, so that frame is the raw jittered one. A failure keeps
+pixels = non-edge pixels < 0.7x their 17x17 mean, in Sobel-edge pixels, and worst single channel). v2 must stay
+<= max(1.2 x Original, 0.25) whole and shadow, <= max(1.2 x Original, 1.0) edge, worst <= max(1.2 x Original, 64) in every mode but animated.
+A failure keeps
 `temporal-<mode>-<preset>-worst-a/b.png`. `AOMAC_GFX_TEMPORAL_PROBE=x,y` prints `PROBE mode preset frame r g b` per measured frame.
 
 ### Diagnostics (real window, all read once, zero cost when unset)

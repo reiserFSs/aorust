@@ -127,7 +127,7 @@ fn compile(device: &wgpu::Device, shader: &wgpu::ShaderModule, layouts: &[wgpu::
 }
 
 impl Pipes {
-    pub(super) fn new(r: &Renderer) -> Self {
+    pub(super) fn new(r: &super::Seed) -> Self {
         let device = &r.device;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Enhanced v2 G-buffer"), source: wgpu::ShaderSource::Wgsl(shader_source().into()),

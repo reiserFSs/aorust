@@ -294,7 +294,7 @@ fn layout_entry(binding: u32, ty: wgpu::BindingType, visibility: wgpu::ShaderSta
 }
 
 impl Shadows {
-    pub(super) fn new(r: &Renderer, visibility: &wgpu::Buffer) -> Self {
+    pub(super) fn new(r: &super::Seed, visibility: &wgpu::Buffer) -> Self {
         let device = &r.device;
         let sun_static = depth_array(device, "v2 sun cascades (static)", SUN_RES, SUN_CASCADES as u32);
         let sun_dyn = depth_array(device, "v2 sun cascades (actors)", SUN_DYN_RES, SUN_CASCADES as u32);

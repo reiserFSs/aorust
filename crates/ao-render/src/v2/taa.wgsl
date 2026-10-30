@@ -23,6 +23,20 @@
 @group(0) @binding(7) var halo: texture_2d<f32>;
 @group(0) @binding(8) var<uniform> ctl: Ctl;
 @group(0) @binding(9) var g3t: texture_2d<f32>;
+@group(0) @binding(10) var<uniform> regions: Rects;
+
+// Admission-changed pixel regions (region.rs): history-less this frame (DESIGN section 8), everything else keeps its history.
+struct Rects {
+    count: vec4<u32>,
+    r: array<vec4<f32>, 16>,
+}
+fn in_region(p: vec2<f32>) -> bool {
+    for (var i = 0u; i < regions.count.x; i++) {
+        let r = regions.r[i];
+        if p.x >= r.x && p.y >= r.y && p.x < r.z && p.y < r.w { return true; }
+    }
+    return false;
+}
 
 // Per-pixel emission mask: a native self-lit pixel (authored G3 emission) keeps its own colour; the bloom halo is a dark-lift that must
 // not land on it (the Newland lamp pole, one self-lit material with the head, stays at its native brightness).
@@ -159,7 +173,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
     let uv = (vec2<f32>(id.xy) + vec2<f32>(0.5)) * fc.viewport.zw;
     let huv = uv - mv;
     let valid = ctl.taa.x == 0u && abs(mv.x) < 32.0 && abs(mv.y) < 32.0
-        && all(huv > vec2<f32>(0.0)) && all(huv < vec2<f32>(1.0));
+        && all(huv > vec2<f32>(0.0)) && all(huv < vec2<f32>(1.0)) && !in_region(vec2<f32>(id.xy) + vec2<f32>(0.5));
     var out_lin = cur_lin;
     var count = 1.0;
     if valid {

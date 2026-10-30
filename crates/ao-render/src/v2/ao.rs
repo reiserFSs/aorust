@@ -1,7 +1,7 @@
 //! Ambient occlusion (slot 3b): half-res GTAO on the shared HiZ + G1 normals (2 slices x 6 steps per side), a 3x3 bilateral +
 //! temporal denoise, and a depth-aware upsample into the full-res `R8Unorm` texture the resolve reads at binding 6. The AO texture
 //! only ever multiplies the ambient term. Fairness: inputs are the G-buffer depth/normals (admitted actors only) and nothing else;
-//! fully fogged and sky texels are 1 and never act as occluders; history is dropped when the admitted-actor hash changes.
+//! fully fogged and sky texels are 1 and never act as occluders; history is dropped inside the screen regions whose drawn-actor set changed (`region.rs`).
 use super::gbuffer::Targets;
 use super::pyramid::{entry, storage, texture, uniform, Pyramid};
 use super::timers::PassTimers;
@@ -26,7 +26,7 @@ impl Pipes {
         let (cs, fs) = (wgpu::ShaderStages::COMPUTE, wgpu::ShaderStages::FRAGMENT);
         let layout = |label, entries: &[wgpu::BindGroupLayoutEntry]| device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries });
         let l_gtao = layout("v2 gtao", &[uniform(0, cs), texture(1, cs, false), texture(2, cs, false), storage(3, RAW)]);
-        let l_denoise = layout("v2 ao denoise", &[uniform(0, cs), texture(1, cs, false), texture(4, cs, false), texture(5, cs, false), storage(6, HIST), uniform(7, cs)]);
+        let l_denoise = layout("v2 ao denoise", &[uniform(0, cs), texture(1, cs, false), texture(4, cs, false), texture(5, cs, false), storage(6, HIST), uniform(7, cs), uniform(9, cs)]);
         let l_up = layout("v2 ao upsample", &[uniform(0, fs), texture(1, fs, false), texture(8, fs, false)]);
         let source = format!("{}\n{}\n{}\n", crate::shader_source::load("v2/common.wgsl", include_str!("common.wgsl")),
             crate::shader_source::load("v2/packing.wgsl", include_str!("packing.wgsl")), crate::shader_source::load("v2/ao.wgsl", include_str!("ao.wgsl")));
@@ -47,11 +47,11 @@ impl Pipes {
     }
 }
 
-/// Why the denoise must not read the history, `None` when it is kept (also the `AOMAC_V2_TEMPORAL_TRACE` log text): nothing valid
-/// yet (first frame / resize), the admitted-actor set changed (DESIGN section 8: history must not carry a hidden actor's signal
-/// across an admission change), or TAA jitter was toggled.
-fn reset_reason(valid: bool, last_hash: u32, hash: u32, last_jitter: bool, jitter: bool) -> Option<&'static str> {
-    if !valid { Some("first-frame/resize") } else if last_hash != hash { Some("admission-change") } else if last_jitter != jitter { Some("jitter-toggle") } else { None }
+/// Why the denoise must not read the history ANYWHERE, `None` when it is kept (also the `AOMAC_V2_TEMPORAL_TRACE` log text): nothing valid
+/// yet (first frame / resize), a set-wide admission change (DESIGN section 8; the ordinary per-actor change only drops the history inside
+/// its `region::Change` rects), or TAA jitter was toggled.
+fn reset_reason(valid: bool, admission_full: bool, last_jitter: bool, jitter: bool) -> Option<&'static str> {
+    if !valid { Some("first-frame/resize") } else if admission_full { Some("admission-change") } else if last_jitter != jitter { Some("jitter-toggle") } else { None }
 }
 
 /// Uniform words of `params` (`vec4<u32>` in ao.wgsl): x = reset, yz = bit patterns of the jitter (pixels) that produced the history.
@@ -70,14 +70,13 @@ pub(super) struct Ao {
     up_bind: [wgpu::BindGroup; 2],
     params: wgpu::Buffer,
     valid: Cell<bool>,
-    hash: Cell<u32>,
     /// Jitter (pixels) of the frame that wrote the history `hist[parity ^ 1]`; the denoise looks the reprojected texel up through it.
     jitter: Cell<[f32; 2]>,
     parity: Cell<usize>,
 }
 
 impl Ao {
-    pub(super) fn new(device: &wgpu::Device, pipes: &Pipes, consts: &wgpu::Buffer, pyramid: &Pyramid, targets: &Targets) -> Self {
+    pub(super) fn new(device: &wgpu::Device, pipes: &Pipes, consts: &wgpu::Buffer, regions: &wgpu::Buffer, pyramid: &Pyramid, targets: &Targets) -> Self {
         let size = targets.size;
         let half = (size.0.div_ceil(2), size.1.div_ceil(2));
         let make = |label, size: (u32, u32), format, usage| device.create_texture(&wgpu::TextureDescriptor {
@@ -95,26 +94,27 @@ impl Ao {
             entries: &[fc(), entry(1, pyramid.view()), entry(2, &targets.g1), entry(3, &raw)] });
         let denoise = |p: usize| device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("v2 ao denoise"), layout: &pipes.l_denoise,
             entries: &[fc(), entry(1, pyramid.view()), entry(4, &raw), entry(5, &hist[p ^ 1]), entry(6, &hist[p]),
-                wgpu::BindGroupEntry { binding: 7, resource: params.as_entire_binding() }] });
+                wgpu::BindGroupEntry { binding: 7, resource: params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: regions.as_entire_binding() }] });
         let up = |p: usize| device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("v2 ao upsample"), layout: &pipes.l_up,
             entries: &[fc(), entry(1, pyramid.view()), entry(8, &hist[p])] });
         Self { view, half, gtao_bind, denoise_bind: [denoise(0), denoise(1)], up_bind: [up(0), up(1)], params,
-            valid: Cell::new(false), hash: Cell::new(0), jitter: Cell::new([0.0; 2]), parity: Cell::new(0) }
+            valid: Cell::new(false), jitter: Cell::new([0.0; 2]), parity: Cell::new(0) }
     }
 
     /// Full-resolution `R8Unorm` AO, 1 = open; bound to the resolve at binding 6 and valid after [`Ao::encode`].
     pub(super) fn view(&self) -> &wgpu::TextureView { &self.view }
 
-    /// Encodes `ao`, `ao_denoise` and `ao_up` (after the pyramid of the same frame). `admission` = `FrameConsts.flags.z`, `jitter` = this
-    /// frame's projection jitter in pixels (`FrameConsts.jitter.xy`). Returns why the history was reset, if it was (temporal trace).
-    pub(super) fn encode(&self, pipes: &Pipes, queue: &wgpu::Queue, enc: &mut wgpu::CommandEncoder, timer: Option<&PassTimers>, admission: u32, jitter: [f32; 2]) -> Option<&'static str> {
+    /// Encodes `ao`, `ao_denoise` and `ao_up` (after the pyramid of the same frame). `admission_full` = the drawn-actor set changed
+    /// massively (the region rects are in the shared `regions` uniform), `jitter` = this frame's projection jitter in pixels
+    /// (`FrameConsts.jitter.xy`). Returns why the history was reset, if it was (temporal trace).
+    pub(super) fn encode(&self, pipes: &Pipes, queue: &wgpu::Queue, enc: &mut wgpu::CommandEncoder, timer: Option<&PassTimers>, admission_full: bool, jitter: [f32; 2]) -> Option<&'static str> {
         let (last, now) = (self.jitter.get(), jitter != [0.0; 2]);
-        let reason = reset_reason(self.valid.get(), self.hash.get(), admission, last != [0.0; 2], now);
+        let reason = reset_reason(self.valid.get(), admission_full, last != [0.0; 2], now);
         let reset = reason.is_some();
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params_words(reset, last)));
         let p = self.parity.get();
         self.valid.set(true);
-        self.hash.set(admission);
         self.jitter.set(jitter);
         self.parity.set(p ^ 1);
         let groups = (self.half.0.div_ceil(8), self.half.1.div_ceil(8));
@@ -148,15 +148,16 @@ mod tests {
     use super::*;
     use crate::v2::pyramid;
 
-    fn history_reset(valid: bool, last_hash: u32, hash: u32, last_jitter: bool, jitter: bool) -> bool { reset_reason(valid, last_hash, hash, last_jitter, jitter).is_some() }
+    fn history_reset(valid: bool, admission_full: bool, last_jitter: bool, jitter: bool) -> bool { reset_reason(valid, admission_full, last_jitter, jitter).is_some() }
 
     #[test]
-    fn history_resets_on_first_frame_admission_change_and_jitter_toggle() {
-        assert!(history_reset(false, 7, 7, true, true), "nothing valid yet (first frame / resize)");
-        assert!(!history_reset(true, 7, 7, true, true), "identical frames keep the history");
-        assert!(history_reset(true, 7, 8, true, true), "a (dis)appearing actor drops it");
-        assert!(history_reset(true, 7, 7, false, true), "TAA switched on");
-        assert!(history_reset(true, 7, 7, true, false), "TAA switched off");
+    fn history_resets_on_first_frame_set_wide_admission_change_and_jitter_toggle() {
+        assert!(history_reset(false, false, true, true), "nothing valid yet (first frame / resize)");
+        assert!(!history_reset(true, false, true, true), "identical frames (or a regional change) keep the history outside the rects");
+        assert!(history_reset(true, true, true, true), "a massive admission change drops it everywhere");
+        assert!(history_reset(true, false, false, true), "TAA switched on");
+        assert!(history_reset(true, false, true, false), "TAA switched off");
+        assert!(include_str!("ao.wgsl").contains("!in_region("), "the denoise skips the history inside the changed regions");
     }
 
     #[test]

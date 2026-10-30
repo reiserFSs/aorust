@@ -13,6 +13,7 @@ mod post;
 mod pyramid;
 mod resolve;
 mod shadows;
+mod region;
 mod skyfix;
 mod taa;
 mod timers;
@@ -67,10 +68,24 @@ pub(crate) struct V2 {
     taa_key: Option<taa::HistoryKey>,
     /// Frame parity of the TAA ping-pong.
     taa_index: usize,
+    /// Previous frame's drawn items: the diff is this frame's admission-changed screen regions.
+    region: region::Tracker,
+    /// `region::RectUniform`, rewritten every frame; read by TAA (binding 10) and the AO denoise (binding 9).
+    rects: wgpu::Buffer,
+}
+
+/// Owned handles [`V2::new`] needs from the renderer, so it can run off the render thread.
+pub(crate) struct Seed {
+    pub(crate) device: wgpu::Device,
+    format: wgpu::TextureFormat,
+    pub(crate) g_layout: wgpu::BindGroupLayout,
+    pub(crate) tex_layout: wgpu::BindGroupLayout,
+    holo_layout: wgpu::BindGroupLayout,
+    shadow_pipelines: std::sync::Arc<crate::sun_shadows::Compiled>,
 }
 
 impl V2 {
-    pub(crate) fn new(r: &Renderer) -> Self {
+    pub(crate) fn new(r: &Seed) -> Self {
         let admission = admission::Admission::new(r);
         let shadows = shadows::Shadows::new(r, admission.visibility());
         let lamps = lamps::Lamps::new(&r.device, admission.visibility());
@@ -107,6 +122,11 @@ impl V2 {
             taa: std::env::var_os("AOMAC_V2_NO_TAA").is_none(),
             taa_key: None,
             taa_index: 0,
+            region: region::Tracker::default(),
+            rects: r.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("v2 admission regions"), size: std::mem::size_of::<region::RectUniform>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+            }),
         }
     }
 }
@@ -154,6 +174,37 @@ fn pack_unorm3(v: Vec3) -> u32 {
 }
 
 impl Renderer {
+    pub(crate) fn v2_seed(&self) -> Seed {
+        Seed { device: self.device.clone(), format: self.format, g_layout: self.g_layout.clone(), tex_layout: self.tex_layout.clone(),
+            holo_layout: self.holo_layout.clone(), shadow_pipelines: self.shadow_pipelines.clone() }
+    }
+
+    /// Starts building [`V2`] (shader modules, pipelines, buffers) on a worker thread; idempotent.
+    pub(crate) fn start_v2(&mut self) {
+        if self.v2.is_none() && self.v2_build.is_none() {
+            let seed = self.v2_seed();
+            self.v2_build = Some(crate::variant::spawn_compile_worker("enhanced v2 build", move || V2::new(&seed)));
+        }
+    }
+
+    /// Installs the finished build. Never blocks unless `block`. Returns whether `self.v2` is usable.
+    pub(crate) fn finish_v2(&mut self, block: bool) -> bool {
+        if self.v2.is_some() { return true; }
+        let Some(build) = &self.v2_build else { return false };
+        if !block && !build.is_finished() { return false; }
+        match self.v2_build.take().expect("checked above").join() {
+            Ok(v2) => { self.v2 = Some(v2); true }
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    /// Per frame: applies the v2 settings that were held back while [`V2`] was building (the previous path kept rendering).
+    pub(crate) fn poll_v2(&mut self) {
+        if let Some(settings) = self.v2_waiting {
+            if self.finish_v2(false) { self.v2_waiting = None; self.request_enhanced_settings(settings); }
+        }
+    }
+
     /// v2 replaces the world pass only; GUI viewports, depth-clear layers and other native screens stay faithful.
     pub(crate) fn v2_eligible(&self) -> bool {
         self.screen.layers.is_empty() && self.screen.depth_clears.is_empty()
@@ -161,10 +212,8 @@ impl Renderer {
 
     /// Per-pass GPU timing for the offline harness (allocates timestamp queries; off by default).
     pub fn set_v2_pass_timing(&mut self, enabled: bool) -> anyhow::Result<()> {
-        if self.v2.is_none() {
-            let v2 = V2::new(self);
-            self.v2 = Some(v2);
-        }
+        self.start_v2();
+        self.finish_v2(true);
         let timers = enabled.then(|| timers::PassTimers::new(&self.device, &self.queue)).flatten();
         anyhow::ensure!(timers.is_some() || !enabled, "v2 pass timing needs TIMESTAMP_QUERY");
         let v2 = self.v2.as_mut().expect("created above");
@@ -199,7 +248,9 @@ impl Renderer {
 
     pub(crate) fn render_v2(&mut self, resolve: &wgpu::TextureView, t: &Targets, cam: &Camera) -> wgpu::SubmissionIndex {
         let _compile_scope = crate::pipeline_creation::FrameGuard::enter();
-        let mut v2 = self.v2.take().unwrap_or_else(|| V2::new(self));
+        self.start_v2();
+        self.finish_v2(true);
+        let mut v2 = self.v2.take().expect("v2 built above");
         self.sync_live_v2_timers(&mut v2);
         self.update_liquids(cam.pos);
         self.update_ground_detail(cam.pos);
@@ -229,14 +280,15 @@ impl Renderer {
         if v2.sized.as_ref().is_none_or(|s| s.targets.size != size) {
             let targets = gbuffer::Targets::new(&self.device, size);
             let pyramid = pyramid::Pyramid::new(&self.device, &v2.pyramid, &v2.consts, &targets);
-            let ao = ao::Ao::new(&self.device, &v2.ao, &v2.consts, &pyramid, &targets);
+            let ao = ao::Ao::new(&self.device, &v2.ao, &v2.consts, &v2.rects, &pyramid, &targets);
             let resolve_bind = v2.resolve.bind(&self.device, &v2.consts, &targets, Some(ao.view()));
             let bloom = v2.bloom.bind(&self.device, &v2.consts, &targets);
-            let taa = v2.taa_pass.bind(&self.device, &v2.consts, &v2.ctl, &bloom.halo, &targets);
+            let taa = v2.taa_pass.bind(&self.device, &v2.consts, &v2.ctl, &v2.rects, &bloom.halo, &targets);
             let post_binds = [0, 1].map(|k| v2.post.bind(&self.device, &v2.consts, &v2.ctl, &taa.hist[1 - k], &targets.depth));
             let skyfix_bind = v2.skyfix.bind(&self.device, &targets.g1);
             v2.sized = Some(Sized { targets, resolve_bind, pyramid, ao, bloom, taa, post_binds, skyfix_bind });
             v2.taa_key = None;
+            v2.region.clear();
             v2.taa_index = 0;
         }
         let sized = v2.sized.as_ref().expect("sized above");
@@ -247,15 +299,25 @@ impl Renderer {
             Some((Vec3::from(m.toward_light).normalize_or_zero(), Vec3::new(0.235, 0.39, 0.55) * 0.4 * (budget.max_element() / 0.2).clamp(0.0, 1.0)))
         });
         // Order-independent, non-cancelling hash of the actor items actually DRAWN this frame (post-cull actor layer, not every host
-        // frame: projectiles/props that never reach a pixel list do not churn it); temporal consumers reset when it changes (DESIGN section 8).
+        // frame: projectiles/props that never reach a pixel list do not churn it); traced only. The temporal histories are invalidated per
+        // REGION: items entering/leaving the drawn set drop the TAA/AO history inside their padded screen rects (region.rs, DESIGN section 8),
+        // and the whole history only on a massive set change.
         let (admission, drawn_items) = admission::drawn_set_hash(self.drawn_actor_items());
-        // TAA history is discarded on frame 0 / resize, camera cuts and any change of the drawn-actor set (a hidden actor cannot
-        // ghost); every actor pose of the motion pass shares that decision.
-        let key = taa::HistoryKey { admission, eye: cam.pos, forward: cam.forward() };
-        let taa_reset = if v2.taa { taa::reset_reason(v2.taa_key.as_ref(), &key) } else { Some("taa-off") };
+        let previous_unjit = if v2.frame == 0 { view_proj_unjit } else { v2.prev_view_proj };
+        let change = v2.region.update(self.drawn_actor_spheres(), previous_unjit, view_proj_unjit, size);
+        // `AOMAC_V2_OFF=admission-region` (diagnostic, read once): any set change resets everything again, the pre-region behaviour, for before/after.
+        let (admission_full, regions) = match &change {
+            region::Change::Full => (true, &[][..]),
+            region::Change::Rects(rects) if off("admission-region") && !rects.is_empty() => (true, &[][..]),
+            region::Change::Rects(rects) => (false, &rects[..]),
+        };
+        self.queue.write_buffer(&v2.rects, 0, bytemuck::bytes_of(&region::RectUniform::new(regions)));
+        // TAA history is discarded on frame 0 / resize, camera cuts and a massive drawn-set change; every actor pose of the motion pass
+        // shares that decision.
+        let key = taa::HistoryKey { eye: cam.pos, forward: cam.forward() };
+        let taa_reset = if v2.taa { taa::reset_reason(v2.taa_key.as_ref(), &key, admission_full) } else { Some("taa-off") };
         let history_reset = taa_reset.is_some();
         v2.taa_key = Some(key);
-        let previous_unjit = if v2.frame == 0 { view_proj_unjit } else { v2.prev_view_proj };
         let consts = FrameConsts {
             view: view.to_cols_array_2d(),
             view_proj: view_proj.to_cols_array_2d(),
@@ -321,7 +383,7 @@ impl Renderer {
         v2.shadows.encode(self, &mut enc, &shadow_view, (look.sun_up > 0.5).then(|| light(look.sun)), moon.map(|(dir, _)| light(dir)), &v2.admission);
         // [slot 3] pyramid + AO (writes the AO texture the resolve reads, flags.y bit 0), [slot 4] light clusters + lamp cube atlas.
         sized.pyramid.encode(&v2.pyramid, &mut enc, timer.and_then(|t| t.compute("hiz")));
-        let ao_reset = if off("ao") { None } else { sized.ao.encode(&v2.ao, &self.queue, &mut enc, timer, admission, jitter) };
+        let ao_reset = if off("ao") { None } else { sized.ao.encode(&v2.ao, &self.queue, &mut enc, timer, admission_full, jitter) };
         let lamps_bind = self.encode_lamps(&mut v2.lamps, &mut enc, timer, &v2.consts, cam, view_proj, [env.fog_start, env.fog_end, far]);
         v2.resolve.encode(&mut enc, &sized.resolve_bind, &[&v2.shadows.bind, &lamps_bind], size, timer.and_then(|t| t.compute("resolve")));
         {
@@ -352,7 +414,7 @@ impl Renderer {
         v2.prev_view_proj = view_proj_unjit;
         if taa::trace_enabled() {
             taa::trace(&taa::TraceFrame { frame: v2.frame, time: self.time, eye: cam.pos, forward: cam.forward(), jitter, admission, drawn_items,
-                taa_reset, ao_reset });
+                regions: regions.len(), taa_reset, ao_reset });
         }
         v2.frame = v2.frame.wrapping_add(1);
         let submission = self.queue.submit([enc.finish()]);
@@ -370,5 +432,55 @@ mod look_tests {
     fn native_ambient_floor_round_trips_through_flags_w() {
         let p = pack_unorm3(Vec3::new(0.0, 0.5, 2.0));
         assert_eq!((p & 1023, p >> 10 & 1023, p >> 20 & 1023), (0, 512, 1023));
+    }
+}
+
+#[cfg(test)]
+mod switch_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Selecting v2 at runtime must not build it on the render thread: the request returns at once, the previous path (and its
+    /// settings) keep rendering until the worker lands, then the next frame swaps v2 in.
+    #[test]
+    fn runtime_selection_builds_off_the_render_thread() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut r = Renderer::new(&instance, None).expect("v2 switch regression requires a GPU");
+        r.wait_for_pipeline_warmup();
+        let v2 = crate::EnhancedSettings { enhanced_v2: true, ..Default::default() };
+        let started = Instant::now();
+        r.request_enhanced_settings(v2);
+        let request = started.elapsed();
+        eprintln!("v2 request returned in {request:?}");
+        assert!(request < Duration::from_millis(100), "request blocked the caller for {request:?}");
+        if r.v2.is_none() {
+            assert!(!r.enhanced_settings.enhanced_v2, "settings were applied before v2 was ready");
+            assert!(r.v2_waiting.is_some());
+        }
+        let output = r.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("v2 switch"), size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: r.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+        });
+        let view = output.create_view(&Default::default());
+        let targets = Targets::new(&r, 64, 64);
+        let camera = Camera::look_at(Vec3::ZERO, Vec3::NEG_Z);
+        let mut worst = Duration::ZERO;
+        while !r.enhanced_settings.enhanced_v2 {
+            let frame = Instant::now();
+            r.render(&view, &targets, &camera);
+            worst = worst.max(frame.elapsed());
+            assert!(started.elapsed() < Duration::from_secs(120), "v2 never became ready");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        eprintln!("v2 ready after {:?}, worst old-path frame {worst:?}", started.elapsed());
+        assert!(r.v2.is_some() && r.v2_waiting.is_none());
+        let frame = Instant::now();
+        r.render(&view, &targets, &camera);
+        eprintln!("first v2 frame {:?}", frame.elapsed());
+
+        // A cancelled selection never applies later.
+        r.request_enhanced_settings(crate::EnhancedSettings::default());
+        assert!(r.v2_waiting.is_none());
     }
 }

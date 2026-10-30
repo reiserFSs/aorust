@@ -94,7 +94,7 @@ fn compile(device: &wgpu::Device, shader: &wgpu::ShaderModule, layout: &wgpu::Pi
 }
 
 impl Admission {
-    pub(super) fn new(r: &Renderer) -> Self {
+    pub(super) fn new(r: &super::Seed) -> Self {
         let device = &r.device;
         let source = format!("{}\n{}", crate::shader_source::load("shader.wgsl", include_str!("../shader.wgsl")),
             crate::shader_source::load("sun_shadows.wgsl", include_str!("../sun_shadows.wgsl")));

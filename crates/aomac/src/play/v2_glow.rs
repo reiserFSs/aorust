@@ -145,10 +145,11 @@ fn graphics_v2_newland_lamp_pole_stays_native_and_head_glows() -> anyhow::Result
     Ok(())
 }
 
-/// Fairness (e), DESIGN section 8: an admission flip leaves no TAA history residue. Run A shows the actor on frame 1 and hides it
-/// (alpha 0) on frames 2-3; run B admits the same actor on frame 1 behind the camera (invisible, same admission hash) and hides it
-/// the same way. Both histories are discarded on frame 2, so frames 2 and 3 must match byte for byte: nothing of the frame-1 actor
-/// survived. Frame 1 must differ (positive control).
+/// Fairness (e), DESIGN section 8: an admission flip leaves no TAA/AO history residue, and only drops history where it flipped. Run A
+/// shows the actor on frame 1 and hides it (alpha 0) on frames 2-3; the reference never shows it. On frame 2 the actor leaves the
+/// drawn set, so the history inside its padded screen rect is dropped: on the pixels the actor covered on frame 1 frames 2 and 3 must
+/// match the reference (no residue, only the raw-vs-accumulated jitter noise of the reset), and outside a generous box around it
+/// they must match BYTE for BYTE (the rest of the screen keeps its history: no full-screen reset). Frame 1 must differ (positive control).
 #[test]
 #[ignore = "offline v2 fairness regression; requires installed client and the GPU timing lock"]
 fn graphics_v2_admission_flip_leaves_no_history_residue() -> anyhow::Result<()> {
@@ -158,27 +159,40 @@ fn graphics_v2_admission_flip_leaves_no_history_residue() -> anyhow::Result<()> 
     let store = ao_rdb::RecordStore::open(&dir)?;
     let mut avatar = super::super::avatar::Avatar::new(&store, &dir, 25988, &graphics_fixture_actor()?, ao_formats::character::actor::ActorAssets::new(&store)?)?;
     let model = Arc::new(avatar.model().clone());
-    let frame_at = |avatar: &mut super::super::avatar::Avatar, position: Vec3, alpha: f32| {
-        avatar.set_transform(position.to_array(), 0.0);
+    let front = view.fixed.pos + view.fixed.forward() * 6.0 - Vec3::Y;
+    avatar.set_transform(front.to_array(), 0.0);
+    let frame_at = |avatar: &super::super::avatar::Avatar, alpha: f32| {
         let mut frame = avatar.frame();
         frame.id = 25988;
         frame.alpha = alpha;
-        frame
+        Some(frame)
     };
-    let front = view.fixed.pos + view.fixed.forward() * 3.0 - Vec3::Y;
-    let behind = view.fixed.pos - view.fixed.forward() * 6.0 - Vec3::Y;
     let settings = graphics_fixture_settings("v2-high")?;
-    let a: Vec<_> = [(front, 1.0), (front, 0.0), (front, 0.0)].into_iter().map(|(p, alpha)| Some(frame_at(&mut avatar, p, alpha))).collect();
-    let b: Vec<_> = [(behind, 1.0), (front, 0.0), (front, 0.0)].into_iter().map(|(p, alpha)| Some(frame_at(&mut avatar, p, alpha))).collect();
-    let (run_a, run_b) = (render_sequence(&view, settings, Some(&model), &a)?, render_sequence(&view, settings, Some(&model), &b)?);
-    for (i, (fa, fb)) in run_a.iter().zip(&run_b).enumerate() {
+    let a: Vec<_> = [1.0, 0.0, 0.0].into_iter().map(|alpha| frame_at(&avatar, alpha)).collect();
+    let run_a = render_sequence(&view, settings, Some(&model), &a)?;
+    let reference = render_sequence(&view, settings, None, &[None, None, None])?;
+    for (i, (fa, fb)) in run_a.iter().zip(&reference).enumerate() {
         save(&out, &format!("flip-a{}.png", i + 1), fa)?;
-        save(&out, &format!("flip-b{}.png", i + 1), fb)?;
+        save(&out, &format!("flip-ref{}.png", i + 1), fb)?;
     }
-    ensure!(run_a[0] != run_b[0], "positive control: the visible actor must change frame 1");
+    ensure!(run_a[0] != reference[0], "positive control: the visible actor must change frame 1");
+    let (w, h) = (SIZE.0 as usize, SIZE.1 as usize);
+    let covered: Vec<bool> = (0..w * h).map(|i| (0..3).map(|c| u32::from(run_a[0][i * 4 + c].abs_diff(reference[0][i * 4 + c]))).sum::<u32>() > 60).collect();
+    let covered_count = covered.iter().filter(|&&c| c).count();
+    ensure!(covered_count > 800, "fixture: the actor covers only {covered_count} pixels");
+    let (mut lo, mut hi) = ((w, h), (0, 0));
+    for (i, _) in covered.iter().enumerate().filter(|(_, c)| **c) { let (x, y) = (i % w, i / w); lo = (lo.0.min(x), lo.1.min(y)); hi = (hi.0.max(x), hi.1.max(y)); }
+    // 2.5x the covered box + 256 px: well past the padded sphere rect the renderer drops history in (1.25x its bounding cube + 24 px;
+    // the pose-margin sphere of a body 6 m away spans ~1000 px, far more than the body's own pixels).
+    let (cx, cy, hx, hy) = ((lo.0 + hi.0) as f32 / 2.0, (lo.1 + hi.1) as f32 / 2.0, (hi.0 - lo.0) as f32 * 2.5 + 256.0, (hi.1 - lo.1) as f32 * 2.5 + 256.0);
+    let near = |x: usize, y: usize| (x as f32 - cx).abs() <= hx && (y as f32 - cy).abs() <= hy;
     for i in 1..3 {
-        let differing = run_a[i].iter().zip(&run_b[i]).filter(|(x, y)| x != y).count();
-        ensure!(differing == 0, "frame {}: {differing} bytes differ, the frame-1 actor left history residue", i + 1);
+        let differing = (0..w * h).filter(|&p| !near(p % w, p / w) && run_a[i][p * 4..p * 4 + 3] != reference[i][p * 4..p * 4 + 3]).count();
+        let residue = mean_abs_diff(&run_a[i], &reference[i], &|x, y| covered[y * w + x]);
+        let worst = (0..w * h).filter(|&p| covered[p]).flat_map(|p| (0..3).map(move |c| (p, c))).map(|(p, c)| run_a[i][p * 4 + c].abs_diff(reference[i][p * 4 + c])).max().unwrap_or(0);
+        eprintln!("flip frame {}: {differing} bytes differ outside the actor box; on its {covered_count} old pixels mean {residue:.3} max {worst}", i + 1);
+        ensure!(differing == 0, "frame {}: {differing} pixels outside the actor's region differ, the history was reset beyond it", i + 1);
+        ensure!(residue <= 1.0 && worst <= 32, "frame {}: actor residue on its old pixels (mean {residue:.3}, max {worst})", i + 1);
     }
     Ok(())
 }
