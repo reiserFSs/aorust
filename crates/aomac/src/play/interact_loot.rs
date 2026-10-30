@@ -212,6 +212,8 @@ impl LootUi {
                     WindowSize::Fixed(w, canvas_size_for(SLOTS).1)
                 } else { WindowSize::Preferred };
                 let Ok(window) = gui.open_tabbed_window_xml("LootView", title, &xml, (0, 0), size) else { return };
+                // Style-0 `WndBorder` is movable unless flag 0x8 is set; container windows set no such flag.
+                gui.set_window_frame(window, true, false);
                 let (ow, oh) = gui.outer_size(window);
                 // `Window::MoveToCenter` is the default of a window without a saved frame (`container_position` is not stored)
                 gui.set_window_pos(window, ((screen.0 as i32 - ow as i32) / 2, (screen.1 as i32 - oh as i32) / 2));
@@ -497,6 +499,29 @@ mod tests {
         assert!(gui.has_view(window, "contracts") && !gui.has_view(window, "grid"));
         assert_eq!(ui.event(&mut gui, &Event::MultiMouse { window, view: "contracts".into(), id: Some(29), button: 1, clicks: 2, x: 0, y: 0 }, 0.0), Some(Some(Identity { kind: ao_net::n3::inventory::KIND_CONTRACT, instance: 29 })));
         assert_eq!(ui.container_drop(&gui, 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn container_window_moves_by_its_frame() {
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&client, None).unwrap();
+        gui.set_screen_size(1280, 800);
+        let mut ui = LootUi::default();
+        let c = Identity { kind: 0xc749, instance: 7 };
+        let mut u = update(true, &[3]);
+        u.container = c;
+        ui.update(&mut gui, None, (1280, 800), c, "Backpack", &u, true);
+        let w = ui.window_of(c).unwrap();
+        let (x, y, ..) = gui.window_outer_frame(w).unwrap();
+        let (gx, gy) = (x as f32 + 100.0, y as f32 + 12.0);
+        gui.input(ao_gui::InputEvent::MouseMove { x: gx, y: gy });
+        gui.input(ao_gui::InputEvent::MouseDown { x: gx, y: gy, button: ao_gui::MouseButton::Left });
+        gui.input(ao_gui::InputEvent::MouseMove { x: gx + 40.0, y: gy + 30.0 });
+        gui.input(ao_gui::InputEvent::MouseUp { x: gx + 40.0, y: gy + 30.0, button: ao_gui::MouseButton::Left });
+        let (nx, ny, ..) = gui.window_outer_frame(w).unwrap();
+        assert_eq!((nx, ny), (x + 40, y + 30));
+        ui.close_all(&mut gui);
     }
 
     #[test]
