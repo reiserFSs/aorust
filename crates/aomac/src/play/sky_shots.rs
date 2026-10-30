@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 mod ao_grain;
 mod preset_matrix;
+mod cpu_encode;
 mod temporal;
 
 struct Shot {

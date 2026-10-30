@@ -182,3 +182,11 @@ Look at: tree/lamp/pole shadows on grass and the platform shadow on the beach (n
 building bases and under the ICC overhang (no halos), stable edges while walking (TAA), cyan signs and lamp heads glowing, the lamp
 pole staying dull, and a carried Light Bar lighting the ground with the actor's shadow. Not in M2 (later milestones): authored
 sky/cloud rework, froxel haze/shafts, water material, grass/foliage in the G-buffer, night look, per-zone grade.
+
+## CPU encode cost (main thread)
+`AOMAC_GFX_CPU_ENCODE=1 AOMAC_GFX_VIEW=icc-platform-authored cargo test --release -p aomac graphics_v2_cpu_encode -- --ignored --nocapture`
+reports mean/p95 wall of render + finish + submit (faithful vs v2-high, walking camera, GPU drained per frame). Dominant cost was
+wgpu `command_encoder_finish`; the lamp cube atlas (shared v1 point cache) re-rendered faces every frame because its fingerprint hashed
+the camera pose. In v2 the pose is hashed only with owned (carried) lights or more possible lights than cubes; otherwise only each
+light's 30/80 m distance band is. Result (icc-platform, offscreen): v2 3.13 -> 1.88 ms (faithful 1.09). Sorting G-buffer draws by
+state was tried: it removes ~40% of finish but changes pixels (rejected, byte gate).

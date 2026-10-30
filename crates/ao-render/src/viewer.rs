@@ -1366,6 +1366,9 @@ impl Offscreen {
         self.r.render(&perf.view, &self.targets, &self.host.camera);
         Ok(())
     }
+    /// Blocks until all submitted GPU work finished (CPU-timing harnesses).
+    pub fn wait_idle(&self) { self.r.device.poll(wgpu::PollType::wait_indefinitely()).expect("offscreen idle wait"); }
+    pub fn frame_stats(&self) -> crate::FrameStats { self.r.stats }
 
     /// Isolates actual GUI encoding/submission CPU wall time from preceding world work.
     /// Evidence-only blocking boundary; the live profiler supplies rolling GUI GPU costs.

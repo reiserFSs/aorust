@@ -248,6 +248,8 @@ impl Renderer {
 
     pub(crate) fn render_v2(&mut self, resolve: &wgpu::TextureView, t: &Targets, cam: &Camera) -> wgpu::SubmissionIndex {
         let _compile_scope = crate::pipeline_creation::FrameGuard::enter();
+        let timed = self.cpu_timings.is_some();
+        let prepare_start = timed.then(std::time::Instant::now);
         self.start_v2();
         self.finish_v2(true);
         let mut v2 = self.v2.take().expect("v2 built above");
@@ -345,6 +347,7 @@ impl Renderer {
         self.queue.write_buffer(&v2.ctl, 0, bytemuck::bytes_of(&post_ctl));
         v2.motion.prepare(self, view_proj_unjit, previous_unjit, history_reset);
 
+        let encode_start = timed.then(std::time::Instant::now);
         let mut enc = self.device.create_command_encoder(&Default::default());
         if let Some(timers) = &v2.timers { timers.begin_frame(); }
         self.encode_actor_skins(&mut enc);
@@ -417,7 +420,15 @@ impl Renderer {
                 regions: regions.len(), taa_reset, ao_reset });
         }
         v2.frame = v2.frame.wrapping_add(1);
-        let submission = self.queue.submit([enc.finish()]);
+        let finish_start = timed.then(std::time::Instant::now);
+        let commands = enc.finish();
+        let submit_start = timed.then(std::time::Instant::now);
+        let submission = self.queue.submit([commands]);
+        if let (Some(prepare), Some(encode), Some(finish), Some(submit)) = (prepare_start, encode_start, finish_start, submit_start) {
+            self.cpu_timings = Some(crate::FrameCpuTimings { prepare_ms: (encode - prepare).as_secs_f64() * 1e3,
+                encode_ms: (finish - encode).as_secs_f64() * 1e3, finish_ms: (submit - finish).as_secs_f64() * 1e3,
+                queue_submit_ms: submit.elapsed().as_secs_f64() * 1e3, ..Default::default() });
+        }
         if let Some(timers) = &v2.timers { timers.submitted(&submission); }
         self.v2 = Some(v2);
         submission

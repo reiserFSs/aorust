@@ -134,10 +134,16 @@ impl Dispatch {
 impl Renderer {
     pub(super) fn point_dispatch_inputs(&self, cam: &Camera, points: &mut PointShadows, admission_planes: [f32; 3]) -> u64 {
         let mut hash = 14695981039346656037u64;
-        for value in [cam.pos.x, cam.pos.y, cam.pos.z, cam.yaw, cam.pitch, cam.roll,
+        // Enhanced v2: the static cubes of unowned lamps do not depend on the camera (selection is hashed through the possible
+        // lights below), so camera motion must not re-render them every frame; only owner occlusion proofs (below) are view-dependent.
+        let v2 = self.enhanced_settings.enhanced_v2;
+        let camera_words = |hash: &mut u64| for value in [cam.pos.x, cam.pos.y, cam.pos.z, cam.yaw, cam.pitch, cam.roll,
             self.lens.fov, self.lens.near, self.lens.far.unwrap_or(self.gpu.radius)] {
-            hash_word(&mut hash, value.to_bits());
-        }
+            hash_word(hash, value.to_bits());
+        };
+        if v2 {
+            for value in [self.lens.fov, self.lens.near, self.lens.far.unwrap_or(self.gpu.radius)] { hash_word(&mut hash, value.to_bits()); }
+        } else { camera_words(&mut hash); }
         for word in [u32::from(self.lens.horizontal), points.size.0, points.size.1] { hash_word(&mut hash, word); }
         let candidates = self.cluster_frame.data[2..].as_chunks::<5>().0;
         let mut nearest = [f32::INFINITY; CUBES];
@@ -160,6 +166,7 @@ impl Renderer {
         dispatch.owners.dedup();
         self.point_owner_capsules(&dispatch.owners, &mut dispatch.owner_capsules);
         if !dispatch.owners.is_empty() {
+            if v2 { camera_words(&mut hash); }
             let occluders = self.point_owner_occluder_hash(cam.pos, &dispatch.owner_capsules);
             hash_word(&mut hash, occluders as u32);
             hash_word(&mut hash, (occluders >> 32) as u32);
@@ -205,6 +212,18 @@ impl Renderer {
             hash_word(&mut hash, source[4][2].to_bits());
             hash_word(&mut hash, if owned { source[4][3].to_bits() } else { source[4][1].to_bits() });
             dispatch.possible_lights.push(PossibleLight { sphere, owned });
+        }
+        if v2 && dispatch.owners.is_empty() {
+            // `select_cubes` keeps every possible light in a cube while they fit, so the selection cannot change; what still reacts to
+            // the camera is each cube's raster ratio (distance bands 30 m / 80 m). Otherwise (more possible lights than cubes, or
+            // owned sources) the exact camera pose stays an input.
+            if dispatch.possible_lights.len() > points.count { camera_words(&mut hash); }
+            else {
+                for light in &dispatch.possible_lights {
+                    let d = (Vec3::from_slice(&light.sphere[..3]) - cam.pos).length();
+                    hash_word(&mut hash, u32::from(d < 30.0) + u32::from(d < 80.0));
+                }
+            }
         }
         dispatch.retained_sources.retain(|old| old.seen == dispatch.frame
             && (self.time <= old.last_possible_time + FADE_SECONDS || dispatch.frame.wrapping_sub(old.last_possible_frame) <= 3));
